@@ -38,7 +38,7 @@ use masonry_winit::winit::window::Window;
 
 use crate::editor::NodeEditor;
 use crate::model::{GraphModel, NODE_SIZE, SharedGraph, share};
-use crate::node::GraphNode;
+use crate::node::GraphSource;
 
 /// Default graph size. The figure comes straight from the Phase 0 brief.
 pub const DEFAULT_NODES: usize = 5000;
@@ -54,10 +54,7 @@ pub fn build_canvas(count: usize) -> (CanvasLayer, SharedGraph) {
         let graph = graph.clone();
         move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
     };
-    let source = {
-        let graph = graph.clone();
-        move |i: usize| GraphNode::build(&graph, i)
-    };
+    let source = GraphSource::new(graph.clone());
     (CanvasLayer::new(count, geometry, source), graph)
 }
 

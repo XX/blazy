@@ -218,6 +218,28 @@ pub fn run(count: usize) {
         }));
     }
 
+    // --- Scenario 7: the whole graph on screen.
+    //
+    // Virtualisation bounds cost by the *visible* set, so zooming out far enough
+    // that every node is visible removes the bound by definition. This scenario
+    // exists to measure what is left when it does.
+    {
+        let mut harness = new_harness(count);
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.04);
+            });
+        });
+        let _ = harness.redraw();
+        reports.push(measure("pan, whole graph shown", &mut harness, 30, |h, _| {
+            h.edit_root_widget(|mut editor| {
+                NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
+                });
+            });
+        }));
+    }
+
     println!();
     for report in &reports {
         report.print();

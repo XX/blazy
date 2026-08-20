@@ -81,9 +81,9 @@ impl Detail {
     /// Thresholds are picked so controls disappear slightly before they become too
     /// small to hit, rather than after.
     pub fn for_scale(scale: f64) -> Self {
-        if scale > 0.6 {
+        if scale > 0.3 {
             Self::Full
-        } else if scale > 0.25 {
+        } else if scale > 0.1 {
             Self::Simplified
         } else {
             Self::Box
@@ -197,6 +197,19 @@ pub trait NodeSource: 'static {
     /// Called every time the node enters the materialised region, so it must read
     /// current state from the model rather than assuming defaults.
     fn build(&mut self, index: usize) -> NewWidget<dyn Widget>;
+
+    /// Draws node `index` when it is too small to deserve a widget.
+    ///
+    /// Below the [`Detail::Box`] threshold the canvas stops materialising widgets
+    /// entirely and paints the nodes itself, in one pass, into its own scene. A node
+    /// a few pixels across does not need layout, hit testing, accessibility or an
+    /// event route — it needs a filled rectangle, and a rectangle costs nanoseconds
+    /// where a widget costs microseconds.
+    ///
+    /// `rect` is in canvas coordinates. The default draws nothing.
+    fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {
+        let _ = (index, rect, painter);
+    }
 }
 
 impl<F> NodeSource for F
@@ -230,7 +243,17 @@ pub struct CanvasContent {
     /// Builds widgets on demand.
     source: Box<dyn NodeSource>,
     /// Indices with a live widget, ascending.
+    ///
+    /// Empty in far-field mode: below the [`Detail::Box`] threshold no node gets a
+    /// widget at all.
     live: Vec<usize>,
+    /// Indices inside the visible rect, ascending.
+    ///
+    /// Equal to `live` above the far-field threshold. Below it, this is what gets
+    /// painted directly.
+    visible: Vec<usize>,
+    /// Whether the canvas is painting nodes itself instead of materialising them.
+    far_field: bool,
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
@@ -257,6 +280,8 @@ impl CanvasContent {
             slots,
             source,
             live: Vec::new(),
+            visible: Vec::new(),
+            far_field: false,
             pending: None,
             visible_rect: Rect::ZERO,
             detail: None,
@@ -292,6 +317,9 @@ impl CanvasContent {
             return;
         };
         if desired == this.widget.live {
+            // No widget changes, but `cull` only queued this when something moved,
+            // which in far-field mode means the painted set changed.
+            this.ctx.request_paint_only();
             return;
         }
 
@@ -348,25 +376,40 @@ impl CanvasContent {
         this.widget.live = desired;
         this.ctx.children_changed();
         this.ctx.request_layout();
+        // The far field is drawn into this widget's own scene, so a change to the
+        // visible set is a repaint. Above the threshold this is a no-op cost.
+        this.ctx.request_paint_only();
     }
 
-    /// Computes the set of nodes that should have widgets.
+    /// Computes the set of nodes inside the visible rect.
     ///
     /// A linear scan over the geometry array. That is O(total) per frame, but it
     /// touches 32 bytes per node and no widget state, so it costs a few microseconds
     /// where materialising the same nodes costs milliseconds. A spatial index drops
     /// in here when the scan itself starts to matter.
     fn cull(&mut self) {
-        let mut desired = Vec::with_capacity(self.live.len() + 8);
+        let mut visible = Vec::with_capacity(self.visible.len() + 8);
         for (index, slot) in self.slots.iter().enumerate() {
             if Rect::from_origin_size(slot.pos, slot.size).overlaps(self.visible_rect) {
-                desired.push(index);
+                visible.push(index);
             }
         }
-        if desired == self.live {
-            self.pending = None;
-        } else {
+
+        // Below the box threshold the canvas paints nodes itself, so nothing is
+        // materialised. This is what keeps a fully zoomed-out graph affordable: the
+        // visible set stops bounding the cost, so the cost must stop depending on
+        // widgets. See `paint`.
+        let far_field = self.detail == Some(Detail::Box);
+        let desired: Vec<usize> = if far_field { Vec::new() } else { visible.clone() };
+
+        let visible_changed = visible != self.visible;
+        self.visible = visible;
+
+        if desired != self.live || far_field != self.far_field || (far_field && visible_changed) {
+            self.far_field = far_field;
             self.pending = Some(desired);
+        } else {
+            self.pending = None;
         }
     }
 }
@@ -428,7 +471,19 @@ impl Widget for CanvasContent {
         self.composes.set(self.composes.get() + 1);
     }
 
-    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        if !self.far_field {
+            return;
+        }
+        // One pass over the visible nodes, straight into this widget's cached scene.
+        // The scene is in canvas coordinates, so panning and zooming re-use it via
+        // the layer transform without re-encoding anything.
+        for &index in &self.visible {
+            let slot = &self.slots[index];
+            let rect = Rect::from_origin_size(slot.pos, slot.size);
+            self.source.paint_far(index, rect, painter);
+        }
+    }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
         for &index in &self.live {
@@ -660,6 +715,7 @@ impl CanvasLayer {
     /// Moves a child from an event handler.
     fn move_child_at(&mut self, index: usize, pos: Point, ctx: &mut EventCtx<'_>) {
         let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+        let far_field = content.far_field;
         if let Some(slot) = content.slots.get_mut(index) {
             if slot.pos == pos {
                 return;
@@ -669,16 +725,21 @@ impl CanvasLayer {
             // scenes; the moved node keeps its own too, since only its position
             // changed, not its contents.
             raw.request_layout();
+            if far_field {
+                // In far-field mode the node is part of this widget's own scene,
+                // so moving it is a repaint rather than a re-place.
+                raw.request_paint_only();
+            }
         }
     }
 
     /// Finds the topmost child under a canvas-space point, from an event handler.
     fn hit_child(&mut self, canvas_pos: Point, ctx: &mut EventCtx<'_>) -> Option<(usize, Point)> {
         let (content, _) = ctx.get_raw(&mut self.content);
-        // Only materialised nodes can be grabbed: a node with no widget is not on
-        // screen, so the pointer cannot be over it.
+        // Hit testing uses the visible set, not the materialised one, so nodes stay
+        // grabbable in far-field mode where they have no widget at all.
         content
-            .live
+            .visible
             .iter()
             .rev()
             .map(|&i| (i, &content.slots[i]))

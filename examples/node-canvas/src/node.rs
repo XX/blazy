@@ -11,7 +11,7 @@
 
 use std::any::TypeId;
 
-use blazy_canvas::{CanvasDetail, Detail};
+use blazy_canvas::{CanvasDetail, Detail, NodeSource};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx,
@@ -215,4 +215,33 @@ impl Widget for GraphNode {
     }
 
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
+}
+
+/// Builds and draws nodes for the canvas.
+///
+/// A struct rather than a closure because the canvas needs two things from it: a
+/// widget when the node is big enough to interact with, and a rectangle when it is
+/// not. See [`NodeSource::paint_far`].
+pub struct GraphSource {
+    graph: SharedGraph,
+}
+
+impl GraphSource {
+    /// Creates a source over the given graph.
+    pub fn new(graph: SharedGraph) -> Self {
+        Self { graph }
+    }
+}
+
+impl NodeSource for GraphSource {
+    fn build(&mut self, index: usize) -> NewWidget<dyn Widget> {
+        GraphNode::build(&self.graph, index)
+    }
+
+    fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {
+        // The far field: no widget, no layout, no hit route — one filled rounded
+        // rect per node, straight into the canvas's own scene.
+        let tint = self.graph.borrow().node(index).tint;
+        painter.fill(RoundedRect::from_rect(rect, RADIUS), tint).draw();
+    }
 }
