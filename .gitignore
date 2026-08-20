@@ -1,0 +1,9 @@
+**/target/
+
+Project.toml
+tmp/
+
+.claude
+.idea
+*.iml
+**/.vscode

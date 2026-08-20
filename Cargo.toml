@@ -1,0 +1,5 @@
+[package]
+name = "blazy"
+edition = "2024"
+
+[dependencies]
