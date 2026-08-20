@@ -461,8 +461,8 @@ impl Widget for CanvasContent {
             if ctx.child_needs_layout(pod) {
                 self.child_layouts.set(self.child_layouts.get() + 1);
             }
-            let child_size = ctx.compute_size(pod, SizeDef::fixed(size), size.into());
-            ctx.run_layout(pod, child_size);
+            // The size is known from the model, so there is nothing to resolve.
+            ctx.run_layout(pod, size);
             ctx.place_child(pod, pos);
         }
     }

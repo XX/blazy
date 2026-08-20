@@ -58,6 +58,7 @@ impl Report {
             self.after.visible,
             (self.after.builds - self.before.builds) as f64 / self.frames as f64,
         );
+        println!("{:<26}   detail {:?}", "", self.after.detail);
     }
 }
 
@@ -209,7 +210,29 @@ pub fn run(count: usize) {
             });
         });
         let _ = harness.redraw();
-        reports.push(measure("pan at box LOD", &mut harness, FRAMES, |h, _| {
+        reports.push(measure("pan, zoom 0.15", &mut harness, FRAMES, |h, _| {
+            h.edit_root_widget(|mut editor| {
+                NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
+                });
+            });
+        }));
+    }
+
+    // --- Scenario 6b: pan at Simplified detail.
+    //
+    // Between Full and the far field: nodes still have widgets, but the checkbox is
+    // stashed. Worth measuring separately because stashing is exactly the halfway
+    // measure that section 20.2 showed does not pay.
+    {
+        let mut harness = new_harness(count);
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.4);
+            });
+        });
+        let _ = harness.redraw();
+        reports.push(measure("pan, zoom 0.40", &mut harness, FRAMES, |h, _| {
             h.edit_root_widget(|mut editor| {
                 NodeEditor::with_canvas(&mut editor, |mut canvas| {
                     CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
@@ -346,7 +369,7 @@ fn verdict(reports: &[Report], count: usize, scaling: &[ScalePoint]) {
         );
     }
 
-    if let (Some(pan), Some(boxed)) = (find("pan"), find("pan at box LOD")) {
+    if let (Some(pan), Some(boxed)) = (find("pan"), find("pan, zoom 0.15")) {
         // Not a pass/fail criterion, just the datum that decides whether LOD earns
         // its complexity.
         println!(
