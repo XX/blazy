@@ -1,9 +1,15 @@
 # blazy — архитектура
 
-> Исходный вопрос: как реализовать GUI-библиотеку на Rust поверх Vello с возможностями
-> уровня Blender (сплиты окон, произвольное масштабирование UI в разных фреймах,
-> контролы на нодах), со сменным рендером для интеграции в движки, без недостатков
-> immediate-mode (egui), при том что компонентом может быть произвольная фигура.
+> **Задача.** GUI-библиотека на Rust с возможностями уровня Blender: сплиты окон,
+> произвольное масштабирование UI в разных фреймах, контролы на нодах. Со сменным
+> рендером для интеграции в движки. Без недостатков immediate-mode (egui). Компонентом
+> может быть произвольная фигура.
+>
+> **Ревизия 2, август 2026.** Первая редакция проектировала весь стек с нуля. Проверка
+> `linebender/xilem@main` показала, что три из четырёх ключевых подсистем уже реализованы
+> апстримом. Документ переписан под связку **`imaging` + `masonry_core`**.
+> Предыдущая редакция — `rnd/architecture.v1.md`, читать только ради истории решений:
+> в ней есть фактические ошибки (см. §2.3).
 
 ---
 
@@ -11,704 +17,823 @@
 
 | Вопрос | Решение |
 |---|---|
-| Парадигма | **Retained element tree** + тонкий декларативный слой с мемоизацией поверх. Не чистый IM, не классический ООП-ретейн |
-| Layout | Box-constraints (Flutter/Druid), один проход, relayout boundaries; flex/grid через taffy внутри |
-| Абстракция рендера | Не `trait Renderer{fill_rect()}`, а **backend-agnostic display list** (форма Vello `Scene`) + `trait SceneRenderer` |
-| Производительность | Три уровня кэша: (A) skip frame, (B) per-area render-to-texture, (C) per-layer scene fragments |
-| Произвольные фигуры | Разделить **layout-геометрию (Rect)**, **визуальную геометрию (BezPath)** и **hit-геометрию** |
-| gpui | Его *рендер* (quad-based) не подходит; его *архитектура элементов* — подходит и стоит заимствовать |
-| Окна Blender | Отдельная подсистема `Screen → Area → Region` **над** деревом виджетов, каждый Region — независимая единица рендера |
-| Ноды | `CanvasLayer` — first-class элемент с аффинным преобразованием, инверсией событий, LOD и spatial index |
-| Взаимодействие | Система **операторов + keymap** (как в Blender), модальные обработчики на стеке |
+| Основа | **`imaging` (IR рендера) + `masonry_core` (retained-дерево)** как git-зависимости. Не писать своё |
+| View-слой | `xilem` **не брать** на первом этапе. `masonry_core` работает без него |
+| Что такое blazy | Не «ещё один тулкит», а **Blender-слой поверх Masonry**: areas/regions, нод-канвас, операторы |
+| Абстракция рендера | Дана: `imaging::PaintSink` / `Painter` / `record::Scene`; бэкенды vello / vello_cpu / vello_hybrid / skia / tiny_skia / wgpu |
+| Layout | Дан, но **не box constraints**: осевой measure/layout в стиле CSS (`Axis`, `LenReq`, `Dim`, `Length`) с встроенным кэшем измерений |
+| Произвольные фигуры | Layout-геометрия — прямоугольник; визуальная — произвольная через `Painter`; хит — переопределяемый `find_widget_under_pointer` |
+| Производительность | Уровни A и C даны (skip-frame, per-widget scene cache). **Уровень B (per-area текстуры) и damage — писать/контрибьютить** |
+| Окна Blender | `blazy-areas`: Screen → Area → Region над деревом виджетов. Апстримного аналога нет |
+| Ноды | `blazy-canvas`: контейнер с per-child `Affine`, culling, spatial index, LOD. `masonry::Canvas` для этого не годится |
+| Взаимодействие | `blazy-ops`: операторы + keymap как данные + модальные обработчики |
+| Главный риск | Апстрим в движении: crates.io отстаёт от main на ~10 месяцев, `imaging` — 0.0.1 |
 
 ---
 
-## 1. Диагноз: что на самом деле тормозит в immediate mode
+## 1. Что уже дано апстримом
 
-Важно точно локализовать проблему, иначе «лечение» будет не там.
+Всё проверено по исходникам `linebender/xilem@main` и crates.io в августе 2026.
+Ссылки на файлы даны, чтобы это можно было перепроверить, а не принимать на веру.
 
-Повторный прогон пользовательского кода каждый кадр — **дёшево**. Это не проблема.
-Дорого повторять **производную работу**:
+### 1.1 `imaging` — абстракция рендера
 
-1. **Тесселяция на CPU каждый кадр.** egui гоняет `Tessellator` по всем шейпам → мегабайты вершин, аллокации, upload в GPU. Это главная статья расхода.
-2. **Отсутствие damage tracking.** Перерисовывается весь экран, даже если мигает один курсор.
-3. **Layout заново на всё дерево.** Нет границ перелейаута, нет кэша размеров.
-4. **Text shaping.** Кэшируется по строке, но при промахе — полный shaping.
-5. **Нет стабильной идентичности.** Отсюда боль с анимациями, фокусом, drag-state, доступностью (AccessKit), и `Id`-коллизии.
-6. **Аллокации на кадр.** Vec шейпов, галлей, мешей.
+Крейт [`forest-rs/imaging`](https://github.com/forest-rs/imaging), самоописание:
+«backend-agnostic imaging IR and recording». Ровно та архитектура, которую первая
+редакция предлагала строить самим.
 
-Отсюда принцип blazy:
+* **Два режима.** Стриминг: `Painter` пишет команды в любой `PaintSink`.
+  Ретейн: `record::Scene` — владеющее хранилище команд с валидацией и реплеем.
+* **Примитивы.** `FillRef`/`FillBuilder`, `StrokeRef`/`StrokeBuilder`, `GlyphRunRef`,
+  `BlurredRoundedRect`, `ClipRef`, `GroupRef` с `Filter`, `MaskRef`/`MaskMode`.
+* **Композиция.** `replay_transformed(&scene, sink, affine)`,
+  `Scene::append_transformed(&scene, affine)` — вставка готового фрагмента с
+  произвольным трансформом. Это и есть механизм кэширования из первой редакции.
+* **Бэкенды.** `imaging_vello` (+ `_cpu`, `_hybrid`), `imaging_skia`,
+  `imaging_tiny_skia`, `imaging_wgpu`.
+* **Трейты рендера.** `render::{ImageRenderer, RenderSource}`, целевые типы и форматы.
 
-> **Сохранить эргономику авторинга, близкую к immediate mode, но ретейнить всю
-> производную работу: layout, shaping, закодированную сцену — и инвалидировать её
-> точечно.**
+### 1.2 Masonry отвязан от Vello
 
-Vello сразу снимает пункт (1): тесселяции на CPU нет вообще, флэттеринг кривых
-происходит на GPU в момент рендера с учётом полного трансформа. Это же автоматически
-решает «произвольное масштабирование»: закэшированный фрагмент сцены **разрешение-независим**,
-его можно вставить с любым зумом без потери качества и без перекодирования.
+[xilem#1696](https://github.com/linebender/xilem/pull/1696), мерж **24.03.2026**:
+`Widget::paint` принимает `imaging::Painter<'_>` вместо `vello::Scene`.
+`masonry_core/Cargo.toml` на main: `imaging`, `kurbo`, `peniko`, `parley`,
+`accesskit`, `tree_arena`, `ui-events`, `smallvec`, `tracing`.
+**Ни `vello`, ни `wgpu`, ни `winit`.**
 
-Пункты (2)–(6) решаются архитектурой ниже.
+Мотивация апстрима — нерешённые проблемы Vello classic и переход на sparse-strips.
+Для нас это означает, что требование «сменный рендер» выполнено чужими руками и
+поддерживается людьми, которые пишут сам рендер.
 
----
+### 1.3 Retained-дерево с точечной инвалидацией
 
-## 2. Слои и крейты
-
-Жёсткое правило: **`blazy-core` не знает ни про wgpu, ни про winit, ни про Vello.**
-
-```
-blazy-geom        kurbo (Bezier, Affine, Shape), peniko (Brush, Blend), color
-blazy-scene       display list: кодирование, слои (Layer), кэш фрагментов, damage
-blazy-text        parley/fontique: shaping, line breaking, кэш галлей, cursor/selection
-blazy-layout      box constraints, taffy-адаптер, кэш измерений
-blazy-core        Element, Id, дерево, события, dirty-флаги, focus, анимации, AccessKit
-blazy-widgets     базовые контролы поверх core
-blazy-view        (опц.) декларативный слой с диффингом и memoize
-blazy-areas       Screen/Area/Region: сплиты, редакторы, keymap, операторы, модальность
------------------------------------------------------- граница абстракции
-blazy-render-vello       wgpu compute (основной)
-blazy-render-vello-cpu   софтверный/hybrid: fallback, headless, golden-тесты
-blazy-render-tiny-skia   чистый CPU
-blazy-render-lyon-gl     тесселяция в треугольники для движков с готовым GL/VK-пайплайном
-blazy-shell-winit        адаптер окна/событий
-blazy-embed-wgpu         рендер в чужой Device/Queue/RenderPass
-blazy-embed-bevy         плагин
-```
-
-Ключевой момент для встраивания: `blazy-embed-*` **никогда не владеет окном и девайсом**.
-Хост отдаёт `&wgpu::Device`, `&Queue`, целевую `TextureView` или уже открытый `RenderPass`,
-и прокидывает сырые события. Всё, что делает blazy — кладёт свои команды в чужой
-командный буфер.
-
----
-
-## 3. Абстракция рендера — главный вопрос интеграции
-
-> **ОБНОВЛЕНО (авг 2026).** Описанный ниже display list — уже не гипотеза: ровно такая
-> абстракция существует как крейт [`imaging`](https://github.com/forest-rs/imaging)
-> («backend-agnostic imaging IR and recording»), и Masonry перешёл на неё в
-> [xilem#1696](https://github.com/linebender/xilem/pull/1696) (мерж 24.03.2026),
-> отвязавшись от Vello. Готовые бэкенды: `imaging_vello` (+ cpu, + hybrid),
-> `imaging_skia`, `imaging_tiny_skia`, `imaging_wgpu`. Раздел ниже сохранён как
-> изложение *принципа*; практический вывод — не писать свой IR, а брать `imaging`.
-> См. §19.
-
-### Антипаттерн
+`masonry_core/src/passes/paint.rs`:
 
 ```rust
-// ПЛОХО
-trait Renderer {
-    fn fill_rect(&mut self, r: Rect, c: Color);
-    fn draw_text(&mut self, s: &str, p: Point);
-}
-```
-Виджет вызывает бэкенд напрямую → chatty-интерфейс, невозможно кэшировать,
-невозможно рендерить в другом потоке, невозможно сериализовать, каждый бэкенд
-обязан уметь всё, включая шейпинг текста.
-
-### Правильный разрез
-
-Виджеты рисуют в **immutable-ish display list**, бэкенд получает его целиком.
-
-```rust
-// blazy-scene
-pub struct Scene {
-    cmds:       Vec<Cmd>,        // SoA-потоки, а не Vec<Box<dyn Draw>>
-    paths:      PathStream,      // плоский буфер сегментов
-    transforms: Vec<Affine>,
-    brushes:    Vec<Brush>,
-    glyphs:     Vec<Glyph>,
-}
-
-pub enum Cmd {
-    Fill   { path: PathRef, brush: BrushRef, xform: XformRef, rule: FillRule },
-    Stroke { path: PathRef, brush: BrushRef, xform: XformRef, style: StrokeRef },
-    Glyphs { run: GlyphRunRef, brush: BrushRef, xform: XformRef },
-    Image  { image: ImageRef, xform: XformRef, quality: Quality },
-    PushLayer { clip: ClipRef, blend: BlendMode, alpha: f32 },
-    PopLayer,
-    /// Вставка ранее закодированного фрагмента — основа кэширования.
-    Fragment { frag: Arc<Scene>, xform: XformRef },
-    /// Дыра для хоста: движок рисует сюда сам (3D-вьюпорт, видео, custom pass).
-    Hole { rect: Rect, id: HoleId },
+scene_cache: &mut HashMap<WidgetId, (Scene, Scene, Scene)>   // pre / main / post
+...
+if ctx.widget_state.request_paint {
+    scene.clear();
+    let mut painter = Painter::new(scene as &mut dyn PaintSink);
+    widget.paint(&mut ctx, &props, &mut painter);
 }
 ```
 
+`paint()` виджета вызывается **только** при взведённом `request_paint`. У виджета
+три сцены: `pre_paint` (фон, бордер, тень — вне клипа), `paint` (содержимое, под
+детьми), `post_paint` (поверх детей, вне клипа). Плюс — отдельный кэш измерений
+(`layout/measurement_cache.rs`) с ключом `(axis, len_req, cross_length)`.
+
+### 1.4 Слои и дыры для хоста
+
+`masonry_core/src/app/visual_layers.rs` (Copyright 2026 — совсем свежий код):
+
 ```rust
-pub trait SceneRenderer {
-    type Target;
-    type Error;
-    fn render(&mut self, scene: &Scene, target: &mut Self::Target, p: RenderParams)
-        -> Result<(), Self::Error>;
-    fn caps(&self) -> Caps;   // blend modes, clip paths, gradients, msaa, ...
+pub struct VisualLayerPlan { pub layers: Vec<VisualLayer> }
+
+pub struct VisualLayer {
+    pub kind: VisualLayerKind,
+    pub transform: Affine,      // из layer-local в window space
+    pub widget_id: WidgetId,
+}
+
+pub enum VisualLayerKind {
+    Scene(Scene),               // ретейненная сцена в локальных координатах
+    External { bounds: Rect },  // плейсхолдер: содержимое рисует хост
 }
 ```
 
-Почему именно так:
+`RenderRoot::redraw() -> (VisualLayerPlan, Option<TreeUpdate>)` — на выходе **план
+слоёв**, а не одна сцена. `VisualLayerKind::External` — это ровно `Cmd::Hole` из
+первой редакции: дыра под 3D-вьюпорт хоста.
 
-* **Форма списка совместима с `vello::Scene`** — бэкенд Vello становится почти
-  тривиальным транслятором, а не переизобретением.
-* **Шейпинг текста остаётся в ядре.** Бэкенд получает уже *позиционированные глифы*
-  (`font_id, size, glyph_id, x, y`) и обязан лишь растеризовать аутлайны или взять
-  их из атласа. Это единственно верный разрез: иначе Vello-версия и GL-версия будут
-  переносить строки по-разному.
-* **Сериализуемость** → рендер в другом потоке, headless-тесты, потенциально remote UI.
-* **`Caps`** позволяет деградировать: если бэкенд не тянет clip-path — превращаем в
-  clip-rect с предупреждением, а не падаем.
-* **`Hole`** решает интеграцию с 3D: blazy не пытается рисовать вьюпорт, он
-  оставляет прямоугольник, а композитор хоста заполняет его.
+Документация типа прямо говорит: *«This is the semantic paint output of Masonry.
+Current hosts still consume it through compatibility helpers that flatten or
+reinterpret it, but the plan is the source of truth.»* То есть хост **вправе
+реализовать слои иначе** — например, каждый в свою текстуру. Это наш штатный
+крючок для уровня B (§7.3).
 
-Два режима встраивания, оба обязаны поддерживаться:
-1. **Owner mode** — blazy владеет surface (десктоп-приложение через `blazy-shell-winit`).
-2. **Guest mode** — blazy рендерит в переданную текстуру или чужой render pass;
-   хост решает, когда и куда композитить.
+### 1.5 Трансформы и compose-проход
 
----
+`WidgetState`: `transform: Affine`, `scroll_translation`, `window_transform`,
+`transform_changed`, `compose_local_transform()`. Отдельный дешёвый проход
+`Widget::compose(&mut ComposeCtx)` — «cheaper alternative than doing a full layout».
 
-## 4. «Компонентом может быть любая фигура» — и почему gpui тут не подходит
+Это фундамент для нод-канваса: подвинуть ноду = обновить `transform` и запросить
+compose, без перелейаута и без перекодирования сцен детей.
 
-Ты прав насчёт gpui, но важно понять **что именно** не подходит.
+### 1.6 Остальное из коробки
 
-**Рендер gpui не подходит.** Он построен на специализированных шейдерах для узкого
-набора примитивов: quad со скруглениями и бордером, тень, спрайт глифа из атласа,
-подчёркивание. Произвольные пути там — отдельный, менее оптимизированный путь.
-Модель «всё есть прямоугольник» проникает в шейдеры и в layout. Для UI редактора
-нод с сокетами-кругами, безье-связями, радиальными меню и нестандартными формами
-это постоянная борьба с фреймворком.
-
-**Архитектура элементов gpui подходит и её стоит взять**: retained-дерево с
-элементами, taffy для layout, per-frame rebuild с сохранением состояния,
-типизированные хендлы на состояние.
-
-**Решение — разделить три геометрии, которые обычно склеены в одну:**
-
-```rust
-pub trait Element {
-    /// 1. LAYOUT-геометрия: всегда прямоугольник. Иначе layout невозможен.
-    fn measure(&mut self, bc: BoxConstraints, cx: &mut LayoutCx) -> Size;
-
-    /// 2. ВИЗУАЛЬНАЯ геометрия: произвольная. Кодируется в Scene.
-    fn paint(&mut self, cx: &mut PaintCx, scene: &mut Scene);
-
-    /// 3. HIT-геометрия: произвольная, по умолчанию выводится из визуальной.
-    fn hit_test(&self, p: Point) -> Hit { Hit::Rect }
-
-    fn event(&mut self, ev: &Event, cx: &mut EventCx) -> Handled;
-}
-
-pub enum Hit {
-    Rect,                       // дёшево, 99% контролов
-    Shape(&'static ShapeCache), // точный winding-тест по кэшированному пути
-    Custom,                     // радиальное меню, сокет ноды, кривая связи
-}
-```
-
-Layout остаётся прямоугольным — это не ограничение, а необходимость: любой
-flow/flex/grid работает с bounding box. А то, что *нарисовано* и что *кликабельно*
-внутри этого бокса — произвольные кривые.
-
-**Хит-тест по произвольной фигуре — две фазы:**
-1. Грубая: bbox через дерево / spatial index. Отсекает всё, кроме нескольких кандидатов.
-2. Точная: `kurbo::Shape::contains` (winding number) по закэшированному flatten'у пути.
-   Для штрихов (связи между нодами) — расстояние до кривой ≤ `width/2 + slop`,
-   через `kurbo::ParamCurveNearest`.
-
-Кэш `ShapeCache` версионируется вместе с виджетом — пересчитывается только при
-изменении геометрии, не каждый кадр.
-
-Vello здесь — правильный выбор именно потому, что произвольная кривая для него
-**нативный примитив, а не спецслучай**. Стоимость fill сложного пути и fill
-прямоугольника отличаются линейно по площади/сегментам, а не на порядок.
+* **Текст** — `parley` (shaping, перенос строк, bidi, курсор, выделение), виджеты
+  `prose`, `text_area`, `text_input`, `variable_label`.
+* **Доступность** — `accesskit`, отдельный проход, `TreeUpdate` из `redraw()`.
+* **Развязка с winit** — `ui-events`; апстрим обсуждает `baseview` для VST-плагинов,
+  то есть встраиваемость для них не абстрактное требование.
+* **Свойства** — CSS-подобная система: `PropertiesRef/Mut`, `PropertyArena`,
+  `DefaultProperties`, `property_stack_id`, `class_set`, колбэк `property_changed`.
+  Готовая база для тем и стилей.
+* **Мульти-окно** — в `masonry_winit` окна по `HandleId`, у каждого свой `RenderRoot`.
+* **Слои виджетов** — `get_layer_root(idx)`, `edit_base_layer(..)` для попапов/оверлеев.
+* **Виджеты** — 38 штук, включая `split`, `virtual_scroll`, `portal`, `zstack`,
+  `indexed_stack`, `grid`, `flex`, `svg`, `resize_observer`.
 
 ---
 
-## 5. Layout
+## 2. Что это меняет для blazy
 
-Box constraints в стиле Flutter/Druid: родитель спускает `BoxConstraints{min,max}`,
-ребёнок возвращает `Size`. Один проход сверху вниз + позиционирование.
+### 2.1 Позиционирование
 
-```rust
-pub struct BoxConstraints { pub min: Size, pub max: Size }
-```
+Писать свой IR, своё retained-дерево, свою обвязку parley/AccessKit — значит потратить
+человеко-годы на догон того, что уже работает, и получить на выходе четвёртый
+Rust-тулкит общего назначения.
 
-Почему не полноценный constraint solver (Cassowary): он O(n) с большой константой,
-нелинейно ведёт себя при инкрементальных изменениях и сложно отлаживается. Box
-constraints предсказуемы, кэшируемы и достаточны для 99% UI. Cassowary имеет смысл
-только для системы сплитов (см. §8), и то опционально.
+**blazy = Blender-слой поверх Masonry.** В экосистеме этого действительно нет, и
+это защитимая позиция: система областей, нод-канвас с виджетами внутри нод, операторы
+и keymap. Всё это аддитивно, **форк Masonry не требуется**.
 
-**Relayout boundary** (ключ к инкрементальности): узел является границей, если его
-constraints *tight* (min == max) или он явно объявлен boundary. Изменение внутри
-поддерева ниже границы не может изменить размер родителя → перелейаут останавливается
-на границе, не поднимается до корня. Регионы, панели, тела нод — всегда границы.
+### 2.2 Что остаётся написать
 
-Внутри узла — свободный выбор алгоритма: своя колонка/строка (дёшево) или taffy для
-полноценных flex/grid.
+| Подсистема | Апстрим | Наше |
+|---|---|---|
+| IR рендера, бэкенды | ✅ `imaging` | — |
+| Retained-дерево, проходы, кэш сцен | ✅ `masonry_core` | — |
+| Layout | ✅ осевой measure/layout | адаптеры для areas и канваса |
+| Текст, a11y, свойства | ✅ | — |
+| Трансформы виджетов | ✅ `WidgetState::transform` | — |
+| Дыры под 3D хоста | ✅ `VisualLayerKind::External` | реализация в хосте |
+| **Screen/Area/Region** | ❌ | `blazy-areas` (§8) |
+| **Per-region UI scale** | ❌ | `blazy-areas` (§9) |
+| **Нод-канвас** | ❌ | `blazy-canvas` (§10) |
+| **Операторы, keymap, модальность** | ❌ | `blazy-ops` (§11) |
+| **Damage regions** | ❌ TODO #789 | контрибьютить (§7.3) |
+| **Per-area render-to-texture** | ⚠️ скелет | контрибьютить + хост (§7.3) |
+| **Точный хит-тест по фигуре** | ⚠️ крючок есть | `blazy-shape` (§6.2) |
 
-Кэш: `(constraints, content_version) -> Size`. Промах кэша только при реальном изменении.
+### 2.3 Ошибки первой редакции — исправить
 
----
-
-## 6. Декларативный слой поверх retained
-
-Ретейн-дерево эргономически неприятно писать руками (Qt-подобная боль синхронизации
-состояния). Поэтому сверху — тонкий слой view/diff, как в Xilem:
-
-```
-State ──build──> View tree (дешёвые дескрипторы, без аллокаций на кадр)
-                     │ rebuild(prev, next) — диффинг
-                     ▼
-                 Element tree (retained: layout-кэш, scene-кэш, состояние, ID)
-```
-
-`View` — это лёгкое описание («здесь кнопка с текстом X»), а не сам виджет.
-Diff сравнивает `prev`/`next` view и выдаёт минимальные мутации элементов.
-
-**Мемоизация — то, что убивает главный аргумент против «пересборки каждый кадр»:**
-
-```rust
-memoize(&self.node_graph.version, |g| render_graph(g))
-```
-Если версия данных не изменилась — поддерево вообще не строится и не диффится.
-Пересборка UI при движении мыши затрагивает единицы узлов, а не десятки тысяч.
-
-Такой слой стоит сделать **опциональным**: `blazy-core` работает и без него,
-что важно для встраивания в движки со своей реактивностью (Bevy ECS, свой
-observable-стор).
+1. **«Layout — box constraints (Flutter/Druid)».** Неверно для текущего Masonry.
+   Там осевая CSS-подобная модель `measure`/`layout` с `LenReq` и `Dim` (§5).
+   Проектировать areas и канвас надо под неё.
+2. **«Xilem — заимствовать идеи, не зависеть».** Написано по данным, устаревшим на
+   год: тогда Masonry был жёстко прибит к Vello. После #1696 это не так.
+3. **«Написать свой display list в форме `vello::Scene`».** Не нужно, есть `imaging`.
+4. **«Relayout boundaries по tight constraints».** Понятия tight constraints в
+   текущей модели нет; инкрементальность обеспечивается кэшем измерений и флагами
+   `request_layout`.
 
 ---
 
-## 7. Кэширование и damage: три уровня
+## 3. Структура крейтов
 
-Это ядро производительности. Vello не умеет из коробки инкрементальную
-перерисовку по damage-регионам, поэтому инкрементальность строится **над** ним.
+```
+        imaging            IR: Painter, PaintSink, record::Scene
+        imaging_vello      + _cpu, _hybrid, _skia, _tiny_skia, _wgpu
+        masonry_core       Widget, RenderRoot, проходы, scene cache, parley, accesskit
+── граница blazy ──────────────────────────────────────────────────────
+blazy-areas     Screen/Area/Region: сплиты, join, workspaces, per-region scale   §8 §9
+blazy-canvas    CanvasLayer: per-child Affine, culling, spatial index, LOD       §10
+blazy-ops       операторы, keymap, модальность, undo/redo                        §11
+blazy-shape     произвольные хит-формы, кэш flatten, хит по кривой               §6
+blazy-widgets   контролы, рассчитанные на нод-канвас и плотный UI редактора
+blazy-compose   per-area render-to-texture поверх VisualLayerPlan                §7.3
+blazy-shell     хост: окна, ввод, композиция (winit / встраивание)               §14
+```
 
-### Уровень A — кадр не рисуется вообще
-Если ни один элемент не грязный и нет активных анимаций — кадр не запрашивается.
-Никакого «60 fps просто так». Пробуждение — по событию, таймеру анимации или
-внешнему инвалидированию.
+`xilem` в списке нет намеренно (§15.3).
 
-### Уровень B — per-area render-to-texture
-Каждая Area (см. §8) рендерится в свою текстуру. Если внутри Area ничего не
-изменилось — текстура переиспользуется, композит всего экрана = тривиальный
-blit-пасс на несколько квадов.
+**Правило зависимостей:** `blazy-areas`, `blazy-canvas`, `blazy-ops`, `blazy-shape`
+зависят от `masonry_core` и `imaging`, но **не** от `masonry_winit`, `wgpu` и `winit`.
+Всё, что знает про конкретный GPU-бэкенд и оконную систему, живёт в `blazy-shell`
+и `blazy-compose`. Это то же правило, что и в первой редакции, просто граница
+абстракции теперь проходит по чужому коду, а не по нашему.
 
-Практический эффект: пользователь тащит ноду в редакторе нод — остальные пять
-редакторов (таймлайн, аутлайнер, свойства, 3D-вьюпорт-оверлей, шейдер) не
-перерисовываются вообще. Именно так делает браузерный композитор и, по сути,
-сам Blender со своими region redraw flags.
+---
 
-Цена — VRAM. Лимитировать: LRU-пул текстур, для маленьких areas не выделять
-отдельную, схлопывать при памяти под давлением.
+## 4. Рендер и интеграция
 
-### Уровень C — per-layer scene fragments внутри Area
-Внутри грязной Area перекодируется не всё. Элементы, помеченные как **repaint
-boundary** (тело ноды, панель, айтем списка), хранят собственный `Arc<Scene>`.
-Пересборка сцены Area = вставка `Cmd::Fragment` для чистых слоёв + перекодирование
-только грязных.
+### 4.1 Как рисует виджет
 
 ```rust
-struct LayerCache {
-    scene:   Arc<Scene>,
-    version: u64,       // сравнивается с content_version элемента
-    local_bbox: Rect,
+fn paint(&mut self, ctx: &mut PaintCtx<'_>, props: &PropertiesRef<'_>,
+         painter: &mut Painter<'_>) {
+    painter.fill(&self.body_path, brush).draw();
+    painter.stroke(&self.outline, &stroke_style, color).draw();
 }
 ```
 
-Дополнительно: поскольку фрагмент хранит **кривые, а не тесселяцию**, его можно
-вставлять с *любым* трансформом — при зуме/пане перекодирование не нужно вовсе.
-Это прямой ответ на «произвольное масштабирование в разных фреймах»: пан и зум
-канваса не инвалидируют ни один кэш, меняется только одна `Affine` на корне слоя.
+Никакого `vello::Scene`. `Painter` пишет в `dyn PaintSink`, за которым может стоять
+`record::Scene` (Masonry так и делает — ретейн) или напрямую бэкенд (стриминг).
 
-### Гигиена аллокаций
-Bump-аллокатор на кадр для транзиентных данных, пулы `Vec`, `SmallVec` для
-детей, интернированные ID и брашы. Цель — ноль аллокаций в steady state.
+### 4.2 Как хост получает картинку
+
+```rust
+let (plan, tree_update) = render_root.redraw();
+// вариант 1 — совместимость: сплющить всё в одну сцену
+plan.replay_into(&mut sink);
+// вариант 2 — наш: реализовать слои по-своему (§7.3)
+for layer in &plan.layers { /* своя текстура на слой */ }
+```
+
+`masonry_winit` идёт по варианту 1: берёт `root_layer()` и `overlay_layers()`,
+собирает `PreparedFrame` и зовёт
+`ImagingRenderer::render_to_texture(ImagingRenderTarget { adapter, device, queue, texture, view }, frame)`.
+
+Это же — готовая форма guest mode: **хост отдаёт свои `Device`/`Queue`/текстуру**,
+`imaging` не создаёт ни окна, ни девайса. Требование «встраивание в чужой движок»
+удовлетворяется без единой строки нашего кода на уровне рендера.
+
+### 4.3 3D-вьюпорт внутри UI
+
+`VisualLayerKind::External { bounds }` — виджет объявляет, что его содержимое
+рисует хост. Masonry записывает плейсхолдер в план, композитор хоста заполняет
+прямоугольник своим пассом.
+
+Оговорка из исходников: *«Current hosts do not realize these placeholders yet;
+compatibility consumers simply skip them while flattening scene content.»*
+Модель ядра готова, реализация в хосте — за нами (`blazy-shell`, §14). Для
+Blender-подобного приложения это обязательный пункт, а не опция.
 
 ---
 
-## 8. Окна Blender: Screen → Area → Region
+## 5. Layout: осевая модель Masonry
 
-Это **отдельная подсистема над деревом виджетов**, а не «ещё один виджет».
-Смешивать её с обычным layout — ошибка: у неё другие инварианты (persistent,
-сериализуемая, с собственным hit-тестом краёв и drag-логикой).
+Это самое серьёзное отличие от первой редакции. Проектировать `blazy-areas` и
+`blazy-canvas` надо под реальную модель.
+
+### 5.1 Модель
 
 ```rust
-struct Screen { root: NodeId, nodes: Slab<SplitNode>, }
+fn measure(&mut self, ctx: &mut MeasureCtx<'_>, props: &PropertiesRef<'_>,
+           axis: Axis, len_req: LenReq, cross_length: Option<Length>) -> Length;
 
-enum SplitNode {
+fn layout(&mut self, ctx: &mut LayoutCtx<'_>, props: &PropertiesRef<'_>, size: Size);
+```
+
+* `measure` — «сколько ты хочешь по этой оси», вызывается **только** когда длина по
+  оси не задана явно. Может вызываться много раз за проход, может не вызываться вовсе.
+* `LenReq::{MinContent, MaxContent, FitContent(Length)}` — прямая калька с CSS
+  intrinsic sizing.
+* `Dim::{Auto, Fixed(Length), Ratio(f64), ...}` — как длина задаётся снаружи.
+  `Ratio(0.5)` = 50% контекстной длины, с откатом в `Auto`, если контекста ещё нет.
+* `layout` — родитель решил размер, контейнер обязан для каждого ребёнка вызвать
+  `compute_size`/`compute_length` → `run_layout` → `place_child`.
+* `LayoutCtx::set_clip_path` — клип, влияющий на paint (но не на `pre_paint`/`post_paint`).
+
+### 5.2 Инкрементальность
+
+Кэш измерений встроен: ключ `(axis, len_req, cross_length)`, инвалидация через
+`request_layout`. Документация трезво предупреждает: кэш маленький, несколько записей
+на виджет; если измерение дорогое — виджет обязан иметь свой внутренний кэш.
+
+**Что это значит для нас.** Тело ноды в графе — виджет с дорогим измерением
+(много детей). Значит `blazy-canvas` обязан:
+* задавать нодам явные `Dim::Fixed` там, где размер известен (позиция и ширина ноды
+  хранятся в модели графа) — тогда `measure` не вызывается вообще;
+* иметь собственный кэш измерений на ноду поверх масонриевского;
+* при LOD-переходе в `Detail::Box` (§10.3) не измерять содержимое вовсе.
+
+### 5.3 Ловушка
+
+`measure` **не должен** коммитить состояние: «don't commit any layout choices».
+Соблазн посчитать в `measure` раскладку сокетов ноды и сохранить — прямой путь к
+трудноуловимым багам, потому что за одним `measure` не гарантирован `layout`,
+а `measure` может быть вызван несколько раз с разными гипотезами.
+
+---
+
+## 6. Произвольные фигуры
+
+### 6.1 Три геометрии — тезис остаётся в силе
+
+| Геометрия | Форма | Где живёт |
+|---|---|---|
+| Layout | всегда прямоугольник | `measure`/`layout`, `Size` |
+| Визуальная | произвольная | `Painter::fill/stroke` по `kurbo` |
+| Хит | произвольная | `find_widget_under_pointer` |
+
+Layout обязан быть прямоугольным — любой flow/grid работает с bounding box; это не
+ограничение, а условие существования компоновки. Нарисовано и кликабельно внутри
+бокса — что угодно.
+
+### 6.2 Хит-тест по фигуре
+
+Апстрим даёт два крючка:
+
+```rust
+fn accepts_pointer_interaction(&self) -> bool { true }        // грубый флаг
+fn find_widget_under_pointer<'c>(&'c self, ctx: QueryCtx<'c>, pos: Point)
+    -> Option<WidgetRef<'c, dyn Widget>>;                     // переопределяемый
+```
+
+Второй — то, что нужно. `blazy-shape`:
+
+```rust
+pub struct ShapeHit {
+    path: BezPath,
+    flat: RefCell<Option<Flattened>>,   // кэш, версионируется с геометрией
+    mode: HitMode,
+}
+
+pub enum HitMode {
+    Fill { rule: FillRule },      // winding number: kurbo::Shape::contains
+    Stroke { width: f64, slop: f64 },  // расстояние до кривой: ParamCurveNearest
+}
+```
+
+Две фазы: грубая по bbox (её делает Masonry, спуская по дереву), точная — наша,
+в переопределённом `find_widget_under_pointer`. Для связей между нодами — режим
+`Stroke`: расстояние до кубической безье ≤ `width/2 + slop`.
+
+### 6.3 Почему gpui не подходит — и что в нём всё-таки верно
+
+**Рендер gpui не подходит.** Он построен на специализированных шейдерах под узкий
+набор примитивов: quad со скруглением и бордером, тень, спрайт глифа из атласа,
+подчёркивание. Произвольные пути — отдельный, менее оптимизированный путь. Модель
+«всё есть прямоугольник» протекает в шейдеры. Для нод с круглыми сокетами, безье-связями
+и радиальными меню это постоянная борьба с фреймворком. Плюс атласный рендер плохо
+переносит произвольный зум: смена масштаба = ресемплинг или ретесселяция.
+
+**Архитектура элементов gpui верна** — retained-дерево, taffy, типизированные хендлы
+состояния. Но брать её теперь неоткуда и незачем: `masonry_core` даёт то же самое,
+только с векторным рендером и без привязки к бэкенду.
+
+Vello/`imaging` подходят именно потому, что произвольная кривая для них **нативный
+примитив, а не спецслучай**, а закодированная сцена хранит кривые, а не треугольники,
+и потому разрешение-независима.
+
+---
+
+## 7. Производительность
+
+### 7.1 Диагноз IM — что именно дорого
+
+Повторный прогон пользовательского кода каждый кадр дёшев. Дорого повторять
+**производную работу**: CPU-тесселяцию, layout всего дерева, shaping, аллокации.
+Плюс отсутствие стабильной идентичности бьёт по анимациям, фокусу, drag-state и
+доступности.
+
+Masonry снимает это конструктивно: стабильные `WidgetId`, `paint()` только по
+`request_paint`, кэш измерений, `imaging` без тесселяции на CPU, `compose` вместо
+полного layout для чистых сдвигов.
+
+### 7.2 Что реально даёт кэш сцен — и где предел
+
+Уровень A (кадр не рисуется, если ничего не изменилось) и уровень C (per-widget
+кэш сцен) — есть.
+
+**Но есть нюанс, который надо понимать до того, как строить на нём планы.**
+В `paint.rs` после проверки `request_paint` идёт безусловное:
+
+```rust
+layer_collector.scene_mut().append_transformed(pre_scene,  content_box_to_layer_transform);
+// ... clip ...
+layer_collector.scene_mut().append_transformed(scene,      content_box_to_layer_transform);
+// ... рекурсия по детям ...
+layer_collector.scene_mut().append_transformed(post_scene, content_box_to_layer_transform);
+```
+
+Кэш экономит **вызов `paint()`**, но сцена слоя пересобирается каждый кадр: команды
+всех видимых виджетов копируются в неё заново. Стоимость кадра — `O(суммарного объёма
+команд видимых виджетов)`, а не `O(изменившихся)`.
+
+Для обычного приложения это несущественно. Для Blender-подобного (шесть редакторов,
+тысячи элементов) — это и есть потолок. Отсюда два вывода:
+
+1. **Culling в нод-канвасе обязателен**, а не «оптимизация на потом» (§10.2).
+   Невидимая нода не должна попадать в `append_transformed`.
+2. **Уровень B критичен.** Без него перетаскивание одной ноды пересобирает сцену
+   всего окна.
+
+В исходниках это признано:
+* `passes/paint.rs`: `// TODO - Handle damage regions` → [xilem#789](https://github.com/linebender/xilem/issues/789)
+* `passes/paint.rs`: `// TODO - Reserve scene` → [xilem#524](https://github.com/linebender/xilem/issues/524)
+* `render_root.rs::redraw`: `// TODO - Handle invalidation regions`
+* комментарий в рекурсии: *«Once we implement compositor layers…»*
+
+### 7.3 Уровень B: per-area render-to-texture
+
+Каркас в апстриме уже есть:
+
+```rust
+pub enum PaintLayerMode { Inline, IsolatedScene, External }
+```
+
+`IsolatedScene` заставляет paint-проход завершить текущий слой и начать новый —
+поддерево получает собственный `VisualLayer` со своим `transform`.
+
+**Состояние: скелет.** Поле `WidgetState::paint_layer_mode` — `pub(crate)`, публичного
+сеттера для виджета нет; в паспорте типа написано: *«Current hosts still flatten these
+scene layers back together, so changing this does not yet change runtime presentation
+behavior.»*
+
+Наш план, по возрастанию инвазивности:
+
+1. **Контрибьютить публичный API** для объявления виджета границей слоя
+   (`PaintCtx::set_paint_layer_mode` или свойство). Изменение маленькое, ложится
+   в направление, которое апстрим уже выбрал.
+2. **`blazy-compose`: реализовать слои по-настоящему.** `VisualLayerPlan` для этого
+   и задуман («the plan is the source of truth»). Каждый `VisualLayer` — своя
+   текстура; чистый слой переиспользуется, композит экрана = blit нескольких квадов.
+   LRU-пул текстур, для мелких областей отдельная текстура не выделяется.
+3. **Damage regions** — самое инвазивное, делать только через апстрим (#789).
+
+Практический эффект уровня B: тащим ноду в нод-редакторе — таймлайн, аутлайнер,
+свойства и шейдер-редактор не перерисовываются вообще. Ровно так работает браузерный
+композитор и, по сути, сам Blender со своими region redraw flags.
+
+Смежные заготовки в forest-rs, стоит посмотреть перед тем, как писать своё:
+`cachet` (atlas allocation, tiled-surface caching), `invalidation` (dirty tracking,
+топологически упорядоченная инвалидация), `understory` (пространственные и scene-структуры
+для UI и графических редакторов), `layerstack`.
+
+### 7.4 Что мерить
+
+Бенчмарк, который надо завести первым и держать в CI:
+
+* 5000 нод в канвасе, видимо ~40 → время кадра при движении одной ноды;
+* то же при пане канваса (меняется один `Affine`, layout не трогается);
+* шесть областей на экране, активна одна → доля кадра, потраченная на неактивные;
+* 10k элементов в списке, меняется один.
+
+Без этих цифр рассуждения об уровнях кэша — гадание.
+
+---
+
+## 8. `blazy-areas`: Screen → Area → Region
+
+Апстримного аналога нет. `masonry::widgets::split` — сплиттер на две панели, а не
+модель экрана: нет join, maximize/restore, типов редакторов, сериализуемых
+workspace-лейаутов, отсоединения области в отдельное ОС-окно.
+
+Это **отдельная подсистема над деревом виджетов**, а не «ещё один виджет»: у неё
+другие инварианты — персистентность, сериализуемость, собственный хит-тест краёв
+и drag-логика.
+
+```rust
+pub struct Screen { root: NodeId, nodes: Slab<SplitNode> }
+
+pub enum SplitNode {
     Split { dir: Axis, ratio: f32, a: NodeId, b: NodeId },
     Area(AreaId),
 }
 
-struct Area {
-    editor:  Box<dyn Editor>,   // 3D view, node editor, timeline, outliner...
-    regions: Vec<Region>,       // header, toolbar, sidebar, main, footer
+pub struct Area {
+    editor:  Box<dyn Editor>,     // 3D view, node editor, timeline, outliner...
+    regions: Vec<Region>,         // header, toolbar, sidebar, main, footer
     rect:    Rect,
-    cache:   Option<TextureId>, // уровень B
 }
 
-struct Region {
-    kind:   RegionKind,
-    rect:   Rect,
-    view:   Affine,      // пан/зум содержимого
-    scale:  f32,         // ЛОКАЛЬНЫЙ UI-scale региона
-    dirty:  DirtyFlags,
-    root:   ElementId,
+pub struct Region {
+    kind:      RegionKind,
+    root:      WidgetId,          // корень поддерева Masonry
+    view:      Affine,            // пан/зум содержимого
+    ui_scale:  f32,               // ЛОКАЛЬНЫЙ масштаб интерфейса
 }
 ```
 
-**Бинарное дерево сплитов vs граф вершин/рёбер.** Blender использует граф
-вершин и рёбер, чтобы при ресайзе выравнивались границы соседних областей,
-не находящихся в отношении родитель/потомок. Бинарное дерево этого не умеет,
-но проще на порядок.
+**Стыковка с Masonry.** Дерево сплитов — наша структура; каждая `Area` держит
+`WidgetId` корня своего поддерева в общем `RenderRoot`. Layout области выполняется
+через `Dim::Fixed` по посчитанным нами прямоугольникам — то есть Masonry не
+пересчитывает раскладку сплитов, он получает готовые размеры. Каждый корень области
+помечается `PaintLayerMode::IsolatedScene` (§7.3), чтобы получить свой `VisualLayer`.
 
-Рекомендация: **начать с бинарного дерева**, вынести операции сплита/джойна/
-ресайза за интерфейс менеджера. Если выравнивание границ реально понадобится —
-заменить реализацию на граф или добавить Cassowary-солвер поверх, не трогая
-остальной код.
+**Бинарное дерево против графа вершин и рёбер.** Blender использует граф, чтобы при
+ресайзе выравнивались границы областей, не находящихся в отношении родитель/потомок.
+Бинарное дерево этого не умеет, но проще на порядок. Рекомендация: начать с дерева,
+спрятав операции за интерфейсом менеджера; если выравнивание понадобится — заменить
+реализацию, не трогая остальной код.
 
-Операции: `split(area, axis, ratio)`, `join(a, b)` (только для совместимых
-соседей), `swap`, `maximize/restore`, drag границы, drag угла (кортер-виджет),
-detach в отдельное ОС-окно. Всё дерево сериализуемо → workspaces/layouts
-сохраняются в файл, как в Blender.
-
-**Мульти-окно**: несколько `Screen`, каждый в своём ОС-окне, общий `AppState`,
-общий кэш шрифтов/шейдеров/девайс. Renderer один, surface много.
+Операции: `split`, `join` (только совместимые соседи), `swap`, `maximize/restore`,
+drag границы, drag угла, detach в отдельное ОС-окно (в `masonry_winit` мульти-окно
+уже есть). Дерево сериализуемо → workspaces сохраняются в файл.
 
 ---
 
-## 9. Произвольное масштабирование UI в разных фреймах
+## 9. Масштабирование в разных фреймах
 
-Три независимых множителя, которые нельзя путать:
+Три независимых множителя, которые нельзя смешивать:
 
-1. **`device_scale`** — HiDPI окна (от ОС). Влияет на размер целевой текстуры.
-2. **`ui_scale`** — пользовательская настройка размера интерфейса, **своя у каждого
-   региона**. Влияет на layout: шрифты, паддинги, размеры контролов в логических px.
-3. **`view`** — пан/зум содержимого канваса (нод-редактор, таймлайн, image editor).
-   **Не влияет на layout вообще** — это чистый трансформ при композиции.
+1. **`device_scale`** — HiDPI окна, от ОС. Влияет на размер целевой текстуры.
+   В Masonry — `global_state.scale_factor`, один на окно.
+2. **`ui_scale`** — пользовательский размер интерфейса, **свой у каждого региона**.
+   Влияет на **layout**: кегль, паддинги, размеры контролов.
+3. **`view`** — пан/зум содержимого канваса. **Не влияет на layout вообще** —
+   чистый трансформ при композиции.
 
 ```rust
-// на входе в регион
-let layout_scale = device_scale * region.ui_scale;   // → в BoxConstraints и в текст
-let paint_xform  = Affine::scale(layout_scale) * region.view;
+let layout_scale = device_scale * region.ui_scale;   // → в Length/Dim и в текст
+let paint_xform  = region.view;                      // → в VisualLayer::transform
 ```
 
-Критично: (2) идёт в **layout**, (3) — только в **paint**. Если смешать, зум
-канваса начнёт перезапускать layout каждый кадр — ровно та ошибка, которая убивает
-производительность нод-редакторов.
+Критично: (2) идёт в layout, (3) — только в paint. Смешать их — значит перезапускать
+layout на каждый кадр зума. Это ровно та ошибка, которая убивает производительность
+нод-редакторов.
 
-Поскольку Vello растеризует из кривых с учётом финального трансформа, изменение
-любого из трёх множителей даёт корректный результат без перекодирования сцены и
-без потери резкости. Это преимущество, которого нет у атласных рендеров (gpui) и
-CPU-тесселяторов (egui/lyon), где смена масштаба означает ретесселяцию или
-ресемплинг атласа.
+**Чего нет в апстриме.** У Masonry один scale factor на окно. Визуальную часть
+даёт `WidgetState::transform`, но выбор кегля и метрики паддингов надо протаскивать
+самим. Механизм: `ui_scale` региона — свойство в масонриевской системе свойств,
+наследуемое вниз по поддереву; `Length` вычисляется из логических единиц с его учётом.
+Система `PropertyArena` + `property_changed` для этого и предназначена — при смене
+`ui_scale` региона поддерево получает инвалидацию штатным путём.
+
+Поскольку `imaging` растеризует из кривых с учётом финального трансформа, изменение
+любого из трёх множителей корректно без перекодирования сцены и без потери резкости.
+Этого нет ни у атласных рендеров (gpui), ни у CPU-тесселяторов (egui/lyon).
 
 ---
 
-## 10. Контролы на нодах: `CanvasLayer`
+## 10. `blazy-canvas`: контролы на нодах
 
-Нод-редактор — это регион, содержащий один first-class элемент `CanvasLayer`:
+### 10.1 Почему не `masonry::widgets::Canvas`
+
+`Canvas` в Masonry — painter-callback: он держит `imaging::record::Scene`, которую
+приложение перерисовывает через `update_scene`, и **не имеет детей**. Для графа нод,
+внутри которых живут слайдеры и чекбоксы, он не годится принципиально.
+
+### 10.2 Контейнер
 
 ```rust
-struct CanvasLayer {
-    view:    Affine,                    // пан/зум
-    index:   RTree<ElementId>,          // spatial index в координатах канваса
-    children: Vec<CanvasChild>,         // {элемент, позиция, bbox}
+pub struct CanvasLayer {
+    view:     Affine,                 // пан/зум
+    index:    RTree<WidgetId>,        // spatial index в координатах канваса
+    children: Vec<CanvasChild>,       // { pod, canvas_pos, bbox }
+    visible:  Vec<WidgetId>,          // результат culling за прошлый кадр
 }
 ```
 
-Обязанности:
+**Layout.** Не осевая раскладка, а свободное размещение: позиция ребёнка берётся из
+модели графа, размер — `Dim::Fixed` там, где он известен, `Auto` только для нод с
+динамическим содержимым. `place_child` в координатах канваса.
 
-* **Layout**: не box-constraints, а «свободное размещение» — каждый ребёнок
-  измеряется с `BoxConstraints::loose(node_max_size)` и позиционируется по своим
-  координатам канваса. Каждая нода — relayout + repaint boundary.
-* **Culling**: `index.query(inverse(view) * viewport_rect)` — рисуются только
-  видимые ноды. 10k нод при 30 видимых стоят как 30.
-* **События**: точка указателя переводится `view.inverse() * p` перед спуском в
-  детей. Это позволяет **обычным виджетам работать внутри нод без единой правки** —
-  слайдеры, чекбоксы, комбо-боксы, поля ввода. Именно этого не хватает большинству
-  нод-редакторов.
-* **LOD**: слой сообщает детям эффективный масштаб.
+**Culling.** `index.query(view.inverse() * viewport_rect)` перед layout и paint.
+Невидимые дети помечаются `is_stashed` — Masonry их не красит и не добавляет в
+сцену слоя. С учётом §7.2 это не микрооптимизация, а условие работоспособности:
+10k нод при 40 видимых должны стоить как 40.
+
+**Пан и зум.** Меняется только `view` → `WidgetState::transform` корня слоя →
+`request_compose`. Ни layout, ни перекодирование сцен детей не запускаются. Это
+главный выигрыш от связки retained-дерево + векторный IR.
+
+**События.** Точка указателя переводится `view.inverse() * p` перед спуском в детей.
+Masonry уже делает это для своих трансформов (`window_transform`), так что обычные
+виджеты работают внутри нод **без единой правки** — слайдеры, чекбоксы, комбо-боксы,
+поля ввода. Именно этого не хватает большинству нод-редакторов.
+
+### 10.3 LOD
 
 ```rust
-enum Detail { Full, Simplified, Box }
+pub enum Detail { Full, Simplified, Box }
 
 fn detail(scale: f32) -> Detail {
-    if scale > 0.6 { Detail::Full }        // все контролы
-    else if scale > 0.25 { Detail::Simplified } // заголовок + сокеты
-    else { Detail::Box }                   // цветной прямоугольник
+    if scale > 0.6  { Detail::Full }        // все контролы
+    else if scale > 0.25 { Detail::Simplified } // заголовок и сокеты
+    else { Detail::Box }                     // цветной прямоугольник
 }
 ```
-LOD даёт двойной выигрыш: меньше геометрии в сцене и — важнее — при переходе в
-`Box` можно отключить layout детей целиком.
 
-* **Связи** — не виджеты, а отдельный слой кривых, рисуемый одним проходом:
-  кубические безье, батчатся в один fill/stroke-стрим. Хит-тест по расстоянию
-  до кривой. Отдельный кэш-фрагмент, инвалидируемый только при изменении топологии
-  или движении конечных нод.
-* **Порядок**: z-order = порядок в списке; выделенная нода поднимается наверх.
+Двойной выигрыш: меньше команд в сцене и — важнее — в режиме `Box` содержимое ноды
+не измеряется и не раскладывается вовсе (§5.2).
+
+### 10.4 Связи
+
+Не виджеты, а отдельный слой кривых: кубические безье, батчатся в один
+`Painter::stroke`-стрим, отдельная `record::Scene`, инвалидируемая только при
+изменении топологии или движении концевых нод. Хит-тест — по расстоянию до кривой
+(`blazy-shape`, `HitMode::Stroke`).
 
 ---
 
-## 11. События, keymap, операторы
+## 11. `blazy-ops`: операторы, keymap, модальность
 
-Здесь стоит заимствовать у Blender самое ценное, что в нём есть архитектурно.
+Самое ценное, что есть у Blender архитектурно, и чего нет ни в одном Rust-тулките.
 
-**Операторы.** Каждое действие — именованный оператор с параметрами:
 ```rust
-trait Operator {
-    fn poll(&self, cx: &Context) -> bool;              // доступен ли сейчас
-    fn invoke(&mut self, cx: &mut Context) -> OpResult; // запуск (из UI)
-    fn exec(&mut self, cx: &mut Context) -> OpResult;   // запуск (из скрипта/redo)
+pub trait Operator {
+    fn poll(&self, cx: &Context) -> bool;                 // доступен ли сейчас
+    fn invoke(&mut self, cx: &mut Context) -> OpResult;   // запуск из UI
+    fn exec(&mut self, cx: &mut Context) -> OpResult;     // запуск из скрипта / redo
     fn modal(&mut self, ev: &Event, cx: &mut Context) -> OpResult { OpResult::Finished }
 }
-enum OpResult { Running, Finished, Cancelled, PassThrough }
-```
-Выгода: одна точка для undo/redo, для меню, для горячих клавиш, для скриптинга,
-для тестов и для записи макросов. Меню и keymap ссылаются на операторы по имени,
-а не хранят замыкания.
 
-**Keymap** — данные, а не код: `(context, event_pattern) -> (operator, props)`.
+pub enum OpResult { Running, Finished, Cancelled, PassThrough }
+```
+
+Одна точка для undo/redo, меню, горячих клавиш, скриптинга, тестов и записи макросов.
+Меню и keymap ссылаются на операторы по имени, а не хранят замыкания.
+
+**Keymap — данные, а не код:** `(context, event_pattern) -> (operator, props)`.
 Контексты вложены: Window → Screen → Area → Region → активный модальный оператор.
-Пользовательские переопределения — просто ещё один слой поверх. Сериализуемо.
+Пользовательские переопределения — ещё один слой поверх. Сериализуемо.
 
 **Модальность.** Стек модальных обработчиков на регион. Оператор трансформации
-(перетаскивание ноды, ресайз сплита, box-select) захватывает ввод, получает все
-события до `Finished`/`Cancelled`, и может вернуть `PassThrough` для проброса.
-Это чище, чем разбрасывать `is_dragging: bool` по виджетам.
+(перетаскивание ноды, ресайз сплита, box-select) захватывает ввод и получает все
+события до `Finished`/`Cancelled`, с возможностью `PassThrough`. Это чище, чем
+разбрасывать `is_dragging: bool` по виджетам.
 
-**Маршрутизация обычных событий**: hit-test → capture-фаза сверху вниз →
-bubble-фаза снизу вверх, с pointer capture и focus ring. Стандартно, но требует
-стабильных ID — ещё один аргумент за retained-дерево.
-
-**Доступность**: AccessKit. На retained-дереве это почти бесплатно (обход дерева
-с дельтами), в immediate mode — вечная боль.
+**Стыковка с Masonry.** Обычная маршрутизация (`on_pointer_event`, `on_text_event`,
+bubbling, focus) остаётся масонриевской. `blazy-ops` сидит **выше**: перехватывает
+событие до спуска в дерево, сверяется с keymap текущего контекста, и либо запускает
+оператор, либо пропускает событие в дерево. Действия виджетов (`Widget::Action`,
+`on_action`) транслируются в вызовы операторов — так кнопка в тулбаре и горячая
+клавиша идут одним путём и одинаково попадают в undo.
 
 ---
 
 ## 12. Текст
 
-Parley (shaping via swash/harfrust) + fontique (сбор системных шрифтов) — они из
-той же экосистемы Linebender, что и Vello/kurbo/peniko, и стыкуются без швов.
+Даётся `parley` через Masonry: shaping (swash/harfrust), перенос строк, bidi, курсор,
+выделение, IME. Изобретать нечего.
 
-* Кэш галлей: `(text_hash, style_id, max_width) -> Layout`. Инвалидация по версии.
-* Шейпинг параллелится по абзацам (rayon) — важно для аутлайнеров и логов.
-* **Подводный камень**: векторный рендер = нет хинтинга. Мелкий UI-текст (10–11px)
-  на низком DPI будет мягче, чем в egui/gpui с их атласами и субпиксельным
-  позиционированием. Варианты: (а) считать это приемлемым (Blender тоже мягкий),
-  (б) держать отдельный glyph-atlas путь для мелких размеров, (в) посмотреть на
-  `vello_hybrid`, который ближе к традиционной растеризации.
-  Решение стоит отложить до момента, когда будет что мерить глазами.
-* Редактирование: курсор, выделение, IME, bidi — берутся из parley, не изобретать.
+**Один подводный камень, о котором надо знать заранее.** Векторный рендер = нет
+хинтинга. Мелкий UI-текст (10–11 px) на низком DPI будет мягче, чем в egui/gpui с
+их глифовыми атласами и субпиксельным позиционированием. Варианты: считать приемлемым
+(Blender тоже мягкий); держать атласный путь для мелких кеглей; смотреть на
+`vello_hybrid`, который ближе к традиционной растеризации и уже имеет кэш глифов.
+
+Решение откладывается до момента, когда будет что мерить глазами — но заложить
+переключение бэкенда на уровне `blazy-shell` стоит сразу, тем более что `imaging`
+это позволяет бесплатно.
 
 ---
 
 ## 13. Многопоточность
 
+`imaging::record::Scene` — владеющее значение с реплеем, а не граф объектов с `&mut`.
+Значит `VisualLayerPlan` можно передать в рендер-поток и там реплеить в бэкенд, пока
+UI-поток считает следующий кадр.
+
 ```
-UI thread          : события → view diff → layout → кодирование Scene
-                        │ Arc<Scene> (immutable snapshot), double buffer
-Render thread      : Vello encode → GPU submit → present
-Worker pool (rayon): text shaping, декодирование картинок, тяжёлые вычисления Area
+UI thread    : события → операторы → layout → compose → paint (Painter → record::Scene)
+                  │ VisualLayerPlan (значение), double buffer
+Render thread: replay_into(backend) → GPU submit → present
+Workers      : shaping, декодирование картинок, вычисления редакторов
 ```
 
-Snapshot-модель возможна именно потому, что `Scene` — плоский сериализуемый буфер,
-а не граф объектов с `&mut`. Заминка в логике UI не роняет фреймрейт композитора,
-и наоборот.
+Оговорка: в текущем `masonry_winit` рендер синхронный, в том же потоке. Разнос по
+потокам — наша работа в `blazy-shell`, и делать её надо после уровня B, не раньше:
+без разбиения на слои переносить в другой поток нечего.
 
 ---
 
-## 14. Интеграция в движки
+## 14. Встраивание в движки
 
-Требования к guest mode:
+Требования к guest mode и их текущий статус:
 
-* Не владеть `Device`/`Queue`/`Surface`/окном.
-* Не создавать свой event loop.
-* Принимать события в нормализованном виде (`RawEvent`), а не типы winit.
-* Рендерить либо в переданную текстуру, либо командами в переданный `RenderPass`.
-* Не форсировать свой аллокатор/рантайм/tokio.
-* `Cmd::Hole` для областей, которые рисует хост (3D-вьюпорт, видео).
-* Явный контракт по времени: `update(events, dt) -> DirtyRegions`, затем
-  `render(target)`. Хост решает, вызывать ли render.
+| Требование | Статус |
+|---|---|
+| Не владеть Device/Queue/Surface/окном | ✅ `ImagingRenderTarget` принимает чужие |
+| Не создавать свой event loop | ✅ `RenderRoot` — просто объект, ввод подаётся снаружи |
+| Нормализованные события, не типы winit | ✅ `ui-events` |
+| Рендер в переданную текстуру | ✅ `render_to_texture` |
+| Дыры под содержимое хоста | ⚠️ модель есть (`External`), реализации в хосте нет |
+| Бэкенд без wgpu | ✅ `imaging_skia`, `imaging_tiny_skia`, `vello_cpu` |
+| Явный контракт по времени | ⚠️ `redraw()` есть, политика пробуждения — за хостом |
 
-Для движков без wgpu (собственный GL/Vulkan) — `blazy-render-lyon-gl`: тесселяция
-display list в треугольники + атлас глифов. Медленнее, но открывает дверь в
-существующие кодовые базы. Именно ради этого сценария абстракция — display list,
-а не «трейт с методами рисования».
+`blazy-shell` даёт два режима:
+1. **Owner** — свои окна через `masonry_winit` (или свой аналог на `ui-events`).
+2. **Guest** — движок отдаёт `Device`/`Queue`/`TextureView` и подаёт события;
+   blazy кладёт команды в чужой командный буфер и возвращает список `External`-дыр,
+   которые движок заполняет сам.
+
+Для движка со своим GL/Vulkan и без wgpu путь — свой `PaintSink`/`ImageRenderer`
+с тесселяцией в треугольники и атласом глифов. Медленнее, но `imaging` это допускает
+by design, и писать придётся только бэкенд, а не тулкит.
 
 ---
 
-## 15. Риски Vello и обходные пути
+## 15. Риски
+
+### 15.1 Апстрим в движении — главный риск
+
+| Крейт | crates.io | Дата | Комментарий |
+|---|---|---|---|
+| `masonry`, `masonry_core`, `xilem` | 0.4.0 | **2025-10-29** | до миграции на `imaging` |
+| `imaging` | 0.0.1 | 2026-05-21 | |
+| `imaging_vello`, `imaging_wgpu` | 0.0.2 | 2026-05-30 | |
+| `imaging_skia` | 0.0.1 | 2026-05-21 | |
+| `vello_cpu`, `vello_hybrid` | 0.2.0 | 2026-08-07 | hybrid ≈ beta |
+
+Опубликованный `masonry_core` 0.4.0 старше миграции на `imaging` на пять месяцев.
+Всё, на чём построен этот документ, живёт **только в git-main**.
+
+**Следствие:** зависимость от `masonry_core` и `imaging` будет git-зависимостью с
+пиннингом по коммиту, с ручными обновлениями и регулярными поломками API. Для
+приложения это терпимо. Для публикуемой библиотеки — это транслируется пользователям.
+
+Смягчение:
+* пиннинг по коммиту, обновление осознанными подходами, не «раз в неделю»;
+* тонкий фасадный слой в `blazy-core` над теми местами Masonry, которые мы дёргаем
+  чаще всего, чтобы поломка API правилась в одном месте;
+* golden-image тесты через `imaging_tiny_skia` / `vello_cpu` — детерминированный
+  CPU-бэкенд позволяет ловить регрессии после каждого обновления апстрима;
+* контрибьютить то, что нам нужно (§7.3), а не форкать.
+
+### 15.2 Критический путь вне нашего контроля
+
+Blender-подобный UI нагружает нетипичные места: тысячи виджетов под одним трансформом,
+per-region scale, произвольные хит-формы, damage. Это ровно те места, где Masonry
+менее всего обкатан. Значит — регулярные апстрим-issue на критическом пути и
+готовность самим присылать патчи.
+
+### 15.3 Почему не `xilem` (view-слой)
+
+`masonry_core` работает и без него. Причины отложить:
+* тяжёлые дженерики и время компиляции;
+* динамический контент требует `AnyView` с боксингом; граф из тысяч разнородных
+  нод упрётся в это повсеместно;
+* для нод-редактора реактивность всё равно своя — она следует из модели графа,
+  а не из дерева view.
+
+Это не приговор: когда ядро blazy устоится, поверх можно сделать декларативный слой
+(свой или xilem'овский) как **удобство, а не фундамент**. Если начать с него,
+его абстракции протекут вниз и заблокируют встраивание в движки со своей реактивностью.
+
+### 15.4 Риски рендера
 
 | Риск | Обход |
 |---|---|
-| Нужны compute shaders → нет WebGL, слабые/старые GPU | `vello_cpu` / `vello_hybrid` как fallback; выбор бэкенда в рантайме |
-| Нет нативного partial redraw по damage | Уровни B и C из §7 — инкрементальность строится над Vello |
-| Дорогие `PushLayer` с clip-path и blend | Предпочитать clip-rect; layer только там, где реально нужен; следить за глубиной вложенности |
-| Conflation artifacts на смежных фигурах | Не строить UI из встык прилегающих путей; лёгкие оверлапы; проверять на своей палитре |
-| Мягкий мелкий текст (нет хинтинга) | См. §12 |
-| Долгая компиляция шейдеров на старте | Кэш пайплайнов на диск, прогрев |
-| API Vello ещё не стабилизирован | Собственный `Scene` как буфер абстракции — обновление Vello не расходится по всему коду |
-
-Последний пункт — не бюрократия. Собственный display list означает, что смена
-версии Vello (или уход с него) затрагивает один крейт из двенадцати.
+| Vello classic требует compute shaders → нет WebGL, слабые GPU | `vello_cpu` / `vello_hybrid` / `tiny_skia`, выбор бэкенда в рантайме |
+| Нет damage-инкрементальности | §7.3 |
+| Дорогие группы с клип-путями и блендом | предпочитать clip-rect; следить за глубиной вложенности |
+| Conflation artifacts на встык прилегающих фигурах | не строить UI из встык прилегающих путей, лёгкие оверлапы |
+| Мягкий мелкий текст | §12 |
+| Долгая компиляция шейдеров на старте | кэш пайплайнов на диск, прогрев |
 
 ---
 
-## 16. Порядок реализации
+## 16. План работ
 
-1. `blazy-geom` + `blazy-scene` (display list, кодирование, фрагменты) + Vello-бэкенд.
-   Критерий готовности: закэшированный фрагмент вставляется с произвольным
-   трансформом, отрисовывается корректно, перекодирования нет.
-2. `blazy-cpu` бэкенд — сразу, ради golden-image тестов. Без него дальше слепота.
-3. `blazy-layout` (box constraints + relayout boundaries) + `blazy-core`
-   (Element, Id, dirty-флаги, события).
-4. Damage/repaint boundaries, уровни A и C кэша. Бенчмарк: 10k прямоугольников,
-   меняется один → замер времени кадра.
-5. `blazy-text` (parley) + базовые виджеты.
-6. `blazy-areas`: сплиты, джойны, ресайз, сериализация лейаута. Уровень B кэша.
-7. `CanvasLayer`: пан/зум, culling, spatial index, LOD, виджеты внутри нод.
-8. Операторы + keymap + модальность. Undo/redo поверх операторов.
-9. `blazy-view` (декларативный слой с memoize) — последним, когда retained-ядро
-   стабильно. Он должен быть удобством, а не фундаментом.
-10. AccessKit, IME, мульти-окно, `blazy-embed-bevy`.
+**Фаза 0 — проверка гипотезы (до любых обязательств).**
+Собрать нод-канвас на 5000 нод поверх `masonry_core@main`: per-child `Affine`,
+culling через R-tree, LOD, обычные слайдеры и чекбоксы внутри нод, пан и зум через
+`transform` + `compose`. Замерить (§7.4).
 
-Пункт 9 намеренно поздно: если начать с декларативного слоя, его абстракции
-протекут в ядро и заблокируют встраивание в движки со своей реактивностью.
+Критерий: пан канваса не запускает layout, движение одной ноды не пересобирает
+всё окно до неприемлемых величин. Если да — Masonry берём. Если нет — мы точно знаем,
+что именно писать самим, а `imaging` всё равно остаётся пригоден отдельно от Masonry.
 
----
+**Фаза 1 — фундамент.**
+1. `blazy-shell` (owner mode) + выбор бэкенда в рантайме + golden-image тесты на CPU.
+2. `blazy-shape`: точный хит-тест через `find_widget_under_pointer`.
+3. Бенчмарки из §7.4 в CI.
 
-## 17. Что откуда заимствовать
+**Фаза 2 — области.**
+4. `blazy-areas`: дерево сплитов, split/join/resize/maximize, сериализация workspace.
+5. Per-region `ui_scale` через систему свойств Masonry.
+6. Мульти-окно и detach области.
 
-| Источник | Что брать | Что не брать |
-|---|---|---|
-| **Blender** | Screen/Area/Region, keymap как данные, операторы, модальные операторы, per-region UI scale, region redraw flags | C-шную работу с памятью, глобальный контекст |
-| **Flutter** | Box constraints, relayout boundaries, repaint boundaries, компоновка слоёв | Тяжесть Element/Widget/RenderObject-триады |
-| **Xilem / Masonry** | View→Element диффинг, memoize, разделение view и элемента | Незрелость API |
-| **gpui** | Эргономику элементов, taffy, GPU-first, типизированные хендлы состояния | Quad-based рендер, box-only визуал |
-| **Браузерный компositor** | Слои, damage rects, render-to-texture per layer | Сложность CSS-модели |
-| **egui** | Эргономику авторинга, immediate-эскейп для кастомных канвасов | CPU-тесселяцию, отсутствие стабильной идентичности |
+**Фаза 3 — производительность.**
+7. Патч в апстрим: публичный API для `PaintLayerMode::IsolatedScene`.
+8. `blazy-compose`: per-area render-to-texture поверх `VisualLayerPlan`, LRU-пул текстур.
+9. Реализация `VisualLayerKind::External` в хосте → 3D-вьюпорт внутри UI.
 
----
+**Фаза 4 — редактор нод.**
+10. `blazy-canvas` в продовом виде: spatial index, LOD, слой связей.
+11. `blazy-widgets`: контролы, рассчитанные на плотный UI и работу внутри нод.
 
-## 18. Итог одним абзацем
+**Фаза 5 — взаимодействие.**
+12. `blazy-ops`: операторы, keymap, модальность, undo/redo.
+13. `blazy-embed-*`: guest mode, плагин для Bevy.
 
-Retained-дерево элементов со стабильными ID и точечной инвалидацией; поверх —
-опциональный декларативный слой с мемоизацией, дающий эргономику immediate mode
-без его расходов. Рендер абстрагирован не трейтом с методами рисования, а
-backend-agnostic display list в форме, близкой к `vello::Scene`, с шейпингом
-текста на стороне ядра — это делает и смену рендера, и встраивание в чужой
-wgpu-контекст, и рендер в отдельном потоке, и headless-тесты одним и тем же
-механизмом. Производительность строится тремя уровнями кэша (кадр / area-текстура /
-scene-фрагмент), а разрешение-независимость закодированных фрагментов Vello делает
-пан, зум и произвольный UI-scale бесплатными в терминах перекодирования. Произвольные
-фигуры поддерживаются разделением layout-геометрии (всегда Rect), визуальной
-геометрии (произвольный BezPath) и hit-геометрии (двухфазный тест) — поэтому
-quad-ориентированный подход gpui действительно не подходит, а вот его модель
-элементов подходит вполне. Окна Blender — отдельная подсистема Screen/Area/Region
-над деревом виджетов, ноды — `CanvasLayer` с инверсией событий, culling и LOD,
-что позволяет использовать внутри нод обычные виджеты без изменений.
+**Потом.** Разнос рендера по потокам (§13), декларативный слой (§15.3),
+участие в damage regions (#789).
 
 ---
 
-## 19. Подходит ли Xilem? (проверено по main, август 2026)
+## 17. Работа с апстримом
 
-Короткий ответ: **да, Masonry сейчас — разумная основа, но не весь Xilem.** Раздел §17
-(«заимствовать, не зависеть») был написан по устаревшим данным и здесь корректируется.
+Стратегия — **контрибьютить, а не форкать**. Три вещи, которые нам нужны, лежат
+в направлении, которое апстрим уже выбрал, и которые он с высокой вероятностью
+примет:
 
-### 19.1 Что изменилось и что это значит
+1. Публичный API для `PaintLayerMode` (§7.3) — маленькое изменение, инфраструктура готова.
+2. Реализация `VisualLayerKind::External` в хосте — апстрим прямо пишет, что модель
+   ядра ждёт host integration.
+3. Damage regions (#789) — большая работа, но заявленная в TODO самим апстримом.
 
-| Проверено | Факт |
-|---|---|
-| `Widget::paint` | Принимает `imaging::Painter<'_>`, **не** `vello::Scene` (xilem#1696, мерж 24.03.2026) |
-| `masonry_core` (main) | Зависит от `imaging`, `kurbo`, `peniko`, `parley`, `accesskit`, `tree_arena`, `ui-events`. **Ни `vello`, ни `wgpu`, ни `winit`** |
-| Бэкенды `imaging` | `imaging_vello` (+ cpu, + hybrid), `imaging_skia`, `imaging_tiny_skia`, `imaging_wgpu` |
-| Кэш сцен | `scene_cache: HashMap<WidgetId, (Scene, Scene, Scene)>` (pre/main/post), перекодирование только при `request_paint` |
-| Выход рендера | `RenderRoot::redraw() -> (VisualLayerPlan, Option<TreeUpdate>)` — план слоёв, а не одна сцена |
-| Дыры для хоста | `VisualLayerKind::External { bounds }` — ровно то, что в §3 названо `Cmd::Hole` |
-| Трансформы | `WidgetState::transform: Affine`, `window_transform`, `transform_changed`, `compose_local_transform()`, отдельный compose-проход |
-| Damage regions | **Отсутствуют.** В `passes/paint.rs` буквально `// TODO - Handle damage regions` → linebender/xilem#789 |
-| Виджеты | есть `split`, `canvas`, `virtual_scroll`, `portal`, `zstack`, `indexed_stack` |
-| Зрелость | xilem 0.4.0 / masonry 0.4.0, самоописание — «alpha»; `imaging` — **0.0.1** |
+Что делать у себя, не пытаясь протолкнуть наверх: areas/regions, операторы, keymap,
+нод-канвас. Это предметная специфика Blender-подобного приложения, ей не место в
+тулките общего назначения.
 
-То есть три из четырёх ключевых пунктов этого документа уже реализованы апстримом:
-абстракция рендера (§3), retained-дерево с точечной инвалидацией и кэшем фрагментов
-(§7, уровень C), дыры для 3D-вьюпорта хоста. Плюс бесплатно: parley, AccessKit,
-`ui-events` (развязка с winit), четыре бэкенда рендера.
+---
 
-**Расхождение, которое надо проверить самому.** Опубликованный `masonry_core` 0.4.0
-(16.08.2026) по данным crates.io всё ещё числит зависимость `vello ^0.6.0`, тогда как
-`main` — нет. Похоже, миграция на `imaging` пока не попала в релиз. Перед решением:
-`cargo tree -p masonry_core | grep -E 'vello|imaging'` — и, вероятно, придётся сидеть
-на git-зависимости, а не на crates.io.
+## 18. Итог
 
-### 19.2 Чего нет и что придётся строить самому
+`imaging` + `masonry_core` закрывают три из четырёх ключевых требований: сменный
+рендер с шестью бэкендами, retained-дерево со стабильными ID и точечной инвалидацией,
+дыры под содержимое хоста. Плюс бесплатно — parley, AccessKit, система свойств,
+развязка с winit, мульти-окно.
 
-Важно: **ничего из этого не требует форка**, всё аддитивно.
+Остаётся то, ради чего blazy и затевается: **система областей Blender, нод-канвас с
+обычными виджетами внутри нод, операторы с keymap** — и один инженерно тяжёлый
+пункт, **per-area композиция**, потому что кэш сцен в Masonry экономит вызов `paint()`,
+но не пересборку сцены слоя (§7.2). Последнее — правильное место для контрибьюта,
+а не для обхода.
 
-1. **Система Area/Region (§8) — отсутствует.** `split.rs` — это виджет-сплиттер на две
-   панели, а не модель экрана Blender: нет join, maximize/restore, типов редакторов,
-   сериализуемых workspace-лейаутов, отсоединения в отдельное ОС-окно.
-2. **Per-region UI scale (§9) — отсутствует.** У Masonry один scale factor на окно.
-   Визуальную часть даёт `WidgetState::transform`, но выбор кегля, снэппинг и метрики
-   паддингов надо протаскивать отдельно.
-3. **Damage regions и per-area render-to-texture (§7, уровень B) — отсутствуют.**
-   Это самый болезненный пункт: для приложения с шестью редакторами на экране именно
-   уровень B даёт основной выигрыш. Апстрим этого хочет (#789), так что правильный
-   ход — контрибьютить, а не обходить. Смежные заготовки есть в forest-rs:
-   `cachet` (atlas allocation, tiled-surface caching) и `invalidation`
-   (dirty tracking, топологическая инвалидация).
-4. **Нод-канвас (§10) — отсутствует.** `Canvas` в Masonry — это painter-callback
-   без детей: он пишет в `imaging::record::Scene`, но виджетов внутри не держит.
-   Нужен контейнер с per-child `Affine`, culling, spatial index и LOD. Строится
-   поверх `WidgetState::transform` + compose-прохода; для пространственных структур
-   стоит посмотреть forest-rs `understory` («foundational spatial and scene data
-   structures for user interfaces and graphics editors»).
-5. **Операторы и keymap (§11) — отсутствуют.** Но это и так уровень приложения.
-6. **Точный хит-тест по фигуре (§4).** `accepts_pointer_interaction()` — булев флаг,
-   но `find_widget_under_pointer` переопределяем, так что winding-тест по пути
-   реализуется, просто пишется руками.
+Цена решения — жизнь на git-main двух молодых крейтов и участие в чужом API-churn.
+Альтернатива — написать всё это самим и потратить годы на догон. Для приложения
+выбор очевиден; для публикуемой библиотеки его надо принимать сознательно, с
+фасадным слоем и golden-тестами как страховкой.
 
-### 19.3 Реальные причины отказаться
-
-* **Зрелость.** masonry/xilem 0.4 в статусе alpha, `imaging` — **0.0.1**, миграция
-  на него пятимесячной давности и, судя по всему, ещё не в релизе. Строить *приложение*
-  на двух движущихся 0.x-основаниях — нормально. Строить на них *публикуемую библиотеку*
-  — значит транслировать этот churn своим пользователям.
-* **Критический путь вне твоего контроля.** Blender-подобный UI нагружает нетипичные
-  места: тысячи виджетов под одним трансформом, per-region scale, произвольные хит-формы,
-  damage. Это ровно те места, где Masonry менее всего обкатан, — значит регулярные
-  апстрим-issue на критическом пути.
-* **View-слой `xilem` конкретно.** Тяжёлые дженерики, время компиляции, боксинг через
-  `AnyView` для динамического контента. Динамический граф из тысяч разнородных нод
-  упрётся в `AnyView` повсеместно. Но слой **опционален** — `masonry_core` работает
-  без него.
-
-### 19.4 Решение
-
-**Брать `imaging` + `masonry_core`. View-слой `xilem` на первом этапе не брать.**
-
-```
-imaging (+ imaging_vello / _cpu / _skia / _wgpu)   ← §3 решён апстримом
-masonry_core (retained tree, passes, scene cache)  ← §5–§7 (уровни A, C)
-------------------------------------------------- граница blazy
-blazy-areas    Screen/Area/Region, сплиты, workspaces, per-region scale   (§8, §9)
-blazy-canvas   CanvasLayer: трансформ + дети, culling, spatial index, LOD (§10)
-blazy-ops      операторы, keymap, модальность, undo/redo                  (§11)
-blazy-cache    per-area render-to-texture — или апстримом в #789          (§7 B)
-```
-
-blazy при этом перестаёт быть «ещё одним GUI-тулкитом» и становится тем, чего в
-экосистеме действительно нет: **Blender-слоем поверх Masonry**. Это и меньше работы,
-и более защитимая позиция.
-
-**Проверочный прототип перед коммитом** (порядок §16 сокращается до этого):
-собрать нод-канвас на 5000 нод поверх `masonry_core` — per-child `Affine`, culling,
-LOD, обычные слайдеры/чекбоксы внутри нод. Если compose-проход и `scene_cache`
-это держат — брать Masonry. Если нет — ты точно знаешь, что писать самому, а `imaging`
-всё равно остаётся пригодным отдельно от Masonry.
-
-### 19.5 Корректировка к §17
-
-Строка про Xilem меняется с «заимствовать идеи, не зависеть» на:
-**`imaging` и `masonry_core` — брать как зависимость; `xilem` (view-слой) — отложить
-до стабилизации ядра.**
+Фаза 0 из §16 существует именно затем, чтобы этот выбор был основан на замерах,
+а не на этом документе.
