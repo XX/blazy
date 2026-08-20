@@ -214,3 +214,35 @@ fn far_field_nodes_stay_draggable() {
         "a node with no widget should still be movable through the model"
     );
 }
+
+/// The HUD must survive being cached.
+///
+/// Its shaped text is now rebuilt only when the string changes, which is exactly the
+/// kind of optimisation that shows up as a large speed-up when it silently stops
+/// drawing. Same guard as `far_field_is_actually_painted`: look at the pixels.
+#[test]
+fn hud_is_painted_and_survives_reshaping() {
+    let (mut harness, _graph) = harness(500);
+
+    let lit_in_hud = |image: &image::RgbaImage| {
+        let h = image.height();
+        image
+            .enumerate_pixels()
+            .filter(|(_, y, p)| {
+                // Bottom strip only, and brighter than the HUD panel background.
+                *y > h - 46 && p.0[0] as u32 + p.0[1] as u32 + p.0[2] as u32 > 3 * 0x60
+            })
+            .count()
+    };
+
+    let before = lit_in_hud(&harness.render());
+    assert!(before > 50, "expected HUD text pixels, got {before}");
+
+    // Force the text to change, which invalidates the cached shaping.
+    zoom_out(&mut harness, 0.5);
+    let after = lit_in_hud(&harness.render());
+    assert!(
+        after > 50,
+        "HUD disappeared after its text changed, got {after} lit pixels"
+    );
+}
