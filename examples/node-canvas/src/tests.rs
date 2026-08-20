@@ -6,6 +6,7 @@
 
 use blazy_canvas::CanvasLayer;
 use masonry::core::NewWidget;
+use masonry::core::{WidgetId, WidgetRef};
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::Vec2;
 use masonry::testing::TestHarness;
@@ -45,6 +46,24 @@ fn live(harness: &mut TestHarness<NodeEditor>) -> Vec<(usize, masonry::core::Wid
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
     })
+}
+
+/// Borrows a live node as its concrete type.
+fn node_ref<'a>(harness: &'a TestHarness<NodeEditor>, id: WidgetId) -> WidgetRef<'a, GraphNode> {
+    harness
+        .get_widget_with_id(id)
+        .downcast::<GraphNode>()
+        .expect("a canvas child should be a GraphNode")
+}
+
+/// Whether the node with this id currently carries real control widgets.
+fn has_controls(harness: &TestHarness<NodeEditor>, id: WidgetId) -> bool {
+    node_ref(harness, id).checkbox_id().is_some()
+}
+
+/// The live index/id pair for `index`, if it is materialised.
+fn live_id(harness: &mut TestHarness<NodeEditor>, index: usize) -> Option<WidgetId> {
+    live(harness).into_iter().find(|(i, _)| *i == index).map(|(_, id)| id)
 }
 
 /// Moves the pointer over node `index` and settles the resulting passes.
@@ -120,10 +139,8 @@ fn state_survives_a_round_trip_out_of_view() {
         .find(|(i, _)| *i == 0)
         .expect("node 0 should be back on screen");
 
-    let widget = harness.get_widget_with_id(*id);
-    let node = widget.downcast::<GraphNode>().expect("node 0 should be a GraphNode");
     assert_eq!(
-        node.built_value(),
+        node_ref(&harness, *id).built_value(),
         0.875,
         "the rebuilt widget did not pick up the model's current value"
     );
@@ -149,19 +166,10 @@ fn controls_write_back_to_the_model() {
     hover_node(&mut harness, index);
 
     let before = graph.borrow().node(index).checked;
-    let id = live(&mut harness)
-        .into_iter()
-        .find(|(i, _)| *i == index)
-        .map(|(_, id)| id)
-        .expect("hovered node should be live");
-    let checkbox = {
-        let widget = harness.get_widget_with_id(id);
-        widget
-            .downcast::<GraphNode>()
-            .expect("live child should be a GraphNode")
-            .checkbox_id()
-            .expect("the hovered node should have controls")
-    };
+    let id = live_id(&mut harness, index).expect("hovered node should be live");
+    let checkbox = node_ref(&harness, id)
+        .checkbox_id()
+        .expect("the hovered node should have controls");
 
     harness.mouse_click_on(checkbox, Some(PointerButton::Primary));
 
@@ -286,10 +294,8 @@ fn full_detail_nodes_all_have_controls() {
     let live = live(&mut harness);
     assert!(!live.is_empty());
     for (_, id) in &live {
-        let widget = harness.get_widget_with_id(*id);
-        let node = widget.downcast::<GraphNode>().expect("a GraphNode");
         assert!(
-            node.checkbox_id().is_some(),
+            has_controls(&harness, *id),
             "a node at full detail should carry real controls"
         );
     }
@@ -306,13 +312,7 @@ fn only_the_hovered_node_has_controls() {
     let with_controls = |h: &mut TestHarness<NodeEditor>| -> Vec<usize> {
         live(h)
             .into_iter()
-            .filter(|(_, id)| {
-                h.get_widget_with_id(*id)
-                    .downcast::<GraphNode>()
-                    .expect("a GraphNode")
-                    .checkbox_id()
-                    .is_some()
-            })
+            .filter(|(_, id)| has_controls(h, *id))
             .map(|(i, _)| i)
             .collect()
     };
@@ -357,13 +357,8 @@ fn detail_rebuild_preserves_state() {
     );
     zoom_out(&mut harness, 5.0);
 
-    let id = live(&mut harness)
-        .into_iter()
-        .find(|(i, _)| *i == target)
-        .map(|(_, id)| id)
-        .expect("node should be live again");
-    let widget = harness.get_widget_with_id(id);
-    let node = widget.downcast::<GraphNode>().expect("a GraphNode");
+    let id = live_id(&mut harness, target).expect("node should be live again");
+    let node = node_ref(&harness, id);
     assert!(node.checkbox_id().is_some(), "back at full detail the controls return");
     assert_eq!(
         node.built_value(),
@@ -388,14 +383,14 @@ fn far_field_does_not_repaint_while_panning() {
     // pan settle before reading the baseline.
     pan(&mut harness, Vec2::new(-6.0, -2.0));
     pan(&mut harness, Vec2::new(-6.0, -2.0));
-    let before = stats(&mut harness).far_repaints;
+    let before = stats(&mut harness).counters.far_repaints;
     assert!(before > 0, "entering the far field should have recorded a scene");
 
     for _ in 0..30 {
         pan(&mut harness, Vec2::new(-6.0, -2.0));
     }
 
-    let after = stats(&mut harness).far_repaints;
+    let after = stats(&mut harness).counters.far_repaints;
     assert_eq!(
         after,
         before,

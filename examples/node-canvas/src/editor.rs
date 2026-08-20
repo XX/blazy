@@ -81,11 +81,11 @@ fn format_hud(stats: &CanvasStats, out: &mut String) {
         out,
         "nodes {visible}/{total} materialised   zoom {zoom:.2}x   lod {detail}   built {builds}\n\
          drag a node - left-drag empty space or middle-drag to pan - wheel to zoom",
-        visible = stats.visible,
+        visible = stats.materialised,
         total = stats.total,
         zoom = stats.zoom,
         detail = detail,
-        builds = stats.builds,
+        builds = stats.counters.builds,
     );
 }
 

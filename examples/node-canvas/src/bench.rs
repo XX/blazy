@@ -28,6 +28,12 @@ const VIEWPORT: (u32, u32) = (1100, 750);
 /// Frames per scenario. Enough to see a trend, short enough to stay interactive.
 const FRAMES: usize = 120;
 
+/// Centre of the viewport, used as the zoom anchor everywhere.
+const VIEWPORT_CENTRE: Point = Point::new(VIEWPORT.0 as f64 / 2.0, VIEWPORT.1 as f64 / 2.0);
+
+/// One pan step, in viewport pixels.
+const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
+
 /// Result of one scenario.
 struct Report {
     name: &'static str,
@@ -44,7 +50,7 @@ impl Report {
     }
 
     fn child_layouts_per_frame(&self) -> f64 {
-        (self.after.child_layouts - self.before.child_layouts) as f64 / self.frames as f64
+        (self.after.counters.child_layouts - self.before.counters.child_layouts) as f64 / self.frames as f64
     }
 
     fn print(&self) {
@@ -55,16 +61,35 @@ impl Report {
             self.mean_ms(),
             self.worst.as_secs_f64() * 1000.0,
             self.child_layouts_per_frame(),
-            self.after.visible,
-            (self.after.builds - self.before.builds) as f64 / self.frames as f64,
+            self.after.materialised,
+            (self.after.counters.builds - self.before.counters.builds) as f64 / self.frames as f64,
         );
         println!(
             "{:<26}   detail {:<18} far repaints/frame {:>6.2}",
             "",
             format!("{:?}", self.after.detail),
-            (self.after.far_repaints - self.before.far_repaints) as f64 / self.frames as f64,
+            (self.after.counters.far_repaints - self.before.counters.far_repaints) as f64 / self.frames as f64,
         );
     }
+}
+
+/// Pans the canvas by one step, as a scenario body.
+fn pan_step(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::pan(&mut canvas, delta));
+    });
+}
+
+/// A harness zoomed to `factor` about the centre of the viewport, already settled.
+fn zoomed_harness(count: usize, factor: f64, controls_on_hover: bool) -> TestHarness<NodeEditor> {
+    let mut harness = new_harness_with(count, controls_on_hover);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::zoom_around(&mut canvas, VIEWPORT_CENTRE, factor);
+        });
+    });
+    let _ = harness.redraw();
+    harness
 }
 
 /// Reads the canvas counters out of the live widget tree.
@@ -149,13 +174,7 @@ pub fn run(count: usize) {
     // rather than the number of visible nodes, the design holds.
     {
         let mut harness = new_harness(count);
-        reports.push(measure("pan", &mut harness, FRAMES, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
-        }));
+        reports.push(measure("pan", &mut harness, FRAMES, |h, _| pan_step(h, PAN_STEP)));
     }
 
     // --- Scenario 3: zoom.
@@ -212,19 +231,9 @@ pub fn run(count: usize) {
     // laid-out widgets drops by roughly two thirds. This is the measurement that
     // says whether LOD is worth its complexity.
     {
-        let mut harness = new_harness(count);
-        harness.edit_root_widget(|mut editor| {
-            NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.15);
-            });
-        });
-        let _ = harness.redraw();
+        let mut harness = zoomed_harness(count, 0.15, false);
         reports.push(measure("pan, zoom 0.15", &mut harness, FRAMES, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
+            pan_step(h, PAN_STEP)
         }));
     }
 
@@ -234,19 +243,9 @@ pub fn run(count: usize) {
     // stashed. Worth measuring separately because stashing is exactly the halfway
     // measure that section 20.2 showed does not pay.
     {
-        let mut harness = new_harness(count);
-        harness.edit_root_widget(|mut editor| {
-            NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.4);
-            });
-        });
-        let _ = harness.redraw();
+        let mut harness = zoomed_harness(count, 0.4, false);
         reports.push(measure("pan, zoom 0.40", &mut harness, FRAMES, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
+            pan_step(h, PAN_STEP)
         }));
     }
 
@@ -256,19 +255,9 @@ pub fn run(count: usize) {
     // Masonry's themed controls closely enough for the swap to go unnoticed. Kept as
     // a scenario so the price of that decision stays a number rather than a memory.
     {
-        let mut harness = new_harness_with(count, true);
-        harness.edit_root_widget(|mut editor| {
-            NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.4);
-            });
-        });
-        let _ = harness.redraw();
+        let mut harness = zoomed_harness(count, 0.4, true);
         reports.push(measure("pan, zoom 0.40, on hover", &mut harness, FRAMES, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
+            pan_step(h, PAN_STEP)
         }));
     }
 
@@ -277,19 +266,9 @@ pub fn run(count: usize) {
     // The worst point on the curve: nodes are still materialised, but the viewport
     // covers most of the graph.
     {
-        let mut harness = new_harness(count);
-        harness.edit_root_widget(|mut editor| {
-            NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.11);
-            });
-        });
-        let _ = harness.redraw();
+        let mut harness = zoomed_harness(count, 0.11, false);
         reports.push(measure("pan, zoom 0.11", &mut harness, 40, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
+            pan_step(h, PAN_STEP)
         }));
     }
 
@@ -299,19 +278,9 @@ pub fn run(count: usize) {
     // that every node is visible removes the bound by definition. This scenario
     // exists to measure what is left when it does.
     {
-        let mut harness = new_harness(count);
-        harness.edit_root_widget(|mut editor| {
-            NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.04);
-            });
-        });
-        let _ = harness.redraw();
+        let mut harness = zoomed_harness(count, 0.04, false);
         reports.push(measure("pan, whole graph shown", &mut harness, 30, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
+            pan_step(h, PAN_STEP)
         }));
     }
 
@@ -352,17 +321,11 @@ fn scaling_sweep() -> Vec<ScalePoint> {
         let idle = measure("idle", &mut harness, SWEEP_FRAMES, |_, _| {});
 
         let mut harness = new_harness(nodes);
-        let pan = measure("pan", &mut harness, SWEEP_FRAMES, |h, _| {
-            h.edit_root_widget(|mut editor| {
-                NodeEditor::with_canvas(&mut editor, |mut canvas| {
-                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
-                });
-            });
-        });
+        let pan = measure("pan", &mut harness, SWEEP_FRAMES, |h, _| pan_step(h, PAN_STEP));
 
         let point = ScalePoint {
             nodes,
-            visible: pan.after.visible,
+            visible: pan.after.materialised,
             idle_ms: idle.mean_ms(),
             pan_ms: pan.mean_ms(),
         };
@@ -388,7 +351,7 @@ fn verdict(reports: &[Report], count: usize, scaling: &[ScalePoint]) {
 
     if let Some(pan) = find("pan") {
         let per_frame = pan.child_layouts_per_frame();
-        let visible = pan.after.visible as f64;
+        let visible = pan.after.materialised as f64;
         // A pan should only lay out nodes newly entering the viewport. Anything
         // approaching the visible count means every visible node is being relaid
         // out, which is the failure mode this design exists to avoid.
@@ -413,11 +376,11 @@ fn verdict(reports: &[Report], count: usize, scaling: &[ScalePoint]) {
     }
 
     if let Some(pan) = find("pan") {
-        let ok = pan.after.visible < count / 4;
+        let ok = pan.after.materialised < count / 4;
         println!(
             "  [{}] culling keeps the visible set small  ({} of {count} nodes visible)",
             mark(ok),
-            pan.after.visible
+            pan.after.materialised
         );
     }
 
@@ -436,7 +399,7 @@ fn verdict(reports: &[Report], count: usize, scaling: &[ScalePoint]) {
                 name,
                 r.mean_ms(),
                 r.worst.as_secs_f64() * 1000.0,
-                r.after.visible,
+                r.after.materialised,
                 r.after.detail,
             );
         }
