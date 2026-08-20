@@ -1,6 +1,3 @@
-// Copyright 2026 the blazy Authors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Phase 0 feasibility experiment for blazy.
 //!
 //! `rnd/architecture.md` §16 says: before committing to Masonry, build a node
@@ -27,65 +24,41 @@
 
 mod bench;
 mod editor;
+mod model;
 mod node;
+#[cfg(test)]
+mod tests;
 
-use blazy_canvas::{CanvasItem, CanvasLayer};
+use blazy_canvas::CanvasLayer;
 use masonry::core::NewWidget;
 use masonry::dpi::LogicalSize;
-use masonry::kurbo::{Point, Size};
-use masonry::peniko::Color;
 use masonry::theme::default_property_set;
 use masonry_winit::app::{AppDriver, DriverCtx, NewWindow, WindowId};
 use masonry_winit::winit::window::Window;
 
 use crate::editor::NodeEditor;
+use crate::model::{GraphModel, NODE_SIZE, SharedGraph, share};
 use crate::node::GraphNode;
 
 /// Default graph size. The figure comes straight from the Phase 0 brief.
 pub const DEFAULT_NODES: usize = 5000;
 
-/// Node footprint in canvas units.
-pub const NODE_SIZE: Size = Size::new(160.0, 96.0);
-
-/// Spacing between nodes in the generated grid.
-const GRID_STEP: f64 = 220.0;
-/// Nodes per row in the generated grid.
-const GRID_COLS: usize = 80;
-
-/// Builds a deterministic grid of nodes.
+/// Builds a virtualised canvas over a generated graph.
 ///
-/// Deterministic on purpose: two benchmark runs must be comparable, so there is no
-/// randomness anywhere. The jitter is a cheap hash of the index, not an RNG.
-pub fn build_canvas(count: usize) -> CanvasLayer {
-    let items = (0..count).map(|i| {
-        let col = i % GRID_COLS;
-        let row = i / GRID_COLS;
-
-        // A reproducible pseudo-random offset, so the grid does not look like graph
-        // paper while staying identical between runs.
-        let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let jitter_x = ((h >> 33) % 61) as f64 - 30.0;
-        let jitter_y = ((h >> 17) % 41) as f64 - 20.0;
-
-        let pos = Point::new(col as f64 * GRID_STEP + jitter_x, row as f64 * GRID_STEP + jitter_y);
-
-        let hue = (i % 6) as u8;
-        let tint = match hue {
-            0 => Color::from_rgb8(0x6b, 0x4b, 0x8a),
-            1 => Color::from_rgb8(0x3c, 0x6e, 0x71),
-            2 => Color::from_rgb8(0x8a, 0x5a, 0x3c),
-            3 => Color::from_rgb8(0x44, 0x6b, 0x3c),
-            4 => Color::from_rgb8(0x8a, 0x3c, 0x51),
-            _ => Color::from_rgb8(0x3c, 0x4e, 0x8a),
-        };
-
-        let value = ((h >> 5) % 100) as f64 / 100.0;
-        let checked = h & 1 == 0;
-
-        CanvasItem::new(NewWidget::new(GraphNode::new(tint, value, checked)), pos, NODE_SIZE)
-    });
-
-    CanvasLayer::new(items)
+/// Only geometry is handed to the canvas up front. Widgets are built on demand by
+/// the closure, which reads current state from the shared model — so a node that
+/// scrolls out of view and back again comes back with the user's edits intact.
+pub fn build_canvas(count: usize) -> (CanvasLayer, SharedGraph) {
+    let graph = share(GraphModel::generated(count));
+    let geometry = {
+        let graph = graph.clone();
+        move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
+    };
+    let source = {
+        let graph = graph.clone();
+        move |i: usize| GraphNode::build(&graph, i)
+    };
+    (CanvasLayer::new(count, geometry, source), graph)
 }
 
 struct Driver;
@@ -124,7 +97,8 @@ fn main() {
     }
 
     let count = parse_count(&args).unwrap_or(DEFAULT_NODES);
-    let editor = NodeEditor::new(build_canvas(count));
+    let (canvas, _graph) = build_canvas(count);
+    let editor = NodeEditor::new(canvas);
 
     let window_size = LogicalSize::new(1100.0, 750.0);
     let attributes = Window::default_attributes()

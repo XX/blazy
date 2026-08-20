@@ -1,6 +1,3 @@
-// Copyright 2026 the blazy Authors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! The node editor: a canvas plus a heads-up display of the Phase 0 counters.
 //!
 //! The HUD exists because Phase 0 is a measurement, not a demo. Numbers that only

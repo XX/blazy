@@ -156,7 +156,10 @@ impl CanvasItem {
 pub struct CanvasStats {
     /// Total number of children.
     pub total: usize,
-    /// Children that survived culling and were laid out and painted.
+    /// Nodes that currently have a widget in the tree.
+    ///
+    /// With virtualisation this is also the number of widgets the passes walk, which
+    /// is the point: it is bounded by the viewport, not by the graph.
     pub visible: usize,
     /// Layout passes run on the content widget since it was created.
     pub content_layouts: u64,
@@ -169,20 +172,50 @@ pub struct CanvasStats {
     pub child_layouts: u64,
     /// Compose passes run on the content widget since it was created.
     pub composes: u64,
+    /// Widgets built since the canvas was created.
+    ///
+    /// Each one is a node scrolling into view. If this climbs steeply while panning
+    /// slowly, the cull margin is too tight and nodes are thrashing in and out.
+    pub builds: u64,
     /// Detail level applied at the last layout.
     pub detail: Option<Detail>,
     /// Current zoom factor.
     pub zoom: f64,
 }
 
-struct Child {
-    pod: WidgetPod<dyn Widget>,
-    /// Position of the child's top-left corner, in canvas coordinates.
+/// Builds the widget for a node when it scrolls into view.
+///
+/// The canvas materialises widgets lazily, so a node's *state* cannot live in its
+/// widget: the widget does not exist most of the time. The model behind this trait
+/// is the source of truth, and the widget is a view over it — which is the normal
+/// arrangement for a node editor anyway, since the graph outlives any view of it.
+///
+/// Implemented for any `FnMut(usize) -> NewWidget<dyn Widget>`.
+pub trait NodeSource: 'static {
+    /// Builds the widget for the node at `index`.
+    ///
+    /// Called every time the node enters the materialised region, so it must read
+    /// current state from the model rather than assuming defaults.
+    fn build(&mut self, index: usize) -> NewWidget<dyn Widget>;
+}
+
+impl<F> NodeSource for F
+where
+    F: FnMut(usize) -> NewWidget<dyn Widget> + 'static,
+{
+    fn build(&mut self, index: usize) -> NewWidget<dyn Widget> {
+        self(index)
+    }
+}
+
+/// One node's slot: geometry always, a widget only while it is in view.
+struct Slot {
+    /// Position of the node's top-left corner, in canvas coordinates.
     pos: Point,
     /// Size in canvas coordinates. Fixed, so children are never measured.
     size: Size,
-    /// Whether this child survived the last cull.
-    visible: bool,
+    /// The materialised widget, if this node currently has one.
+    pod: Option<WidgetPod<dyn Widget>>,
 }
 
 // --- MARK: CONTENT
@@ -192,7 +225,15 @@ struct Child {
 /// Holds the freely positioned children and carries the pan/zoom transform. Not
 /// constructed directly; a [`CanvasLayer`] owns one.
 pub struct CanvasContent {
-    children: Vec<Child>,
+    /// Geometry for every node; widgets for the materialised ones only.
+    slots: Vec<Slot>,
+    /// Builds widgets on demand.
+    source: Box<dyn NodeSource>,
+    /// Indices with a live widget, ascending.
+    live: Vec<usize>,
+    /// Indices that should have a widget, computed by the last cull and applied in
+    /// the next mutate pass.
+    pending: Option<Vec<usize>>,
     /// Visible region in canvas coordinates, pushed down by the parent.
     visible_rect: Rect,
     /// Detail level pushed down by the parent.
@@ -200,7 +241,7 @@ pub struct CanvasContent {
     layouts: Cell<u64>,
     child_layouts: Cell<u64>,
     composes: Cell<u64>,
-    visible_count: Cell<usize>,
+    builds: Cell<u64>,
 }
 
 // `CanvasLayer` owns this widget completely and reaches into it during layout to
@@ -211,54 +252,122 @@ pub struct CanvasContent {
 impl AllowRawMut for CanvasContent {}
 
 impl CanvasContent {
-    fn new(children: Vec<Child>) -> Self {
+    fn new(slots: Vec<Slot>, source: Box<dyn NodeSource>) -> Self {
         Self {
-            children,
+            slots,
+            source,
+            live: Vec::new(),
+            pending: None,
             visible_rect: Rect::ZERO,
             detail: None,
             layouts: Cell::new(0),
             child_layouts: Cell::new(0),
             composes: Cell::new(0),
-            visible_count: Cell::new(0),
+            builds: Cell::new(0),
         }
     }
 
-    /// Sets the detail property on every child.
+    /// Sets the detail property on every live child.
     ///
-    /// Only called on a zoom threshold crossing, so an O(n) walk is acceptable —
-    /// unlike the per-frame work, which is culled first.
-    pub fn set_detail(this: &mut WidgetMut<'_, Self>, detail: Detail) {
-        for i in 0..this.widget.children.len() {
-            let pod = &mut this.widget.children[i].pod;
+    /// Only called on a zoom threshold crossing, and only over materialised
+    /// children, so this is bounded by the visible set rather than the graph.
+    fn set_detail(this: &mut WidgetMut<'_, Self>, detail: Detail) {
+        for i in 0..this.widget.live.len() {
+            let index = this.widget.live[i];
+            let Some(pod) = this.widget.slots[index].pod.as_mut() else {
+                continue;
+            };
             let mut child = this.ctx.get_mut(pod);
             child.insert_prop(CanvasDetail(detail));
         }
     }
 
-    /// Marks children inside the visible rect and stashes the rest.
+    /// Materialises and dematerialises children to match the last cull.
     ///
-    /// A linear scan. For Phase 0 that is the honest baseline: it makes the cost of
-    /// *not* having a spatial index visible in the measurements, so the decision to
-    /// add one is driven by numbers rather than assumption. An R-tree drops in here
-    /// without changing anything else.
-    ///
-    /// Stashing from `layout` is the same thing `virtual_scroll` does. The stashed
-    /// pass runs before the layout pass inside the rewrite loop, so a child that
-    /// becomes visible is unstashed and laid out within the same frame.
-    fn cull(&mut self, ctx: &mut LayoutCtx<'_>) {
-        let mut visible = 0;
-        for child in &mut self.children {
-            let bounds = Rect::from_origin_size(child.pos, child.size);
-            let is_visible = bounds.overlaps(self.visible_rect);
-            if is_visible != child.visible {
-                child.visible = is_visible;
-                ctx.set_stashed(&mut child.pod, !is_visible);
-            }
-            if is_visible {
-                visible += 1;
+    /// Runs in the mutate pass, which is where adding and removing children is
+    /// legal. The mutate pass runs before the layout pass inside the rewrite loop,
+    /// so a node entering the view is built, laid out and painted in the same frame.
+    fn apply_pending(this: &mut WidgetMut<'_, Self>) {
+        let Some(desired) = this.widget.pending.take() else {
+            return;
+        };
+        if desired == this.widget.live {
+            return;
+        }
+
+        // Both lists are ascending, so a merge walk finds the difference in one
+        // pass over the live set — no allocation, no hashing.
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let (mut a, mut b) = (0, 0);
+        while a < this.widget.live.len() || b < desired.len() {
+            match (this.widget.live.get(a), desired.get(b)) {
+                (Some(&l), Some(&d)) if l == d => {
+                    a += 1;
+                    b += 1;
+                },
+                (Some(&l), Some(&d)) if l < d => {
+                    removed.push(l);
+                    a += 1;
+                },
+                (Some(_), Some(&d)) => {
+                    added.push(d);
+                    b += 1;
+                },
+                (Some(&l), None) => {
+                    removed.push(l);
+                    a += 1;
+                },
+                (None, Some(&d)) => {
+                    added.push(d);
+                    b += 1;
+                },
+                (None, None) => break,
             }
         }
-        self.visible_count.set(visible);
+
+        // Removing takes the widget out of the tree entirely. This is the whole
+        // point: a stashed widget is still walked by every pass, a removed one is
+        // not. Its state is not lost — it lives in the model behind `NodeSource`.
+        for index in removed {
+            if let Some(pod) = this.widget.slots[index].pod.take() {
+                this.ctx.remove_child(pod);
+            }
+        }
+
+        let detail = this.widget.detail;
+        for index in added {
+            let mut widget = this.widget.source.build(index);
+            if let Some(detail) = detail {
+                widget = widget.with_props(CanvasDetail(detail));
+            }
+            this.widget.slots[index].pod = Some(widget.to_pod());
+            this.widget.builds.set(this.widget.builds.get() + 1);
+        }
+
+        this.widget.live = desired;
+        this.ctx.children_changed();
+        this.ctx.request_layout();
+    }
+
+    /// Computes the set of nodes that should have widgets.
+    ///
+    /// A linear scan over the geometry array. That is O(total) per frame, but it
+    /// touches 32 bytes per node and no widget state, so it costs a few microseconds
+    /// where materialising the same nodes costs milliseconds. A spatial index drops
+    /// in here when the scan itself starts to matter.
+    fn cull(&mut self) {
+        let mut desired = Vec::with_capacity(self.live.len() + 8);
+        for (index, slot) in self.slots.iter().enumerate() {
+            if Rect::from_origin_size(slot.pos, slot.size).overlaps(self.visible_rect) {
+                desired.push(index);
+            }
+        }
+        if desired == self.live {
+            self.pending = None;
+        } else {
+            self.pending = Some(desired);
+        }
     }
 }
 
@@ -273,9 +382,8 @@ impl Widget for CanvasContent {
         len_req: LenReq,
         _cross_length: Option<Length>,
     ) -> Length {
-        // Never measures its children. Asking thousands of nodes how big they want
-        // to be, on every layout pass, is precisely the cost this design avoids:
-        // node sizes come from the graph model, so they are known before layout.
+        // Never measures its children. Node sizes come from the model, so they are
+        // known before layout starts.
         match len_req {
             LenReq::MinContent | LenReq::MaxContent => Length::ZERO,
             LenReq::FitContent(space) => space,
@@ -284,22 +392,35 @@ impl Widget for CanvasContent {
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {
         self.layouts.set(self.layouts.get() + 1);
-        self.cull(ctx);
+
+        self.cull();
+        if self.pending.is_some() {
+            // Adding and removing children needs a `WidgetMut`, which layout does
+            // not have. Queue it for the mutate pass, which runs before the next
+            // layout pass in the same rewrite loop.
+            ctx.mutate_self_later(|mut this| {
+                let mut this = this.downcast::<Self>();
+                Self::apply_pending(&mut this);
+            });
+        }
 
         // Children are laid out in canvas coordinates at their natural size; the
         // zoom lives entirely in this widget's transform. That separation is the
         // point. A per-region `ui_scale` would belong here, in layout — but `view`
         // must not, or every zoom step would relayout the whole graph.
-        for child in &mut self.children {
-            if !child.visible {
+        for i in 0..self.live.len() {
+            let index = self.live[i];
+            let size = self.slots[index].size;
+            let pos = self.slots[index].pos;
+            let Some(pod) = self.slots[index].pod.as_mut() else {
                 continue;
-            }
-            if ctx.child_needs_layout(&child.pod) {
+            };
+            if ctx.child_needs_layout(pod) {
                 self.child_layouts.set(self.child_layouts.get() + 1);
             }
-            let child_size = ctx.compute_size(&mut child.pod, SizeDef::fixed(child.size), child.size.into());
-            ctx.run_layout(&mut child.pod, child_size);
-            ctx.place_child(&mut child.pod, child.pos);
+            let child_size = ctx.compute_size(pod, SizeDef::fixed(size), size.into());
+            ctx.run_layout(pod, child_size);
+            ctx.place_child(pod, pos);
         }
     }
 
@@ -310,13 +431,19 @@ impl Widget for CanvasContent {
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
-        for child in &mut self.children {
-            ctx.register_child(&mut child.pod);
+        for &index in &self.live {
+            if let Some(pod) = self.slots[index].pod.as_mut() {
+                ctx.register_child(pod);
+            }
         }
     }
 
     fn children_ids(&self) -> ChildrenIds {
-        self.children.iter().map(|c| c.pod.id()).collect()
+        self.live
+            .iter()
+            .filter_map(|&i| self.slots[i].pod.as_ref())
+            .map(|pod| pod.id())
+            .collect()
     }
 
     fn accessibility_role(&self) -> Role {
@@ -365,19 +492,21 @@ pub struct CanvasLayer {
 }
 
 impl CanvasLayer {
-    /// Creates a canvas holding the given items.
-    pub fn new(items: impl IntoIterator<Item = CanvasItem>) -> Self {
-        let children = items
-            .into_iter()
-            .map(|item| Child {
-                pod: item.widget.to_pod(),
-                pos: item.pos,
-                size: item.size,
-                visible: true,
+    /// Creates a canvas over `count` nodes.
+    ///
+    /// `geometry` supplies each node's position and size, and `source` builds its
+    /// widget when it scrolls into view. Only the geometry is stored up front: a
+    /// graph of a million nodes costs a million `(Point, Size)` pairs, not a million
+    /// widgets.
+    pub fn new(count: usize, mut geometry: impl FnMut(usize) -> (Point, Size), source: impl NodeSource) -> Self {
+        let slots = (0..count)
+            .map(|i| {
+                let (pos, size) = geometry(i);
+                Slot { pos, size, pod: None }
             })
             .collect();
         Self {
-            content: WidgetPod::new(CanvasContent::new(children)),
+            content: WidgetPod::new(CanvasContent::new(slots, Box::new(source))),
             view: Affine::IDENTITY,
             view_dirty: true,
             viewport: Size::ZERO,
@@ -469,8 +598,11 @@ impl CanvasLayer {
     /// and no other child's scene is re-encoded.
     pub fn move_child(this: &mut WidgetMut<'_, Self>, index: usize, pos: Point) {
         let mut content = this.ctx.get_mut(&mut this.widget.content);
-        if let Some(child) = content.widget.children.get_mut(index) {
-            child.pos = pos;
+        if let Some(slot) = content.widget.slots.get_mut(index) {
+            if slot.pos == pos {
+                return;
+            }
+            slot.pos = pos;
             content.ctx.request_layout();
         }
     }
@@ -482,18 +614,32 @@ impl CanvasLayer {
         let content = this.ctx.get_mut(&mut this.widget.content);
         content
             .widget
-            .children
+            .slots
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, c)| Rect::from_origin_size(c.pos, c.size).contains(canvas_pos))
+            .find(|(_, s)| Rect::from_origin_size(s.pos, s.size).contains(canvas_pos))
             .map(|(i, _)| i)
+    }
+
+    /// The nodes that currently have a widget, as `(index, widget id)` pairs.
+    ///
+    /// Useful for tests and for apps that need to reach into a live node. The list
+    /// changes as nodes scroll in and out, so ids must not be cached across frames.
+    pub fn live_children(this: &mut WidgetMut<'_, Self>) -> Vec<(usize, masonry::core::WidgetId)> {
+        let content = this.ctx.get_mut(&mut this.widget.content);
+        content
+            .widget
+            .live
+            .iter()
+            .filter_map(|&i| content.widget.slots[i].pod.as_ref().map(|pod| (i, pod.id())))
+            .collect()
     }
 
     /// The canvas-space position of a child.
     pub fn child_pos(this: &mut WidgetMut<'_, Self>, index: usize) -> Option<Point> {
         let content = this.ctx.get_mut(&mut this.widget.content);
-        content.widget.children.get(index).map(|c| c.pos)
+        content.widget.slots.get(index).map(|s| s.pos)
     }
 
     // --- MARK: INTERNAL
@@ -514,11 +660,11 @@ impl CanvasLayer {
     /// Moves a child from an event handler.
     fn move_child_at(&mut self, index: usize, pos: Point, ctx: &mut EventCtx<'_>) {
         let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
-        if let Some(child) = content.children.get_mut(index) {
-            if child.pos == pos {
+        if let Some(slot) = content.slots.get_mut(index) {
+            if slot.pos == pos {
                 return;
             }
-            child.pos = pos;
+            slot.pos = pos;
             // Only the content widget is dirtied. Sibling nodes keep their cached
             // scenes; the moved node keeps its own too, since only its position
             // changed, not its contents.
@@ -529,13 +675,15 @@ impl CanvasLayer {
     /// Finds the topmost child under a canvas-space point, from an event handler.
     fn hit_child(&mut self, canvas_pos: Point, ctx: &mut EventCtx<'_>) -> Option<(usize, Point)> {
         let (content, _) = ctx.get_raw(&mut self.content);
+        // Only materialised nodes can be grabbed: a node with no widget is not on
+        // screen, so the pointer cannot be over it.
         content
-            .children
+            .live
             .iter()
-            .enumerate()
             .rev()
-            .find(|(_, c)| c.visible && Rect::from_origin_size(c.pos, c.size).contains(canvas_pos))
-            .map(|(i, c)| (i, c.pos))
+            .map(|&i| (i, &content.slots[i]))
+            .find(|(_, s)| Rect::from_origin_size(s.pos, s.size).contains(canvas_pos))
+            .map(|(i, s)| (i, s.pos))
     }
 }
 
@@ -551,6 +699,14 @@ impl Widget for CanvasLayer {
     fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &PointerEvent) {
         match event {
             PointerEvent::Down(e) if !ctx.is_handled() => {
+                // A control inside a node may have taken pointer capture without
+                // marking the event handled — `Checkbox` and `Slider` both do
+                // exactly that. Starting a drag here would steal the capture out
+                // from under them and break every control on the canvas, so the
+                // capture target is the signal to defer to, not `is_handled`.
+                if ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
+                    return;
+                }
                 let pos = ctx.local_position(e.state.position);
                 let canvas_pos = self.view.inverse() * pos;
                 self.drag = match e.button {
@@ -676,6 +832,11 @@ impl Widget for CanvasLayer {
             content.detail = Some(detail);
             if view_dirty {
                 raw.set_transform(view);
+                // `set_transform` marks the content as needing *compose*, not
+                // layout. Culling lives in layout and depends on the view, so
+                // without this the visible set would be computed once and then
+                // never again — nodes would neither enter nor leave the tree.
+                raw.request_layout();
             }
         }
 
@@ -700,11 +861,12 @@ impl Widget for CanvasLayer {
         let zoom = self.zoom();
         let (content, _) = ctx.get_raw(&mut self.content);
         self.stats.set(CanvasStats {
-            total: content.children.len(),
-            visible: content.visible_count.get(),
+            total: content.slots.len(),
+            visible: content.live.len(),
             content_layouts: content.layouts.get(),
             child_layouts: content.child_layouts.get(),
             composes: content.composes.get(),
+            builds: content.builds.get(),
             detail: content.detail,
             zoom,
         });

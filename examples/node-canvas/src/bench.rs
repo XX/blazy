@@ -1,6 +1,3 @@
-// Copyright 2026 the blazy Authors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Headless measurements for Phase 0.
 //!
 //! Runs the scenarios from `rnd/architecture.md` §7.4 against a `TestHarness`, so
@@ -52,12 +49,14 @@ impl Report {
 
     fn print(&self) {
         println!(
-            "{:<26} {:>7.3} ms/frame  worst {:>7.3} ms  child-layouts/frame {:>8.1}  visible {:>5}",
+            "{:<26} {:>7.3} ms/frame  worst {:>7.3} ms  child-layouts/frame {:>7.1}  \
+             live {:>4}  builds/frame {:>6.1}",
             self.name,
             self.mean_ms(),
             self.worst.as_secs_f64() * 1000.0,
             self.child_layouts_per_frame(),
             self.after.visible,
+            (self.after.builds - self.before.builds) as f64 / self.frames as f64,
         );
     }
 }
@@ -70,7 +69,8 @@ fn stats(harness: &TestHarness<NodeEditor>) -> CanvasStats {
 }
 
 fn new_harness(count: usize) -> TestHarness<NodeEditor> {
-    let editor = NodeEditor::new(build_canvas(count));
+    let (canvas, _graph) = build_canvas(count);
+    let editor = NodeEditor::new(canvas);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(editor),

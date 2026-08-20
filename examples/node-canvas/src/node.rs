@@ -1,6 +1,3 @@
-// Copyright 2026 the blazy Authors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! A graph node: a rounded body with a coloured header and interactive controls.
 //!
 //! The node is a container, not a painter callback. That is the whole point of
@@ -17,14 +14,16 @@ use std::any::TypeId;
 use blazy_canvas::{CanvasDetail, Detail};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::{
-    AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PropertiesRef, RegisterCtx, UpdateCtx,
-    UsesProperty, Widget, WidgetPod,
+    AccessCtx, ActionCtx, ChildrenIds, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx,
+    PropertiesMut, PropertiesRef, RegisterCtx, UpdateCtx, UsesProperty, Widget, WidgetId, WidgetPod,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, Point, Rect, RoundedRect, Size, Stroke};
 use masonry::layout::{LenReq, Length, SizeDef};
 use masonry::peniko::Color;
-use masonry::widgets::{Checkbox, Slider};
+use masonry::widgets::{Checkbox, CheckboxToggled, Slider, SliderMoved};
+
+use crate::model::SharedGraph;
 
 /// Height of the coloured header strip, in canvas units.
 const HEADER_HEIGHT: f64 = 22.0;
@@ -34,24 +33,56 @@ const RADIUS: f64 = 6.0;
 const PADDING: f64 = 8.0;
 
 /// A graph node with a slider and a checkbox.
+///
+/// The node is a *view* over [`GraphModel`](crate::model::GraphModel): it is built
+/// when the node scrolls into view and dropped when it scrolls out, so anything the
+/// user changes has to be written back to the model immediately. That write-back is
+/// [`on_action`](Widget::on_action).
 pub struct GraphNode {
+    /// The graph this node belongs to.
+    graph: SharedGraph,
+    /// This node's index in the graph.
+    index: usize,
     /// Header tint, used to tell nodes apart at a glance when zoomed out.
     tint: Color,
     slider: WidgetPod<Slider>,
     checkbox: WidgetPod<Checkbox>,
     /// Whether the contents are currently stashed.
     stashed: bool,
+    /// The slider value this widget was built with.
+    ///
+    /// Kept so tests can assert that a rebuilt node picked up the model's current
+    /// state rather than a stale default.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
+    built_value: f64,
 }
 
 impl GraphNode {
-    /// Creates a node with the given header tint and initial control values.
-    pub fn new(tint: Color, value: f64, checked: bool) -> Self {
-        Self {
-            tint,
-            slider: WidgetPod::new(Slider::new(0.0, 1.0, value)),
-            checkbox: WidgetPod::new(Checkbox::new(checked, "on")),
+    /// The slider value this node was built with.
+    #[cfg(test)]
+    pub fn built_value(&self) -> f64 {
+        self.built_value
+    }
+
+    /// The id of this node's checkbox, for driving it from tests.
+    #[cfg(test)]
+    pub fn checkbox_id(&self) -> WidgetId {
+        self.checkbox.id()
+    }
+
+    /// Builds the widget for node `index`, reading its current state from the model.
+    pub fn build(graph: &SharedGraph, index: usize) -> NewWidget<dyn Widget> {
+        let state = graph.borrow().node(index);
+        NewWidget::new(Self {
+            graph: graph.clone(),
+            index,
+            tint: state.tint,
+            slider: WidgetPod::new(Slider::new(0.0, 1.0, state.value)),
+            checkbox: WidgetPod::new(Checkbox::new(state.checked, "on")),
             stashed: false,
-        }
+            built_value: state.value,
+        })
+        .erased()
     }
 }
 
@@ -144,6 +175,26 @@ impl Widget for GraphNode {
         painter
             .stroke(body, &Stroke::new(1.0), Color::from_rgb8(0x18, 0x18, 0x1c))
             .draw();
+    }
+
+    /// Writes control changes straight back into the model.
+    ///
+    /// Without this, virtualisation would silently discard the user's edits the
+    /// moment a node scrolled off screen.
+    fn on_action(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        _props: &mut PropertiesMut<'_>,
+        action: &ErasedAction,
+        _source: WidgetId,
+    ) {
+        if let Some(moved) = action.downcast_ref::<SliderMoved>() {
+            self.graph.borrow_mut().set_value(self.index, moved.value);
+            ctx.set_handled();
+        } else if let Some(toggled) = action.downcast_ref::<CheckboxToggled>() {
+            self.graph.borrow_mut().set_checked(self.index, toggled.0);
+            ctx.set_handled();
+        }
     }
 
     fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
