@@ -20,7 +20,7 @@ use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 
 use crate::editor::NodeEditor;
-use crate::{DEFAULT_NODES, build_canvas};
+use crate::{DEFAULT_NODES, build_canvas_with};
 
 /// Viewport used for all scenarios.
 const VIEWPORT: (u32, u32) = (1100, 750);
@@ -75,7 +75,11 @@ fn stats(harness: &TestHarness<NodeEditor>) -> CanvasStats {
 }
 
 fn new_harness(count: usize) -> TestHarness<NodeEditor> {
-    let (canvas, _graph) = build_canvas(count);
+    new_harness_with(count, false)
+}
+
+fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEditor> {
+    let (canvas, _graph) = build_canvas_with(count, controls_on_hover);
     let editor = NodeEditor::new(canvas);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -238,6 +242,28 @@ pub fn run(count: usize) {
         });
         let _ = harness.redraw();
         reports.push(measure("pan, zoom 0.40", &mut harness, FRAMES, |h, _| {
+            h.edit_root_widget(|mut editor| {
+                NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
+                });
+            });
+        }));
+    }
+
+    // --- Scenario 5b: the same view with controls materialised only on hover.
+    //
+    // Measured but not enabled by default: the painted stand-in does not match
+    // Masonry's themed controls closely enough for the swap to go unnoticed. Kept as
+    // a scenario so the price of that decision stays a number rather than a memory.
+    {
+        let mut harness = new_harness_with(count, true);
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.4);
+            });
+        });
+        let _ = harness.redraw();
+        reports.push(measure("pan, zoom 0.40, on hover", &mut harness, FRAMES, |h, _| {
             h.edit_root_widget(|mut editor| {
                 NodeEditor::with_canvas(&mut editor, |mut canvas| {
                     CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));

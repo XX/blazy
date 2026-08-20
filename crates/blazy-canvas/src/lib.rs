@@ -296,10 +296,10 @@ pub struct CanvasContent {
     far_nodes: Vec<usize>,
     /// Set when the far-field scene must be re-recorded.
     far_dirty: bool,
-    /// The node the pointer is on, if any.
-    ///
-    /// Only this node gets interactive controls; see [`CanvasContent::effective_detail`].
+    /// The node the pointer is on, if any. Only meaningful with `controls_on_hover`.
     active: Option<usize>,
+    /// Whether only the node under the pointer gets interactive controls.
+    controls_on_hover: bool,
     /// Set when `detail` or `active` changed, so stale widgets get rebuilt.
     detail_dirty: bool,
     /// Whether the queued `pending` needs a staleness sweep as well as a set diff.
@@ -337,6 +337,7 @@ impl CanvasContent {
             far_nodes: Vec::new(),
             far_dirty: false,
             active: None,
+            controls_on_hover: false,
             detail_dirty: false,
             pending_stale: false,
             pending: None,
@@ -352,18 +353,19 @@ impl CanvasContent {
 
     /// The detail level node `index` should be built at.
     ///
-    /// Only the node under the pointer gets real controls. Every other node on screen
-    /// gets the painted stand-in, because a control nobody is touching is three
-    /// widgets that every pass has to walk for nothing. At any moment a user is
-    /// interacting with one node, so materialising one node's controls is enough.
-    ///
-    /// The cost of this trick is a visual swap when the pointer arrives, so the
-    /// painted stand-in has to resemble the real controls closely.
+    /// By default this is simply the canvas-wide level: at [`Detail::Full`] every node
+    /// gets real controls. With [`CanvasLayer::with_controls_on_hover`] only the node
+    /// under the pointer does, which is several times cheaper but swaps a painted
+    /// stand-in for real widgets as the pointer arrives. See that method.
     fn effective_detail(&self, index: usize) -> Detail {
-        match self.detail.unwrap_or(Detail::Full) {
-            Detail::Box => Detail::Box,
-            _ if self.active == Some(index) => Detail::Full,
-            _ => Detail::Simplified,
+        let global = self.detail.unwrap_or(Detail::Full);
+        if !self.controls_on_hover || global == Detail::Box {
+            return global;
+        }
+        if self.active == Some(index) {
+            Detail::Full
+        } else {
+            Detail::Simplified
         }
     }
 
@@ -644,6 +646,8 @@ pub struct CanvasLayer {
     stats: Cell<CanvasStats>,
     /// Current pointer gesture.
     drag: Drag,
+    /// Whether only the node under the pointer gets interactive controls.
+    controls_on_hover: bool,
 }
 
 impl CanvasLayer {
@@ -676,7 +680,26 @@ impl CanvasLayer {
                 ..CanvasStats::default()
             }),
             drag: Drag::None,
+            controls_on_hover: false,
         }
+    }
+
+    /// Materialises interactive controls only for the node under the pointer.
+    ///
+    /// Off by default. When on, every other node gets whatever its `Simplified` form
+    /// paints instead of real control widgets, which at 140 visible nodes is roughly
+    /// five times cheaper per frame — a control nobody is touching is still three or
+    /// four widgets that every pass has to walk.
+    ///
+    /// The catch is visual: the painted stand-in is swapped for real widgets as the
+    /// pointer arrives, so unless it matches them closely the interface appears to
+    /// change under the cursor. Matching Masonry's themed controls by hand is also
+    /// fragile — a theme change silently breaks the resemblance. Turn this on only
+    /// where the node body is drawn by the application anyway, or where nodes are
+    /// small enough that the difference does not read.
+    pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
+        self.controls_on_hover = enabled;
+        self
     }
 
     /// The current view transform.
@@ -911,13 +934,14 @@ impl Widget for CanvasLayer {
             PointerEvent::Move(PointerUpdate { current, .. }) => {
                 let pos = ctx.local_position(current.position);
                 match self.drag {
-                    Drag::None => {
+                    Drag::None if self.controls_on_hover => {
                         // Materialise controls for the node under the pointer, and
                         // only that one. Everything else keeps its painted stand-in.
                         let canvas_pos = self.view.inverse() * pos;
                         let hit = self.hit_child(canvas_pos, ctx).map(|(index, _)| index);
                         self.set_active(hit, ctx);
                     },
+                    Drag::None => {},
                     Drag::Pan { last } => {
                         self.drag = Drag::Pan { last: pos };
                         let view = Affine::translate(pos - last) * self.view;
@@ -931,7 +955,7 @@ impl Widget for CanvasLayer {
                     },
                 }
             },
-            PointerEvent::Leave(_) => {
+            PointerEvent::Leave(_) if self.controls_on_hover => {
                 self.set_active(None, ctx);
             },
             PointerEvent::Up(_) | PointerEvent::Cancel(_) => {
@@ -1026,6 +1050,7 @@ impl Widget for CanvasLayer {
         // the transform does all the work and no layout is needed at all.
         let needs_mutate = {
             let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+            content.controls_on_hover = self.controls_on_hover;
             content.visible_rect = visible_rect;
             if content.detail != Some(detail) {
                 content.detail = Some(detail);

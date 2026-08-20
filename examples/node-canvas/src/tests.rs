@@ -12,13 +12,17 @@ use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 use masonry::ui_events::pointer::PointerButton;
 
-use crate::build_canvas;
+use crate::build_canvas_with;
 use crate::editor::NodeEditor;
 use crate::model::{NODE_SIZE, SharedGraph};
 use crate::node::GraphNode;
 
 fn harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
-    let (canvas, graph) = build_canvas(count);
+    harness_with(count, false)
+}
+
+fn harness_with(count: usize, controls_on_hover: bool) -> (TestHarness<NodeEditor>, SharedGraph) {
+    let (canvas, graph) = build_canvas_with(count, controls_on_hover);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -271,14 +275,33 @@ fn hud_is_painted_and_survives_reshaping() {
     );
 }
 
-/// Controls exist for exactly one node: the one under the pointer.
+/// By default every node on screen at `Full` carries real controls.
 ///
-/// Everything else shows a painted stand-in. Stashing the controls instead would look
-/// identical on screen and cost the same as before, which is exactly the trap section
-/// 20.2 of the architecture note describes.
+/// The painted stand-in is for `Simplified` only, where the node is too small to
+/// interact with anyway. Using it at `Full` is possible but off by default: see
+/// `only_the_hovered_node_has_controls`.
+#[test]
+fn full_detail_nodes_all_have_controls() {
+    let (mut harness, _graph) = harness(5000);
+    let live = live(&mut harness);
+    assert!(!live.is_empty());
+    for (_, id) in &live {
+        let widget = harness.get_widget_with_id(*id);
+        let node = widget.downcast::<GraphNode>().expect("a GraphNode");
+        assert!(
+            node.checkbox_id().is_some(),
+            "a node at full detail should carry real controls"
+        );
+    }
+}
+
+/// With `with_controls_on_hover`, controls exist for exactly one node.
+///
+/// Stashing them instead would look identical on screen and cost the same as before,
+/// which is exactly the trap section 20.2 of the architecture note describes.
 #[test]
 fn only_the_hovered_node_has_controls() {
-    let (mut harness, _graph) = harness(5000);
+    let (mut harness, _graph) = harness_with(5000, true);
 
     let with_controls = |h: &mut TestHarness<NodeEditor>| -> Vec<usize> {
         live(h)
@@ -325,17 +348,23 @@ fn detail_rebuild_preserves_state() {
 
     graph.borrow_mut().set_value(target, 0.625);
 
-    // Hovering promotes the node to Full, which rebuilds it with real controls.
-    hover_node(&mut harness, target);
+    // Crossing into Simplified drops the controls; coming back rebuilds them, and the
+    // rebuilt widget has to pick up what the model holds now.
+    zoom_out(&mut harness, 0.2);
+    assert!(
+        live(&mut harness).iter().any(|(i, _)| *i == target),
+        "the node should still be materialised at simplified detail"
+    );
+    zoom_out(&mut harness, 5.0);
 
     let id = live(&mut harness)
         .into_iter()
         .find(|(i, _)| *i == target)
         .map(|(_, id)| id)
-        .expect("hovered node should be live");
+        .expect("node should be live again");
     let widget = harness.get_widget_with_id(id);
     let node = widget.downcast::<GraphNode>().expect("a GraphNode");
-    assert!(node.checkbox_id().is_some(), "hovering should have promoted the node");
+    assert!(node.checkbox_id().is_some(), "back at full detail the controls return");
     assert_eq!(
         node.built_value(),
         0.625,

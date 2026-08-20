@@ -49,13 +49,24 @@ pub const DEFAULT_NODES: usize = 5000;
 /// the closure, which reads current state from the shared model — so a node that
 /// scrolls out of view and back again comes back with the user's edits intact.
 pub fn build_canvas(count: usize) -> (CanvasLayer, SharedGraph) {
+    build_canvas_with(count, false)
+}
+
+/// As [`build_canvas`], with control-on-hover materialisation optionally enabled.
+///
+/// Off by default: at `Full` the painted stand-in does not resemble Masonry's themed
+/// slider and checkbox closely enough, so swapping them in on hover reads as the
+/// interface changing under the cursor. The benchmark keeps measuring both so the
+/// price of that choice stays visible.
+pub fn build_canvas_with(count: usize, controls_on_hover: bool) -> (CanvasLayer, SharedGraph) {
     let graph = share(GraphModel::generated(count));
     let geometry = {
         let graph = graph.clone();
         move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
     };
     let source = GraphSource::new(graph.clone());
-    (CanvasLayer::new(count, geometry, source), graph)
+    let canvas = CanvasLayer::new(count, geometry, source).with_controls_on_hover(controls_on_hover);
+    (canvas, graph)
 }
 
 struct Driver;
