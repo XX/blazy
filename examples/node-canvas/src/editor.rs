@@ -5,6 +5,7 @@
 
 use blazy_canvas::{CanvasLayer, CanvasStats, Detail};
 use masonry::accesskit::{Node as AccessNode, Role};
+use masonry::core::BrushIndex;
 use masonry::core::{
     AccessCtx, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent, PropertiesMut,
     PropertiesRef, RegisterCtx, StyleProperty, Widget, WidgetMut, WidgetPod, render_text,
@@ -12,6 +13,7 @@ use masonry::core::{
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size};
 use masonry::layout::{LenReq, Length, SizeDef};
+use masonry::parley::Layout;
 use masonry::peniko::Color;
 use masonry::{TextAlign, TextAlignOptions};
 
@@ -20,8 +22,16 @@ pub struct NodeEditor {
     canvas: WidgetPod<CanvasLayer>,
     /// Stats cached during layout, so `post_paint` draws numbers from this frame.
     stats: CanvasStats,
-    /// Rendered HUD text, rebuilt when `stats` changes.
+    /// The HUD text currently on screen.
     hud: String,
+    /// Scratch buffer the next HUD text is formatted into, reused between frames.
+    hud_next: String,
+    /// The HUD text, shaped.
+    ///
+    /// Shaping three lines of text costs more than everything else this widget does,
+    /// so it must not happen per frame. It is redone only when [`Self::hud`] actually
+    /// changes, which during a steady pan is almost never.
+    hud_layout: Option<Layout<BrushIndex>>,
 }
 
 impl NodeEditor {
@@ -45,29 +55,38 @@ impl NodeEditor {
             canvas: WidgetPod::new(canvas),
             stats: CanvasStats::default(),
             hud: String::new(),
+            hud_next: String::new(),
+            hud_layout: None,
         }
     }
 }
 
-fn format_hud(stats: &CanvasStats) -> String {
+/// Formats the HUD into `out`, reusing its allocation.
+///
+/// Deliberately shows only quantities a human watches: how much of the graph is
+/// materialised, the zoom, the detail level, and how many widgets have been built.
+/// The cumulative pass counters live in [`CanvasStats`] for the benchmark; putting
+/// them on screen would change the text every frame and defeat the cache.
+fn format_hud(stats: &CanvasStats, out: &mut String) {
+    use std::fmt::Write as _;
+
     let detail = match stats.detail {
         Some(Detail::Full) => "full",
         Some(Detail::Simplified) => "simplified",
         Some(Detail::Box) => "box",
         None => "-",
     };
-    format!(
-        "nodes {visible}/{total} visible   zoom {zoom:.2}x   lod {detail}\n\
-         content layouts {content}   child layouts {child}   composes {composes}\n\
+    out.clear();
+    let _ = write!(
+        out,
+        "nodes {visible}/{total} materialised   zoom {zoom:.2}x   lod {detail}   built {builds}\n\
          drag a node - left-drag empty space or middle-drag to pan - wheel to zoom",
-        visible = stats.visible,
+        visible = stats.materialised,
         total = stats.total,
         zoom = stats.zoom,
         detail = detail,
-        content = stats.content_layouts,
-        child = stats.child_layouts,
-        composes = stats.composes,
-    )
+        builds = stats.counters.builds,
+    );
 }
 
 impl Widget for NodeEditor {
@@ -112,7 +131,15 @@ impl Widget for NodeEditor {
         let (canvas, _) = ctx.get_raw(&mut self.canvas);
         let stats = canvas.stats();
         self.stats = stats;
-        self.hud = format_hud(&stats);
+
+        // Format into the scratch buffer and only swap when the text really changed.
+        // Formatting is cheap; shaping is not, so the point is to keep `hud_layout`
+        // valid for as long as possible.
+        format_hud(&stats, &mut self.hud_next);
+        if self.hud_next != self.hud {
+            std::mem::swap(&mut self.hud, &mut self.hud_next);
+            self.hud_layout = None;
+        }
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
@@ -123,21 +150,27 @@ impl Widget for NodeEditor {
 
     fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
         let content_box = ctx.content_box();
-        let panel = Rect::new(content_box.x0, content_box.y1 - 64.0, content_box.x1, content_box.y1);
+        let panel = Rect::new(content_box.x0, content_box.y1 - 46.0, content_box.x1, content_box.y1);
         painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();
 
-        let text = self.hud.clone();
-        let (fcx, lcx) = ctx.text_contexts();
-        let mut builder = lcx.ranged_builder(fcx, &text, 1.0, true);
-        builder.push_default(StyleProperty::FontSize(12.0));
-        let mut layout = builder.build(&text);
-        layout.break_all_lines(None);
-        layout.align(None, TextAlign::Start, TextAlignOptions::default());
+        if self.hud_layout.is_none() {
+            let text = &self.hud;
+            let (fcx, lcx) = ctx.text_contexts();
+            let mut builder = lcx.ranged_builder(fcx, text, 1.0, true);
+            builder.push_default(StyleProperty::FontSize(12.0));
+            let mut layout = builder.build(text);
+            layout.break_all_lines(None);
+            layout.align(None, TextAlign::Start, TextAlignOptions::default());
+            self.hud_layout = Some(layout);
+        }
+        let Some(layout) = self.hud_layout.as_ref() else {
+            return;
+        };
 
         render_text(
             painter,
             Affine::translate((panel.x0 + 10.0, panel.y0 + 8.0)),
-            &layout,
+            layout,
             &[Color::from_rgb8(0xd0, 0xd0, 0xd8).into()],
             true,
         );

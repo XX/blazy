@@ -45,16 +45,28 @@ pub struct GraphNode {
     index: usize,
     /// Header tint, used to tell nodes apart at a glance when zoomed out.
     tint: Color,
-    slider: WidgetPod<Slider>,
-    checkbox: WidgetPod<Checkbox>,
-    /// Whether the contents are currently stashed.
-    stashed: bool,
+    /// Interactive controls, present only at [`Detail::Full`].
+    ///
+    /// At `Simplified` a node is roughly 50 px wide: the slider would be 3 px tall and
+    /// unusable. Building it anyway would cost three extra widgets per node in every
+    /// pass, for something the user cannot touch — so the value is painted instead.
+    controls: Option<Controls>,
+    /// The slider value, kept for painting when there is no slider widget.
+    value: f64,
+    /// The checkbox state, kept for painting when there is no checkbox widget.
+    checked: bool,
     /// The slider value this widget was built with.
     ///
     /// Kept so tests can assert that a rebuilt node picked up the model's current
     /// state rather than a stale default.
     #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
     built_value: f64,
+}
+
+/// The interactive half of a node, built only at [`Detail::Full`].
+struct Controls {
+    slider: WidgetPod<Slider>,
+    checkbox: WidgetPod<Checkbox>,
 }
 
 impl GraphNode {
@@ -66,20 +78,24 @@ impl GraphNode {
 
     /// The id of this node's checkbox, for driving it from tests.
     #[cfg(test)]
-    pub fn checkbox_id(&self) -> WidgetId {
-        self.checkbox.id()
+    pub fn checkbox_id(&self) -> Option<WidgetId> {
+        self.controls.as_ref().map(|c| c.checkbox.id())
     }
 
     /// Builds the widget for node `index`, reading its current state from the model.
-    pub fn build(graph: &SharedGraph, index: usize) -> NewWidget<dyn Widget> {
+    pub fn build(graph: &SharedGraph, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
         let state = graph.borrow().node(index);
+        let controls = (detail == Detail::Full).then(|| Controls {
+            slider: WidgetPod::new(Slider::new(0.0, 1.0, state.value)),
+            checkbox: WidgetPod::new(Checkbox::new(state.checked, "on")),
+        });
         NewWidget::new(Self {
             graph: graph.clone(),
             index,
             tint: state.tint,
-            slider: WidgetPod::new(Slider::new(0.0, 1.0, state.value)),
-            checkbox: WidgetPod::new(Checkbox::new(state.checked, "on")),
-            stashed: false,
+            controls,
+            value: state.value,
+            checked: state.checked,
             built_value: state.value,
         })
         .erased()
@@ -112,55 +128,34 @@ impl Widget for GraphNode {
         }
     }
 
-    fn layout(&mut self, ctx: &mut LayoutCtx<'_>, props: &PropertiesRef<'_>, size: Size) {
-        let detail = props.get::<CanvasDetail>(ctx.property_cache()).0;
-
-        // At Box detail the contents are stashed: not laid out, not painted, not
-        // hit-tested. This is where LOD actually pays for itself — skipping paint
-        // saves draw commands, but skipping layout saves the expensive half.
-        let want_stashed = detail == Detail::Box;
-        if want_stashed != self.stashed {
-            self.stashed = want_stashed;
-            ctx.set_stashed(&mut self.slider, want_stashed);
-            ctx.set_stashed(&mut self.checkbox, want_stashed);
-        }
-        if want_stashed {
+    fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
+        // Whether this node has controls was decided when it was built, not here.
+        // Below Full it has none at all, so there is nothing to stash and nothing to
+        // lay out — which is the entire saving.
+        let Some(controls) = self.controls.as_mut() else {
             return;
-        }
+        };
 
         let inner_width = (size.width - 2.0 * PADDING).max(0.0);
         let mut y = HEADER_HEIGHT + PADDING;
 
         let slider_size = Size::new(inner_width, 20.0);
-        let s = ctx.compute_size(&mut self.slider, SizeDef::fixed(slider_size), size.into());
-        ctx.run_layout(&mut self.slider, s);
-        ctx.place_child(&mut self.slider, Point::new(PADDING, y));
-        y += s.height + PADDING;
+        ctx.run_layout(&mut controls.slider, slider_size);
+        ctx.place_child(&mut controls.slider, Point::new(PADDING, y));
+        y += slider_size.height + PADDING;
 
-        // The checkbox is only laid out at Full detail. At Simplified it stays in
-        // the tree but is stashed, so the cost of a half-zoomed-out graph is the
-        // header and the slider only.
-        let want_controls = detail == Detail::Full;
-        ctx.set_stashed(&mut self.checkbox, !want_controls);
-        if want_controls {
-            let cb_size = Size::new(inner_width, 20.0);
-            let c = ctx.compute_size(&mut self.checkbox, SizeDef::fit(cb_size), size.into());
-            ctx.run_layout(&mut self.checkbox, c);
-            ctx.place_child(&mut self.checkbox, Point::new(PADDING, y));
-        }
+        let cb_size = Size::new(inner_width, 20.0);
+        let c = ctx.compute_size(&mut controls.checkbox, SizeDef::fit(cb_size), size.into());
+        ctx.run_layout(&mut controls.checkbox, c);
+        ctx.place_child(&mut controls.checkbox, Point::new(PADDING, y));
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
-        let detail = props.get::<CanvasDetail>(ctx.property_cache()).0;
+        // The *global* level, not this node's: it says how many nodes are on screen,
+        // and therefore how much a single extra draw command costs.
+        let global = props.get::<CanvasDetail>(ctx.property_cache()).0;
         let box_rect = ctx.content_box();
         let body = RoundedRect::from_rect(box_rect, RADIUS);
-
-        if detail == Detail::Box {
-            // One filled shape for the whole node. At this zoom a node is a few
-            // pixels across, so anything more is wasted.
-            painter.fill(body, self.tint).draw();
-            return;
-        }
 
         painter.fill(body, Color::from_rgb8(0x2b, 0x2b, 0x30)).draw();
 
@@ -171,6 +166,48 @@ impl Widget for GraphNode {
             (box_rect.y0 + HEADER_HEIGHT).min(box_rect.y1),
         );
         painter.fill(RoundedRect::from_rect(header, RADIUS), self.tint).draw();
+
+        // Without control widgets the node still has to show its state. The stand-in
+        // sits where the real controls would, because it is swapped for them the
+        // moment the pointer arrives: a mismatch here would read as the UI jumping
+        // under the cursor.
+        //
+        // Fidelity is bought only where it is affordable. Every node's scene is
+        // appended into the layer scene on every frame, so one extra command here is
+        // multiplied by the number of visible nodes.
+        if self.controls.is_none() {
+            let detailed = global == Detail::Full;
+            let inner_width = (box_rect.width() - 2.0 * PADDING).max(0.0);
+            let track = Rect::from_origin_size(
+                (box_rect.x0 + PADDING, box_rect.y0 + HEADER_HEIGHT + PADDING + 8.0),
+                Size::new(inner_width, 4.0),
+            );
+            painter.fill(track, Color::from_rgb8(0x3a, 0x3a, 0x42)).draw();
+            painter
+                .fill(
+                    Rect::from_origin_size(track.origin(), Size::new(inner_width * self.value, 4.0)),
+                    Color::from_rgb8(0x6a, 0x6a, 0x88),
+                )
+                .draw();
+            if detailed {
+                // Few nodes on screen: draw the knob and the checkbox, so that
+                // swapping in the real controls on hover is not visible.
+                let knob_x = track.x0 + inner_width * self.value;
+                painter
+                    .fill(
+                        Rect::new(knob_x - 4.0, track.y0 - 4.0, knob_x + 4.0, track.y1 + 4.0),
+                        Color::from_rgb8(0xc8, 0xc8, 0xd4),
+                    )
+                    .draw();
+
+                let cb =
+                    Rect::from_origin_size((box_rect.x0 + PADDING, track.y1 + PADDING + 3.0), Size::new(12.0, 12.0));
+                painter.fill(cb, Color::from_rgb8(0x3a, 0x3a, 0x42)).draw();
+                if self.checked {
+                    painter.fill(cb.inset(-3.0), Color::from_rgb8(0xc8, 0xc8, 0xd4)).draw();
+                }
+            }
+        }
 
         painter
             .stroke(body, &Stroke::new(1.0), Color::from_rgb8(0x18, 0x18, 0x1c))
@@ -189,9 +226,11 @@ impl Widget for GraphNode {
         _source: WidgetId,
     ) {
         if let Some(moved) = action.downcast_ref::<SliderMoved>() {
+            self.value = moved.value;
             self.graph.borrow_mut().set_value(self.index, moved.value);
             ctx.set_handled();
         } else if let Some(toggled) = action.downcast_ref::<CheckboxToggled>() {
+            self.checked = toggled.0;
             self.graph.borrow_mut().set_checked(self.index, toggled.0);
             ctx.set_handled();
         }
@@ -202,12 +241,17 @@ impl Widget for GraphNode {
     }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
-        ctx.register_child(&mut self.slider);
-        ctx.register_child(&mut self.checkbox);
+        if let Some(controls) = self.controls.as_mut() {
+            ctx.register_child(&mut controls.slider);
+            ctx.register_child(&mut controls.checkbox);
+        }
     }
 
     fn children_ids(&self) -> ChildrenIds {
-        ChildrenIds::from_slice(&[self.slider.id(), self.checkbox.id()])
+        match self.controls.as_ref() {
+            Some(c) => ChildrenIds::from_slice(&[c.slider.id(), c.checkbox.id()]),
+            None => ChildrenIds::new(),
+        }
     }
 
     fn accessibility_role(&self) -> Role {
@@ -234,8 +278,8 @@ impl GraphSource {
 }
 
 impl NodeSource for GraphSource {
-    fn build(&mut self, index: usize) -> NewWidget<dyn Widget> {
-        GraphNode::build(&self.graph, index)
+    fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
+        GraphNode::build(&self.graph, index, detail)
     }
 
     fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {

@@ -15,3 +15,8 @@ masonry_winit.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Only to name `RgbaImage` when inspecting rendered frames; masonry_testing returns
+# one but does not re-export the type.
+image = { version = "0.25", default-features = false }

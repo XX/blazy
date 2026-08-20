@@ -2000,6 +2000,7 @@ name = "node-canvas"
 version = "0.1.0"
 dependencies = [
  "blazy-canvas",
+ "image",
  "masonry",
  "masonry_winit",
 ]
