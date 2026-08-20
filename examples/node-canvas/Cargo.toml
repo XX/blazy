@@ -1,0 +1,17 @@
+[package]
+name = "node-canvas"
+description = "Phase 0 feasibility experiment: 5000-node canvas on masonry_core@main."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blazy-canvas.workspace = true
+masonry = { workspace = true, features = ["testing"] }
+masonry_winit.workspace = true
+
+[lints]
+workspace = true
