@@ -192,11 +192,17 @@ pub struct CanvasStats {
 ///
 /// Implemented for any `FnMut(usize) -> NewWidget<dyn Widget>`.
 pub trait NodeSource: 'static {
-    /// Builds the widget for the node at `index`.
+    /// Builds the widget for the node at `index`, at the given detail level.
     ///
     /// Called every time the node enters the materialised region, so it must read
     /// current state from the model rather than assuming defaults.
-    fn build(&mut self, index: usize) -> NewWidget<dyn Widget>;
+    ///
+    /// `detail` is [`Detail::Full`] or [`Detail::Simplified`]; below that the canvas
+    /// paints the node itself and never calls this. Implementations should build
+    /// *fewer child widgets* at `Simplified`, not merely stash them: a stashed widget
+    /// still costs a visit in every pass. A control a few pixels tall cannot be used,
+    /// so it should be drawn rather than built.
+    fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget>;
 
     /// Draws node `index` when it is too small to deserve a widget.
     ///
@@ -214,10 +220,10 @@ pub trait NodeSource: 'static {
 
 impl<F> NodeSource for F
 where
-    F: FnMut(usize) -> NewWidget<dyn Widget> + 'static,
+    F: FnMut(usize, Detail) -> NewWidget<dyn Widget> + 'static,
 {
-    fn build(&mut self, index: usize) -> NewWidget<dyn Widget> {
-        self(index)
+    fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
+        self(index, detail)
     }
 }
 
@@ -254,6 +260,14 @@ pub struct CanvasContent {
     visible: Vec<usize>,
     /// Whether the canvas is painting nodes itself instead of materialising them.
     far_field: bool,
+    /// The detail level the live widgets were built at.
+    ///
+    /// A node built at `Simplified` has no controls, so crossing the threshold is not
+    /// a repaint but a rebuild. Threshold crossings are rare, so an O(visible) rebuild
+    /// is the right trade.
+    built_detail: Option<Detail>,
+    /// Set when the live widgets must be rebuilt because `built_detail` went stale.
+    rebuild: bool,
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
@@ -282,6 +296,8 @@ impl CanvasContent {
             live: Vec::new(),
             visible: Vec::new(),
             far_field: false,
+            built_detail: None,
+            rebuild: false,
             pending: None,
             visible_rect: Rect::ZERO,
             detail: None,
@@ -316,11 +332,20 @@ impl CanvasContent {
         let Some(desired) = this.widget.pending.take() else {
             return;
         };
-        if desired == this.widget.live {
+        let rebuild = std::mem::take(&mut this.widget.rebuild);
+        if desired == this.widget.live && !rebuild {
             // No widget changes, but `cull` only queued this when something moved,
             // which in far-field mode means the painted set changed.
             this.ctx.request_paint_only();
             return;
+        }
+        if rebuild {
+            // Drop every live widget so they all come back at the new detail level.
+            for index in std::mem::take(&mut this.widget.live) {
+                if let Some(pod) = this.widget.slots[index].pod.take() {
+                    this.ctx.remove_child(pod);
+                }
+            }
         }
 
         // Both lists are ascending, so a merge walk finds the difference in one
@@ -363,12 +388,10 @@ impl CanvasContent {
             }
         }
 
-        let detail = this.widget.detail;
+        let detail = this.widget.detail.unwrap_or(Detail::Full);
+        this.widget.built_detail = Some(detail);
         for index in added {
-            let mut widget = this.widget.source.build(index);
-            if let Some(detail) = detail {
-                widget = widget.with_props(CanvasDetail(detail));
-            }
+            let widget = this.widget.source.build(index, detail).with_props(CanvasDetail(detail));
             this.widget.slots[index].pod = Some(widget.to_pod());
             this.widget.builds.set(this.widget.builds.get() + 1);
         }
@@ -399,14 +422,20 @@ impl CanvasContent {
         // materialised. This is what keeps a fully zoomed-out graph affordable: the
         // visible set stops bounding the cost, so the cost must stop depending on
         // widgets. See `paint`.
-        let far_field = self.detail == Some(Detail::Box);
+        let detail = self.detail.unwrap_or(Detail::Full);
+        let far_field = detail == Detail::Box;
         let desired: Vec<usize> = if far_field { Vec::new() } else { visible.clone() };
+
+        // Crossing the Full/Simplified line changes what a node *is*, not just how it
+        // looks, so the live widgets have to be rebuilt rather than repainted.
+        let rebuild = !far_field && self.built_detail.is_some_and(|d| d != detail);
 
         let visible_changed = visible != self.visible;
         self.visible = visible;
 
-        if desired != self.live || far_field != self.far_field || (far_field && visible_changed) {
+        if desired != self.live || far_field != self.far_field || rebuild || (far_field && visible_changed) {
             self.far_field = far_field;
+            self.rebuild = rebuild;
             self.pending = Some(desired);
         } else {
             self.pending = None;

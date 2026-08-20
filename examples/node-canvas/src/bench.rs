@@ -241,6 +241,27 @@ pub fn run(count: usize) {
         }));
     }
 
+    // --- Scenario 6c: just above the far-field threshold.
+    //
+    // The worst point on the curve: nodes are still materialised, but the viewport
+    // covers most of the graph.
+    {
+        let mut harness = new_harness(count);
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::zoom_around(&mut canvas, Point::new(550.0, 375.0), 0.11);
+            });
+        });
+        let _ = harness.redraw();
+        reports.push(measure("pan, zoom 0.11", &mut harness, 40, |h, _| {
+            h.edit_root_widget(|mut editor| {
+                NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                    CanvasLayer::pan(&mut canvas, Vec2::new(-6.0, -2.0));
+                });
+            });
+        }));
+    }
+
     // --- Scenario 7: the whole graph on screen.
     //
     // Virtualisation bounds cost by the *visible* set, so zooming out far enough
@@ -369,14 +390,25 @@ fn verdict(reports: &[Report], count: usize, scaling: &[ScalePoint]) {
         );
     }
 
-    if let (Some(pan), Some(boxed)) = (find("pan"), find("pan, zoom 0.15")) {
-        // Not a pass/fail criterion, just the datum that decides whether LOD earns
-        // its complexity.
-        println!(
-            "  [i] LOD effect: {:.3} ms/frame at full detail vs {:.3} ms/frame at box detail",
-            pan.mean_ms(),
-            boxed.mean_ms()
-        );
+    // Not a pass/fail criterion: the cost of the same gesture at each detail level,
+    // which is what decides whether a level earns its complexity.
+    for name in [
+        "pan",
+        "pan, zoom 0.40",
+        "pan, zoom 0.15",
+        "pan, zoom 0.11",
+        "pan, whole graph shown",
+    ] {
+        if let Some(r) = find(name) {
+            println!(
+                "  [i] {:<24} {:>7.3} ms/frame  worst {:>7.3} ms  {:>5} live  detail {:?}",
+                name,
+                r.mean_ms(),
+                r.worst.as_secs_f64() * 1000.0,
+                r.after.visible,
+                r.after.detail,
+            );
+        }
     }
 
     if let Some(idle) = find("idle") {

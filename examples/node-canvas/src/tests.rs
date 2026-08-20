@@ -133,6 +133,7 @@ fn controls_write_back_to_the_model() {
             .downcast::<GraphNode>()
             .expect("live child should be a GraphNode")
             .checkbox_id()
+            .expect("at full detail a node should have controls")
     };
 
     harness.mouse_click_on(checkbox, Some(PointerButton::Primary));
@@ -244,5 +245,59 @@ fn hud_is_painted_and_survives_reshaping() {
     assert!(
         after > 50,
         "HUD disappeared after its text changed, got {after} lit pixels"
+    );
+}
+
+/// Below Full detail a node must carry no control widgets at all.
+///
+/// Stashing them would look identical on screen and cost the same as before, which
+/// is exactly the trap section 20.2 of the architecture note describes.
+#[test]
+fn simplified_nodes_have_no_control_widgets() {
+    let (mut harness, _graph) = harness(5000);
+
+    let (_, id) = *live(&mut harness).first().expect("nodes on screen");
+    assert!(
+        harness
+            .get_widget_with_id(id)
+            .downcast::<GraphNode>()
+            .expect("a GraphNode")
+            .checkbox_id()
+            .is_some(),
+        "at full detail a node should have controls"
+    );
+
+    // 0.2 is below the Full threshold but above the far-field one.
+    zoom_out(&mut harness, 0.2);
+
+    let live = live(&mut harness);
+    assert!(!live.is_empty(), "expected simplified nodes, not far field");
+    for (_, id) in &live {
+        let widget = harness.get_widget_with_id(*id);
+        let node = widget.downcast::<GraphNode>().expect("a GraphNode");
+        assert!(
+            node.checkbox_id().is_none(),
+            "a simplified node still carries control widgets"
+        );
+    }
+}
+
+/// Rebuilding at a new detail level must not lose the user's edits.
+#[test]
+fn detail_rebuild_preserves_state() {
+    let (mut harness, graph) = harness(5000);
+    graph.borrow_mut().set_value(0, 0.625);
+
+    zoom_out(&mut harness, 0.2);
+    zoom_out(&mut harness, 5.0);
+
+    let live = live(&mut harness);
+    let (_, id) = live.iter().find(|(i, _)| *i == 0).expect("node 0 back on screen");
+    let widget = harness.get_widget_with_id(*id);
+    let node = widget.downcast::<GraphNode>().expect("a GraphNode");
+    assert_eq!(
+        node.built_value(),
+        0.625,
+        "rebuilding at a new detail level dropped the model value"
     );
 }
