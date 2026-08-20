@@ -14,7 +14,7 @@ use masonry::ui_events::pointer::PointerButton;
 
 use crate::build_canvas;
 use crate::editor::NodeEditor;
-use crate::model::SharedGraph;
+use crate::model::{NODE_SIZE, SharedGraph};
 use crate::node::GraphNode;
 
 fn harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
@@ -41,6 +41,21 @@ fn live(harness: &mut TestHarness<NodeEditor>) -> Vec<(usize, masonry::core::Wid
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
     })
+}
+
+/// Moves the pointer over node `index` and settles the resulting passes.
+///
+/// Controls are materialised only for the node under the pointer, so anything that
+/// wants to touch a slider or a checkbox has to hover first — exactly as a user does.
+fn hover_node(harness: &mut TestHarness<NodeEditor>, index: usize) {
+    let centre = harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            let pos = CanvasLayer::child_pos(&mut canvas, index).expect("node exists");
+            masonry::kurbo::Point::new(pos.x + NODE_SIZE.width / 2.0, pos.y + 6.0)
+        })
+    });
+    harness.mouse_move(centre);
+    let _ = harness.redraw();
 }
 
 #[test]
@@ -113,27 +128,35 @@ fn state_survives_a_round_trip_out_of_view() {
 #[test]
 fn controls_write_back_to_the_model() {
     let (mut harness, graph) = harness(500);
-    let live = live(&mut harness);
 
     // Pick a node comfortably inside the viewport: the canvas clips to its bounds,
     // and a control hanging off the left edge is not clickable.
-    let (index, id) = harness.edit_root_widget(|mut editor| {
+    let live_now = live(&mut harness);
+    let index = harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
-            live.iter()
-                .copied()
-                .find(|(i, _)| CanvasLayer::child_pos(&mut canvas, *i).is_some_and(|p| p.x > 40.0 && p.y > 40.0))
+            live_now
+                .iter()
+                .map(|(i, _)| *i)
+                .find(|i| CanvasLayer::child_pos(&mut canvas, *i).is_some_and(|p| p.x > 40.0 && p.y > 40.0))
                 .expect("some node should be fully inside the viewport")
         })
     });
 
+    hover_node(&mut harness, index);
+
     let before = graph.borrow().node(index).checked;
+    let id = live(&mut harness)
+        .into_iter()
+        .find(|(i, _)| *i == index)
+        .map(|(_, id)| id)
+        .expect("hovered node should be live");
     let checkbox = {
         let widget = harness.get_widget_with_id(id);
         widget
             .downcast::<GraphNode>()
             .expect("live child should be a GraphNode")
             .checkbox_id()
-            .expect("at full detail a node should have controls")
+            .expect("the hovered node should have controls")
     };
 
     harness.mouse_click_on(checkbox, Some(PointerButton::Primary));
@@ -248,56 +271,106 @@ fn hud_is_painted_and_survives_reshaping() {
     );
 }
 
-/// Below Full detail a node must carry no control widgets at all.
+/// Controls exist for exactly one node: the one under the pointer.
 ///
-/// Stashing them would look identical on screen and cost the same as before, which
-/// is exactly the trap section 20.2 of the architecture note describes.
+/// Everything else shows a painted stand-in. Stashing the controls instead would look
+/// identical on screen and cost the same as before, which is exactly the trap section
+/// 20.2 of the architecture note describes.
 #[test]
-fn simplified_nodes_have_no_control_widgets() {
+fn only_the_hovered_node_has_controls() {
     let (mut harness, _graph) = harness(5000);
 
-    let (_, id) = *live(&mut harness).first().expect("nodes on screen");
+    let with_controls = |h: &mut TestHarness<NodeEditor>| -> Vec<usize> {
+        live(h)
+            .into_iter()
+            .filter(|(_, id)| {
+                h.get_widget_with_id(*id)
+                    .downcast::<GraphNode>()
+                    .expect("a GraphNode")
+                    .checkbox_id()
+                    .is_some()
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+
     assert!(
-        harness
-            .get_widget_with_id(id)
-            .downcast::<GraphNode>()
-            .expect("a GraphNode")
-            .checkbox_id()
-            .is_some(),
-        "at full detail a node should have controls"
+        with_controls(&mut harness).is_empty(),
+        "nothing is hovered, so no node should carry control widgets"
     );
 
-    // 0.2 is below the Full threshold but above the far-field one.
-    zoom_out(&mut harness, 0.2);
+    let target = live(&mut harness)
+        .iter()
+        .map(|(i, _)| *i)
+        .find(|i| *i > 0)
+        .expect("several nodes on screen");
+    hover_node(&mut harness, target);
 
-    let live = live(&mut harness);
-    assert!(!live.is_empty(), "expected simplified nodes, not far field");
-    for (_, id) in &live {
-        let widget = harness.get_widget_with_id(*id);
-        let node = widget.downcast::<GraphNode>().expect("a GraphNode");
-        assert!(
-            node.checkbox_id().is_none(),
-            "a simplified node still carries control widgets"
-        );
-    }
+    assert_eq!(
+        with_controls(&mut harness),
+        vec![target],
+        "exactly the hovered node should carry control widgets"
+    );
 }
 
-/// Rebuilding at a new detail level must not lose the user's edits.
+/// Rebuilding a node at a new detail level must not lose the user's edits.
 #[test]
 fn detail_rebuild_preserves_state() {
     let (mut harness, graph) = harness(5000);
-    graph.borrow_mut().set_value(0, 0.625);
+    let target = live(&mut harness)
+        .iter()
+        .map(|(i, _)| *i)
+        .find(|i| *i > 0)
+        .expect("several nodes on screen");
 
-    zoom_out(&mut harness, 0.2);
-    zoom_out(&mut harness, 5.0);
+    graph.borrow_mut().set_value(target, 0.625);
 
-    let live = live(&mut harness);
-    let (_, id) = live.iter().find(|(i, _)| *i == 0).expect("node 0 back on screen");
-    let widget = harness.get_widget_with_id(*id);
+    // Hovering promotes the node to Full, which rebuilds it with real controls.
+    hover_node(&mut harness, target);
+
+    let id = live(&mut harness)
+        .into_iter()
+        .find(|(i, _)| *i == target)
+        .map(|(_, id)| id)
+        .expect("hovered node should be live");
+    let widget = harness.get_widget_with_id(id);
     let node = widget.downcast::<GraphNode>().expect("a GraphNode");
+    assert!(node.checkbox_id().is_some(), "hovering should have promoted the node");
     assert_eq!(
         node.built_value(),
         0.625,
         "rebuilding at a new detail level dropped the model value"
+    );
+}
+
+/// Panning inside the far field must not re-record its scene.
+///
+/// The scene is stored in canvas coordinates, so a pan is a change of one `Affine`
+/// and nothing else. This is the property the whole vector-display-list argument
+/// rests on, so it is worth asserting rather than assuming.
+#[test]
+fn far_field_does_not_repaint_while_panning() {
+    let (mut harness, _graph) = harness(5000);
+    zoom_out(&mut harness, 0.04);
+
+    let stats = |h: &mut TestHarness<NodeEditor>| h.edit_root_widget(|editor| editor.widget.stats());
+
+    // The counters are captured during layout, which runs before paint, so let one
+    // pan settle before reading the baseline.
+    pan(&mut harness, Vec2::new(-6.0, -2.0));
+    pan(&mut harness, Vec2::new(-6.0, -2.0));
+    let before = stats(&mut harness).far_repaints;
+    assert!(before > 0, "entering the far field should have recorded a scene");
+
+    for _ in 0..30 {
+        pan(&mut harness, Vec2::new(-6.0, -2.0));
+    }
+
+    let after = stats(&mut harness).far_repaints;
+    assert_eq!(
+        after,
+        before,
+        "panning re-recorded the far-field scene {} times",
+        after - before
     );
 }

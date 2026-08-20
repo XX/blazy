@@ -91,7 +91,15 @@ impl Detail {
     }
 }
 
-/// The detail level a canvas child should render at.
+/// The detail level the canvas as a whole is showing.
+///
+/// Note this is the *global* level, not the level the individual node was built at:
+/// a node under the pointer keeps its controls while everything around it is
+/// simplified. Use it to decide how much effort a painted stand-in deserves — at
+/// [`Detail::Simplified`] there are hundreds of nodes on screen and each draw command
+/// is multiplied by that count, while at [`Detail::Full`] there are few and the
+/// stand-in has to resemble the real controls closely enough that swapping them in on
+/// hover is not jarring.
 ///
 /// The canvas sets this property on every child when the zoom crosses a threshold.
 /// Children opt in by reading it in `layout`/`paint` and handling it in
@@ -172,6 +180,12 @@ pub struct CanvasStats {
     pub child_layouts: u64,
     /// Compose passes run on the content widget since it was created.
     pub composes: u64,
+    /// Times the far-field scene has been re-recorded since the canvas was created.
+    ///
+    /// The scene is in canvas coordinates, so panning and zooming inside the painted
+    /// region reuse it untouched. If this climbs while panning, the region is too
+    /// tight and the recording is being thrown away every frame.
+    pub far_repaints: u64,
     /// Widgets built since the canvas was created.
     ///
     /// Each one is a node scrolling into view. If this climbs steeply while panning
@@ -235,6 +249,17 @@ struct Slot {
     size: Size,
     /// The materialised widget, if this node currently has one.
     pod: Option<WidgetPod<dyn Widget>>,
+    /// How `pod` was built: its own detail level, and the canvas-wide one.
+    ///
+    /// Both matter. The first decides whether the node has controls; the second is
+    /// handed to it as [`CanvasDetail`] so it can scale how much effort its painted
+    /// stand-in deserves. A change in either makes the widget stale.
+    built: Option<(Detail, Detail)>,
+}
+
+/// Whether `outer` fully contains `inner`.
+fn contains_rect(outer: Rect, inner: Rect) -> bool {
+    outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
 }
 
 // --- MARK: CONTENT
@@ -260,14 +285,25 @@ pub struct CanvasContent {
     visible: Vec<usize>,
     /// Whether the canvas is painting nodes itself instead of materialising them.
     far_field: bool,
-    /// The detail level the live widgets were built at.
+    /// The canvas-space region the far-field scene was painted for, if it is valid.
     ///
-    /// A node built at `Simplified` has no controls, so crossing the threshold is not
-    /// a repaint but a rebuild. Threshold crossings are rare, so an O(visible) rebuild
-    /// is the right trade.
-    built_detail: Option<Detail>,
-    /// Set when the live widgets must be rebuilt because `built_detail` went stale.
-    rebuild: bool,
+    /// The scene is recorded in canvas coordinates, so it stays correct under any
+    /// pan or zoom — that is the whole point of a vector display list. It only has to
+    /// be re-recorded when the viewport leaves this region, which with a generous
+    /// margin means "almost never" rather than "every frame".
+    far_region: Option<Rect>,
+    /// The nodes in `far_region`, painted by `paint`.
+    far_nodes: Vec<usize>,
+    /// Set when the far-field scene must be re-recorded.
+    far_dirty: bool,
+    /// The node the pointer is on, if any.
+    ///
+    /// Only this node gets interactive controls; see [`CanvasContent::effective_detail`].
+    active: Option<usize>,
+    /// Set when `detail` or `active` changed, so stale widgets get rebuilt.
+    detail_dirty: bool,
+    /// Whether the queued `pending` needs a staleness sweep as well as a set diff.
+    pending_stale: bool,
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
@@ -279,6 +315,7 @@ pub struct CanvasContent {
     child_layouts: Cell<u64>,
     composes: Cell<u64>,
     builds: Cell<u64>,
+    far_repaints: Cell<u64>,
 }
 
 // `CanvasLayer` owns this widget completely and reaches into it during layout to
@@ -296,8 +333,12 @@ impl CanvasContent {
             live: Vec::new(),
             visible: Vec::new(),
             far_field: false,
-            built_detail: None,
-            rebuild: false,
+            far_region: None,
+            far_nodes: Vec::new(),
+            far_dirty: false,
+            active: None,
+            detail_dirty: false,
+            pending_stale: false,
             pending: None,
             visible_rect: Rect::ZERO,
             detail: None,
@@ -305,22 +346,30 @@ impl CanvasContent {
             child_layouts: Cell::new(0),
             composes: Cell::new(0),
             builds: Cell::new(0),
+            far_repaints: Cell::new(0),
         }
     }
 
-    /// Sets the detail property on every live child.
+    /// The detail level node `index` should be built at.
     ///
-    /// Only called on a zoom threshold crossing, and only over materialised
-    /// children, so this is bounded by the visible set rather than the graph.
-    fn set_detail(this: &mut WidgetMut<'_, Self>, detail: Detail) {
-        for i in 0..this.widget.live.len() {
-            let index = this.widget.live[i];
-            let Some(pod) = this.widget.slots[index].pod.as_mut() else {
-                continue;
-            };
-            let mut child = this.ctx.get_mut(pod);
-            child.insert_prop(CanvasDetail(detail));
+    /// Only the node under the pointer gets real controls. Every other node on screen
+    /// gets the painted stand-in, because a control nobody is touching is three
+    /// widgets that every pass has to walk for nothing. At any moment a user is
+    /// interacting with one node, so materialising one node's controls is enough.
+    ///
+    /// The cost of this trick is a visual swap when the pointer arrives, so the
+    /// painted stand-in has to resemble the real controls closely.
+    fn effective_detail(&self, index: usize) -> Detail {
+        match self.detail.unwrap_or(Detail::Full) {
+            Detail::Box => Detail::Box,
+            _ if self.active == Some(index) => Detail::Full,
+            _ => Detail::Simplified,
         }
+    }
+
+    /// How node `index` should be built right now.
+    fn build_spec(&self, index: usize) -> (Detail, Detail) {
+        (self.effective_detail(index), self.detail.unwrap_or(Detail::Full))
     }
 
     /// Materialises and dematerialises children to match the last cull.
@@ -332,30 +381,24 @@ impl CanvasContent {
         let Some(desired) = this.widget.pending.take() else {
             return;
         };
-        let rebuild = std::mem::take(&mut this.widget.rebuild);
-        if desired == this.widget.live && !rebuild {
-            // No widget changes, but `cull` only queued this when something moved,
-            // which in far-field mode means the painted set changed.
-            this.ctx.request_paint_only();
-            return;
-        }
-        if rebuild {
-            // Drop every live widget so they all come back at the new detail level.
-            for index in std::mem::take(&mut this.widget.live) {
-                if let Some(pod) = this.widget.slots[index].pod.take() {
-                    this.ctx.remove_child(pod);
-                }
-            }
-        }
+        let stale = std::mem::take(&mut this.widget.pending_stale);
 
-        // Both lists are ascending, so a merge walk finds the difference in one
-        // pass over the live set — no allocation, no hashing.
+        // Both lists are ascending, so a merge walk finds the difference in one pass
+        // over the live set. Doing this by lookup instead costs a search per visible
+        // node on every frame of a pan, which is measurably worse.
         let mut removed = Vec::new();
         let mut added = Vec::new();
         let (mut a, mut b) = (0, 0);
         while a < this.widget.live.len() || b < desired.len() {
             match (this.widget.live.get(a), desired.get(b)) {
                 (Some(&l), Some(&d)) if l == d => {
+                    // Kept. Only worth checking for a stale detail level when one
+                    // actually changed, which is a threshold crossing or a new node
+                    // under the pointer — never during a plain pan.
+                    if stale && this.widget.slots[l].built != Some(this.widget.build_spec(l)) {
+                        removed.push(l);
+                        added.push(l);
+                    }
                     a += 1;
                     b += 1;
                 },
@@ -382,26 +425,29 @@ impl CanvasContent {
         // Removing takes the widget out of the tree entirely. This is the whole
         // point: a stashed widget is still walked by every pass, a removed one is
         // not. Its state is not lost — it lives in the model behind `NodeSource`.
+        let changed = !removed.is_empty() || !added.is_empty();
         for index in removed {
             if let Some(pod) = this.widget.slots[index].pod.take() {
+                this.widget.slots[index].built = None;
                 this.ctx.remove_child(pod);
             }
         }
 
-        let detail = this.widget.detail.unwrap_or(Detail::Full);
-        this.widget.built_detail = Some(detail);
         for index in added {
-            let widget = this.widget.source.build(index, detail).with_props(CanvasDetail(detail));
+            let (detail, global) = this.widget.build_spec(index);
+            let widget = this.widget.source.build(index, detail).with_props(CanvasDetail(global));
             this.widget.slots[index].pod = Some(widget.to_pod());
+            this.widget.slots[index].built = Some((detail, global));
             this.widget.builds.set(this.widget.builds.get() + 1);
         }
 
         this.widget.live = desired;
-        this.ctx.children_changed();
-        this.ctx.request_layout();
-        // The far field is drawn into this widget's own scene, so a change to the
-        // visible set is a repaint. Above the threshold this is a no-op cost.
-        this.ctx.request_paint_only();
+        if changed {
+            this.ctx.children_changed();
+            this.ctx.request_layout();
+        }
+        // The far-field repaint is requested by the parent, which is where culling
+        // and the region check happen.
     }
 
     /// Computes the set of nodes inside the visible rect.
@@ -422,24 +468,61 @@ impl CanvasContent {
         // materialised. This is what keeps a fully zoomed-out graph affordable: the
         // visible set stops bounding the cost, so the cost must stop depending on
         // widgets. See `paint`.
-        let detail = self.detail.unwrap_or(Detail::Full);
-        let far_field = detail == Detail::Box;
+        let far_field = self.detail.unwrap_or(Detail::Full) == Detail::Box;
         let desired: Vec<usize> = if far_field { Vec::new() } else { visible.clone() };
 
-        // Crossing the Full/Simplified line changes what a node *is*, not just how it
-        // looks, so the live widgets have to be rebuilt rather than repainted.
-        let rebuild = !far_field && self.built_detail.is_some_and(|d| d != detail);
-
-        let visible_changed = visible != self.visible;
         self.visible = visible;
 
-        if desired != self.live || far_field != self.far_field || rebuild || (far_field && visible_changed) {
+        // A widget built at the wrong detail level has to be replaced, not repainted:
+        // the levels differ in which child widgets exist, not only in how they look.
+        let stale = std::mem::take(&mut self.detail_dirty)
+            && self
+                .live
+                .iter()
+                .any(|&i| self.slots[i].built != Some(self.build_spec(i)));
+
+        if far_field {
+            self.refresh_far_region();
+        } else if self.far_region.take().is_some() {
+            self.far_nodes.clear();
+        }
+
+        if desired != self.live || far_field != self.far_field || stale || self.far_dirty {
             self.far_field = far_field;
-            self.rebuild = rebuild;
+            self.pending_stale = stale;
             self.pending = Some(desired);
         } else {
             self.pending = None;
         }
+    }
+
+    /// Re-records the far-field node set when the viewport leaves the painted region.
+    ///
+    /// The recorded scene lives in canvas coordinates, so panning and zooming inside
+    /// the region cost one `Affine` and nothing else. The margin is what turns
+    /// "re-record every frame" into "re-record when you have travelled half a
+    /// screen": it is bought with a larger scene, which the paint pass appends every
+    /// frame either way, so it should be generous but not unbounded.
+    fn refresh_far_region(&mut self) {
+        const OVERSCAN: f64 = 0.5;
+
+        if self.far_region.is_some_and(|r| contains_rect(r, self.visible_rect)) {
+            return;
+        }
+
+        let region = self.visible_rect.inflate(
+            self.visible_rect.width() * OVERSCAN,
+            self.visible_rect.height() * OVERSCAN,
+        );
+
+        self.far_nodes.clear();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if Rect::from_origin_size(slot.pos, slot.size).overlaps(region) {
+                self.far_nodes.push(index);
+            }
+        }
+        self.far_region = Some(region);
+        self.far_dirty = true;
     }
 }
 
@@ -464,17 +547,6 @@ impl Widget for CanvasContent {
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {
         self.layouts.set(self.layouts.get() + 1);
-
-        self.cull();
-        if self.pending.is_some() {
-            // Adding and removing children needs a `WidgetMut`, which layout does
-            // not have. Queue it for the mutate pass, which runs before the next
-            // layout pass in the same rewrite loop.
-            ctx.mutate_self_later(|mut this| {
-                let mut this = this.downcast::<Self>();
-                Self::apply_pending(&mut this);
-            });
-        }
 
         // Children are laid out in canvas coordinates at their natural size; the
         // zoom lives entirely in this widget's transform. That separation is the
@@ -504,10 +576,11 @@ impl Widget for CanvasContent {
         if !self.far_field {
             return;
         }
+        self.far_repaints.set(self.far_repaints.get() + 1);
         // One pass over the visible nodes, straight into this widget's cached scene.
         // The scene is in canvas coordinates, so panning and zooming re-use it via
         // the layer transform without re-encoding anything.
-        for &index in &self.visible {
+        for &index in &self.far_nodes {
             let slot = &self.slots[index];
             let rect = Rect::from_origin_size(slot.pos, slot.size);
             self.source.paint_far(index, rect, painter);
@@ -571,8 +644,6 @@ pub struct CanvasLayer {
     stats: Cell<CanvasStats>,
     /// Current pointer gesture.
     drag: Drag,
-    /// Detail level already pushed to the children.
-    applied_detail: Option<Detail>,
 }
 
 impl CanvasLayer {
@@ -586,7 +657,12 @@ impl CanvasLayer {
         let slots = (0..count)
             .map(|i| {
                 let (pos, size) = geometry(i);
-                Slot { pos, size, pod: None }
+                Slot {
+                    pos,
+                    size,
+                    pod: None,
+                    built: None,
+                }
             })
             .collect();
         Self {
@@ -600,7 +676,6 @@ impl CanvasLayer {
                 ..CanvasStats::default()
             }),
             drag: Drag::None,
-            applied_detail: None,
         }
     }
 
@@ -755,11 +830,26 @@ impl CanvasLayer {
             // changed, not its contents.
             raw.request_layout();
             if far_field {
-                // In far-field mode the node is part of this widget's own scene,
-                // so moving it is a repaint rather than a re-place.
+                // In far-field mode the node is part of this widget's own scene, so
+                // moving it means re-recording that scene.
+                content.far_region = None;
                 raw.request_paint_only();
             }
         }
+    }
+
+    /// Marks the node under the pointer, so only it gets interactive controls.
+    ///
+    /// Returns `true` if the active node changed.
+    fn set_active(&mut self, active: Option<usize>, ctx: &mut EventCtx<'_>) -> bool {
+        let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+        if content.active == active || content.far_field {
+            return false;
+        }
+        content.active = active;
+        content.detail_dirty = true;
+        raw.request_layout();
+        true
     }
 
     /// Finds the topmost child under a canvas-space point, from an event handler.
@@ -821,7 +911,13 @@ impl Widget for CanvasLayer {
             PointerEvent::Move(PointerUpdate { current, .. }) => {
                 let pos = ctx.local_position(current.position);
                 match self.drag {
-                    Drag::None => {},
+                    Drag::None => {
+                        // Materialise controls for the node under the pointer, and
+                        // only that one. Everything else keeps its painted stand-in.
+                        let canvas_pos = self.view.inverse() * pos;
+                        let hit = self.hit_child(canvas_pos, ctx).map(|(index, _)| index);
+                        self.set_active(hit, ctx);
+                    },
                     Drag::Pan { last } => {
                         self.drag = Drag::Pan { last: pos };
                         let view = Affine::translate(pos - last) * self.view;
@@ -834,6 +930,9 @@ impl Widget for CanvasLayer {
                         ctx.set_handled();
                     },
                 }
+            },
+            PointerEvent::Leave(_) => {
+                self.set_active(None, ctx);
             },
             PointerEvent::Up(_) | PointerEvent::Cancel(_) => {
                 if self.drag != Drag::None {
@@ -916,31 +1015,39 @@ impl Widget for CanvasLayer {
         // Push the view down to the content widget. `set_transform` marks it as
         // needing compose, which runs after layout — so this does not violate the
         // "don't set flags for an earlier pass" rule that `get_raw_mut` warns about.
-        {
+        // Culling belongs here, not in the content widget: it depends on the view and
+        // the viewport, both of which live on this side. Doing it in the content's
+        // own `layout` would mean asking the content to re-lay-out on every pan — and
+        // Masonry marks anything that re-lays-out for repaint (`passes/layout.rs`,
+        // "TODO - Not everything that has been re-laid out needs to be repainted").
+        // That is what made a far-field pan re-record its scene every frame.
+        //
+        // Child positions are in canvas coordinates, so a view change moves nobody:
+        // the transform does all the work and no layout is needed at all.
+        let needs_mutate = {
             let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
             content.visible_rect = visible_rect;
-            content.detail = Some(detail);
+            if content.detail != Some(detail) {
+                content.detail = Some(detail);
+                content.detail_dirty = true;
+            }
             if view_dirty {
                 raw.set_transform(view);
-                // `set_transform` marks the content as needing *compose*, not
-                // layout. Culling lives in layout and depends on the view, so
-                // without this the visible set would be computed once and then
-                // never again — nodes would neither enter nor leave the tree.
-                raw.request_layout();
             }
-        }
 
-        // Push the detail level down when, and only when, it changes. `applied_detail`
-        // is updated at queue time rather than when the callback runs, so a threshold
-        // crossing queues exactly one batch even though the rewrite loop may run
-        // layout several times before the mutate pass fires.
-        //
-        // The mutate pass runs before the layout pass inside that loop, so a crossing
-        // still takes effect in the same frame.
-        if self.applied_detail != Some(detail) {
-            self.applied_detail = Some(detail);
-            ctx.mutate_child_later(&mut self.content, move |mut content| {
-                CanvasContent::set_detail(&mut content, detail);
+            content.cull();
+            if std::mem::take(&mut content.far_dirty) {
+                raw.request_paint_only();
+            }
+            content.pending.is_some()
+        };
+        if needs_mutate {
+            // Adding and removing children needs a `WidgetMut`, which layout does not
+            // have. The mutate pass runs before the next layout pass in the same
+            // rewrite loop, so a node entering the view is built and placed in the
+            // same frame.
+            ctx.mutate_child_later(&mut self.content, |mut content| {
+                CanvasContent::apply_pending(&mut content);
             });
         }
 
@@ -957,6 +1064,7 @@ impl Widget for CanvasLayer {
             child_layouts: content.child_layouts.get(),
             composes: content.composes.get(),
             builds: content.builds.get(),
+            far_repaints: content.far_repaints.get(),
             detail: content.detail,
             zoom,
         });

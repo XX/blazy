@@ -58,7 +58,12 @@ impl Report {
             self.after.visible,
             (self.after.builds - self.before.builds) as f64 / self.frames as f64,
         );
-        println!("{:<26}   detail {:?}", "", self.after.detail);
+        println!(
+            "{:<26}   detail {:<18} far repaints/frame {:>6.2}",
+            "",
+            format!("{:?}", self.after.detail),
+            (self.after.far_repaints - self.before.far_repaints) as f64 / self.frames as f64,
+        );
     }
 }
 

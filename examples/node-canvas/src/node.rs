@@ -151,16 +151,11 @@ impl Widget for GraphNode {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
-        let detail = props.get::<CanvasDetail>(ctx.property_cache()).0;
+        // The *global* level, not this node's: it says how many nodes are on screen,
+        // and therefore how much a single extra draw command costs.
+        let global = props.get::<CanvasDetail>(ctx.property_cache()).0;
         let box_rect = ctx.content_box();
         let body = RoundedRect::from_rect(box_rect, RADIUS);
-
-        if detail == Detail::Box {
-            // One filled shape for the whole node. At this zoom a node is a few
-            // pixels across, so anything more is wasted.
-            painter.fill(body, self.tint).draw();
-            return;
-        }
 
         painter.fill(body, Color::from_rgb8(0x2b, 0x2b, 0x30)).draw();
 
@@ -172,25 +167,45 @@ impl Widget for GraphNode {
         );
         painter.fill(RoundedRect::from_rect(header, RADIUS), self.tint).draw();
 
-        // Without controls the node still has to show its state, so the slider and
-        // checkbox become two rectangles. Two draw commands replace three widgets.
+        // Without control widgets the node still has to show its state. The stand-in
+        // sits where the real controls would, because it is swapped for them the
+        // moment the pointer arrives: a mismatch here would read as the UI jumping
+        // under the cursor.
+        //
+        // Fidelity is bought only where it is affordable. Every node's scene is
+        // appended into the layer scene on every frame, so one extra command here is
+        // multiplied by the number of visible nodes.
         if self.controls.is_none() {
+            let detailed = global == Detail::Full;
             let inner_width = (box_rect.width() - 2.0 * PADDING).max(0.0);
-            let bar = Rect::from_origin_size(
-                (box_rect.x0 + PADDING, box_rect.y0 + HEADER_HEIGHT + PADDING),
-                Size::new(inner_width, 6.0),
+            let track = Rect::from_origin_size(
+                (box_rect.x0 + PADDING, box_rect.y0 + HEADER_HEIGHT + PADDING + 8.0),
+                Size::new(inner_width, 4.0),
             );
-            painter.fill(bar, Color::from_rgb8(0x3a, 0x3a, 0x42)).draw();
+            painter.fill(track, Color::from_rgb8(0x3a, 0x3a, 0x42)).draw();
             painter
                 .fill(
-                    Rect::from_origin_size(bar.origin(), Size::new(inner_width * self.value, 6.0)),
-                    Color::from_rgb8(0x9a, 0x9a, 0xb0),
+                    Rect::from_origin_size(track.origin(), Size::new(inner_width * self.value, 4.0)),
+                    Color::from_rgb8(0x6a, 0x6a, 0x88),
                 )
                 .draw();
+            if detailed {
+                // Few nodes on screen: draw the knob and the checkbox, so that
+                // swapping in the real controls on hover is not visible.
+                let knob_x = track.x0 + inner_width * self.value;
+                painter
+                    .fill(
+                        Rect::new(knob_x - 4.0, track.y0 - 4.0, knob_x + 4.0, track.y1 + 4.0),
+                        Color::from_rgb8(0xc8, 0xc8, 0xd4),
+                    )
+                    .draw();
 
-            if self.checked {
-                let mark = Rect::from_origin_size((box_rect.x0 + PADDING, bar.y1 + PADDING), Size::new(8.0, 8.0));
-                painter.fill(mark, Color::from_rgb8(0x9a, 0x9a, 0xb0)).draw();
+                let cb =
+                    Rect::from_origin_size((box_rect.x0 + PADDING, track.y1 + PADDING + 3.0), Size::new(12.0, 12.0));
+                painter.fill(cb, Color::from_rgb8(0x3a, 0x3a, 0x42)).draw();
+                if self.checked {
+                    painter.fill(cb.inset(-3.0), Color::from_rgb8(0xc8, 0xc8, 0xd4)).draw();
+                }
             }
         }
 
