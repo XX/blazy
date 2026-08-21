@@ -1,0 +1,63 @@
+name: "Lint, Test & Bench"
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    name: Lint, Test & Bench
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable, nightly
+          components: clippy, rustfmt
+
+      - name: Install cargo-make
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-make
+
+      - name: Run linting and formatting
+        run: |
+          cargo make lint
+
+      - name: Run tests
+        run: cargo make test
+
+      # The Phase 0 criteria (rnd/architecture.md §20.5) as a gate rather than a
+      # paragraph: `--bench` exits non-zero if one stops holding. Everything gated is
+      # a deterministic counter, so a shared runner does not change the verdict; the
+      # milliseconds are reported and archived but never a bound. See
+      # examples/node-canvas/src/criteria.rs for that argument in full.
+      - name: Run benchmark criteria
+        run: cargo make bench-ci
+
+      # Archived even on failure — a failing run's numbers are the ones worth reading.
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: target/bench-report.json
+          if-no-files-found: warn

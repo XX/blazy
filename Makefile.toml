@@ -47,3 +47,25 @@ dependencies = ["fmt-check", "clippy"]
 
 [tasks.lint-test]
 dependencies = ["lint", "test"]
+
+
+# Always release, never `${PROFILE}`: a debug build measures the optimiser, not the
+# architecture, and a number from one is not comparable with a number from the other.
+# Exits non-zero if a Phase 0 criterion fails — see examples/node-canvas/src/criteria.rs.
+[tasks.bench]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "node-canvas", "--release", "--", "--bench", "${@}"]
+
+# What CI gates on. The full scenario set, because the whole run is under a second
+# and the extra scenarios cost nothing while making the archived report worth diffing.
+[tasks.bench-ci]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "node-canvas", "--release", "--", "--bench", "--report", "${BENCH_REPORT}"]
+
+[tasks.bench-ci.env]
+BENCH_REPORT = "target/bench-report.json"
+
+[tasks.ci]
+dependencies = ["lint", "test", "bench-ci"]

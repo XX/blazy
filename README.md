@@ -14,14 +14,19 @@ keymap.
 |---|---|
 | `crates/blazy` | Фасад (пока пустой) |
 | `crates/blazy-canvas` | Канвас с паном, зумом, culling и LOD |
-| `examples/node-canvas` | Эксперимент Фазы 0 с замерами |
+| `examples/node-canvas` | Эксперимент Фазы 0 с замерами и критериями |
 
 ## Быстрый старт
 
 ```bash
-cargo run -p node-canvas --release              # окно с 5000 нод
-cargo run -p node-canvas --release -- --bench   # замеры
+cargo make run-node-canvas   # окно с 5000 нод
+cargo make bench             # замеры и критерии Фазы 0
+cargo make ci                # то же, что гоняет CI: lint + тесты + критерии
 ```
+
+Критерии Фазы 0 — гейт, а не абзац в документе: `cargo make bench` завершается
+ненулевым кодом, если хоть один перестал выполняться. Гейтятся детерминированные
+счётчики, а не миллисекунды; почему именно так — `examples/node-canvas/src/criteria.rs`.
 
 ## Зависимости
 

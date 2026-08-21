@@ -12,22 +12,31 @@
 //! Two modes:
 //!
 //! ```text
-//! cargo run -p node-canvas --release              # interactive window
-//! cargo run -p node-canvas --release -- --bench   # headless measurements
+//! cargo make run-node-canvas                     # interactive window
+//! cargo make bench                               # headless measurements
+//! cargo make bench-ci                            # what CI runs, plus a JSON report
 //! ```
 //!
 //! The benchmark is the deliverable. The window is there so the claims can be
 //! checked by eye as well as by counter.
+//!
+//! `--bench` exits non-zero if any criterion fails, so the claims above are a CI
+//! gate rather than a paragraph someone has to remember to re-read. What is gated
+//! and what is merely reported is argued in [`criteria`].
 
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod bench;
+mod criteria;
 mod editor;
 mod model;
 mod node;
 #[cfg(test)]
 mod tests;
+
+use std::fs;
+use std::process::ExitCode;
 
 use blazy_canvas::CanvasLayer;
 use masonry::core::NewWidget;
@@ -84,24 +93,27 @@ impl AppDriver for Driver {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.iter().any(|a| a == "--bench") {
-        let count = parse_count(&args).unwrap_or(DEFAULT_NODES);
-        bench::run(count);
-        return;
-    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
             "Phase 0 node canvas\n\n\
              USAGE:\n    \
-             node-canvas [--bench] [--nodes N]\n\n\
+             node-canvas [--bench [--quick] [--report FILE]] [--nodes N]\n\n\
              OPTIONS:\n    \
-             --bench       run headless measurements instead of opening a window\n    \
-             --nodes N     number of nodes (default {DEFAULT_NODES})\n"
+             --bench          run headless measurements instead of opening a window;\n                     \
+             exits non-zero if a Phase 0 criterion fails\n    \
+             --quick          with --bench, run only the scenarios the criteria are\n                     \
+             decided on; same verdict, fewer numbers\n    \
+             --report FILE    with --bench, also write the run as JSON to FILE\n    \
+             --nodes N        number of nodes (default {DEFAULT_NODES})\n"
         );
-        return;
+        return ExitCode::SUCCESS;
+    }
+
+    if args.iter().any(|a| a == "--bench") {
+        return run_bench(&args);
     }
 
     let count = parse_count(&args).unwrap_or(DEFAULT_NODES);
@@ -121,9 +133,47 @@ fn main() {
         default_property_set(),
     )
     .unwrap();
+
+    ExitCode::SUCCESS
+}
+
+/// Runs the measurements and turns the verdict into an exit code.
+fn run_bench(args: &[String]) -> ExitCode {
+    let opts = bench::Options {
+        count: parse_count(args).unwrap_or(DEFAULT_NODES),
+        quick: args.iter().any(|a| a == "--quick"),
+    };
+
+    let outcome = bench::run(&opts);
+
+    // Written after the report is printed, so a failure to write cannot cost us the
+    // numbers — the console output is the primary record and the file is the archive.
+    if let Some(path) = parse_flag(args, "--report") {
+        match fs::write(path, outcome.to_json()) {
+            Ok(()) => println!("report written to {path}"),
+            // Worth failing the run over: a CI job asked for an artifact and did not
+            // get one, and a silently missing report is discovered weeks later when
+            // someone goes looking for the history.
+            Err(err) => {
+                eprintln!("could not write report to {path}: {err}");
+                return ExitCode::FAILURE;
+            },
+        }
+    }
+
+    if outcome.passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn parse_count(args: &[String]) -> Option<usize> {
-    let idx = args.iter().position(|a| a == "--nodes")?;
-    args.get(idx + 1)?.parse().ok()
+    parse_flag(args, "--nodes")?.parse().ok()
+}
+
+/// The argument following `flag`, if the flag is present and has one.
+fn parse_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let idx = args.iter().position(|a| a == flag)?;
+    args.get(idx + 1).map(String::as_str)
 }
