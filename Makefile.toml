@@ -1,0 +1,49 @@
+[config]
+default_to_workspace = false
+additional_profiles = ["debug"]
+
+[env]
+RUST_BACKTRACE = 0
+
+
+[tasks.choose-profile.env]
+PROFILE = "release"
+PROFILE_BUILD_DIR = "${PROFILE}"
+
+    [tasks.choose-profile.env.debug]
+    PROFILE = "dev"
+    PROFILE_BUILD_DIR = "debug"
+
+
+[tasks.run-node-canvas]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "node-canvas", "--profile", "${PROFILE}"]
+dependencies = ["choose-profile"]
+
+
+[tasks.fmt-check]
+command = "cargo"
+toolchain = "nightly"
+args = ["fmt", "--check"]
+
+[tasks.fmt]
+command = "cargo"
+toolchain = "nightly"
+args = ["fmt"]
+
+[tasks.clippy]
+command = "cargo"
+toolchain = "stable"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.test]
+command = "cargo"
+toolchain = "stable"
+args = ["test", "--workspace"]
+
+[tasks.lint]
+dependencies = ["fmt-check", "clippy"]
+
+[tasks.lint-test]
+dependencies = ["lint", "test"]

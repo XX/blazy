@@ -5,10 +5,9 @@
 
 use blazy_canvas::{CanvasLayer, CanvasStats, Detail};
 use masonry::accesskit::{Node as AccessNode, Role};
-use masonry::core::BrushIndex;
 use masonry::core::{
-    AccessCtx, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent, PropertiesMut,
-    PropertiesRef, RegisterCtx, StyleProperty, Widget, WidgetMut, WidgetPod, render_text,
+    AccessCtx, BrushIndex, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent,
+    PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, Widget, WidgetMut, WidgetPod, render_text,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size};

@@ -5,8 +5,7 @@
 //! edits when a node scrolls off screen would post excellent numbers.
 
 use blazy_canvas::CanvasLayer;
-use masonry::core::NewWidget;
-use masonry::core::{WidgetId, WidgetRef};
+use masonry::core::{NewWidget, WidgetId, WidgetRef};
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::Vec2;
 use masonry::testing::TestHarness;
