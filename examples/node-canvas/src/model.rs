@@ -75,11 +75,6 @@ impl GraphModel {
         Self { nodes }
     }
 
-    /// The number of nodes.
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
     /// Returns the state of a node.
     pub fn node(&self, index: usize) -> NodeState {
         self.nodes[index]

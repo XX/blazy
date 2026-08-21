@@ -8,6 +8,31 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# A library plus a thin binary, rather than one binary: `benches/` targets are
+# separate crates and can only reach the package's lib, and the benchmark must build
+# its graph with exactly the same code the window and the tests use.
+#
+# `bench = false` on both, because otherwise `cargo bench` also runs their libtest
+# harnesses, which reject the benchmark's own flags. Only `[[bench]]` is a benchmark.
+[lib]
+name = "node_canvas"
+path = "src/lib.rs"
+bench = false
+
+[[bin]]
+name = "node-canvas"
+path = "src/main.rs"
+bench = false
+
+# `harness = false` because the verdict is a set of counter thresholds, not a sampled
+# timing distribution; see the target's own docs for why neither libtest nor criterion
+# fits. Cargo builds bench targets with the `bench` profile, which inherits `release`,
+# so the numbers are optimised without anyone having to remember a flag.
+[[bench]]
+name = "phase0"
+path = "benches/phase0.rs"
+harness = false
+
 [dependencies]
 blazy-canvas.workspace = true
 masonry = { workspace = true, features = ["testing"] }
