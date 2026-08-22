@@ -19,10 +19,10 @@
 //! checked by eye as well as by counter.
 //!
 //! This crate is a library so that the window (`src/main.rs`), the benchmark
-//! (`benches/phase0.rs`) and the correctness tests can share one canvas
-//! construction. Cargo bench targets are separate crates and can only reach a
-//! package's library, so a binary-only layout would mean duplicating the graph
-//! generator — the one thing every measurement depends on being identical.
+//! (`benches/phase0/`) and the correctness tests can share one canvas construction.
+//! Cargo bench targets are separate crates and can only reach a package's library,
+//! so a binary-only layout would mean duplicating the graph generator — the one
+//! thing every measurement depends on being identical.
 
 pub mod editor;
 pub mod model;
@@ -63,21 +63,4 @@ pub fn build_canvas_with(count: usize, controls_on_hover: bool) -> (CanvasLayer,
     let source = GraphSource::new(graph.clone());
     let canvas = CanvasLayer::new(count, geometry, source).with_controls_on_hover(controls_on_hover);
     (canvas, graph)
-}
-
-/// The argument following `flag`, if the flag is present and has one.
-///
-/// Shared by the window and the benchmark, which both take `--nodes`. Hand-rolled
-/// rather than via a parser crate: four flags between the two of them, and the
-/// benchmark's dependencies are part of what it measures the cost of building.
-pub fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let idx = args.iter().position(|a| a == flag)?;
-    args.get(idx + 1).map(String::as_str)
-}
-
-/// The value of `--nodes`, or [`DEFAULT_NODES`].
-pub fn node_count(args: &[String]) -> usize {
-    flag_value(args, "--nodes")
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(DEFAULT_NODES)
 }

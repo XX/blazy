@@ -14,6 +14,7 @@ keymap.
 |---|---|
 | `crates/blazy` | Фасад (пока пустой) |
 | `crates/blazy-canvas` | Канвас с паном, зумом, culling и LOD |
+| `crates/bench-utils` | Критерии как проверяемые утверждения, вердикт, JSON-отчёт |
 | `examples/node-canvas` | Эксперимент Фазы 0 с замерами и критериями |
 
 ## Быстрый старт
@@ -26,8 +27,8 @@ cargo make ci                # то же, что гоняет CI: lint + тес�
 
 Критерии Фазы 0 — гейт, а не абзац в документе: `cargo make bench` завершается
 ненулевым кодом, если хоть один перестал выполняться. Гейтятся детерминированные
-счётчики, а не миллисекунды; почему именно так — `examples/node-canvas/src/criteria.rs`,
-почему не `criterion` — `examples/node-canvas/benches/phase0.rs`.
+счётчики, а не миллисекунды; почему именно так — `crates/bench-utils/src/criteria.rs`,
+почему не `criterion` — `examples/node-canvas/benches/phase0/main.rs`.
 
 ## Зависимости
 

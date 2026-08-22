@@ -38,6 +38,7 @@ workspace = true
 
 [dependencies]
 blazy-canvas = { workspace = true }
+clap = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
 masonry_winit = { workspace = true }
 
