@@ -1,0 +1,43 @@
+[package]
+name = "area-screen"
+description = "Phase 0.5 feasibility experiment: a window tiled into Blender-style areas."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Same split as node-canvas, and for the same reason: a bench target is a separate
+# crate and can only reach the package's library.
+[lib]
+name = "area_screen"
+path = "src/lib.rs"
+bench = false
+
+[[bin]]
+name = "area-screen"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "screen"
+path = "benches/screen/main.rs"
+harness = false
+
+[lints]
+workspace = true
+
+[dependencies]
+blazy-areas = { workspace = true }
+blazy-canvas = { workspace = true }
+clap = { workspace = true }
+masonry = { workspace = true, features = ["testing"] }
+masonry_winit = { workspace = true }
+# The area experiment measures many views of the graph Phase 0 already measured one
+# view of. Depending on that example rather than copying its model is what keeps the
+# two sets of numbers comparable.
+node-canvas = { workspace = true }
+
+[dev-dependencies]
+bench-utils = { workspace = true }

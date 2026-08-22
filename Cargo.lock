@@ -269,6 +269,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a38750a2a9617d9f1a1428b408fb909f7256a2766c59b0b07993170959731bb"
 
 [[package]]
+name = "area-screen"
+version = "0.1.0"
+dependencies = [
+ "bench-utils",
+ "blazy-areas",
+ "blazy-canvas",
+ "clap",
+ "masonry",
+ "masonry_winit",
+ "node-canvas",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -529,6 +542,13 @@ name = "blazy"
 version = "0.1.0"
 dependencies = [
  "blazy-canvas",
+]
+
+[[package]]
+name = "blazy-areas"
+version = "0.1.0"
+dependencies = [
+ "masonry",
 ]
 
 [[package]]

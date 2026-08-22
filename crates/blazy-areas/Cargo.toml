@@ -1,0 +1,18 @@
+[package]
+name = "blazy-areas"
+description = "Blender-style screen areas for Masonry: a split tree laid out over one widget tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+masonry = { workspace = true }
+
+[dev-dependencies]
+masonry = { workspace = true, features = ["testing"] }

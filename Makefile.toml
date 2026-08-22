@@ -21,6 +21,12 @@ toolchain = "stable"
 args = ["run", "-p", "node-canvas", "--profile", "${PROFILE}"]
 dependencies = ["choose-profile"]
 
+[tasks.run-area-screen]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "area-screen", "--profile", "${PROFILE}"]
+dependencies = ["choose-profile"]
+
 
 [tasks.fmt-check]
 command = "cargo"
@@ -52,7 +58,7 @@ dependencies = ["lint", "test"]
 # The `bench` profile inherits `release`, so no `--profile` juggling here: a debug
 # build would measure the optimiser rather than the architecture, and cargo already
 # knows that about bench targets. Exits non-zero if a Phase 0 criterion fails — see
-# examples/node-canvas/src/criteria.rs.
+# crates/bench-utils/src/criteria.rs.
 [tasks.bench]
 command = "cargo"
 toolchain = "stable"
@@ -69,5 +75,21 @@ command = "cargo"
 toolchain = "stable"
 args = ["bench", "-p", "node-canvas", "--", "--report", "${BENCH_REPORT}"]
 
+# Phase 0.5: the same gate for the area screen. Separate task rather than a flag on
+# `bench`, because the two answer different questions and a failure should name which.
+[tasks.bench-areas]
+command = "cargo"
+toolchain = "stable"
+args = ["bench", "-p", "area-screen", "--", "${@}"]
+
+[tasks.bench-areas-ci]
+env = { AREAS_REPORT = "${CARGO_MAKE_WORKING_DIRECTORY}/target/areas-report.json" }
+command = "cargo"
+toolchain = "stable"
+args = ["bench", "-p", "area-screen", "--", "--report", "${AREAS_REPORT}"]
+
+[tasks.bench-all-ci]
+dependencies = ["bench-ci", "bench-areas-ci"]
+
 [tasks.ci]
-dependencies = ["lint", "test", "bench-ci"]
+dependencies = ["lint", "test", "bench-all-ci"]
