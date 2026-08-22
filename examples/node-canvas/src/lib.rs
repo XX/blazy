@@ -56,11 +56,21 @@ pub fn build_canvas(count: usize) -> (CanvasLayer, SharedGraph) {
 /// price of that choice stays visible.
 pub fn build_canvas_with(count: usize, controls_on_hover: bool) -> (CanvasLayer, SharedGraph) {
     let graph = share(GraphModel::generated(count));
+    let canvas = canvas_over(&graph, count, controls_on_hover);
+    (canvas, graph)
+}
+
+/// A second canvas over a graph that already exists.
+///
+/// Several views of one model is the normal arrangement — Blender shows the same
+/// scene in several editors at once — and it is the arrangement the area
+/// measurements need: comparing one area against sixteen only means something if
+/// all sixteen are looking at the same graph rather than sixteen graphs of their own.
+pub fn canvas_over(graph: &SharedGraph, count: usize, controls_on_hover: bool) -> CanvasLayer {
     let geometry = {
         let graph = graph.clone();
         move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
     };
     let source = GraphSource::new(graph.clone());
-    let canvas = CanvasLayer::new(count, geometry, source).with_controls_on_hover(controls_on_hover);
-    (canvas, graph)
+    CanvasLayer::new(count, geometry, source).with_controls_on_hover(controls_on_hover)
 }

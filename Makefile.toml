@@ -21,6 +21,12 @@ toolchain = "stable"
 args = ["run", "-p", "node-canvas", "--profile", "${PROFILE}"]
 dependencies = ["choose-profile"]
 
+[tasks.run-area-screen]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "area-screen", "--profile", "${PROFILE}"]
+dependencies = ["choose-profile"]
+
 
 [tasks.fmt-check]
 command = "cargo"
@@ -51,23 +57,35 @@ dependencies = ["lint", "test"]
 
 # The `bench` profile inherits `release`, so no `--profile` juggling here: a debug
 # build would measure the optimiser rather than the architecture, and cargo already
-# knows that about bench targets. Exits non-zero if a Phase 0 criterion fails — see
-# examples/node-canvas/src/criteria.rs.
-[tasks.bench]
+# knows that about bench targets.
+
+[tasks.bench-canvas]
 command = "cargo"
 toolchain = "stable"
 args = ["bench", "-p", "node-canvas", "--", "${@}"]
 
-# What CI gates on. The full scenario set, because the whole run is under a second
-# and the extra scenarios cost nothing while making the archived report worth diffing.
-[tasks.bench-ci]
-# Absolute, because cargo runs a bench target with the *package* as its working
-# directory, not the workspace root — a relative path would land in
-# examples/node-canvas/target/ and the CI artifact step would find nothing.
-env = { BENCH_REPORT = "${CARGO_MAKE_WORKING_DIRECTORY}/target/bench-report.json" }
+[tasks.bench-canvas-report]
+env = { BENCH_REPORT = "${CARGO_MAKE_WORKING_DIRECTORY}/target/bench-canvas-report.json" }
 command = "cargo"
 toolchain = "stable"
-args = ["bench", "-p", "node-canvas", "--", "--report", "${BENCH_REPORT}"]
+args = ["bench", "-p", "node-canvas", "--", "--report", "${BENCH_REPORT}", "${@}"]
+
+[tasks.bench-areas]
+command = "cargo"
+toolchain = "stable"
+args = ["bench", "-p", "area-screen", "--", "${@}"]
+
+[tasks.bench-areas-report]
+env = { BENCH_REPORT = "${CARGO_MAKE_WORKING_DIRECTORY}/target/bench-areas-report.json" }
+command = "cargo"
+toolchain = "stable"
+args = ["bench", "-p", "area-screen", "--", "--report", "${BENCH_REPORT}", "${@}"]
+
+[tasks.bench]
+dependencies = ["bench-canvas", "bench-areas"]
+
+[tasks.bench-report]
+dependencies = ["bench-canvas-report", "bench-areas-report"]
 
 [tasks.ci]
-dependencies = ["lint", "test", "bench-ci"]
+dependencies = ["lint", "test", "bench-report"]

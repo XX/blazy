@@ -1,6 +1,6 @@
 [package]
-name = "blazy-canvas"
-description = "Zoomable node canvas for Masonry: per-child transforms, culling, LOD."
+name = "blazy-areas"
+description = "Blender-style screen areas for Masonry: a split tree laid out over one widget tree."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,4 +13,6 @@ workspace = true
 
 [dependencies]
 masonry = { workspace = true }
-strum = { workspace = true }
+
+[dev-dependencies]
+masonry = { workspace = true, features = ["testing"] }

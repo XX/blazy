@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git
+          sudo apt-get install -y build-essential git libfontconfig-dev
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -45,19 +45,20 @@ jobs:
       - name: Run tests
         run: cargo make test
 
-      # The Phase 0 criteria (rnd/architecture.md §20.5) as a gate rather than a
-      # paragraph: `--bench` exits non-zero if one stops holding. Everything gated is
-      # a deterministic counter, so a shared runner does not change the verdict; the
-      # milliseconds are reported and archived but never a bound. See
-      # examples/node-canvas/src/criteria.rs for that argument in full.
+      # The Phase 0 criteria (rnd/architecture.md §20.5) and the Phase 0.5 ones
+      # (§21) as a gate rather than a paragraph: each run exits non-zero if one of
+      # its criteria stops holding. Everything gated is a deterministic counter, so a
+      # shared runner does not change the verdict; the milliseconds are reported and
+      # archived but never a bound. See crates/bench-utils/src/criteria.rs for that
+      # argument in full.
       - name: Run benchmark criteria
-        run: cargo make bench-ci
+        run: cargo make bench-report
 
       # Archived even on failure — a failing run's numbers are the ones worth reading.
-      - name: Upload benchmark report
+      - name: Upload benchmark reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-report
-          path: target/bench-report.json
+          name: bench-reports
+          path: target/*-report.json
           if-no-files-found: warn
