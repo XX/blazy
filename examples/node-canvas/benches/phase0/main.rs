@@ -22,8 +22,11 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::{env, fs};
 
-use node_canvas::bench::{self, Options};
 use node_canvas::{DEFAULT_NODES, flag_value, node_count};
+
+use self::bench::Options;
+
+mod bench;
 
 fn main() -> ExitCode {
     // Cargo passes `--bench` to a `harness = false` target, along with anything

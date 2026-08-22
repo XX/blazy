@@ -12,16 +12,15 @@
 
 use std::time::{Duration, Instant};
 
+use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
 use blazy_canvas::{CanvasLayer, CanvasStats};
 use masonry::core::NewWidget;
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Point, Vec2};
 use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
-
-use crate::build_canvas_with;
-use crate::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
-use crate::editor::NodeEditor;
+use node_canvas::build_canvas_with;
+use node_canvas::editor::NodeEditor;
 
 /// Viewport used for all scenarios.
 const VIEWPORT: (u32, u32) = (1100, 750);
@@ -369,7 +368,7 @@ pub fn run(opts: &Options) -> Outcome {
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
     };
-    outcome.report();
+    outcome.report("Phase 0 criteria");
     outcome
 }
 

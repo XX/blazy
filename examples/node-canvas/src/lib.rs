@@ -24,8 +24,6 @@
 //! package's library, so a binary-only layout would mean duplicating the graph
 //! generator — the one thing every measurement depends on being identical.
 
-pub mod bench;
-pub mod criteria;
 pub mod editor;
 pub mod model;
 pub mod node;

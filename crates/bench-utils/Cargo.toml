@@ -1,15 +1,13 @@
 [package]
-name = "blazy"
-description = "A Blender-style UI layer on top of Masonry."
+name = "bench-utils"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-blazy-canvas = { workspace = true }

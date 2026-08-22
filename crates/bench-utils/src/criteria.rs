@@ -1,4 +1,4 @@
-//! The Phase 0 pass criteria, as machine-checked assertions.
+//! The Pass criteria, as machine-checked assertions.
 //!
 //! `bench.rs` produces numbers; this module decides whether they still hold, and
 //! renders the answer twice: as a human report on stdout, and as JSON for CI to
@@ -109,8 +109,8 @@ impl Outcome {
     /// A criterion prints its measurement and its bound even when it passes: a
     /// number drifting towards its bound is the warning that a hard failure is
     /// not, and the only way to see the drift is to log it while it still passes.
-    pub fn report(&self) {
-        println!("\nPhase 0 criteria{}", if self.quick { " (quick set)" } else { "" });
+    pub fn report(&self, title: &str) {
+        println!("\n{title}{}", if self.quick { " (quick set)" } else { "" });
         for criterion in &self.criteria {
             println!(
                 "  [{}] {:<52} {:>8.2} < {:>8.2} {} [{}]",

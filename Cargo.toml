@@ -10,17 +10,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/XX/blazy"
 publish = false
 
-[workspace.dependencies]
-blazy = { path = "crates/blazy" }
-blazy-canvas = { path = "crates/blazy-canvas" }
-
-# Pinned to a specific commit on purpose: everything blazy relies on (the `imaging`
-# rendering IR, `Widget::paint(&mut Painter)`, `VisualLayerPlan`) exists only on
-# git main. The published masonry 0.4.0 (2025-10-29) predates the imaging migration
-# (xilem#1696, merged 2026-03-24). See rnd/architecture.md, section 15.1.
-masonry = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144", default-features = false }
-masonry_winit = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144" }
-
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -29,3 +18,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[workspace.dependencies]
+bench-utils = { path = "crates/bench-utils" }
+blazy = { path = "crates/blazy" }
+blazy-canvas = { path = "crates/blazy-canvas" }
+masonry = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144", default-features = false }
+masonry_winit = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144" }
+clap = { version = "4.6", features = ["derive"] }
+image = { version = "0.25", default-features = false }

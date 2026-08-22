@@ -30,18 +30,17 @@ bench = false
 # so the numbers are optimised without anyone having to remember a flag.
 [[bench]]
 name = "phase0"
-path = "benches/phase0.rs"
+path = "benches/phase0/main.rs"
 harness = false
-
-[dependencies]
-blazy-canvas.workspace = true
-masonry = { workspace = true, features = ["testing"] }
-masonry_winit.workspace = true
 
 [lints]
 workspace = true
 
+[dependencies]
+blazy-canvas = { workspace = true }
+masonry = { workspace = true, features = ["testing"] }
+masonry_winit = { workspace = true }
+
 [dev-dependencies]
-# Only to name `RgbaImage` when inspecting rendered frames; masonry_testing returns
-# one but does not re-export the type.
-image = { version = "0.25", default-features = false }
+bench-utils = { workspace = true }
+image = { workspace = true }
