@@ -52,7 +52,7 @@ jobs:
       # archived but never a bound. See crates/bench-utils/src/criteria.rs for that
       # argument in full.
       - name: Run benchmark criteria
-        run: cargo make bench-all-ci
+        run: cargo make bench-report
 
       # Archived even on failure — a failing run's numbers are the ones worth reading.
       - name: Upload benchmark reports
