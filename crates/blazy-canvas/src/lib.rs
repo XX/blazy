@@ -59,6 +59,7 @@ use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Vec2};
 use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
 use masonry::ui_events::pointer::{PointerButton, PointerScrollEvent, PointerUpdate};
+use strum::IntoStaticStr;
 
 /// How much detail a canvas child should draw at the current zoom level.
 ///
@@ -66,7 +67,8 @@ use masonry::ui_events::pointer::{PointerButton, PointerScrollEvent, PointerUpda
 /// one is fewer draw commands per node. The important one is that at
 /// [`Detail::Box`] a node can stash its contents entirely — and layout, not
 /// painting, is what makes a large graph expensive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum Detail {
     /// Full contents: header, body and interactive controls.
     Full,
@@ -74,6 +76,12 @@ pub enum Detail {
     Simplified,
     /// A flat filled rectangle. Contents are stashed and not laid out.
     Box,
+}
+
+impl Detail {
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
 }
 
 /// The zoom levels at which a canvas switches between [`Detail`] levels.
@@ -94,8 +102,8 @@ pub struct DetailThresholds {
 impl Default for DetailThresholds {
     fn default() -> Self {
         Self {
-            full: 0.3,
-            simplified: 0.1,
+            full: 0.2,
+            simplified: 0.05,
         }
     }
 }
@@ -1275,19 +1283,19 @@ mod tests {
 
     #[test]
     fn detail_thresholds_are_ordered() {
-        let t = DetailThresholds::default();
-        assert_eq!(t.for_scale(1.0), Detail::Full);
-        assert_eq!(t.for_scale(0.2), Detail::Simplified);
-        assert_eq!(t.for_scale(0.01), Detail::Box);
+        let thresholds = DetailThresholds::default();
+        assert_eq!(thresholds.for_scale(1.0), Detail::Full);
+        assert_eq!(thresholds.for_scale(0.2), Detail::Simplified);
+        assert_eq!(thresholds.for_scale(0.01), Detail::Box);
     }
 
     #[test]
     fn detail_thresholds_are_configurable() {
-        let t = DetailThresholds {
+        let thresholds = DetailThresholds {
             full: 0.6,
             simplified: 0.25,
         };
-        assert_eq!(t.for_scale(0.4), Detail::Simplified);
-        assert_eq!(t.for_scale(0.1), Detail::Box);
+        assert_eq!(thresholds.for_scale(0.4), Detail::Simplified);
+        assert_eq!(thresholds.for_scale(0.1), Detail::Box);
     }
 }

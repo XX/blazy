@@ -3,7 +3,10 @@
 //! The HUD exists because Phase 0 is a measurement, not a demo. Numbers that only
 //! appear in a log are numbers nobody checks while dragging a node around.
 
-use blazy_canvas::{CanvasLayer, CanvasStats, Detail};
+use std::fmt::Write as _;
+use std::mem;
+
+use blazy_canvas::{CanvasLayer, CanvasStats};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::{
     AccessCtx, BrushIndex, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent,
@@ -67,25 +70,21 @@ impl NodeEditor {
 /// The cumulative pass counters live in [`CanvasStats`] for the benchmark; putting
 /// them on screen would change the text every frame and defeat the cache.
 fn format_hud(stats: &CanvasStats, out: &mut String) {
-    use std::fmt::Write as _;
-
     let detail = match stats.detail {
-        Some(Detail::Full) => "full",
-        Some(Detail::Simplified) => "simplified",
-        Some(Detail::Box) => "box",
+        Some(detail) => detail.as_str(),
         None => "-",
     };
     out.clear();
-    let _ = write!(
+    write!(
         out,
         "nodes {visible}/{total} materialised   zoom {zoom:.2}x   lod {detail}   built {builds}\n\
          drag a node - left-drag empty space or middle-drag to pan - wheel to zoom",
         visible = stats.materialised,
         total = stats.total,
         zoom = stats.zoom,
-        detail = detail,
         builds = stats.counters.builds,
-    );
+    )
+    .ok();
 }
 
 impl Widget for NodeEditor {
@@ -136,7 +135,7 @@ impl Widget for NodeEditor {
         // valid for as long as possible.
         format_hud(&stats, &mut self.hud_next);
         if self.hud_next != self.hud {
-            std::mem::swap(&mut self.hud, &mut self.hud_next);
+            mem::swap(&mut self.hud, &mut self.hud_next);
             self.hud_layout = None;
         }
     }

@@ -29,3 +29,4 @@ masonry = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d
 masonry_winit = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144" }
 clap = { version = "4.6", features = ["derive"] }
 image = { version = "0.25", default-features = false }
+strum = { version = "0.28", features = ["derive"] }
