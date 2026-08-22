@@ -3,10 +3,13 @@
 //! Phase 0 measured one editor filling one window and found that frame cost is the
 //! cost of walking the widget tree, which is a per-window quantity
 //! (`rnd/architecture.md` §20.2). A Blender screen is six or eight editors in that
-//! same window. This experiment asks the two questions that leaves open:
+//! same window, and each of those editors is itself divided into regions with their
+//! own interface scale. This experiment asks the questions that leaves open:
 //!
 //! * do the areas' costs add up, or does splitting a window merely divide the same viewport into smaller pieces?
 //! * does dragging a splitter re-lay-out the screen, or only what it moved?
+//! * does a region's `ui_scale` reach layout, and does it stay inside its region?
+//! * does zooming a region's content stay out of layout entirely?
 //!
 //! ```text
 //! cargo make run-area-screen      # interactive window
@@ -14,7 +17,10 @@
 //! ```
 //!
 //! Every area holds a node canvas over **one shared graph**, so the numbers line up
-//! with Phase 0's and so the sweep over area counts changes only the tiling.
+//! with Phase 0's and so the sweep over area counts changes only the tiling. Above
+//! each canvas sits a header region that honours its own `ui_scale`; the window opens
+//! with a different scale per area, which is the shortest way to see what "per-region"
+//! means.
 
 pub mod header;
 

@@ -541,6 +541,7 @@ dependencies = [
 name = "blazy"
 version = "0.1.0"
 dependencies = [
+ "blazy-areas",
  "blazy-canvas",
 ]
 

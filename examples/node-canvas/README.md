@@ -4,17 +4,18 @@
 построить нод-редактор уровня Blender поверх `masonry_core`, не форкая его.
 
 ```bash
-cargo make run-node-canvas                   # интерактивное окно
-cargo make bench                             # замеры headless и критерии
-cargo make bench -- --quick                  # только сценарии, по которым решаются критерии
-cargo make bench -- --nodes 20000
-cargo make bench-ci                          # то же + JSON-отчёт в target/bench-report.json
+cargo make run-node-canvas             # интерактивное окно
+cargo make bench-canvas                # замеры headless и критерии
+cargo make bench-canvas --quick        # только сценарии, по которым решаются критерии
+cargo make bench-canvas --nodes 20000
+cargo make bench-canvas-report         # то же + JSON-отчёт в target/
 ```
 
 Замеры — отдельная цель `benches/phase0/` с `harness = false`, а не флаг у окна:
 профиль `bench` наследует `release`, так что оптимизацию не нужно помнить руками, и
 бенч-код не попадает в бинарь окна. Прогон возвращает ненулевой код, если хоть один
-критерий Фазы 0 перестал выполняться, поэтому CI гоняет его наравне с тестами.
+критерий Фазы 0 перестал выполняться, поэтому CI гоняет его наравне с тестами. Аргументы передаются без `--`:
+разделитель cargo-make проносит дальше как обычный аргумент, и `clap` на него ругается.
 Почему ни `#[bench]`, ни `criterion` не подходят — в шапке `benches/phase0/main.rs`.
 
 ## Управление

@@ -140,7 +140,10 @@ pub struct AreaContent {
 impl AreaContent {
     /// Builds an area from its regions, in stacking order.
     ///
-    /// `base_height` is a header's height in logical pixels at scale 1.0.
+    /// `base_height` is a header's height in logical pixels at scale 1.0, and is
+    /// ignored for anything else. The last region takes whatever height is left, so
+    /// it is the one that should be [`RegionKind::Main`]; a `Main` that is not last
+    /// would leave nothing for the regions after it.
     pub fn new(regions: Vec<(RegionKind, f64, NewWidget<dyn Widget>)>) -> Self {
         Self {
             slots: regions
@@ -191,11 +194,6 @@ impl AreaContent {
             resizes: self.resizes,
             scale_pushes: self.scale_pushes,
         }
-    }
-
-    /// How many regions this area has.
-    pub fn region_count(&self) -> usize {
-        self.slots.len()
     }
 
     /// The widget id of each region's root, in stacking order.
@@ -281,18 +279,19 @@ impl Widget for AreaContent {
             ctx.mutate_self_later(|mut this| Self::apply_pending(&mut this.downcast::<Self>()));
         }
 
-        // Headers take their scaled height off the top; the last region gets the
-        // rest. Rounded to whole pixels for the reason `split_rect` is: a fractional
-        // boundary would make every region count as resized on every frame.
+        // A header takes its scaled height off the top; anything else takes what is
+        // left, which is why the last region is the one that gets to be `Main`. The
+        // height is rounded to whole pixels for the reason `split_rect` is: a
+        // fractional boundary would make every region count as resized every frame.
         let mut y = 0.0;
         for i in 0..self.slots.len() {
             let last = i + 1 == self.slots.len();
+            let remaining = (size.height - y).max(0.0);
             let height = match self.slots[i].kind {
-                _ if last => (size.height - y).max(0.0),
-                RegionKind::Header => (self.slots[i].base_height * self.slots[i].ui_scale)
+                RegionKind::Header if !last => (self.slots[i].base_height * self.slots[i].ui_scale)
                     .round()
-                    .min((size.height - y).max(0.0)),
-                RegionKind::Main => (size.height - y).max(0.0),
+                    .min(remaining),
+                _ => remaining,
             };
             let region_size = Size::new(size.width, height);
 

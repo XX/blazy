@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo make run-node-canvas
-//! cargo make run-node-canvas -- --nodes 20000
+//! cargo make run-node-canvas --nodes 20000
 //! ```
 //!
 //! The measurements live in `benches/phase0/`; this binary exists so the claims they

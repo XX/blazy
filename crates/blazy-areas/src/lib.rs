@@ -7,7 +7,8 @@
 //! window at once, and nothing measured so far says whether their costs add up or
 //! whether a splitter drag relays out everything on screen.
 //!
-//! Three claims are under test:
+//! Five claims are under test. The first three are about the tiling (§21), the last
+//! two about what lives inside an area (§22).
 //!
 //! 1. **Areas do not add up.** Splitting a window into more areas does not add widgets to the tree, it divides the same
 //!    viewport into smaller pieces. The total live widget count should therefore be roughly flat as the area count
@@ -20,19 +21,35 @@
 //! 3. **An idle screen is idle.** Areas exist as data even when nothing about them changes, and computing rects for
 //!    them every frame must not be mistaken for laying them out.
 //!
+//! 4. **`ui_scale` is a layout input, and a local one.** Changing a region's interface scale has to reach that region's
+//!    layout, and has to reach nothing else — not the area around it, not the areas beside it.
+//!
+//! 5. **`view` is not a layout input.** Panning and zooming a region's content is a transform at composition time.
+//!    Mixing the two knobs means re-running layout on every frame of a zoom, which is the mistake §9 exists to warn
+//!    about.
+//!
 //! # Structure
 //!
 //! [`SplitTree`] is pure geometry and knows nothing of widgets; [`AreaScreen`] is
 //! the Masonry widget that owns one child per area and places it at the rect the
 //! tree computed. §8 asks for exactly this seam, so the tree can later be
 //! serialised, or replaced by a vertex-and-edge graph, without touching the widget.
+//! [`AreaContent`] fills one area with regions, each carrying its own [`UiScale`].
 //!
-//! # What this is not
+//! # What is missing
 //!
-//! Not the finished subsystem. There is no join, no maximize/restore, no swap, no
-//! detach into a second OS window, no region model inside an area (header, toolbar,
-//! sidebar) and no per-region `ui_scale`. Those are features; this crate exists to
-//! find out whether the shape they would be built on is sound.
+//! Not the finished subsystem yet. There is no join, no maximize/restore, no swap, no
+//! detach into a second OS window, and no regions beyond a header and a main view —
+//! no toolbar, no sidebar, no footer. All of those are operations on a split tree that
+//! already exists and is covered by tests; the five claims above have been measured
+//! and held (§21, §22), so they are work rather than risk.
+//!
+//! One limit is not a matter of features and will not go away by writing more of
+//! them: **Masonry's own widgets do not honour [`UiScale`]**. Nothing in
+//! `masonry::widgets` reads it, and their sizes come from the theme's
+//! `DefaultProperties`, which is one map per application rather than one per region.
+//! The test `masonry_widgets_do_not_follow_ui_scale` pins that down, and §22.1 says
+//! what would have to change upstream.
 
 mod region;
 mod tree;

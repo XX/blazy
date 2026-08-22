@@ -38,12 +38,14 @@
 //! is therefore an associated function taking a [`WidgetMut`], which is the normal
 //! Masonry idiom.
 //!
-//! # What this is not
+//! # What is missing
 //!
-//! Not a finished node editor. Culling is a linear scan rather than a spatial
-//! index ([`CanvasContent::cull`]), and there is no link layer, selection model or
-//! serialisation. Those belong to `blazy-canvas` proper, once Phase 0 has answered
-//! the feasibility question.
+//! Not a finished node editor yet. Culling is a linear scan rather than a spatial
+//! index ([`CanvasContent::cull`]) — the only remaining per-frame cost that is linear
+//! in the size of the graph — and there is no link layer, no selection model and no
+//! serialisation. Those are the next things to build here (§16, item 10); the three
+//! claims above have been measured and held (§20), so the shape underneath them is
+//! not in question.
 
 use std::any::TypeId;
 use std::cell::Cell;

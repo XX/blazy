@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo make run-area-screen
-//! cargo make run-area-screen -- --areas 16 --nodes 20000
+//! cargo make run-area-screen --areas 16 --nodes 20000
 //! ```
 //!
 //! Drag a splitter to move a boundary; each area pans and zooms independently over

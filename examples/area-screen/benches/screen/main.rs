@@ -2,8 +2,8 @@
 //!
 //! ```text
 //! cargo make bench-areas                       # every scenario
-//! cargo make bench-areas -- --quick            # only what the criteria need
-//! cargo make bench-areas -- --areas 16
+//! cargo make bench-areas --quick            # only what the criteria need
+//! cargo make bench-areas --areas 16
 //! ```
 //!
 //! Exits non-zero if a criterion fails, on the same terms as the Phase 0 benchmark:

@@ -26,12 +26,13 @@ keymap.
 ```bash
 cargo make run-node-canvas   # окно с 5000 нод
 cargo make run-area-screen   # окно, разбитое на области
-cargo make bench             # замеры и критерии Фазы 0
+cargo make bench-canvas      # замеры и критерии Фазы 0
 cargo make bench-areas       # замеры и критерии Фаз 0.5 и 0.6
+cargo make bench             # оба набора замеров
 cargo make ci                # то же, что гоняет CI: lint + тесты + оба гейта
 ```
 
-Критерии Фазы 0 — гейт, а не абзац в документе: `cargo make bench` завершается
+Критерии — гейт, а не абзац в документе: `cargo make bench` завершается
 ненулевым кодом, если хоть один перестал выполняться. Гейтятся детерминированные
 счётчики, а не миллисекунды; почему именно так — `crates/bench-utils/src/criteria.rs`,
 почему не `criterion` — `examples/node-canvas/benches/phase0/main.rs`.

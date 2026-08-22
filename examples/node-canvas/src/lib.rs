@@ -12,7 +12,7 @@
 //! ```text
 //! cargo make run-node-canvas   # interactive window
 //! cargo make bench             # headless measurements and the criteria
-//! cargo make bench-ci          # what CI runs, plus a JSON report
+//! cargo make bench-report          # what CI runs, plus a JSON report
 //! ```
 //!
 //! The benchmark is the deliverable. The window is there so the claims can be

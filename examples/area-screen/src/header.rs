@@ -34,17 +34,11 @@ pub struct ScaledHeader {
     tint: Color,
     /// The scale the last layout ran at.
     seen_scale: f64,
-    /// Layout passes run.
-    layouts: u64,
 }
 
 impl ScaledHeader {
     pub fn new(tint: Color) -> Self {
-        Self {
-            tint,
-            seen_scale: 1.0,
-            layouts: 0,
-        }
+        Self { tint, seen_scale: 1.0 }
     }
 
     /// The scale this header last laid itself out at.
@@ -53,11 +47,6 @@ impl ScaledHeader {
     /// property did not reach layout, which is exactly the failure §9 is about.
     pub fn seen_scale(&self) -> f64 {
         self.seen_scale
-    }
-
-    /// Layout passes run on this header.
-    pub fn layouts(&self) -> u64 {
-        self.layouts
     }
 
     /// Width the controls need at `scale`.
@@ -92,7 +81,6 @@ impl Widget for ScaledHeader {
     }
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, props: &PropertiesRef<'_>, _size: Size) {
-        self.layouts += 1;
         self.seen_scale = props.get::<UiScale>(ctx.property_cache()).0;
     }
 

@@ -2,9 +2,9 @@
 //!
 //! ```text
 //! cargo make bench                             # every scenario
-//! cargo make bench -- --quick                  # only what the criteria need
-//! cargo make bench -- --nodes 20000
-//! cargo make bench-ci                          # + JSON report for CI to archive
+//! cargo make bench --quick                  # only what the criteria need
+//! cargo make bench --nodes 20000
+//! cargo make bench-report                          # + JSON report for CI to archive
 //! ```
 //!
 //! Exits non-zero if a criterion fails, which is what makes `rnd/architecture.md`

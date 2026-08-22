@@ -1,6 +1,6 @@
 [package]
 name = "blazy-areas"
-description = "Blender-style screen areas for Masonry: a split tree laid out over one widget tree."
+description = "Blender-style screen areas for Masonry: a split tree, regions, and per-region ui_scale."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -18,13 +18,13 @@ PROFILE_BUILD_DIR = "${PROFILE}"
 [tasks.run-node-canvas]
 command = "cargo"
 toolchain = "stable"
-args = ["run", "-p", "node-canvas", "--profile", "${PROFILE}"]
+args = ["run", "-p", "node-canvas", "--profile", "${PROFILE}", "--", "${@}"]
 dependencies = ["choose-profile"]
 
 [tasks.run-area-screen]
 command = "cargo"
 toolchain = "stable"
-args = ["run", "-p", "area-screen", "--profile", "${PROFILE}"]
+args = ["run", "-p", "area-screen", "--profile", "${PROFILE}", "--", "${@}"]
 dependencies = ["choose-profile"]
 
 
@@ -82,6 +82,7 @@ toolchain = "stable"
 args = ["bench", "-p", "area-screen", "--", "--report", "${BENCH_REPORT}", "${@}"]
 
 [tasks.bench]
+clear = true
 dependencies = ["bench-canvas", "bench-areas"]
 
 [tasks.bench-report]

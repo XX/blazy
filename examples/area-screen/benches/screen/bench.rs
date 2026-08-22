@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use area_screen::header::ScaledHeader;
-use area_screen::{DEFAULT_AREAS, build_screen, build_screen_with};
+use area_screen::{build_screen, build_screen_with};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
 use blazy_areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
 use blazy_canvas::CanvasLayer;
@@ -226,6 +226,18 @@ fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
     );
     // Settle the first layout and paint, so the initial sizing of every area is not
     // counted as a resize caused by the gesture under test.
+    let _ = harness.redraw();
+    harness
+}
+
+/// A screen of one region per area: the canvas, with no header above it.
+fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+    let (screen, _graph) = build_screen_with(areas, nodes, false);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+    );
     let _ = harness.redraw();
     harness
 }
@@ -471,6 +483,12 @@ pub fn run(opts: &Options) -> Outcome {
 /// The sweep that decides claim 1. If splitting a window merely divides one
 /// viewport, the live count stays close to flat; if each area is a viewport of its
 /// own that materialises its own share, the count climbs with the tiling.
+///
+/// Deliberately headerless, unlike every other scenario here. With headers, more
+/// areas means more header strips means less canvas, and the live count would fall
+/// for a reason that has nothing to do with the claim — a confound that would make
+/// the sweep look like better evidence than it is. What a region costs is measured
+/// separately, by [`region_cost`].
 fn area_sweep(opts: &Options, nodes: usize) -> Vec<SweepRecord> {
     const COUNTS: [usize; 5] = [1, 2, 4, 8, 16];
     const QUICK_COUNTS: [usize; 2] = [1, 16];
@@ -482,10 +500,10 @@ fn area_sweep(opts: &Options, nodes: usize) -> Vec<SweepRecord> {
     let mut points = Vec::new();
 
     for &areas in counts {
-        let mut harness = new_harness(areas, nodes);
+        let mut harness = headerless_harness(areas, nodes);
         let idle = measure("idle", &mut harness, sweep_frames, |_, _| {});
 
-        let mut harness = new_harness(areas, nodes);
+        let mut harness = headerless_harness(areas, nodes);
         let pan = measure("pan", &mut harness, sweep_frames, |h, _| pan_area(h, 0, PAN_STEP));
 
         let point = SweepRecord {
@@ -511,16 +529,7 @@ fn area_sweep(opts: &Options, nodes: usize) -> Vec<SweepRecord> {
 /// like a widget or like a viewport.
 fn region_cost(opts: &Options, areas: usize, nodes: usize) -> (f64, f64) {
     let frames = if opts.quick { 25 } else { 40 };
-    let mut bare = {
-        let (screen, _graph) = build_screen_with(areas, nodes, false);
-        let mut harness = TestHarness::create_with_size(
-            default_property_set(),
-            NewWidget::new(screen),
-            PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
-        );
-        let _ = harness.redraw();
-        harness
-    };
+    let mut bare = headerless_harness(areas, nodes);
     let without = measure("idle", &mut bare, frames, |_, _| {}).mean_ms();
 
     let mut full = new_harness(areas, nodes);
@@ -665,6 +674,5 @@ fn evaluate(reports: &[Report], sweep: &[SweepRecord], scale_misses: u64, region
         });
     }
 
-    let _ = DEFAULT_AREAS;
     criteria
 }
