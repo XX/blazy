@@ -34,6 +34,7 @@
 //! sidebar) and no per-region `ui_scale`. Those are features; this crate exists to
 //! find out whether the shape they would be built on is sound.
 
+mod region;
 mod tree;
 
 use masonry::accesskit::{Node, Role};
@@ -47,6 +48,7 @@ use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
 use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerButton, PointerUpdate};
 
+pub use crate::region::{AreaContent, RegionCounters, RegionKind, UiScale};
 pub use crate::tree::{AreaId, Bar, NodeId, SplitTree, ratio_at};
 
 /// Thickness of a splitter, in logical pixels.

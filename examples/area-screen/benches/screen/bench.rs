@@ -6,11 +6,13 @@
 //! the screen actually resized — because that is the number a tiling layout can get
 //! catastrophically wrong while still looking correct.
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use area_screen::{DEFAULT_AREAS, build_screen};
+use area_screen::header::ScaledHeader;
+use area_screen::{DEFAULT_AREAS, build_screen, build_screen_with};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
-use blazy_areas::{AreaScreen, Bar, NodeId, ScreenStats};
+use blazy_areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
 use blazy_canvas::CanvasLayer;
 use masonry::core::{NewWidget, WidgetId, WindowEvent};
 use masonry::dpi::PhysicalSize;
@@ -29,6 +31,12 @@ const QUICK_FRAMES: usize = 40;
 
 /// One pan step inside an area, in viewport pixels.
 const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
+
+/// Interface scales the scale scenario cycles through.
+///
+/// Never repeats a value on consecutive steps: `set_ui_scale` ignores a scale equal
+/// to the current one, so a cycle with a repeat would quietly measure idle frames.
+const SCALES: [f64; 4] = [1.0, 1.25, 1.5, 1.25];
 
 /// How the benchmark was asked to run.
 pub struct Options {
@@ -55,6 +63,13 @@ struct Snapshot {
     live: usize,
     /// Nodes laid out across every area, summed over all passes.
     child_layouts: u64,
+    /// Regions handed a new size, summed over every area.
+    region_resizes: u64,
+    /// Regions in areas other than area 0 handed a new size.
+    ///
+    /// Every scale change in these scenarios is made in area 0, so this is the
+    /// leak counter: work that a change should not have been able to reach.
+    other_area_region_resizes: u64,
 }
 
 /// Result of one scenario.
@@ -84,18 +99,27 @@ impl Report {
         self.per_frame(self.after.screen.counters.area_resizes - self.before.screen.counters.area_resizes)
     }
 
+    fn region_resizes_per_frame(&self) -> f64 {
+        self.per_frame(self.after.region_resizes - self.before.region_resizes)
+    }
+
+    fn other_area_region_resizes_per_frame(&self) -> f64 {
+        self.per_frame(self.after.other_area_region_resizes - self.before.other_area_region_resizes)
+    }
+
     fn child_layouts_per_frame(&self) -> f64 {
         self.per_frame(self.after.child_layouts - self.before.child_layouts)
     }
 
     fn print(&self) {
         println!(
-            "{:<26} {:>7.3} ms/frame  worst {:>7.3} ms  area-resizes/frame {:>6.2}  \
-             live {:>4}  node-layouts/frame {:>6.1}",
+            "{:<26} {:>7.3} ms/frame  worst {:>7.3} ms  area-resizes/frame {:>5.2}  \
+             region-resizes/frame {:>5.2}  live {:>4}  node-layouts/frame {:>5.1}",
             self.name,
             self.mean_ms(),
             self.worst_ms(),
             self.area_resizes_per_frame(),
+            self.region_resizes_per_frame(),
             self.after.live,
             self.child_layouts_per_frame(),
         );
@@ -111,25 +135,35 @@ impl Report {
             detail: format!("{} areas", self.after.screen.areas),
             child_layouts_per_frame: self.child_layouts_per_frame(),
             builds_per_frame: self.area_resizes_per_frame(),
-            far_repaints_per_frame: 0.0,
+            far_repaints_per_frame: self.region_resizes_per_frame(),
         }
     }
 }
 
-/// Reads the screen's counters and sums its areas'.
+/// Reads the screen's counters and sums its areas' and regions'.
 fn snapshot(harness: &TestHarness<AreaScreen>) -> Snapshot {
     let screen = harness.root_widget().stats();
     let mut live = 0;
     let mut child_layouts = 0;
-    for id in area_ids(harness) {
-        let stats = canvas(harness, id).stats();
+    let mut region_resizes = 0;
+    let mut other_area_region_resizes = 0;
+    for (area, id) in area_ids(harness).into_iter().enumerate() {
+        let stats = canvas_of(harness, area).stats();
         live += stats.materialised;
         child_layouts += stats.counters.child_layouts;
+
+        let resizes = content(harness, id).counters().resizes;
+        region_resizes += resizes;
+        if area != 0 {
+            other_area_region_resizes += resizes;
+        }
     }
     Snapshot {
         screen,
         live,
         child_layouts,
+        region_resizes,
+        other_area_region_resizes,
     }
 }
 
@@ -137,11 +171,50 @@ fn area_ids(harness: &TestHarness<AreaScreen>) -> Vec<WidgetId> {
     harness.root_widget().area_ids()
 }
 
-fn canvas(harness: &TestHarness<AreaScreen>, id: WidgetId) -> masonry::core::WidgetRef<'_, CanvasLayer> {
+/// The region stack filling one area.
+fn content(harness: &TestHarness<AreaScreen>, id: WidgetId) -> masonry::core::WidgetRef<'_, AreaContent> {
+    harness
+        .get_widget_with_id(id)
+        .downcast::<AreaContent>()
+        .expect("every area holds a region stack")
+}
+
+/// The widget id of one region inside one area.
+fn region_id(harness: &TestHarness<AreaScreen>, area: usize, region: usize) -> WidgetId {
+    let area_id = area_ids(harness)[area];
+    content(harness, area_id).region_ids()[region]
+}
+
+/// The canvas of an area: the last region, whatever else the area carries.
+fn canvas_of(harness: &TestHarness<AreaScreen>, area: usize) -> masonry::core::WidgetRef<'_, CanvasLayer> {
+    let area_id = area_ids(harness)[area];
+    let id = *content(harness, area_id)
+        .region_ids()
+        .last()
+        .expect("an area has regions");
     harness
         .get_widget_with_id(id)
         .downcast::<CanvasLayer>()
-        .expect("every area holds a canvas")
+        .expect("the main region is a canvas")
+}
+
+/// The scale an area's header last laid itself out at.
+fn header_seen(harness: &TestHarness<AreaScreen>, area: usize) -> f64 {
+    let id = region_id(harness, area, 0);
+    harness
+        .get_widget_with_id(id)
+        .downcast::<ScaledHeader>()
+        .expect("region 0 is a header")
+        .seen_scale()
+}
+
+/// Sets the interface scale of an area's header region.
+fn set_header_scale(harness: &mut TestHarness<AreaScreen>, area: usize, scale: f64) {
+    let id = area_ids(harness)[area];
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut content = widget.downcast::<AreaContent>();
+        AreaContent::set_ui_scale(&mut content, 0, scale);
+    });
 }
 
 fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
@@ -227,10 +300,19 @@ fn drag_step(harness: &mut TestHarness<AreaScreen>, split: NodeId, base: Point, 
 
 /// Pans the canvas in area `area` by one step.
 fn pan_area(harness: &mut TestHarness<AreaScreen>, area: usize, delta: Vec2) {
-    let id = area_ids(harness)[area];
+    let id = canvas_of(harness, area).ctx().widget_id();
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
         CanvasLayer::pan(&mut canvas, delta);
+    });
+}
+
+/// Zooms the canvas in area `area` about its centre.
+fn zoom_area(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
+    let id = canvas_of(harness, area).ctx().widget_id();
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut canvas = widget.downcast::<CanvasLayer>();
+        CanvasLayer::zoom_around(&mut canvas, Point::new(200.0, 150.0), factor);
     });
 }
 
@@ -240,7 +322,7 @@ pub fn run(opts: &Options) -> Outcome {
     let nodes = opts.nodes;
     let frames = opts.frames();
     println!(
-        "blazy Phase 0.5 - area screen on masonry_core@main\n\
+        "blazy Phase 0.5/0.6 - area screen on masonry_core@main\n\
          {areas} areas, {nodes} nodes shared between them, viewport {}x{}, \
          {frames} frames per scenario{}\n",
         VIEWPORT.0,
@@ -249,6 +331,9 @@ pub fn run(opts: &Options) -> Outcome {
     );
 
     let mut reports = Vec::new();
+    // Assigned by the scale scenario below, which always runs: the criterion it feeds
+    // is one of the two Phase 0.6 exists to check, so there is no quick set without it.
+    let scale_misses: u64;
 
     // --- Scenario 1: idle.
     //
@@ -305,7 +390,50 @@ pub fn run(opts: &Options) -> Outcome {
         }));
     }
 
-    // --- Scenario 5: resize the window. Informational.
+    // --- Scenario 5: change the interface scale of one region.
+    //
+    // §9's first rule: `ui_scale` is a layout input. The scale is changed in area 0's
+    // header only, so everything this scenario counts outside area 0 is a leak, and
+    // the header is asked afterwards what scale it actually laid out at — a property
+    // that reaches the widget but not its layout would otherwise look like success.
+    {
+        let mut harness = new_harness(areas, nodes);
+        let missed = Cell::new(0u64);
+        let expected = Cell::new(f64::NAN);
+        reports.push(measure("change region ui_scale", &mut harness, frames, |h, i| {
+            let want = expected.get();
+            if want.is_finite() && header_seen(h, 0) != want {
+                missed.set(missed.get() + 1);
+            }
+            let next = SCALES[i % SCALES.len()];
+            set_header_scale(h, 0, next);
+            expected.set(next);
+        }));
+        if header_seen(&harness, 0) != expected.get() {
+            missed.set(missed.get() + 1);
+        }
+        scale_misses = missed.get();
+    }
+
+    // --- Scenario 6: zoom the content of one region.
+    //
+    // §9's second rule, and the one that decides whether the two knobs stayed apart:
+    // `view` is a transform at composition time and must cost no layout at all.
+    // Measured at the region level rather than inside the canvas, because the claim
+    // being checked here is that nothing in the region stack was tempted to treat a
+    // zoom as a resize.
+    {
+        let mut harness = new_harness(areas, nodes);
+        reports.push(measure("zoom content in one region", &mut harness, frames, |h, i| {
+            // Oscillate inside one detail level: crossing an LOD threshold is
+            // supposed to cost a re-layout, and that is the canvas's business, not
+            // the region's.
+            let factor = if (i / 20).is_multiple_of(2) { 0.995 } else { 1.0 / 0.995 };
+            zoom_area(h, 0, factor);
+        }));
+    }
+
+    // --- Scenario 7: resize the window. Informational.
     //
     // Every rect changes, so every area re-lays-out; there is no way around that and
     // no criterion to attach. What the number is worth is knowing whether a window
@@ -324,16 +452,17 @@ pub fn run(opts: &Options) -> Outcome {
     }
 
     let sweep = area_sweep(opts, nodes);
+    let regions = region_cost(opts, areas, nodes);
 
     let outcome = Outcome {
         nodes: areas,
         viewport: VIEWPORT,
         quick: opts.quick,
-        criteria: evaluate(&reports, &sweep),
+        criteria: evaluate(&reports, &sweep, scale_misses, regions),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
     };
-    outcome.report("Phase 0.5 criteria");
+    outcome.report("Phase 0.5/0.6 criteria");
     outcome
 }
 
@@ -375,8 +504,37 @@ fn area_sweep(opts: &Options, nodes: usize) -> Vec<SweepRecord> {
     points
 }
 
-/// The Phase 0.5 criteria, evaluated against the numbers just measured.
-fn evaluate(reports: &[Report], sweep: &[SweepRecord]) -> Vec<Criterion> {
+/// What a second region per area costs, at idle.
+///
+/// Returns (one region per area, two regions per area) in milliseconds. A region is a
+/// widget like any other, so it cannot be free; the question is whether it is priced
+/// like a widget or like a viewport.
+fn region_cost(opts: &Options, areas: usize, nodes: usize) -> (f64, f64) {
+    let frames = if opts.quick { 25 } else { 40 };
+    let mut bare = {
+        let (screen, _graph) = build_screen_with(areas, nodes, false);
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new(screen),
+            PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+        );
+        let _ = harness.redraw();
+        harness
+    };
+    let without = measure("idle", &mut bare, frames, |_, _| {}).mean_ms();
+
+    let mut full = new_harness(areas, nodes);
+    let with = measure("idle", &mut full, frames, |_, _| {}).mean_ms();
+
+    println!(
+        "\nregions: idle with {areas} areas   1 region each {without:>7.3} ms   \
+         2 regions each {with:>7.3} ms"
+    );
+    (without, with)
+}
+
+/// The Phase 0.5 and 0.6 criteria, evaluated against the numbers just measured.
+fn evaluate(reports: &[Report], sweep: &[SweepRecord], scale_misses: u64, regions: (f64, f64)) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
 
@@ -442,6 +600,67 @@ fn evaluate(reports: &[Report], sweep: &[SweepRecord]) -> Vec<Criterion> {
             kind: Kind::Timing,
             measured: last.idle_ms / first.idle_ms,
             bound: area_ratio * 0.5,
+            unit: "x slower",
+        });
+    }
+
+    // --- Phase 0.6: regions and ui_scale.
+
+    if let Some(scale) = find("change region ui_scale") {
+        // The positive claim, counted from the failing side so it can be bounded from
+        // above like everything else: a scale the header did not lay out at is a
+        // scale that never reached layout.
+        criteria.push(Criterion {
+            name: "ui_scale_reaches_the_regions_layout",
+            claim: "every ui_scale change reaches the region's layout",
+            kind: Kind::Counter,
+            measured: scale_misses as f64,
+            bound: 0.5,
+            unit: "changes not seen",
+        });
+
+        // Containment upwards: a region resizing itself must not push the area around.
+        criteria.push(Criterion {
+            name: "ui_scale_change_does_not_resize_areas",
+            claim: "changing ui_scale resizes no area",
+            kind: Kind::Counter,
+            measured: scale.area_resizes_per_frame(),
+            bound: 0.05,
+            unit: "area resizes/frame",
+        });
+
+        // Containment sideways: the change is made in area 0 and nowhere else.
+        criteria.push(Criterion {
+            name: "ui_scale_change_stays_in_its_area",
+            claim: "changing ui_scale does not reach other areas",
+            kind: Kind::Counter,
+            measured: scale.other_area_region_resizes_per_frame(),
+            bound: 0.05,
+            unit: "foreign region resizes/frame",
+        });
+    }
+
+    if let Some(zoom) = find("zoom content in one region") {
+        // §9's second rule. A zoom that resizes a region is a zoom that has been
+        // confused with a scale, and it would cost a re-layout on every frame.
+        criteria.push(Criterion {
+            name: "content_zoom_resizes_no_region",
+            claim: "zooming content resizes no region",
+            kind: Kind::Counter,
+            measured: zoom.region_resizes_per_frame(),
+            bound: 0.05,
+            unit: "region resizes/frame",
+        });
+    }
+
+    let (without, with) = regions;
+    if without > 0.0 {
+        criteria.push(Criterion {
+            name: "a_second_region_is_priced_like_a_widget",
+            claim: "a second region per area does not double idle cost",
+            kind: Kind::Timing,
+            measured: with / without,
+            bound: 2.0,
             unit: "x slower",
         });
     }
