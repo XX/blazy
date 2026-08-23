@@ -191,6 +191,24 @@ fn screen_appearance() {
     assert_render_snapshot!(harness, "screen_four_areas");
 }
 
+/// The graph with its edges.
+///
+/// Worth a picture of its own: the existing screen snapshot tiles the window small
+/// enough that a single node fills an area, so it would go on passing whether or not
+/// links were drawn at all — which it did, when they were added.
+#[test]
+fn canvas_with_links_appearance() {
+    let (canvas, _graph) = build_canvas(400);
+    let mut harness = TestHarness::create_with(
+        default_property_set(),
+        NewWidget::new(canvas),
+        TestHarnessParams::size_and_padding(PhysicalSize::new(260, 180), 0),
+    );
+    // Far enough out that several nodes and the curves between them are on screen.
+    harness.edit_root_widget(|mut canvas| CanvasLayer::zoom_around(&mut canvas, Point::ORIGIN, 0.45));
+    assert_render_snapshot!(harness, "canvas_with_links");
+}
+
 /// A header at two interface scales, as pictures rather than as a number.
 #[test]
 fn header_appearance_at_two_scales() {

@@ -68,7 +68,7 @@ fewer numbers, and a fast inner loop.
 | Crate | Role |
 |---|---|
 | `crates/blazy` | Facade — the crate an application depends on. Re-exports the rest. |
-| `crates/blazy-canvas` | Virtualised, zoomable canvas of freely positioned widgets. |
+| `crates/blazy-canvas` | Virtualised, zoomable canvas: nodes, links, spatial index. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
@@ -123,6 +123,22 @@ pass recursion. Nodes have to leave the tree entirely. `blazy-canvas` therefore
 *virtualises* — geometry for every node, a widget only while it is in view — and node
 state lives in the model, not in the widget, because the widget does not exist most of
 the time. 64× the nodes costs 1.1× the time.
+
+**Links are curves, not widgets, and are chosen through adjacency (§24).** There are
+as many edges as nodes and one with a single endpoint on screen still has to be drawn,
+so an edge that is a widget puts the linear cost straight back. The curve scene lives
+in canvas coordinates like the far field, so a pan reuses it. Keep the two flags
+apart: dragging a node **repaints** its curves without **reselecting** which curves are
+on screen — conflating them walks the region once per frame.
+
+**The visible set comes from a uniform grid, not a scan (§24.2).** Query slack is
+derived from the widest node rather than assumed to be one cell: a node wider than a
+cell would otherwise stop being drawn near the left edge, silently.
+
+**Sweep endpoints are part of a criterion.** The node sweep stopped at 16 000 and the
+"frame cost does not follow graph size" criterion passed for months while a linear cost
+sat there — it only shows above 64 000. When adding a criterion, check where the effect
+it guards against actually becomes visible.
 
 **The canvas is two widgets and they cannot be merged (§20.3).** `CanvasLayer` holds
 the viewport, the clip path and the view; `CanvasContent` carries the view transform

@@ -71,6 +71,11 @@ pub struct ScenarioRecord {
     pub child_layouts_per_frame: f64,
     pub builds_per_frame: f64,
     pub far_repaints_per_frame: f64,
+    /// Extra per-scenario counters, reported and archived but not interpreted here.
+    ///
+    /// The criteria module deliberately knows nothing about what a canvas or a screen
+    /// counts; it knows how to bound a number and how to write it down.
+    pub extra: Vec<(&'static str, f64)>,
 }
 
 /// One point of the scaling sweep.
@@ -169,7 +174,7 @@ impl Outcome {
                 out,
                 "    {{\"name\": {}, \"frames\": {}, \"mean_ms\": {}, \"worst_ms\": {}, \
                  \"materialised\": {}, \"detail\": {}, \"child_layouts_per_frame\": {}, \
-                 \"builds_per_frame\": {}, \"far_repaints_per_frame\": {}}}",
+                 \"builds_per_frame\": {}, \"far_repaints_per_frame\": {}",
                 quote(s.name),
                 s.frames,
                 num(s.mean_ms),
@@ -180,6 +185,10 @@ impl Outcome {
                 num(s.builds_per_frame),
                 num(s.far_repaints_per_frame),
             );
+            for (name, value) in &s.extra {
+                let _ = write!(out, ", {}: {}", quote(name), num(*value));
+            }
+            out.push('}');
             out.push_str(sep(i, self.scenarios.len()));
         }
         out.push_str("  ],\n");

@@ -47,6 +47,9 @@
 //! claims above have been measured and held (§20), so the shape underneath them is
 //! not in question.
 
+mod index;
+mod links;
+
 use std::any::TypeId;
 use std::cell::Cell;
 
@@ -58,10 +61,15 @@ use masonry::core::{
 };
 use masonry::dpi::{LogicalPosition, PhysicalPosition};
 use masonry::imaging::Painter;
-use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Vec2};
+use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
 use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
+use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerButton, PointerScrollEvent, PointerUpdate};
 use strum::IntoStaticStr;
+
+use crate::index::SpatialIndex;
+pub use crate::links::Link;
+use crate::links::{LinkLayer, link_path};
 
 /// How much detail a canvas child should draw at the current zoom level.
 ///
@@ -167,6 +175,28 @@ impl CanvasDetail {
     }
 }
 
+/// How the canvas strokes its links.
+///
+/// Style rather than mechanism, like [`DetailThresholds`]: how a link should look
+/// depends on the application, and baking it into the crate would mean editing this
+/// file to retune a demo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinkStyle {
+    pub color: Color,
+    /// Stroke width in canvas units, so links thicken with the zoom like everything
+    /// else the canvas draws.
+    pub width: f64,
+}
+
+impl Default for LinkStyle {
+    fn default() -> Self {
+        Self {
+            color: Color::from_rgb8(0x8a, 0x8a, 0x96),
+            width: 2.0,
+        }
+    }
+}
+
 /// What the canvas is doing right now, plus counters for the Phase 0 measurements.
 ///
 /// Deliberately cheap to collect: Phase 0 exists to produce numbers, and numbers
@@ -210,6 +240,27 @@ pub struct CanvasCounters {
     /// If this climbs steeply while panning slowly, the overscan is too tight and
     /// nodes are thrashing in and out.
     pub builds: u64,
+    /// Node geometries examined while deciding what is on screen, summed over all
+    /// passes.
+    ///
+    /// The number the spatial index exists to bound. A count rather than a duration
+    /// on purpose: it is exact and machine-independent, where the microseconds it
+    /// replaced are the kind of measurement that disappears into noise until the
+    /// graph is large enough for the problem to be urgent.
+    pub slot_visits: u64,
+    /// Times the link curves have been re-emitted into the scene.
+    ///
+    /// Rises whenever the content widget repaints for any reason — a node entering
+    /// view is enough — so it measures work done rather than a decision made.
+    /// Informational; the decision is [`link_reselects`](Self::link_reselects).
+    pub link_repaints: u64,
+    /// Times the canvas has re-chosen *which* links are recorded.
+    ///
+    /// This is the one to bound. Panning inside the recorded region must not raise
+    /// it, because the curves are in canvas coordinates and the layer transform does
+    /// the work; neither must dragging a node, which moves its own curves without
+    /// changing which curves are on screen. Only leaving the region should.
+    pub link_reselects: u64,
     /// Times the far-field scene has been re-recorded.
     ///
     /// The scene is in canvas coordinates, so panning and zooming inside the painted
@@ -452,6 +503,10 @@ pub struct CanvasContent {
     visible: Vec<usize>,
     /// The far-field recording, used below the [`Detail::Box`] threshold.
     far: FarField,
+    /// Edges between nodes, drawn as curves rather than built as widgets.
+    links: LinkLayer,
+    /// How links are stroked.
+    link_style: LinkStyle,
     /// The node the pointer is on, if any. Only meaningful with `controls_on_hover`.
     active: Option<usize>,
     /// Whether only the node under the pointer gets interactive controls.
@@ -460,9 +515,13 @@ pub struct CanvasContent {
     detail_dirty: bool,
     /// Whether the queued `pending` needs a staleness sweep as well as a set diff.
     pending_stale: bool,
+    /// Finds what is on screen without walking the graph.
+    index: SpatialIndex,
     /// Reused buffers for the set difference, so a pan allocates nothing.
     scratch_removed: Vec<usize>,
     scratch_added: Vec<usize>,
+    /// Reused buffer for index candidates, so culling allocates nothing either.
+    scratch_candidates: Vec<usize>,
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
@@ -475,6 +534,8 @@ pub struct CanvasContent {
     composes: u64,
     builds: u64,
     far_repaints: u64,
+    visits: u64,
+    link_repaints: u64,
 }
 
 // `CanvasLayer` owns this widget completely and reaches into it during layout to
@@ -486,18 +547,23 @@ impl AllowRawMut for CanvasContent {}
 
 impl CanvasContent {
     fn new(slots: Vec<Slot>, source: Box<dyn NodeSource>) -> Self {
+        let index = SpatialIndex::build(slots.iter().map(|s| Rect::from_origin_size(s.pos, s.size)));
         Self {
+            index,
             slots,
             source,
             live: Vec::new(),
             visible: Vec::new(),
             far: FarField::default(),
+            links: LinkLayer::default(),
+            link_style: LinkStyle::default(),
             active: None,
             controls_on_hover: false,
             detail_dirty: false,
             pending_stale: false,
             scratch_removed: Vec::new(),
             scratch_added: Vec::new(),
+            scratch_candidates: Vec::new(),
             pending: None,
             visible_rect: Rect::ZERO,
             detail: None,
@@ -506,6 +572,8 @@ impl CanvasContent {
             composes: 0,
             builds: 0,
             far_repaints: 0,
+            visits: 0,
+            link_repaints: 0,
         }
     }
 
@@ -601,6 +669,8 @@ impl CanvasContent {
             return Invalidate::Nothing;
         }
         slot.pos = pos;
+        self.index.moved(index, pos);
+        self.links.node_moved(index);
         if far_field {
             self.far.region = None;
             Invalidate::LayoutAndPaint
@@ -613,17 +683,23 @@ impl CanvasContent {
 
     /// Computes the set of nodes inside the visible rect.
     ///
-    /// A linear scan over the geometry array. That is O(total) per frame, but it
-    /// touches 32 bytes per node and no widget state, so it costs a few microseconds
-    /// where materialising the same nodes costs milliseconds. A spatial index drops
-    /// in here when the scan itself starts to matter.
+    /// Asks the grid for candidates and tests their rectangles exactly. The grid is
+    /// what keeps this proportional to what is on screen rather than to the graph:
+    /// the linear scan it replaced was invisible up to about 64 000 nodes and cost
+    /// 6.8 ms a frame at a million (§24).
     fn cull(&mut self) {
+        let mut candidates = std::mem::take(&mut self.scratch_candidates);
+        self.index.candidates(self.visible_rect, &mut candidates);
+
         let mut visible = Vec::with_capacity(self.visible.len() + 8);
-        for (index, slot) in self.slots.iter().enumerate() {
+        for &index in &candidates {
+            let slot = &self.slots[index];
             if Rect::from_origin_size(slot.pos, slot.size).overlaps(self.visible_rect) {
                 visible.push(index);
             }
         }
+        self.visits += candidates.len() as u64;
+        self.scratch_candidates = candidates;
 
         // Below the box threshold the canvas paints nodes itself, so nothing is
         // materialised. This is what keeps a fully zoomed-out graph affordable: the
@@ -648,6 +724,8 @@ impl CanvasContent {
             self.far.nodes.clear();
         }
 
+        self.refresh_links();
+
         if desired != self.live || far_field != self.far.active || stale || self.far.dirty {
             self.far.active = far_field;
             self.pending_stale = stale;
@@ -655,6 +733,31 @@ impl CanvasContent {
         } else {
             self.pending = None;
         }
+    }
+
+    /// Re-chooses which links are recorded when the viewport leaves their region.
+    ///
+    /// The same margin the far field uses, and for the same reason: the scene is in
+    /// canvas coordinates, so panning inside the region reuses it untouched and only
+    /// leaving it costs anything.
+    fn refresh_links(&mut self) {
+        if self.links.is_empty() {
+            return;
+        }
+        let region = self.visible_rect.inflate(
+            self.visible_rect.width() * FAR_OVERSCAN,
+            self.visible_rect.height() * FAR_OVERSCAN,
+        );
+        if !self.links.needs_reselect(self.visible_rect) {
+            return;
+        }
+
+        let mut candidates = std::mem::take(&mut self.scratch_candidates);
+        self.index.candidates(region, &mut candidates);
+        self.visits += candidates.len() as u64;
+        candidates.retain(|&i| Rect::from_origin_size(self.slots[i].pos, self.slots[i].size).overlaps(region));
+        self.links.refresh(region, self.visible_rect, &candidates);
+        self.scratch_candidates = candidates;
     }
 
     /// Re-records the far-field node set when the viewport leaves the painted region.
@@ -674,12 +777,17 @@ impl CanvasContent {
             self.visible_rect.height() * FAR_OVERSCAN,
         );
 
+        let mut candidates = std::mem::take(&mut self.scratch_candidates);
+        self.index.candidates(region, &mut candidates);
         self.far.nodes.clear();
-        for (index, slot) in self.slots.iter().enumerate() {
+        for &index in &candidates {
+            let slot = &self.slots[index];
             if Rect::from_origin_size(slot.pos, slot.size).overlaps(region) {
                 self.far.nodes.push(index);
             }
         }
+        self.visits += candidates.len() as u64;
+        self.scratch_candidates = candidates;
         self.far.region = Some(region);
         self.far.dirty = true;
     }
@@ -732,6 +840,26 @@ impl Widget for CanvasContent {
     }
 
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        // Links go under the nodes, at every detail level: they are the graph's
+        // structure, and a graph too small to show a node's controls still has to
+        // show what is wired to what.
+        if !self.links.is_empty() {
+            self.link_repaints += 1;
+            let stroke = Stroke::new(self.link_style.width);
+            for &edge in self.links.recorded() {
+                let link = self.links.edge(edge);
+                let (Some(from), Some(to)) = (self.slots.get(link.from as usize), self.slots.get(link.to as usize))
+                else {
+                    continue;
+                };
+                let path = link_path(
+                    Rect::from_origin_size(from.pos, from.size),
+                    Rect::from_origin_size(to.pos, to.size),
+                );
+                painter.stroke(&path, &stroke, self.link_style.color).draw();
+            }
+        }
+
         if !self.far.active {
             return;
         }
@@ -811,6 +939,9 @@ pub struct CanvasLayer {
     thresholds: DetailThresholds,
     /// Smallest and largest permitted zoom.
     zoom_limits: (f64, f64),
+    /// Links handed to [`CanvasLayer::with_links`] before the canvas was in a tree.
+    pending_links: Option<Vec<Link>>,
+    link_style: LinkStyle,
 }
 
 impl CanvasLayer {
@@ -846,6 +977,8 @@ impl CanvasLayer {
             controls_on_hover: false,
             thresholds: DetailThresholds::default(),
             zoom_limits: (0.02, 8.0),
+            pending_links: None,
+            link_style: LinkStyle::default(),
         }
     }
 
@@ -862,6 +995,26 @@ impl CanvasLayer {
     /// fragile — a theme change silently breaks the resemblance. Turn this on only
     /// where the node body is drawn by the application anyway, or where nodes are
     /// small enough that the difference does not read.
+    /// Adds edges between nodes.
+    ///
+    /// Indices into the node array given to [`new`](Self::new); an edge naming a node
+    /// that does not exist is skipped when drawn rather than rejected here, because
+    /// the graph is the application's to validate.
+    ///
+    /// Held here and handed down at the first layout: a `WidgetPod` gives its widget
+    /// to the arena on insertion, so the canvas cannot reach its own content between
+    /// construction and being in a tree.
+    pub fn with_links(mut self, links: Vec<Link>) -> Self {
+        self.pending_links = Some(links);
+        self
+    }
+
+    /// Restyles the links.
+    pub fn with_link_style(mut self, style: LinkStyle) -> Self {
+        self.link_style = style;
+        self
+    }
+
     pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
         self.controls_on_hover = enabled;
         self
@@ -1175,6 +1328,12 @@ impl Widget for CanvasLayer {
         // the transform does all the work and no layout is needed at all.
         let needs_mutate = {
             let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+            if let Some(links) = self.pending_links.take() {
+                let count = content.slots.len();
+                content.links = LinkLayer::new(links, count);
+                content.links.invalidate();
+            }
+            content.link_style = self.link_style;
             content.controls_on_hover = self.controls_on_hover;
             content.visible_rect = visible_rect;
             if content.detail != Some(detail) {
@@ -1186,7 +1345,7 @@ impl Widget for CanvasLayer {
             }
 
             content.cull();
-            if std::mem::take(&mut content.far.dirty) {
+            if std::mem::take(&mut content.far.dirty) | content.links.take_repaint() {
                 raw.request_paint_only();
             }
             content.pending.is_some()
@@ -1218,6 +1377,9 @@ impl Widget for CanvasLayer {
                 composes: content.composes,
                 builds: content.builds,
                 far_repaints: content.far_repaints,
+                slot_visits: content.visits,
+                link_repaints: content.link_repaints,
+                link_reselects: content.links.refreshes(),
             },
         });
     }

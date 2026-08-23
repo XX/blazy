@@ -31,7 +31,7 @@ pub mod node;
 #[cfg(test)]
 mod tests;
 
-use blazy_canvas::CanvasLayer;
+use blazy_canvas::{CanvasLayer, Link};
 
 use crate::model::{GraphModel, NODE_SIZE, SharedGraph, share};
 use crate::node::GraphSource;
@@ -66,11 +66,45 @@ pub fn build_canvas_with(count: usize, controls_on_hover: bool) -> (CanvasLayer,
 /// scene in several editors at once — and it is the arrangement the area
 /// measurements need: comparing one area against sixteen only means something if
 /// all sixteen are looking at the same graph rather than sixteen graphs of their own.
+/// Edges for a generated graph: each node wired to its neighbour on the right and
+/// the one below.
+///
+/// Local edges on purpose. A node editor's graph is mostly local — that is what makes
+/// it readable — and it is also the case the link layer's region selection is exact
+/// for (`blazy-canvas::links`). Roughly two edges per node, so a 5000-node graph
+/// carries about 10 000 of them.
+pub fn generated_links(count: usize) -> Vec<Link> {
+    let cols = model::GRID_COLS;
+    let mut links = Vec::with_capacity(count * 2);
+    for i in 0..count {
+        if i % cols != cols - 1 && i + 1 < count {
+            links.push(Link::new(i, i + 1));
+        }
+        if i + cols < count {
+            links.push(Link::new(i, i + cols));
+        }
+    }
+    links
+}
+
+/// A canvas over a fresh graph with an explicit edge set, for the link sweep.
+pub fn build_canvas_linked(count: usize, links: Vec<Link>) -> (CanvasLayer, SharedGraph) {
+    let graph = share(GraphModel::generated(count));
+    let geometry = {
+        let graph = graph.clone();
+        move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
+    };
+    let canvas = CanvasLayer::new(count, geometry, GraphSource::new(graph.clone())).with_links(links);
+    (canvas, graph)
+}
+
 pub fn canvas_over(graph: &SharedGraph, count: usize, controls_on_hover: bool) -> CanvasLayer {
     let geometry = {
         let graph = graph.clone();
         move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
     };
     let source = GraphSource::new(graph.clone());
-    CanvasLayer::new(count, geometry, source).with_controls_on_hover(controls_on_hover)
+    CanvasLayer::new(count, geometry, source)
+        .with_controls_on_hover(controls_on_hover)
+        .with_links(generated_links(count))
 }

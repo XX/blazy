@@ -136,6 +136,10 @@ impl Report {
             child_layouts_per_frame: self.child_layouts_per_frame(),
             builds_per_frame: self.area_resizes_per_frame(),
             far_repaints_per_frame: self.region_resizes_per_frame(),
+            extra: vec![(
+                "other_area_region_resizes_per_frame",
+                self.other_area_region_resizes_per_frame(),
+            )],
         }
     }
 }

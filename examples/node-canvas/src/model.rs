@@ -17,7 +17,7 @@ pub const NODE_SIZE: Size = Size::new(160.0, 96.0);
 /// Spacing between nodes in the generated grid.
 const GRID_STEP: f64 = 220.0;
 /// Nodes per row in the generated grid.
-const GRID_COLS: usize = 80;
+pub const GRID_COLS: usize = 80;
 
 /// One node's persistent state.
 #[derive(Clone, Copy, Debug)]
