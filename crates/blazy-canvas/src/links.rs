@@ -24,7 +24,7 @@
 //! as soon as one edge is long. The limitation is pinned by a test rather than left
 //! to be discovered.
 
-use masonry::kurbo::{BezPath, Point, Rect};
+use masonry::kurbo::{BezPath, CubicBez, Point, Rect};
 
 /// A connection between two nodes, by index into the canvas's node array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,20 +174,32 @@ fn contains_rect(outer: Rect, inner: Rect) -> bool {
 /// makes two links between the same pair of columns distinguishable. Ports are the
 /// midpoints of the facing edges: real ports are a node's business, and the canvas
 /// does not know how many a node has.
-pub(crate) fn link_path(from: Rect, to: Rect) -> BezPath {
+///
+/// The curve, not the path, is what both callers actually want: painting strokes it
+/// and hit testing measures the distance to it. One function so that the two can
+/// never disagree about where a link is — a pointer that picks a curve the eye does
+/// not see there is worse than one that misses.
+pub(crate) fn link_curve(from: Rect, to: Rect) -> CubicBez {
     let start = Point::new(from.x1, from.center().y);
     let end = Point::new(to.x0, to.center().y);
     // Handles scale with the gap so a short link does not loop and a long one does
     // not go slack.
     let reach = ((end.x - start.x).abs() * 0.5).max(24.0);
 
-    let mut path = BezPath::new();
-    path.move_to(start);
-    path.curve_to(
+    CubicBez::new(
+        start,
         Point::new(start.x + reach, start.y),
         Point::new(end.x - reach, end.y),
         end,
-    );
+    )
+}
+
+/// The same curve as a path, for stroking.
+pub(crate) fn link_path(from: Rect, to: Rect) -> BezPath {
+    let mut path = BezPath::new();
+    let curve = link_curve(from, to);
+    path.move_to(curve.p0);
+    path.curve_to(curve.p1, curve.p2, curve.p3);
     path
 }
 

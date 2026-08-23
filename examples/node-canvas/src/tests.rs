@@ -4,10 +4,10 @@
 //! is *correct*, which is the harder half: a canvas that quietly loses the user's
 //! edits when a node scrolls off screen would post excellent numbers.
 
-use blazy_canvas::CanvasLayer;
+use blazy_canvas::{CanvasHit, CanvasLayer};
 use masonry::core::{NewWidget, WidgetId, WidgetRef};
 use masonry::dpi::PhysicalSize;
-use masonry::kurbo::Vec2;
+use masonry::kurbo::{Point, Vec2};
 use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 use masonry::ui_events::pointer::PointerButton;
@@ -396,4 +396,171 @@ fn far_field_does_not_repaint_while_panning() {
         "panning re-recorded the far-field scene {} times",
         after - before
     );
+}
+
+// --- MARK: PICKING
+
+/// What the widget tree says is under a window position.
+fn under_pointer(harness: &TestHarness<NodeEditor>, pos: Point) -> Option<WidgetId> {
+    harness
+        .root_widget()
+        .as_dyn()
+        .find_widget_under_pointer(pos)
+        .map(|widget| widget.id())
+}
+
+/// The canvas's own statistics.
+///
+/// Not `NodeEditor::stats`, which is a copy taken during layout: a pick deliberately
+/// does not run one (§25.4), so the copy would be from before the pointer moved.
+fn canvas_stats(harness: &mut TestHarness<NodeEditor>) -> blazy_canvas::CanvasStats {
+    harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats()))
+}
+
+/// What the canvas says is under a window position.
+fn pick(harness: &mut TestHarness<NodeEditor>, pos: Point) -> Option<CanvasHit> {
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::hit_test(&mut canvas, pos))
+    })
+}
+
+/// The canvas-space position of a node, which at the identity view is also its
+/// position in the window.
+fn node_pos(harness: &mut TestHarness<NodeEditor>, index: usize) -> Point {
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::child_pos(&mut canvas, index).expect("node exists")
+        })
+    })
+}
+
+/// A node that sits well inside the viewport, with its right-hand neighbour.
+///
+/// The generated grid starts at the origin and jitters, so the first few nodes hang
+/// off the top-left corner of the window; a test about window positions has to pick
+/// one that is actually in the window.
+fn node_inside_the_viewport(harness: &mut TestHarness<NodeEditor>) -> usize {
+    // Row 0 straddles the top edge of the window, so the search has to reach the
+    // second row: the grid is 80 wide.
+    (0..200)
+        .find(|&index| {
+            let pos = node_pos(harness, index);
+            pos.x > 20.0 && pos.y > 20.0 && pos.x + NODE_SIZE.width < 900.0 && pos.y + NODE_SIZE.height < 600.0
+        })
+        .expect("some node is fully on screen")
+}
+
+/// The precise phase, in the widget tree: a node's corner is drawn round, so it is
+/// not the node.
+///
+/// This is the half of `blazy-shape` that runs inside Masonry's own descent
+/// (§6.2) — the canvas is not consulted at all.
+#[test]
+fn a_rounded_corner_is_not_the_node_in_the_widget_tree() {
+    let (mut harness, _graph) = harness(500);
+    let index = node_inside_the_viewport(&mut harness);
+    let id = live_id(&mut harness, index).expect("the node is on screen");
+    let pos = node_pos(&mut harness, index);
+
+    let corner = Point::new(pos.x + 1.0, pos.y + 1.0);
+    let header = Point::new(pos.x + NODE_SIZE.width / 2.0, pos.y + 6.0);
+
+    assert_eq!(under_pointer(&harness, header), Some(id), "the body is the node");
+    assert_ne!(
+        under_pointer(&harness, corner),
+        Some(id),
+        "a point outside the rounded corner must fall through to what is behind"
+    );
+}
+
+/// The same question asked of the canvas, which answers from the model.
+#[test]
+fn the_canvas_picks_the_node_by_its_shape() {
+    let (mut harness, _graph) = harness(500);
+    let index = node_inside_the_viewport(&mut harness);
+    let pos = node_pos(&mut harness, index);
+
+    let centre = Point::new(pos.x + NODE_SIZE.width / 2.0, pos.y + NODE_SIZE.height / 2.0);
+    assert_eq!(pick(&mut harness, centre).and_then(CanvasHit::node), Some(index));
+    // The corner falls through to whatever is behind it, which in a wired graph is
+    // usually a link — that is what falling through is for.
+    assert_eq!(
+        pick(&mut harness, Point::new(pos.x + 1.0, pos.y + 1.0)).and_then(CanvasHit::node),
+        None
+    );
+}
+
+/// A link is not a widget, so this is the only route to it that exists.
+#[test]
+fn a_link_can_be_picked_and_highlights_under_the_pointer() {
+    let (mut harness, _graph) = harness(500);
+    // Every node is wired to its right-hand neighbour; the curve leaves the right
+    // edge at half height and arrives at the next node's left edge, and its midpoint
+    // is the midpoint of the two ends because the handles are symmetric.
+    let index = node_inside_the_viewport(&mut harness);
+    let from = node_pos(&mut harness, index);
+    let to = node_pos(&mut harness, index + 1);
+    let on_curve = Point::new(
+        (from.x + NODE_SIZE.width + to.x) / 2.0,
+        (from.y + to.y) / 2.0 + NODE_SIZE.height / 2.0,
+    );
+
+    let hit = pick(&mut harness, on_curve);
+    assert!(
+        matches!(hit, Some(CanvasHit::Link { .. })),
+        "expected a link at {on_curve:?}, got {hit:?}"
+    );
+
+    // And the interactive route: moving the pointer there records the same thing.
+    harness.mouse_move(on_curve);
+    let _ = harness.redraw();
+    assert_eq!(canvas_stats(&mut harness).hovered, hit);
+}
+
+/// Below the far-field threshold nothing is a widget, and picking still works.
+///
+/// The point of answering from the model: `find_widget_under_pointer` has nothing
+/// to find here, because the nodes are painted into the canvas's own scene.
+#[test]
+fn picking_works_where_there_are_no_widgets() {
+    let (mut harness, _graph) = harness(5000);
+    zoom_out(&mut harness, 0.05);
+    assert!(live(&mut harness).is_empty(), "far field: no widgets at all");
+
+    let pos = node_pos(&mut harness, 0);
+    let view_zoom = canvas_stats(&mut harness).zoom;
+    let centre = Point::new(pos.x + NODE_SIZE.width / 2.0, pos.y + NODE_SIZE.height / 2.0);
+    // Canvas coordinates to window coordinates, by hand: the view is a scale about
+    // the viewport centre, and this test knows how it got there.
+    let centre = Point::new(550.0, 375.0) + (centre - Point::new(550.0, 375.0)) * view_zoom;
+
+    // Some widget is always under the pointer — the canvas itself — but no node is.
+    let found = under_pointer(&harness, centre).expect("the canvas is there");
+    assert!(
+        harness.get_widget_with_id(found).downcast::<GraphNode>().is_none(),
+        "the far field has no node widgets to find"
+    );
+    assert_eq!(pick(&mut harness, centre).and_then(CanvasHit::node), Some(0));
+}
+
+/// Picking must not drag a layout pass behind it: a pointer moving over a graph is
+/// the most common thing that happens to a canvas (§25.4).
+#[test]
+fn hovering_does_not_relayout() {
+    let (mut harness, _graph) = harness(5000);
+    let before = canvas_stats(&mut harness).counters;
+
+    for i in 0..40 {
+        harness.mouse_move(Point::new(120.0 + i as f64 * 12.0, 300.0));
+        let _ = harness.redraw();
+    }
+
+    let after = canvas_stats(&mut harness).counters;
+    assert_eq!(
+        after.child_layouts,
+        before.child_layouts,
+        "hovering laid out {} children",
+        after.child_layouts - before.child_layouts
+    );
+    assert!(after.hit_queries >= 40, "the moves were picked: {}", after.hit_queries);
 }

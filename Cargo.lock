@@ -548,6 +548,7 @@ version = "0.1.0"
 dependencies = [
  "blazy-areas",
  "blazy-canvas",
+ "blazy-shape",
 ]
 
 [[package]]
@@ -561,8 +562,16 @@ dependencies = [
 name = "blazy-canvas"
 version = "0.1.0"
 dependencies = [
+ "blazy-shape",
  "masonry",
  "strum",
+]
+
+[[package]]
+name = "blazy-shape"
+version = "0.1.0"
+dependencies = [
+ "masonry",
 ]
 
 [[package]]
@@ -2140,6 +2149,7 @@ version = "0.1.0"
 dependencies = [
  "bench-utils",
  "blazy-canvas",
+ "blazy-shape",
  "clap",
  "image",
  "masonry",

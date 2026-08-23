@@ -1,6 +1,6 @@
 [package]
-name = "blazy"
-description = "A Blender-style UI layer on top of Masonry."
+name = "blazy-shape"
+description = "Shape-accurate hit testing for Masonry widgets and for curves that are not widgets."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-blazy-areas = { workspace = true }
-blazy-canvas = { workspace = true }
-blazy-shape = { workspace = true }
+masonry = { workspace = true }

@@ -13,9 +13,10 @@ It is early. Nothing is usable yet, and the work so far has gone into de-risking
 subsystems by measurement before building them out, because several of the load-bearing
 assumptions turned out to be false when checked (§20.2, §22.1). Each phase asks one
 architectural question, answers it with numbers, and writes the answer into
-`rnd/architecture.md` as a numbered section. Phases 0 (node canvas), 0.5 (areas) and
-0.6 (regions and `ui_scale`) and 1.1 (render and sharpness) are done; their checks run
-in CI on every push, so the answers keep holding rather than becoming folklore.
+`rnd/architecture.md` as a numbered section. Phases 0 (node canvas), 0.5 (areas), 0.6
+(regions and `ui_scale`), 1.1 (render and sharpness) and the shape hit test (§25) are
+done; their checks run in CI on every push, so the answers keep holding rather than
+becoming folklore.
 
 Treat the examples as the current front line, not as demos: each one is where a
 subsystem is being worked out before it moves into a crate. That it is a library rather
@@ -70,6 +71,7 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy` | Facade — the crate an application depends on. Re-exports the rest. |
 | `crates/blazy-canvas` | Virtualised, zoomable canvas: nodes, links, spatial index. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
+| `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
@@ -135,10 +137,13 @@ on screen — conflating them walks the region once per frame.
 derived from the widest node rather than assumed to be one cell: a node wider than a
 cell would otherwise stop being drawn near the left edge, silently.
 
-**Sweep endpoints are part of a criterion.** The node sweep stopped at 16 000 and the
-"frame cost does not follow graph size" criterion passed for months while a linear cost
-sat there — it only shows above 64 000. When adding a criterion, check where the effect
-it guards against actually becomes visible.
+**Sweep endpoints are part of a criterion, at both ends.** The node sweep stopped at
+16 000 and the "frame cost does not follow graph size" criterion passed for months while
+a linear cost sat there — it only shows above 64 000 (§24.1). The picking sweep had the
+opposite fault: it started at 250 nodes, a graph *smaller* than the region the canvas
+records links for, so the low end measured the graph running out rather than the index
+working (§25.4). When adding a criterion, check where the effect it guards against
+actually becomes visible — and where it is still hidden by something else.
 
 **The canvas is two widgets and they cannot be merged (§20.3).** `CanvasLayer` holds
 the viewport, the clip path and the view; `CanvasContent` carries the view transform
@@ -156,6 +161,14 @@ that seam: the tree is what will later be serialised into a workspace file.
 Rectangles are **rounded to whole pixels**, and that is load-bearing rather than
 cosmetic — a fractional boundary makes every area count as resized on every frame of a
 drag.
+
+**Picking asks the model, not the widget tree (§25.3).** A node below the far-field
+threshold has no widget and a link never has one, so `find_widget_under_pointer` cannot
+answer for either; `CanvasLayer::hit_test` answers from the geometry and the recorded
+curve set instead. Two consequences that are easy to undo by accident: the pick
+tolerance is in **screen pixels** and divided by the scale at test time (canvas units
+span a factor of 400 across the zoom range), and a pick must not run layout — which is
+why its counters are published by the pick itself rather than by the layout pass.
 
 **`ui_scale` goes into layout; `view` goes only into paint (§9, §22).** Mixing them
 means re-running layout on every frame of a zoom. Four criteria and seven tests hold

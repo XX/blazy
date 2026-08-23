@@ -8,14 +8,22 @@
 //! The node also implements level of detail. The interesting part is not that it
 //! draws less when zoomed out, but that at [`Detail::Box`] it *stashes* its
 //! contents: a stashed widget is not laid out, not painted and not hit-tested.
+//!
+//! It is drawn as a rounded rectangle, so it is picked as one too, twice over: the
+//! widget overrides `find_widget_under_pointer` with a [`ShapeHit`], and
+//! [`GraphSource::hit`] answers the same question for the canvas, which needs it for
+//! nodes that have no widget at all. Both go through the same shape — a corner the
+//! eye sees as empty has to be empty to the pointer as well.
 
 use std::any::TypeId;
 
 use blazy_canvas::{CanvasDetail, Detail, NodeSource};
+use blazy_shape::ShapeHit;
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx,
-    PropertiesMut, PropertiesRef, RegisterCtx, UpdateCtx, UsesProperty, Widget, WidgetId, WidgetPod,
+    PropertiesMut, PropertiesRef, QueryCtx, RegisterCtx, UpdateCtx, UsesProperty, Widget, WidgetId, WidgetPod,
+    WidgetRef,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, Point, Rect, RoundedRect, Size, Stroke};
@@ -61,6 +69,12 @@ pub struct GraphNode {
     /// state rather than a stale default.
     #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
     built_value: f64,
+    /// The body as a hit shape, rebuilt in `layout` when the size changes.
+    ///
+    /// Rebuilt there rather than derived per pick because a `ShapeHit` carries a
+    /// flattened cache, and rebuilding it on every pointer move would throw the cache
+    /// away exactly when it pays (§25.1).
+    hit: ShapeHit,
 }
 
 /// The interactive half of a node, built only at [`Detail::Full`].
@@ -97,6 +111,7 @@ impl GraphNode {
             value: state.value,
             checked: state.checked,
             built_value: state.value,
+            hit: body_shape(Size::ZERO),
         })
         .erased()
     }
@@ -129,6 +144,14 @@ impl Widget for GraphNode {
     }
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
+        // The hit shape follows the size, and it is the *drawn* shape: `paint` fills
+        // the same rounded rectangle. Two places deriving a body from the size is one
+        // too many, but the alternative — rebuilding the shape inside the hit test —
+        // throws away the flattened cache on every pointer move.
+        if self.hit.bounds().size() != size {
+            self.hit = body_shape(size);
+        }
+
         // Whether this node has controls was decided when it was built, not here.
         // Below Full it has none at all, so there is nothing to stash and nothing to
         // lay out — which is the entire saving.
@@ -236,6 +259,16 @@ impl Widget for GraphNode {
         }
     }
 
+    /// The precise half of the two-phase hit test (`rnd/architecture.md` §6.2).
+    ///
+    /// Masonry has already checked the bounding box by the time this runs; what it
+    /// cannot know is that the corners are rounded away. Without this a click three
+    /// pixels into the corner of a node lands on the node instead of on whatever is
+    /// behind it — a link, or the empty canvas that starts a pan.
+    fn find_widget_under_pointer<'c>(&'c self, ctx: QueryCtx<'c>, pos: Point) -> Option<WidgetRef<'c, dyn Widget>> {
+        self.hit.find_widget(self, ctx, pos)
+    }
+
     fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
         CanvasDetail::prop_changed(ctx, property_type);
     }
@@ -261,19 +294,41 @@ impl Widget for GraphNode {
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
 }
 
+/// The node body as a hit shape.
+///
+/// The same rounded rectangle `paint` fills. One function, so the two cannot drift
+/// apart: a shape that is picked where it is not drawn is a bug nobody sees until
+/// they click.
+fn body_shape(size: Size) -> ShapeHit {
+    ShapeHit::fill(RoundedRect::from_rect(
+        Rect::from_origin_size(Point::ORIGIN, size),
+        RADIUS,
+    ))
+}
+
 /// Builds and draws nodes for the canvas.
 ///
-/// A struct rather than a closure because the canvas needs two things from it: a
-/// widget when the node is big enough to interact with, and a rectangle when it is
-/// not. See [`NodeSource::paint_far`].
+/// A struct rather than a closure because the canvas needs three things from it: a
+/// widget when the node is big enough to interact with, a rectangle when it is not,
+/// and the answer to "is this point on this node" for both cases. See
+/// [`NodeSource::paint_far`] and [`NodeSource::hit`].
 pub struct GraphSource {
     graph: SharedGraph,
+    /// One shape for every node, because every node is the same size.
+    ///
+    /// Kept here rather than built per pick: the flattened cache inside it is what
+    /// makes the exact test 15x cheaper than re-walking the path (§25.1), and it only
+    /// pays if it survives between picks.
+    body: ShapeHit,
 }
 
 impl GraphSource {
     /// Creates a source over the given graph.
     pub fn new(graph: SharedGraph) -> Self {
-        Self { graph }
+        Self {
+            graph,
+            body: body_shape(crate::model::NODE_SIZE),
+        }
     }
 }
 
@@ -283,9 +338,21 @@ impl NodeSource for GraphSource {
     }
 
     fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {
-        // The far field: no widget, no layout, no hit route — one filled rounded
-        // rect per node, straight into the canvas's own scene.
+        // The far field: no widget, no layout, no widget-tree hit route — one filled
+        // rounded rect per node, straight into the canvas's own scene. Picking still
+        // works, because the canvas asks `hit` rather than the tree.
         let tint = self.graph.borrow().node(index).tint;
         painter.fill(RoundedRect::from_rect(rect, RADIUS), tint).draw();
+    }
+
+    fn hit(&mut self, _index: usize, rect: Rect, point: Point) -> bool {
+        // Every generated node has the same size, so one shape serves them all: the
+        // point moves into the shape's frame instead of the shape moving to the node.
+        // A graph with per-node sizes would keep a shape per size, not per node.
+        if rect.size() != crate::model::NODE_SIZE {
+            return rect.contains(point);
+        }
+        // Scale is irrelevant for a fill: only a stroke has a tolerance to convert.
+        self.body.contains(point - rect.origin().to_vec2(), 1.0)
     }
 }

@@ -12,5 +12,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+blazy-shape = { workspace = true }
 masonry = { workspace = true }
 strum = { workspace = true }

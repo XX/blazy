@@ -40,12 +40,11 @@
 //!
 //! # What is missing
 //!
-//! Not a finished node editor yet. Culling is a linear scan rather than a spatial
-//! index ([`CanvasContent::cull`]) — the only remaining per-frame cost that is linear
-//! in the size of the graph — and there is no link layer, no selection model and no
-//! serialisation. Those are the next things to build here (§16, item 10); the three
-//! claims above have been measured and held (§20), so the shape underneath them is
-//! not in question.
+//! Not a finished node editor yet. Virtualisation, level of detail, the link layer
+//! and the spatial index are in and measured (§20, §24), and so is picking by shape
+//! rather than by rectangle (§25) — but there is no selection model and no
+//! serialisation of the graph. Those are domain work on top of a canvas whose shape
+//! is no longer in question.
 
 mod index;
 mod links;
@@ -53,6 +52,7 @@ mod links;
 use std::any::TypeId;
 use std::cell::Cell;
 
+use blazy_shape::{near_segment, scale_of};
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
     AccessCtx, AllowRawMut, ChildrenIds, ComposeCtx, EventCtx, LayoutCtx, MeasureCtx, MutateCtx, NewWidget, NoAction,
@@ -69,7 +69,7 @@ use strum::IntoStaticStr;
 
 use crate::index::SpatialIndex;
 pub use crate::links::Link;
-use crate::links::{LinkLayer, link_path};
+use crate::links::{LinkLayer, link_curve, link_path};
 
 /// How much detail a canvas child should draw at the current zoom level.
 ///
@@ -183,16 +183,58 @@ impl CanvasDetail {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkStyle {
     pub color: Color,
+    /// Colour of the link under the pointer.
+    pub hover_color: Color,
     /// Stroke width in canvas units, so links thicken with the zoom like everything
     /// else the canvas draws.
     pub width: f64,
+    /// How far the pointer may miss a link and still pick it, in **screen pixels**.
+    ///
+    /// Screen pixels rather than canvas units, because the tolerance is about the
+    /// pointer and not about the drawing: four canvas units are 0.08 px at the bottom
+    /// of the zoom range and 32 px at the top, which would make a link unpickable
+    /// exactly where it is thinnest (`rnd/architecture.md` §25.2).
+    pub slop: f64,
 }
 
 impl Default for LinkStyle {
     fn default() -> Self {
         Self {
             color: Color::from_rgb8(0x8a, 0x8a, 0x96),
+            hover_color: Color::from_rgb8(0xd8, 0xd8, 0xe4),
             width: 2.0,
+            slop: blazy_shape::DEFAULT_SLOP,
+        }
+    }
+}
+
+/// What the canvas found under a point.
+///
+/// Nodes win over links, at every detail level, because that is the order they are
+/// painted in (§25.3): a pointer that disagrees with the picture is worse than one
+/// that is imprecise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CanvasHit {
+    /// A node, with the canvas-space position of its top-left corner.
+    Node { index: usize, pos: Point },
+    /// A link, by its index in the edge list.
+    Link { edge: usize, link: Link },
+}
+
+impl CanvasHit {
+    /// The node index, if this is a node.
+    pub fn node(self) -> Option<usize> {
+        match self {
+            Self::Node { index, .. } => Some(index),
+            Self::Link { .. } => None,
+        }
+    }
+
+    /// The edge index, if this is a link.
+    pub fn link(self) -> Option<usize> {
+        match self {
+            Self::Link { edge, .. } => Some(edge),
+            Self::Node { .. } => None,
         }
     }
 }
@@ -218,6 +260,12 @@ pub struct CanvasStats {
     pub detail: Option<Detail>,
     /// Current zoom factor.
     pub zoom: f64,
+    /// What the pointer was last found to be over, as of the last pointer move.
+    ///
+    /// One frame behind whatever moved the pointer, because it is recorded during
+    /// event handling and read here during layout — which is exactly the point: a
+    /// pick must not ask for a layout pass of its own (§25.4).
+    pub hovered: Option<CanvasHit>,
     /// Cumulative work counters.
     pub counters: CanvasCounters,
 }
@@ -267,6 +315,23 @@ pub struct CanvasCounters {
     /// region reuse it untouched. If this climbs while panning, the region is too
     /// tight and the recording is being thrown away every frame.
     pub far_repaints: u64,
+    /// Picks performed: pointer moves, button presses, explicit hit tests.
+    ///
+    /// The denominator of the two counters below. On its own it says only how often
+    /// the question was asked.
+    pub hit_queries: u64,
+    /// Node geometries examined while answering picks, summed.
+    ///
+    /// Bounded by the grid cell the point falls in plus its slack, so it is bounded
+    /// by node *density* and not by the size of the graph — which is the difference
+    /// between a pointer that stays cheap on a million nodes and one that does not.
+    pub hit_node_tests: u64,
+    /// Link curves examined while answering picks, summed.
+    ///
+    /// Candidates are the links the canvas has actually recorded, so what can be
+    /// clicked is exactly what can be seen and the count is bounded by the viewport
+    /// region rather than by the edge list.
+    pub hit_curve_tests: u64,
 }
 
 /// Builds the widget for a node when it scrolls into view.
@@ -302,6 +367,26 @@ pub trait NodeSource: 'static {
     /// `rect` is in canvas coordinates. The default draws nothing.
     fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {
         let _ = (index, rect, painter);
+    }
+
+    /// Whether the canvas-space `point` is inside node `index`, whose rectangle is
+    /// `rect`.
+    ///
+    /// The canvas knows where a node is and how big it is; only the application knows
+    /// what it looks like, and a node is not usually its bounding box — a rounded
+    /// corner, a notch, a circular port. This is the seam: the canvas narrows the
+    /// candidates down through its index and asks this about each survivor, so an
+    /// implementation is called a handful of times per pick and can afford to be
+    /// exact. `blazy_shape::ShapeHit` is the intended tool, kept by the implementor
+    /// so that its flattened cache survives between picks.
+    ///
+    /// Called for nodes that have no widget as well — the far field, and anything
+    /// off the materialised set — which is why it cannot be a method on the widget.
+    ///
+    /// The default is the rectangle, which is what the canvas would answer on its own.
+    fn hit(&mut self, index: usize, rect: Rect, point: Point) -> bool {
+        let _ = index;
+        rect.contains(point)
     }
 }
 
@@ -509,6 +594,8 @@ pub struct CanvasContent {
     link_style: LinkStyle,
     /// The node the pointer is on, if any. Only meaningful with `controls_on_hover`.
     active: Option<usize>,
+    /// What the pointer is over, node or link. Repainted, never relaid out.
+    hovered: Option<CanvasHit>,
     /// Whether only the node under the pointer gets interactive controls.
     controls_on_hover: bool,
     /// Set when `detail` or `active` changed, so stale widgets get rebuilt.
@@ -536,6 +623,9 @@ pub struct CanvasContent {
     far_repaints: u64,
     visits: u64,
     link_repaints: u64,
+    hit_queries: u64,
+    hit_node_tests: u64,
+    hit_curve_tests: u64,
 }
 
 // `CanvasLayer` owns this widget completely and reaches into it during layout to
@@ -558,6 +648,7 @@ impl CanvasContent {
             links: LinkLayer::default(),
             link_style: LinkStyle::default(),
             active: None,
+            hovered: None,
             controls_on_hover: false,
             detail_dirty: false,
             pending_stale: false,
@@ -574,7 +665,115 @@ impl CanvasContent {
             far_repaints: 0,
             visits: 0,
             link_repaints: 0,
+            hit_queries: 0,
+            hit_node_tests: 0,
+            hit_curve_tests: 0,
         }
+    }
+
+    // --- MARK: HIT TESTING
+
+    /// What is under a canvas-space point.
+    ///
+    /// `scale` is how many screen pixels one canvas unit covers, which is what turns
+    /// a tolerance in pixels into one in canvas units (§25.2).
+    ///
+    /// Answered from the model rather than from the widget tree, and that is the
+    /// whole reason this exists: below the far-field threshold no node has a widget
+    /// at all, and a link never has one. `find_widget_under_pointer` cannot see
+    /// either of them, so the canvas has to answer for both.
+    fn hit(&mut self, canvas_pos: Point, scale: f64) -> Option<CanvasHit> {
+        self.hit_queries += 1;
+        self.hit_node(canvas_pos).or_else(|| self.hit_link(canvas_pos, scale))
+    }
+
+    /// The topmost node under a point, or `None`.
+    fn hit_node(&mut self, canvas_pos: Point) -> Option<CanvasHit> {
+        let mut candidates = std::mem::take(&mut self.scratch_candidates);
+        // A point, not a rect: the grid widens the query by its own slack, which is
+        // derived from the widest node, so a node reaching into the cell from
+        // outside is still a candidate (§24.2).
+        self.index
+            .candidates(Rect::from_points(canvas_pos, canvas_pos), &mut candidates);
+        self.hit_node_tests += candidates.len() as u64;
+
+        // Descending index order: children are placed in ascending order, so the
+        // highest index is the one painted last and therefore on top.
+        let mut found = None;
+        for &index in candidates.iter().rev() {
+            let slot = &self.slots[index];
+            let rect = Rect::from_origin_size(slot.pos, slot.size);
+            // The rectangle first because it is free and rejects almost everything;
+            // the exact shape only for what survives.
+            if rect.contains(canvas_pos) && self.source.hit(index, rect, canvas_pos) {
+                found = Some(CanvasHit::Node {
+                    index,
+                    pos: rect.origin(),
+                });
+                break;
+            }
+        }
+        self.scratch_candidates = candidates;
+        found
+    }
+
+    /// The topmost link under a point, or `None`.
+    ///
+    /// Candidates are the links the canvas has recorded for this viewport, so what
+    /// can be picked is exactly what is drawn — the selection rule of §24.4 and its
+    /// limitation, inherited rather than reinvented. Choosing candidates a second
+    /// way would mean a pointer that picks a curve nobody can see, or misses one
+    /// everybody can.
+    fn hit_link(&mut self, canvas_pos: Point, scale: f64) -> Option<CanvasHit> {
+        if self.links.is_empty() {
+            return None;
+        }
+        let radius = self.link_style.width / 2.0
+            + if scale > f64::EPSILON {
+                self.link_style.slop / scale
+            } else {
+                0.0
+            };
+
+        let mut examined = 0_u64;
+        let mut found = None;
+        // Reverse recorded order: the curves are stroked in ascending order, so the
+        // last one drawn is the one on top.
+        for &edge in self.links.recorded().iter().rev() {
+            let link = self.links.edge(edge);
+            let (Some(from), Some(to)) = (self.slots.get(link.from as usize), self.slots.get(link.to as usize)) else {
+                continue;
+            };
+            examined += 1;
+            let curve = link_curve(
+                Rect::from_origin_size(from.pos, from.size),
+                Rect::from_origin_size(to.pos, to.size),
+            );
+            if near_segment(curve.into(), canvas_pos, radius) {
+                found = Some(CanvasHit::Link {
+                    edge: edge as usize,
+                    link,
+                });
+                break;
+            }
+        }
+        self.hit_curve_tests += examined;
+        found
+    }
+
+    /// Records what the pointer is over. Returns whether the canvas has to repaint.
+    ///
+    /// A repaint, never a layout: highlighting the link under the pointer changes
+    /// pixels and nothing else. Materialising controls for the node under the pointer
+    /// is a different question with a different answer, and it lives in
+    /// [`CanvasLayer::set_active`].
+    fn set_hovered(&mut self, hit: Option<CanvasHit>) -> bool {
+        if self.hovered == hit {
+            return false;
+        }
+        let was = self.hovered.and_then(CanvasHit::link);
+        self.hovered = hit;
+        was.is_some() || hit.and_then(CanvasHit::link).is_some()
     }
 
     /// The detail level node `index` should be built at.
@@ -846,6 +1045,7 @@ impl Widget for CanvasContent {
         if !self.links.is_empty() {
             self.link_repaints += 1;
             let stroke = Stroke::new(self.link_style.width);
+            let hovered = self.hovered.and_then(CanvasHit::link);
             for &edge in self.links.recorded() {
                 let link = self.links.edge(edge);
                 let (Some(from), Some(to)) = (self.slots.get(link.from as usize), self.slots.get(link.to as usize))
@@ -856,7 +1056,12 @@ impl Widget for CanvasContent {
                     Rect::from_origin_size(from.pos, from.size),
                     Rect::from_origin_size(to.pos, to.size),
                 );
-                painter.stroke(&path, &stroke, self.link_style.color).draw();
+                let color = if hovered == Some(edge as usize) {
+                    self.link_style.hover_color
+                } else {
+                    self.link_style.color
+                };
+                painter.stroke(&path, &stroke, color).draw();
             }
         }
 
@@ -895,6 +1100,22 @@ impl Widget for CanvasContent {
     }
 
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+}
+
+/// Copies what a pick just learned into the published statistics.
+///
+/// Everything else in [`CanvasStats`] is refreshed during layout, which is the
+/// cheapest honest place for it. Picks cannot use it: a hover is meant *not* to run
+/// layout (§25.4), so counters that waited for one would report zero for the very
+/// scenario they exist to measure — and the one place they would be seen is a
+/// benchmark comparing them before and after.
+fn publish_hit_stats(stats: &Cell<CanvasStats>, content: &CanvasContent) {
+    let mut current = stats.get();
+    current.hovered = content.hovered;
+    current.counters.hit_queries = content.hit_queries;
+    current.counters.hit_node_tests = content.hit_node_tests;
+    current.counters.hit_curve_tests = content.hit_curve_tests;
+    stats.set(current);
 }
 
 /// What the pointer is currently doing on the canvas.
@@ -1020,6 +1241,16 @@ impl CanvasLayer {
         self
     }
 
+    /// The canvas-space to viewport-space transform.
+    ///
+    /// Public because anything drawing over the canvas — an overlay, a rubber band,
+    /// a tooltip anchored to a node — has to agree with it about where things are,
+    /// and rederiving it from the zoom and the pan is how two answers start to
+    /// differ.
+    pub fn view(&self) -> Affine {
+        self.view
+    }
+
     /// The current zoom factor, derived from the view transform.
     pub fn zoom(&self) -> f64 {
         let c = self.view.as_coeffs();
@@ -1113,6 +1344,20 @@ impl CanvasLayer {
             .collect()
     }
 
+    /// What is under a point given in this widget's coordinates.
+    ///
+    /// Nodes first, then links; `None` for empty canvas. Answered from the model,
+    /// so it works below the far-field threshold where no node has a widget, and for
+    /// links, which never do.
+    pub fn hit_test(this: &mut WidgetMut<'_, Self>, pos: Point) -> Option<CanvasHit> {
+        let canvas_pos = this.widget.view.inverse() * pos;
+        let scale = this.widget.hit_scale(this.ctx.window_transform());
+        let content = this.ctx.get_mut(&mut this.widget.content);
+        let hit = content.widget.hit(canvas_pos, scale);
+        publish_hit_stats(&this.widget.stats, content.widget);
+        hit
+    }
+
     /// The canvas-space position of a child.
     pub fn child_pos(this: &mut WidgetMut<'_, Self>, index: usize) -> Option<Point> {
         let content = this.ctx.get_mut(&mut this.widget.content);
@@ -1149,6 +1394,17 @@ impl CanvasLayer {
         content.store_child_pos(index, pos).apply(&mut raw);
     }
 
+    /// How many screen pixels one canvas unit covers.
+    ///
+    /// The zoom is only part of it: the canvas may itself be scaled by whatever it
+    /// sits inside — a region with its own `ui_scale`, a device scale factor — and a
+    /// tolerance in screen pixels has to account for the whole chain. The content
+    /// widget's own transform is exactly this product, but reading it back through
+    /// the arena during an event would cost more than multiplying two numbers.
+    fn hit_scale(&self, window: Affine) -> f64 {
+        scale_of(window) * self.zoom()
+    }
+
     /// Marks the node under the pointer, so only it gets interactive controls.
     ///
     /// Returns `true` if the active node changed.
@@ -1163,18 +1419,38 @@ impl CanvasLayer {
         true
     }
 
-    /// Finds the topmost child under a canvas-space point, from an event handler.
-    fn hit_child(&mut self, canvas_pos: Point, ctx: &mut EventCtx<'_>) -> Option<(usize, Point)> {
-        let (content, _) = ctx.get_raw(&mut self.content);
-        // Hit testing uses the visible set, not the materialised one, so nodes stay
-        // grabbable in far-field mode where they have no widget at all.
-        content
-            .visible
-            .iter()
-            .rev()
-            .map(|&i| (i, &content.slots[i]))
-            .find(|(_, s)| Rect::from_origin_size(s.pos, s.size).contains(canvas_pos))
-            .map(|(i, s)| (i, s.pos))
+    /// Picks what is under a point, from an event handler.
+    fn hit_at(&mut self, pos: Point, ctx: &mut EventCtx<'_>) -> Option<CanvasHit> {
+        let canvas_pos = self.view.inverse() * pos;
+        let scale = self.hit_scale(ctx.window_transform());
+        let (content, _) = ctx.get_raw_mut(&mut self.content);
+        let hit = content.hit(canvas_pos, scale);
+        publish_hit_stats(&self.stats, content);
+        hit
+    }
+
+    /// Records what the pointer is over and asks for whatever that changes.
+    ///
+    /// A hover changes pixels — the link under the pointer is highlighted — and with
+    /// `controls_on_hover` it also changes which node has real controls, which is a
+    /// layout. Keeping the two apart is the same distinction the link layer makes
+    /// between repainting a curve and re-choosing the set (§24.3): a highlight must
+    /// not drag a relayout of the graph behind it.
+    fn hover(&mut self, pos: Point, ctx: &mut EventCtx<'_>) {
+        let hit = self.hit_at(pos, ctx);
+        self.set_hovered(hit, ctx);
+        if self.controls_on_hover {
+            self.set_active(hit.and_then(CanvasHit::node), ctx);
+        }
+    }
+
+    /// Stores what the pointer is over, repainting if the highlight changed.
+    fn set_hovered(&mut self, hit: Option<CanvasHit>, ctx: &mut EventCtx<'_>) {
+        let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+        if content.set_hovered(hit) {
+            raw.request_paint_only();
+        }
+        publish_hit_stats(&self.stats, content);
     }
 }
 
@@ -1203,12 +1479,16 @@ impl Widget for CanvasLayer {
                 self.drag = match e.button {
                     // Left button drags a node if there is one under the pointer,
                     // and pans otherwise.
-                    Some(PointerButton::Primary) => match self.hit_child(canvas_pos, ctx) {
-                        Some((index, child_pos)) => Drag::Node {
+                    Some(PointerButton::Primary) => match self.hit_at(pos, ctx) {
+                        Some(CanvasHit::Node { index, pos: child_pos }) => Drag::Node {
                             index,
                             grab: canvas_pos - child_pos,
                         },
-                        None => Drag::Pan { last: pos },
+                        // A link is pickable but not yet draggable: selection and
+                        // rewiring are operators, and operators are `blazy-ops`
+                        // (§11). Until then a press on a curve pans, as it did
+                        // before curves could be picked at all.
+                        Some(CanvasHit::Link { .. }) | None => Drag::Pan { last: pos },
                     },
                     // Middle button always pans, as in Blender.
                     Some(PointerButton::Auxiliary) => Drag::Pan { last: pos },
@@ -1222,14 +1502,7 @@ impl Widget for CanvasLayer {
             PointerEvent::Move(PointerUpdate { current, .. }) => {
                 let pos = ctx.local_position(current.position);
                 match self.drag {
-                    Drag::None if self.controls_on_hover => {
-                        // Materialise controls for the node under the pointer, and
-                        // only that one. Everything else keeps its painted stand-in.
-                        let canvas_pos = self.view.inverse() * pos;
-                        let hit = self.hit_child(canvas_pos, ctx).map(|(index, _)| index);
-                        self.set_active(hit, ctx);
-                    },
-                    Drag::None => {},
+                    Drag::None => self.hover(pos, ctx),
                     Drag::Pan { last } => {
                         self.drag = Drag::Pan { last: pos };
                         let view = Affine::translate(pos - last) * self.view;
@@ -1243,8 +1516,11 @@ impl Widget for CanvasLayer {
                     },
                 }
             },
-            PointerEvent::Leave(_) if self.controls_on_hover => {
-                self.set_active(None, ctx);
+            PointerEvent::Leave(_) => {
+                self.set_hovered(None, ctx);
+                if self.controls_on_hover {
+                    self.set_active(None, ctx);
+                }
             },
             PointerEvent::Up(_) | PointerEvent::Cancel(_) => {
                 if self.drag != Drag::None {
@@ -1371,6 +1647,7 @@ impl Widget for CanvasLayer {
             materialised: content.live.len(),
             detail: content.detail,
             zoom,
+            hovered: content.hovered,
             counters: CanvasCounters {
                 content_layouts: content.layouts,
                 child_layouts: content.child_layouts,
@@ -1380,6 +1657,9 @@ impl Widget for CanvasLayer {
                 slot_visits: content.visits,
                 link_repaints: content.link_repaints,
                 link_reselects: content.links.refreshes(),
+                hit_queries: content.hit_queries,
+                hit_node_tests: content.hit_node_tests,
+                hit_curve_tests: content.hit_curve_tests,
             },
         });
     }
@@ -1451,6 +1731,206 @@ mod tests {
         assert_eq!(thresholds.for_scale(1.0), Detail::Full);
         assert_eq!(thresholds.for_scale(0.2), Detail::Simplified);
         assert_eq!(thresholds.for_scale(0.01), Detail::Box);
+    }
+
+    // --- MARK: HIT TESTS
+
+    /// A source whose nodes are rounded rectangles, like a real one.
+    struct RoundedSource {
+        shape: blazy_shape::ShapeHit,
+        size: Size,
+    }
+
+    impl RoundedSource {
+        fn new(size: Size) -> Self {
+            Self {
+                shape: blazy_shape::ShapeHit::fill(masonry::kurbo::RoundedRect::from_rect(
+                    Rect::from_origin_size(Point::ORIGIN, size),
+                    12.0,
+                )),
+                size,
+            }
+        }
+    }
+
+    impl NodeSource for RoundedSource {
+        fn build(&mut self, _index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
+            unimplemented!("these tests never materialise a widget: that is the point")
+        }
+
+        fn hit(&mut self, _index: usize, rect: Rect, point: Point) -> bool {
+            assert_eq!(rect.size(), self.size);
+            self.shape.contains(point - rect.origin().to_vec2(), 1.0)
+        }
+    }
+
+    /// A canvas content over the given node rectangles and edges, already culled.
+    ///
+    /// Built directly rather than through a harness: everything under test answers
+    /// from the model, so a widget tree would only add a way for the test to be
+    /// about something else.
+    fn content(rects: &[Rect], edges: Vec<Link>, visible: Rect) -> CanvasContent {
+        let size = rects.first().map_or(Size::ZERO, Rect::size);
+        let slots = rects
+            .iter()
+            .map(|r| Slot {
+                pos: r.origin(),
+                size: r.size(),
+                pod: None,
+                built: None,
+            })
+            .collect();
+        let mut content = CanvasContent::new(slots, Box::new(RoundedSource::new(size)));
+        content.links = LinkLayer::new(edges, rects.len());
+        content.links.invalidate();
+        content.detail = Some(Detail::Full);
+        content.visible_rect = visible;
+        content.cull();
+        content
+    }
+
+    fn node_rect(x: f64, y: f64) -> Rect {
+        Rect::from_origin_size(Point::new(x, y), Size::new(100.0, 60.0))
+    }
+
+    const EVERYTHING: Rect = Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
+
+    /// The claim of §6.1: the hit geometry is the shape, not the box it sits in.
+    #[test]
+    fn a_point_in_the_corner_of_a_node_misses_it() {
+        let mut canvas = content(&[node_rect(0.0, 0.0)], Vec::new(), EVERYTHING);
+        let corner = Point::new(1.0, 1.0);
+
+        assert!(node_rect(0.0, 0.0).contains(corner), "inside the rectangle");
+        assert_eq!(canvas.hit(corner, 1.0), None, "outside the rounded body");
+        assert!(matches!(
+            canvas.hit(Point::new(50.0, 30.0), 1.0),
+            Some(CanvasHit::Node { index: 0, .. })
+        ));
+    }
+
+    /// Picking a link is the case Masonry cannot answer at all: a curve is not a
+    /// widget, so nothing in the tree knows it is there.
+    #[test]
+    fn a_link_is_picked_along_its_curve() {
+        let mut canvas = content(
+            &[node_rect(0.0, 0.0), node_rect(400.0, 0.0)],
+            vec![Link::new(0, 1)],
+            EVERYTHING,
+        );
+
+        // The curve runs from the right edge of one node to the left edge of the
+        // other, both centred on y = 30.
+        assert!(matches!(
+            canvas.hit(Point::new(250.0, 30.0), 1.0),
+            Some(CanvasHit::Link { edge: 0, .. })
+        ));
+        assert_eq!(canvas.hit(Point::new(250.0, 90.0), 1.0), None);
+    }
+
+    /// Nodes are painted over links, so they are picked over links too (§25.3).
+    #[test]
+    fn a_node_wins_over_a_link_running_under_it() {
+        let mut canvas = content(
+            &[node_rect(0.0, 0.0), node_rect(400.0, 0.0), node_rect(200.0, 0.0)],
+            vec![Link::new(0, 1)],
+            EVERYTHING,
+        );
+        let on_both = Point::new(250.0, 30.0);
+
+        assert!(
+            blazy_shape::near_segment(
+                crate::links::link_curve(node_rect(0.0, 0.0), node_rect(400.0, 0.0)).into(),
+                on_both,
+                4.0
+            ),
+            "the point really is on the curve"
+        );
+        assert!(matches!(
+            canvas.hit(on_both, 1.0),
+            Some(CanvasHit::Node { index: 2, .. })
+        ));
+    }
+
+    /// The tolerance is in screen pixels, so the same canvas point picks a link when
+    /// the canvas is zoomed out and misses it when zoomed in (§25.2).
+    #[test]
+    fn the_link_tolerance_follows_the_zoom() {
+        let mut canvas = content(
+            &[node_rect(0.0, 0.0), node_rect(400.0, 0.0)],
+            vec![Link::new(0, 1)],
+            EVERYTHING,
+        );
+        // Three canvas units off the curve, with a stroke one unit wide either side.
+        let near = Point::new(250.0, 33.0);
+
+        assert!(canvas.hit(near, 1.0).is_some(), "3 px away at 1x");
+        assert_eq!(canvas.hit(near, 8.0), None, "24 px away at 8x");
+        assert!(canvas.hit(near, 0.25).is_some(), "well under a pixel at 0.25x");
+    }
+
+    /// What can be picked is what is drawn, including where that is not enough: a
+    /// link whose ends are both outside the recorded region is neither (§24.4).
+    #[test]
+    fn a_link_that_is_not_drawn_is_not_picked() {
+        let mut canvas = content(
+            &[node_rect(-5000.0, 0.0), node_rect(5000.0, 0.0)],
+            vec![Link::new(0, 1)],
+            Rect::new(-200.0, -200.0, 200.0, 200.0),
+        );
+
+        assert!(canvas.links.recorded().is_empty(), "neither end is near the viewport");
+        assert_eq!(canvas.hit(Point::new(0.0, 30.0), 1.0), None);
+    }
+
+    /// Nodes below the far-field threshold have no widget at all, and must still be
+    /// pickable — the reason picking asks the model and not the tree (§20.6).
+    #[test]
+    fn a_node_with_no_widget_is_still_picked() {
+        let mut canvas = content(&[node_rect(0.0, 0.0)], Vec::new(), EVERYTHING);
+        canvas.detail = Some(Detail::Box);
+        canvas.cull();
+
+        assert!(canvas.live.is_empty(), "far field: nothing is materialised");
+        assert!(matches!(
+            canvas.hit(Point::new(50.0, 30.0), 1.0),
+            Some(CanvasHit::Node { index: 0, .. })
+        ));
+    }
+
+    /// Picking must not walk the graph: the candidates come from the grid.
+    #[test]
+    fn picking_does_not_examine_the_whole_graph() {
+        let rects: Vec<Rect> = (0..4000)
+            .map(|i| node_rect((i % 80) as f64 * 220.0, (i / 80) as f64 * 220.0))
+            .collect();
+        let mut canvas = content(&rects, Vec::new(), Rect::new(0.0, 0.0, 1100.0, 750.0));
+
+        let before = canvas.hit_node_tests;
+        canvas.hit(Point::new(50.0, 30.0), 1.0);
+        let examined = canvas.hit_node_tests - before;
+
+        assert!(examined < 64, "examined {examined} geometries of 4000");
+    }
+
+    /// A hover highlights a curve, and a highlight is a repaint. Nothing here is
+    /// allowed to ask for layout — that is what `set_active` is for.
+    #[test]
+    fn only_a_link_hover_asks_for_a_repaint() {
+        let mut canvas = content(&[node_rect(0.0, 0.0)], Vec::new(), EVERYTHING);
+        let node = Some(CanvasHit::Node {
+            index: 0,
+            pos: Point::ORIGIN,
+        });
+        let link = Some(CanvasHit::Link {
+            edge: 0,
+            link: Link::new(0, 1),
+        });
+
+        assert!(!canvas.set_hovered(node), "a node highlight is not drawn");
+        assert!(!canvas.set_hovered(node), "and an unchanged hover is not a change");
+        assert!(canvas.set_hovered(link), "arriving on a curve repaints it");
+        assert!(canvas.set_hovered(None), "and leaving it repaints it back");
     }
 
     #[test]
