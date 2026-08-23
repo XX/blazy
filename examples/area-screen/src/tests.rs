@@ -15,14 +15,11 @@
 use bench_utils::render::{block_magnified, differing_fraction, sharpness_gain};
 use blazy_areas::{AreaContent, RegionKind, UiScale};
 use blazy_canvas::CanvasLayer;
+use blazy_shell::Host;
 use image::RgbaImage;
-use imaging_vello_cpu::VelloCpuRenderer;
-use masonry::app::VisualLayerKind;
 use masonry::core::NewWidget;
 use masonry::dpi::PhysicalSize;
-use masonry::imaging::record::{Scene, replay_transformed};
-use masonry::imaging::{ImageRenderer as _, Painter};
-use masonry::kurbo::{Affine, Point, Rect};
+use masonry::kurbo::{Point, Size};
 use masonry::peniko::Color;
 use masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
 use masonry::theme::default_property_set;
@@ -109,33 +106,20 @@ fn canvas_zoom_magnifies_without_blurring() {
 ///
 /// Masonry's own `TestHarness::render` cannot do this: the plan is in logical
 /// coordinates and applying the window's scale factor is the host's job (§4.2), which
-/// the harness does not do. So this is the host — the smallest possible one, and the
-/// first piece of what §16 calls `blazy-shell`.
+/// the harness does not do. §23.4 wrote that host by hand here, in forty lines; it
+/// now lives in `blazy-shell` and this calls it, so the test exercises the code the
+/// window runs rather than a copy of it (§26.4).
 fn render_at_device_scale(harness: &mut TestHarness<AreaContent>, scale: f64, size: (u32, u32)) -> RgbaImage {
     let (plan, _tree) = harness.redraw();
+    let mut host = Host::any()
+        .expect("some backend opens")
+        .with_device_scale(scale)
+        .with_background(Color::from_rgb8(0xff, 0xff, 0xff));
 
-    let (width, height) = (
-        (f64::from(size.0) * scale).round() as u32,
-        (f64::from(size.1) * scale).round() as u32,
-    );
-
-    let mut frame = Scene::new();
-    {
-        let mut painter = Painter::new(&mut frame);
-        painter.fill_rect(
-            Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
-            Color::from_rgb8(0xff, 0xff, 0xff),
-        );
-        for layer in &plan.layers {
-            if let VisualLayerKind::Scene(scene) = &layer.kind {
-                replay_transformed(scene, &mut frame, Affine::scale(scale) * layer.transform);
-            }
-        }
-    }
-
-    let mut renderer = VelloCpuRenderer::new(1, 1);
-    let image = renderer.render_source(&mut frame, width, height).expect("cpu render");
-    RgbaImage::from_vec(image.width, image.height, image.data).expect("rgba image")
+    let frame = host
+        .render(&plan, Size::new(f64::from(size.0), f64::from(size.1)))
+        .expect("the host renders");
+    RgbaImage::from_vec(frame.image.width, frame.image.height, frame.image.data).expect("rgba image")
 }
 
 /// §9, multiplier one: the window's HiDPI factor is an `Affine` like any other, and

@@ -41,7 +41,7 @@ blazy-canvas = { workspace = true }
 blazy-shape = { workspace = true }
 clap = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
-masonry_winit = { workspace = true }
+blazy-shell = { workspace = true }
 
 [dev-dependencies]
 bench-utils = { workspace = true }

@@ -15,3 +15,4 @@ workspace = true
 blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
 blazy-shape = { workspace = true }
+blazy-shell = { workspace = true }

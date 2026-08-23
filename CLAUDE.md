@@ -14,9 +14,9 @@ subsystems by measurement before building them out, because several of the load-
 assumptions turned out to be false when checked (§20.2, §22.1). Each phase asks one
 architectural question, answers it with numbers, and writes the answer into
 `rnd/architecture.md` as a numbered section. Phases 0 (node canvas), 0.5 (areas), 0.6
-(regions and `ui_scale`), 1.1 (render and sharpness) and the shape hit test (§25) are
-done; their checks run in CI on every push, so the answers keep holding rather than
-becoming folklore.
+(regions and `ui_scale`) and the whole of Phase 1 — render and sharpness (§23), the
+shape hit test (§25), the host (§26) — are done; their checks run in CI on every push,
+so the answers keep holding rather than becoming folklore.
 
 Treat the examples as the current front line, not as demos: each one is where a
 subsystem is being worked out before it moves into a crate. That it is a library rather
@@ -31,18 +31,20 @@ Everything goes through `cargo-make`. `cargo fmt` needs nightly; everything else
 stable.
 
 ```bash
-cargo make ci               # what CI runs: lint + tests + both benchmark gates
+cargo make ci               # what CI runs: lint + tests + deps rule + three benchmark gates
 cargo make lint             # fmt --check + clippy -D warnings
 cargo make fmt              # nightly rustfmt
 cargo make test             # cargo test --workspace
+cargo make deps-rule        # core crates must not depend on a window system (§3, §26.4)
 
 cargo make run-node-canvas  # Phase 0 window
 cargo make run-area-screen  # Phase 0.5/0.6 window
 
 cargo make bench-canvas     # Phase 0 measurements and criteria
 cargo make bench-areas      # Phase 0.5/0.6 measurements and criteria
-cargo make bench            # both
-cargo make bench-report     # both, plus JSON reports into target/
+cargo make bench-shell      # host measurements and criteria (§26)
+cargo make bench            # all three
+cargo make bench-report     # all three, plus JSON reports into target/
 ```
 
 **Pass arguments without a `--` separator.** cargo-make forwards the separator itself
@@ -72,6 +74,7 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy-canvas` | Virtualised, zoomable canvas: nodes, links, spatial index. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
 | `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
+| `crates/blazy-shell` | The host: window, event loop, composition, choice of rasteriser. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
@@ -183,12 +186,25 @@ image differs from block magnification. Snapshots are a viable gate here because
 harness pins its font, the rasteriser is CPU-side and the upstream rev is pinned;
 regenerate with `MASONRY_TEST_BLESS=1`.
 
-**The device scale factor is the host's job (§4.2, §23.4).** `VisualLayerPlan` comes
-out in logical coordinates and `TestHarness::render()` never applies a scale factor, so
-anything testing HiDPI has to replay the plan itself. Backend choice is compile-time in
-upstream, but `ImageRenderer` is object-safe and the backend modules are independently
-feature-gated, so a runtime choice is buildable here (§23.5) — it needs our own window
-layer, not an upstream patch.
+**The device scale factor is the host's job (§4.2, §23.4), and the host is now real
+(§26).** `VisualLayerPlan` comes out in logical coordinates; `blazy-shell`'s `Host`
+applies the scale as one `Affine` at composition, which is why a display change costs a
+frame and never a layout pass. Anything testing HiDPI goes through `Host`, not through
+`TestHarness::render()`, which applies no scale factor at all.
+
+**Runtime backend choice is a choice of rasteriser, not of the path to the screen
+(§26.2).** `ImageRenderer` is object-safe and renders into a caller-owned buffer, so
+`Box<dyn ImageRenderer>` picked at startup works. `TextureRenderer` has associated types
+and cannot be a trait object, so presenting straight into a swapchain texture stays a
+compile-time decision and belongs with `blazy-compose` (§7.3). Owner mode therefore
+rasterises to pixels and blits them.
+
+**An external hole lives exactly one paint (§26.1).** `PaintCtx::set_paint_layer_mode`
+is public upstream now — §7.3 and §17 are out of date on that — but the mode is reset
+for every widget at the start of every paint pass, and a clean widget is not painted. A
+widget that wants to stay a host hole has to keep painting; `ExternalContent` does that
+through an animation frame, and a criterion counts frames in which the hole went
+missing.
 
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
@@ -201,12 +217,18 @@ will fail loudly if upstream ever grows a per-subtree scale.
 
 ## Upstream dependency
 
-`masonry` and `masonry_winit` are **git dependencies pinned to a commit** on purpose:
-the rendering IR `imaging`, `Widget::paint(&mut Painter)` and `VisualLayerPlan` exist
-only on git main, and the published 0.4.0 predates that migration. Living on two young
-crates' main branch is the project's declared main risk (§15.1). The pin is in the
-workspace `Cargo.toml`; a local checkout of the pinned tree is the fastest way to
-answer "does Masonry let us do X" and is usually the right first step.
+`masonry` (and `masonry_imaging`, behind an optional feature) are **git dependencies
+pinned to a commit** on purpose: the rendering IR `imaging`,
+`Widget::paint(&mut Painter)` and `VisualLayerPlan` exist only on git main, and the
+published 0.4.0 predates that migration. Living on a young crate's main branch is the
+project's declared main risk (§15.1). The pin is in the workspace `Cargo.toml`; a local
+checkout of the pinned tree is the fastest way to answer "does Masonry let us do X" and
+is usually the right first step.
+
+`masonry_winit` is **no longer a dependency**: `blazy-shell` runs its own winit loop
+over the public `RenderRoot`, because upstream's runner owns a compile-time rasteriser
+and keeps its event conversion private (§26.3). Input conversion is not reimplemented —
+`ui-events-winit` is the same public crate upstream uses.
 
 Strategy towards upstream is **contribute, not fork** (§17). Nothing here patches
 Masonry.
