@@ -70,16 +70,19 @@ command = "cargo"
 toolchain = "stable"
 args = ["bench", "-p", "node-canvas", "--", "--report", "${BENCH_REPORT}", "${@}"]
 
+# `--features vello` so the GPU frame path is measured wherever the machine can run it.
+# On a machine without a graphics device the scenario simply does not run and its
+# criteria are absent, which is the honest answer rather than a failure (§27.5).
 [tasks.bench-shell]
 command = "cargo"
 toolchain = "stable"
-args = ["bench", "-p", "blazy-shell", "--", "${@}"]
+args = ["bench", "-p", "blazy-shell", "--features", "vello", "--", "${@}"]
 
 [tasks.bench-shell-report]
 env = { BENCH_REPORT = "${CARGO_MAKE_WORKING_DIRECTORY}/target/bench-shell-report.json" }
 command = "cargo"
 toolchain = "stable"
-args = ["bench", "-p", "blazy-shell", "--", "--report", "${BENCH_REPORT}", "${@}"]
+args = ["bench", "-p", "blazy-shell", "--features", "vello", "--", "--report", "${BENCH_REPORT}", "${@}"]
 
 [tasks.bench-areas]
 command = "cargo"

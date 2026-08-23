@@ -151,6 +151,15 @@ on screen — conflating them walks the region once per frame.
 derived from the widest node rather than assumed to be one cell: a node wider than a
 cell would otherwise stop being drawn near the left edge, silently.
 
+**A recorded region has to shrink as well as grow (§28).** The link set and the
+far-field set are chosen for a region — the viewport plus half of it on each side — and
+"has the viewport left the region?" is only half the question: a region chosen at the
+overview zoom contains every viewport that follows, so the set never shrank again and
+the canvas kept drawing all 9857 edges at a zoom whose viewport held 96. `region_covers`
+asks for proportion as well as containment. The general lesson is in §28.4: counters
+that measure *work per frame* cannot see a defect that lives in the *size of what is
+held*, and a sweep that enters a state without leaving it tests half a switch.
+
 **Sweep endpoints are part of a criterion, at both ends.** The node sweep stopped at
 16 000 and the "frame cost does not follow graph size" criterion passed for months while
 a linear cost sat there — it only shows above 64 000 (§24.1). The picking sweep had the
@@ -206,9 +215,21 @@ frame and never a layout pass. Anything testing HiDPI goes through `Host`, not t
 **Runtime backend choice is a choice of rasteriser, not of the path to the screen
 (§26.2).** `ImageRenderer` is object-safe and renders into a caller-owned buffer, so
 `Box<dyn ImageRenderer>` picked at startup works. `TextureRenderer` has associated types
-and cannot be a trait object, so presenting straight into a swapchain texture stays a
-compile-time decision and belongs with `blazy-compose` (§7.3). Owner mode therefore
-rasterises to pixels and blits them.
+and cannot be a trait object — so the seam that *is* ours is `Presenter`, and it sits
+after composition rather than around the rasteriser (§27.2).
+
+**Two paths to the screen, and the direct one is not always faster (§27.4).**
+`SwapchainPresenter` draws the scene into a texture and blits it into the swapchain;
+`BlitPresenter` rasterises into a buffer and copies it into the window, and is the
+fallback wherever there is no usable device. Measured: below about a megapixel the blit
+path wins (submission overhead dominates), above it the swapchain path wins by 2-3x, and
+at 3840x2400 the channel swap alone costs 17.4 ms — more than a 60 Hz frame. Both
+examples default to the GPU path; `--backend vello_cpu` selects the other one in a live
+window.
+
+**vello renders through a compute shader**, so the intermediate texture needs
+`STORAGE_BINDING`: without it the first frame fails wgpu validation rather than looking
+wrong (§27.3).
 
 **An external hole lives exactly one paint (§26.1).** `PaintCtx::set_paint_layer_mode`
 is public upstream now — §7.3 and §17 are out of date on that — but the mode is reset

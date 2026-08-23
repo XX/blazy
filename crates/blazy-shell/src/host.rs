@@ -6,9 +6,9 @@
 //! through it rather than through a copy of it.
 
 use masonry::app::VisualLayerPlan;
+use masonry::imaging::RgbaImage;
 use masonry::imaging::render::{ImageRenderer, ImageRendererError};
-use masonry::imaging::{Painter, RgbaImage};
-use masonry::kurbo::{Rect, Size};
+use masonry::kurbo::Size;
 use masonry::peniko::Color;
 
 use crate::backend::{Backend, BackendError};
@@ -146,18 +146,11 @@ impl Host {
         self.counters.scenes += composition.scenes as u64;
         self.counters.holes += composition.holes.len() as u64;
 
-        let mut scene = match self.background {
-            Some(color) => {
-                let mut base = masonry::imaging::record::Scene::new();
-                Painter::new(&mut base)
-                    .fill(Rect::new(0.0, 0.0, f64::from(width), f64::from(height)), color)
-                    .draw();
-                // Identity: the composition is already in physical coordinates.
-                base.append_transformed(&composition.scene, masonry::kurbo::Affine::IDENTITY);
-                base
-            },
-            None => composition.scene,
+        let composition = match self.background {
+            Some(color) => composition.on_background(color, width, height),
+            None => composition,
         };
+        let mut scene = composition.scene;
         let image = self
             .renderer
             .render_source(&mut scene, width, height)
@@ -169,16 +162,9 @@ impl Host {
         })
     }
 
-    /// Physical pixels for a logical size, rounded outwards.
-    ///
-    /// Outwards rather than to nearest: a window 100.5 physical pixels wide has to be
-    /// covered, and a frame one pixel short of the surface shows the surface.
+    /// Physical pixels for a logical size at this host's device scale.
     fn physical_size(&self, size: Size) -> (u32, u32) {
-        let scale = self.device_scale;
-        (
-            ((size.width * scale).ceil() as u32).max(1),
-            ((size.height * scale).ceil() as u32).max(1),
-        )
+        Composition::physical_size(size, self.device_scale)
     }
 }
 

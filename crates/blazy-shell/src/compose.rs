@@ -19,8 +19,10 @@
 
 use masonry::app::{VisualLayerKind, VisualLayerPlan};
 use masonry::core::WidgetId;
+use masonry::imaging::Painter;
 use masonry::imaging::record::{Scene, replay_transformed};
-use masonry::kurbo::{Affine, Rect};
+use masonry::kurbo::{Affine, Rect, Size};
+use masonry::peniko::Color;
 
 /// A rectangle the host is expected to fill itself.
 ///
@@ -75,6 +77,35 @@ impl Composition {
         }
 
         composition
+    }
+
+    /// Prepends an opaque fill, so the frame is opaque before anything presents it.
+    ///
+    /// A widget tree is under no obligation to cover the window — `AreaScreen` paints
+    /// its splitter bars and leaves the rest to its areas — and every path to the
+    /// screen flattens alpha away in the end. Doing the fill here means the rasteriser
+    /// blends the edges, which is what keeps a curve from becoming a staircase
+    /// (§26.4).
+    #[must_use]
+    pub fn on_background(self, color: Color, width: u32, height: u32) -> Self {
+        let mut scene = Scene::new();
+        Painter::new(&mut scene)
+            .fill(Rect::new(0.0, 0.0, f64::from(width), f64::from(height)), color)
+            .draw();
+        // Identity: the composition is already in physical coordinates.
+        scene.append_transformed(&self.scene, Affine::IDENTITY);
+        Self { scene, ..self }
+    }
+
+    /// Physical pixels for a logical window size, rounded outwards.
+    ///
+    /// Outwards rather than to nearest: a window 100.5 physical pixels wide has to be
+    /// covered, and a frame one pixel short of the surface shows the surface.
+    pub fn physical_size(size: Size, device_scale: f64) -> (u32, u32) {
+        (
+            ((size.width * device_scale).ceil() as u32).max(1),
+            ((size.height * device_scale).ceil() as u32).max(1),
+        )
     }
 }
 

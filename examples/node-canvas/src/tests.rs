@@ -564,3 +564,34 @@ fn hovering_does_not_relayout() {
     );
     assert!(after.hit_queries >= 40, "the moves were picked: {}", after.hit_queries);
 }
+
+/// One look at the whole graph must not make the close-up view slow for ever.
+///
+/// §28: the recorded regions used to be able to grow and never shrink, so a trip to
+/// the overview zoom left every edge in the graph recorded, and the canvas kept
+/// drawing all of them at a zoom whose viewport held a hundred. Measured before the
+/// fix: 9857 curves and 2.46 ms a frame where a fresh canvas took 0.27.
+#[test]
+fn a_look_at_the_whole_graph_does_not_stay_expensive() {
+    let (mut harness, _graph) = harness(5000);
+    let close = canvas_stats(&mut harness).recorded_links;
+    assert!(close > 0, "the viewport holds some links to begin with");
+
+    zoom_out(&mut harness, 0.05);
+    let wide = canvas_stats(&mut harness);
+    assert!(
+        wide.recorded_links > close * 10,
+        "the overview really does record the graph: {} against {close}",
+        wide.recorded_links
+    );
+
+    // Back to where we started.
+    zoom_out(&mut harness, 20.0);
+    let back = canvas_stats(&mut harness);
+    assert!(
+        back.recorded_links <= close * 2,
+        "the recorded set stayed at {} after returning, against {close} on arrival",
+        back.recorded_links
+    );
+    assert_eq!(back.recorded_far, 0, "and the far field let its nodes go");
+}

@@ -110,12 +110,16 @@ impl Backend {
         match self {
             Self::VelloCpu => Ok(Box::new(imaging_vello_cpu::VelloCpuRenderer::new(1, 1))),
             #[cfg(feature = "vello")]
-            Self::Vello => masonry_imaging::vello::new_headless_renderer()
-                .map(|renderer| Box::new(renderer) as Box<dyn ImageRenderer>)
-                .map_err(|error| BackendError::Unavailable {
-                    backend: self,
-                    reason: error.to_string(),
-                }),
+            Self::Vello => {
+                let (device, queue) = crate::gpu::headless_device()
+                    .map_err(|reason| BackendError::Unavailable { backend: self, reason })?;
+                imaging_vello::VelloRenderer::new(device, queue)
+                    .map(|renderer| Box::new(renderer) as Box<dyn ImageRenderer>)
+                    .map_err(|error| BackendError::Unavailable {
+                        backend: self,
+                        reason: format!("{error:?}"),
+                    })
+            },
         }
     }
 }

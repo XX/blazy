@@ -18,14 +18,17 @@
 //!
 //! # How a frame reaches the screen
 //!
-//! Composed, rasterised into a buffer, and blitted with `softbuffer`. That follows
-//! from §26.2 rather than from taste: the object-safe seam is the *image* seam, so a
-//! rasteriser chosen at runtime hands back pixels, and pixels have to be presented by
-//! somebody. The cost is one pass over the frame to swap channel order, and a CPU
-//! path where a GPU one would do better. Presenting straight into a swapchain texture
-//! needs the texture seam, which has associated types and cannot be chosen at runtime
-//! at all — that belongs with per-area render-to-texture in `blazy-compose` (§7.3),
-//! not here.
+//! Two ways, chosen at startup along with the rasteriser (§27):
+//!
+//! * [`SwapchainPresenter`](crate::gpu::SwapchainPresenter) — the scene is drawn into a texture and blitted into the
+//!   swapchain. The frame never enters main memory. Needs a graphics device, so it comes with the `vello` feature.
+//! * [`BlitPresenter`] — the frame is rasterised into a buffer and copied into the window with `softbuffer`. Works
+//!   anywhere, including on a machine with no usable GPU, and costs one pass over the frame plus the platform's own
+//!   copy.
+//!
+//! The second is the fallback for the first: asking for the GPU path on a machine
+//! that cannot give it is answered with a warning and a working window, not with a
+//! failure to start.
 //!
 //! # What this does not do yet
 //!
@@ -41,9 +44,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, WindowSizePolicy};
+use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, VisualLayerPlan, WindowSizePolicy};
 use masonry::core::{DefaultProperties, ErasedAction, NewWidget, TextEvent, Widget, WidgetId, WindowEvent};
-use masonry::dpi::LogicalSize;
+use masonry::dpi::{LogicalSize, PhysicalSize};
 use masonry::imaging::RgbaImage;
 use masonry::kurbo::Size;
 use masonry::peniko::Color;
@@ -54,7 +57,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::backend::Backend;
-use crate::host::{Host, HostCounters};
+use crate::compose::Hole;
+use crate::host::Host;
+use crate::present::{PresentCounters, PresentError, Presenter};
 
 /// How the window should be created.
 pub struct WindowConfig {
@@ -136,6 +141,7 @@ impl<F: FnMut(ErasedAction, WidgetId)> ShellDriver for F {
 #[derive(Debug)]
 pub enum Error {
     Backend(crate::BackendError),
+    Presented(PresentError),
     EventLoop(winit::error::EventLoopError),
     Os(winit::error::OsError),
     Present(softbuffer::SoftBufferError),
@@ -146,6 +152,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backend(error) => write!(f, "{error}"),
+            Self::Presented(error) => write!(f, "{error}"),
             Self::EventLoop(error) => write!(f, "{error}"),
             Self::Os(error) => write!(f, "{error}"),
             Self::Present(error) => write!(f, "{error}"),
@@ -163,22 +170,19 @@ pub fn run(
     default_properties: DefaultProperties,
     driver: impl ShellDriver + 'static,
 ) -> Result<(), Error> {
-    let host = match config.backend {
-        Some(backend) => Host::new(backend),
-        None => Host::any(),
-    }
-    .map_err(Error::Backend)?
-    .with_background(config.base_color);
+    // The same courtesy `masonry_winit` extends: if the application has not set up
+    // tracing, set up ours, so that a fallback to the blit path or a lost swapchain
+    // texture says so out loud instead of disappearing.
+    let _ = masonry::app::try_init_tracing();
 
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
     let mut app = ShellApp {
         config,
-        host,
+        presenter: None,
         default_properties: Some(default_properties),
         root: Some(root),
         driver: Box::new(driver),
         window: None,
-        surface: None,
         render_root: None,
         signals: Rc::new(RefCell::new(Vec::new())),
         reducer: WindowEventReducer::default(),
@@ -193,18 +197,85 @@ pub fn run(
 pub struct ShellCounters {
     /// Frames composed, rasterised and presented.
     pub frames: u64,
-    /// Host counters as of the last frame.
-    pub host: HostCounters,
+    /// What the last frame cost on its way to the screen.
+    pub present: PresentCounters,
+}
+
+// --- MARK: BLIT
+
+/// Rasterises the frame into a buffer and copies it into the window.
+///
+/// The path that works everywhere: any [`Backend`], no graphics device required. What
+/// it costs is that the frame passes through main memory — measured at 0.94 ms for the
+/// channel swap alone on an 1100x750 frame — and that a GPU rasteriser has to read its
+/// own output back (§26.2). The swapchain path exists to avoid both; this one exists
+/// because a machine without a usable device still has to show a window.
+pub struct BlitPresenter {
+    host: Host,
+    backend: Backend,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    holes: Vec<Hole>,
+    counters: PresentCounters,
+}
+
+impl BlitPresenter {
+    pub fn new(backend: Backend, window: Arc<Window>, background: Color) -> Result<Self, Error> {
+        let host = Host::new(backend).map_err(Error::Backend)?.with_background(background);
+        let context = softbuffer::Context::new(window.clone()).map_err(Error::Present)?;
+        let surface = softbuffer::Surface::new(&context, window).map_err(Error::Present)?;
+        Ok(Self {
+            host,
+            backend,
+            surface,
+            holes: Vec::new(),
+            counters: PresentCounters::default(),
+        })
+    }
+}
+
+impl Presenter for BlitPresenter {
+    fn name(&self) -> &'static str {
+        "blit"
+    }
+
+    fn present(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
+        self.host.set_device_scale(device_scale);
+        let frame = self.host.render(plan, logical).map_err(PresentError::Host)?;
+
+        self.holes.clear();
+        self.holes.extend_from_slice(&frame.holes);
+        self.counters.frames += 1;
+        self.counters.holes += frame.holes.len() as u64;
+        self.counters.cpu_bytes += u64::from(frame.image.width) * u64::from(frame.image.height) * 4;
+        // A GPU rasteriser on this path has to copy its result out of video memory
+        // once per frame; a CPU one wrote into main memory to begin with.
+        self.counters.readbacks += u64::from(self.backend.needs_device());
+
+        blit(&mut self.surface, &frame.image).map_err(|error| PresentError::Platform(error.to_string()))
+    }
+
+    fn holes(&self) -> &[Hole] {
+        &self.holes
+    }
+
+    fn counters(&self) -> PresentCounters {
+        self.counters
+    }
+
+    fn resize(&mut self, _size: PhysicalSize<u32>) {
+        // `softbuffer` is resized when the frame is presented, from the frame's own
+        // size, so there is nothing to do here — and nothing to get out of step.
+    }
 }
 
 struct ShellApp {
     config: WindowConfig,
-    host: Host,
+    /// How the frame reaches the screen. Chosen once the window exists.
+    presenter: Option<Box<dyn Presenter>>,
     default_properties: Option<DefaultProperties>,
     root: Option<NewWidget<dyn Widget>>,
     driver: Box<dyn ShellDriver>,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
     render_root: Option<RenderRoot>,
     /// Where the render root drops its signals.
     ///
@@ -227,13 +298,10 @@ impl ShellApp {
         if let Some(min) = self.config.min_size {
             attributes = attributes.with_min_inner_size(min);
         }
-        let window = Rc::new(event_loop.create_window(attributes).map_err(Error::Os)?);
-
-        let context = softbuffer::Context::new(window.clone()).map_err(Error::Present)?;
-        let surface = softbuffer::Surface::new(&context, window.clone()).map_err(Error::Present)?;
-
+        let window = Arc::new(event_loop.create_window(attributes).map_err(Error::Os)?);
         let scale_factor = window.scale_factor();
-        self.host.set_device_scale(scale_factor);
+        let presenter = self.open_presenter(&window)?;
+        tracing::info!(presenter = presenter.name(), "blazy shell");
 
         let signals = self.signals.clone();
         let render_root = RenderRoot::new(
@@ -251,9 +319,36 @@ impl ShellApp {
 
         window.request_redraw();
         self.window = Some(window);
-        self.surface = Some(surface);
+        self.presenter = Some(presenter);
         self.render_root = Some(render_root);
         Ok(())
+    }
+
+    /// Chooses how frames will reach the screen.
+    ///
+    /// The GPU path when it was asked for and the machine can give it; the blit path
+    /// otherwise. A machine with no usable device gets a warning and a working
+    /// window, because "start without a GPU" is a requirement and not a courtesy.
+    fn open_presenter(&mut self, window: &Arc<Window>) -> Result<Box<dyn Presenter>, Error> {
+        let base = self.config.base_color;
+
+        #[cfg(feature = "vello")]
+        if self.config.backend.is_none_or(|backend| backend == Backend::Vello) {
+            match crate::gpu::SwapchainPresenter::new(window.clone(), window.inner_size(), base) {
+                Ok(presenter) => return Ok(Box::new(presenter)),
+                Err(error) => tracing::warn!("falling back to the blit path: {error}"),
+            }
+        }
+
+        let backend = match self.config.backend {
+            Some(backend) => backend,
+            None => crate::backend::COMPILED
+                .iter()
+                .copied()
+                .find(|backend| !backend.needs_device())
+                .unwrap_or(Backend::VelloCpu),
+        };
+        Ok(Box::new(BlitPresenter::new(backend, window.clone(), base)?))
     }
 
     /// Composes, rasterises and presents one frame.
@@ -262,8 +357,8 @@ impl ShellApp {
     /// plan rather than flattening it, and put the result on the screen. Anything the
     /// tree left to the host arrives as a hole and is handed to `fill_holes`.
     fn redraw(&mut self) -> Result<(), Error> {
-        let (Some(root), Some(window), Some(surface)) =
-            (self.render_root.as_mut(), self.window.as_ref(), self.surface.as_mut())
+        let (Some(root), Some(window), Some(presenter)) =
+            (self.render_root.as_mut(), self.window.as_ref(), self.presenter.as_mut())
         else {
             return Ok(());
         };
@@ -277,20 +372,17 @@ impl ShellApp {
 
         let (plan, _tree_update) = root.redraw();
 
-        let scale = self.host.device_scale();
+        let scale = window.scale_factor();
         let physical = root.size();
         let logical = Size::new(physical.width as f64 / scale, physical.height as f64 / scale);
-        let frame = self.host.render(&plan, logical).map_err(Error::Render)?;
+        presenter.present(&plan, logical, scale).map_err(Error::Presented)?;
 
         // Holes are reported rather than drawn: the host owns what goes in them, and
         // for an application without external content there are none (§4.3).
-        if !frame.holes.is_empty() {
-            tracing_holes(&frame.holes);
-        }
+        report_holes(presenter.holes());
 
-        present(surface, &frame.image)?;
         self.counters.frames += 1;
-        self.counters.host = self.host.counters();
+        self.counters.present = presenter.counters();
         window.set_cursor(root.cursor_icon());
         Ok(())
     }
@@ -332,7 +424,7 @@ impl ShellApp {
 }
 
 /// Reports holes to whoever is watching. Filling them is the owner's business.
-fn tracing_holes(holes: &[crate::Hole]) {
+fn report_holes(holes: &[Hole]) {
     for hole in holes {
         tracing::trace!(?hole, "external content left to the host");
     }
@@ -343,7 +435,7 @@ fn tracing_holes(holes: &[crate::Hole]) {
 /// One pass over the pixels to drop alpha and reorder the channels, which is what a
 /// CPU presentation path costs. §26.2 explains why the frame arrives as pixels rather
 /// than as a texture, and §26.5 what it would take for it not to.
-fn present(surface: &mut softbuffer::Surface<Rc<Window>, Rc<Window>>, image: &RgbaImage) -> Result<(), Error> {
+fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &RgbaImage) -> Result<(), Error> {
     let (Some(width), Some(height)) = (NonZeroU32::new(image.width), NonZeroU32::new(image.height)) else {
         return Ok(());
     };
@@ -388,6 +480,9 @@ impl ApplicationHandler for ShellApp {
             WinitWindowEvent::CloseRequested => event_loop.exit(),
             WinitWindowEvent::Resized(size) => {
                 root.handle_window_event(WindowEvent::Resize(size));
+                if let Some(presenter) = self.presenter.as_mut() {
+                    presenter.resize(size);
+                }
             },
             WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // The third multiplier of §9, and the only place it is applied: the
@@ -395,7 +490,6 @@ impl ApplicationHandler for ShellApp {
                 // scales the drawing, so a display change costs a frame and not a
                 // relayout.
                 root.handle_window_event(WindowEvent::Rescale(scale_factor));
-                self.host.set_device_scale(scale_factor);
             },
             WinitWindowEvent::Focused(focused) => {
                 root.handle_text_event(TextEvent::WindowFocusChange(focused));

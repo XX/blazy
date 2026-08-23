@@ -25,6 +25,10 @@ use masonry::theme::default_property_set;
 
 /// Window size every scenario uses, in logical pixels.
 const SIZE: (u32, u32) = (1100, 750);
+/// Window sizes the presentation table walks, in logical pixels.
+const PRESENT_SIZES: [(u32, u32); 3] = [(800, 600), (1400, 900), (1920, 1200)];
+/// Device scales the presentation table walks.
+const PRESENT_SCALES: [f64; 2] = [1.0, 2.0];
 /// Scale factors the device-scale sweep walks.
 const SCALES: [f64; 4] = [1.0, 1.5, 2.0, 4.0];
 
@@ -305,6 +309,140 @@ fn backend_report() -> BackendReport {
     }
 }
 
+/// One row of the presentation table.
+struct PresentRow {
+    path: &'static str,
+    size: (u32, u32),
+    scale: f64,
+    /// Turning the scene into pixels, or into a texture.
+    draw_ms: f64,
+    /// Getting those pixels to the window. Zero where nothing has to be moved.
+    show_ms: f64,
+    cpu_bytes: u64,
+}
+
+/// Times drawing and showing separately, which is the comparison the task is about.
+///
+/// The blit path is measured in full: rasterise into a buffer, then swap the channels
+/// into a presentation buffer — the platform's own copy is not included, so the number
+/// is a floor rather than the whole cost. The GPU path is submitted and waited on,
+/// because timing a submission alone would measure the driver's queue.
+fn presentation_table(opts: &Options) {
+    let sizes: &[(u32, u32)] = if opts.quick {
+        &PRESENT_SIZES[..1]
+    } else {
+        &PRESENT_SIZES
+    };
+    let scales: &[f64] = if opts.quick {
+        &PRESENT_SCALES[..1]
+    } else {
+        &PRESENT_SCALES
+    };
+    let frames = 10;
+
+    println!("\npresentation: drawing and showing, separately");
+    let mut rows = Vec::new();
+
+    for &(width, height) in sizes {
+        let layouts = Rc::new(Cell::new(0));
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new(Panel {
+                layouts: layouts.clone(),
+                shapes: 60,
+            }),
+            PhysicalSize::new(width, height),
+        );
+        let _ = harness.redraw();
+        let (plan, _tree) = harness.redraw();
+        let logical = Size::new(f64::from(width), f64::from(height));
+
+        for &scale in scales {
+            // --- The blit path.
+            let mut host = Host::any()
+                .expect("some backend opens")
+                .with_background(Color::from_rgb8(0x14, 0x14, 0x18));
+            host.set_device_scale(scale);
+            let mut draw = Duration::ZERO;
+            let mut show = Duration::ZERO;
+            let mut cpu_bytes = 0;
+            for _ in 0..frames {
+                let start = Instant::now();
+                let frame = host.render(&plan, logical).expect("the host renders");
+                draw += start.elapsed();
+
+                let mut buffer = vec![0_u32; (frame.image.width * frame.image.height) as usize];
+                let start = Instant::now();
+                for (out, pixel) in buffer.iter_mut().zip(frame.image.data.chunks_exact(4)) {
+                    *out = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
+                }
+                show += start.elapsed();
+                cpu_bytes = u64::from(frame.image.width) * u64::from(frame.image.height) * 4;
+            }
+            rows.push(PresentRow {
+                path: "blit",
+                size: (width, height),
+                scale,
+                draw_ms: draw.as_secs_f64() * 1000.0 / f64::from(frames),
+                show_ms: show.as_secs_f64() * 1000.0 / f64::from(frames),
+                cpu_bytes,
+            });
+
+            // --- The GPU path, where there is a device for it.
+            #[cfg(feature = "vello")]
+            if let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(width, height)) {
+                let mut gpu = gpu.with_background(Color::from_rgb8(0x14, 0x14, 0x18));
+                // One frame first: the first one pays for pipelines and allocations.
+                gpu.draw(&plan, logical, scale).expect("the GPU draws");
+                gpu.wait();
+
+                let start = Instant::now();
+                for _ in 0..frames {
+                    gpu.draw(&plan, logical, scale).expect("the GPU draws");
+                }
+                gpu.wait();
+                let draw = start.elapsed();
+
+                rows.push(PresentRow {
+                    path: "swapchain",
+                    size: (width, height),
+                    scale,
+                    draw_ms: draw.as_secs_f64() * 1000.0 / f64::from(frames),
+                    // The blit into the swapchain is a GPU copy inside the same
+                    // submission; there is no separate cost to attribute here, and
+                    // the honest thing is to say so rather than to invent one.
+                    show_ms: 0.0,
+                    cpu_bytes: gpu.counters().cpu_bytes,
+                });
+            }
+        }
+    }
+
+    for row in &rows {
+        println!(
+            "  {:<10} {:>4}x{:<4} x{:<4}  draw {:>7.3} ms  show {:>7.3} ms  through memory {:>8} bytes",
+            row.path, row.size.0, row.size.1, row.scale, row.draw_ms, row.show_ms, row.cpu_bytes,
+        );
+    }
+}
+
+/// What the GPU path did over a run of frames, where a device exists.
+#[cfg(feature = "vello")]
+fn gpu_counters(frames: usize) -> Option<blazy_shell::PresentCounters> {
+    let mut gpu = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(SIZE.0, SIZE.1))
+        .ok()?
+        .with_background(Color::from_rgb8(0x14, 0x14, 0x18));
+
+    let mut harness = harness(ExternalContent::new(Size::new(400.0, 300.0)));
+    for _ in 0..frames {
+        harness.animate_ms(16);
+        let (plan, _tree) = harness.redraw();
+        gpu.draw(&plan, logical_size(), 1.0).expect("the GPU draws");
+    }
+    gpu.wait();
+    Some(gpu.counters())
+}
+
 pub fn run(opts: &Options) -> Outcome {
     let frames = opts.frames();
     println!(
@@ -398,6 +536,22 @@ pub fn run(opts: &Options) -> Outcome {
         count
     };
 
+    presentation_table(opts);
+    #[cfg(feature = "vello")]
+    let gpu = gpu_counters(frames);
+    #[cfg(not(feature = "vello"))]
+    let gpu: Option<blazy_shell::PresentCounters> = None;
+    if gpu.is_none() {
+        println!(
+            "\nno GPU frame path measured here ({}); its criteria are absent from this run",
+            if cfg!(feature = "vello") {
+                "no graphics device"
+            } else {
+                "built without the vello feature"
+            }
+        );
+    }
+
     println!();
     for report in &reports {
         report.print();
@@ -413,6 +567,7 @@ pub fn run(opts: &Options) -> Outcome {
             scale_layouts.get(),
             &scale_frames,
             transparent,
+            gpu,
         ),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep: Vec::new(),
@@ -432,6 +587,7 @@ fn evaluate(
     scale_layouts: u64,
     scale_frames: &[(f64, u32, f64)],
     transparent: usize,
+    gpu: Option<blazy_shell::PresentCounters>,
 ) -> Vec<Criterion> {
     let mut criteria = Vec::new();
 
@@ -495,6 +651,45 @@ fn evaluate(
         bound: 1.0,
         unit: "pixels not opaque",
     });
+
+    // --- The GPU frame path (§27). Absent where there is no device to measure it on,
+    // which is the honest answer on a runner without one.
+    if let Some(gpu) = gpu {
+        let frames = gpu.frames.max(1) as f64;
+
+        // What the task is for: the frame is drawn and shown without ever existing as
+        // bytes in main memory. The blit path in the same table moves megabytes.
+        criteria.push(Criterion {
+            name: "swapchain_frame_stays_on_the_gpu",
+            claim: "the GPU frame path moves no frame data through memory",
+            kind: Kind::Counter,
+            measured: gpu.cpu_bytes as f64 / frames,
+            bound: 1.0,
+            unit: "bytes/frame",
+        });
+
+        // The absurdity §27 removes: a GPU rasteriser that has to hand back pixels
+        // copies them out of video memory every frame.
+        criteria.push(Criterion {
+            name: "gpu_frames_are_not_read_back",
+            claim: "the GPU frame path does not read the frame back",
+            kind: Kind::Counter,
+            measured: gpu.readbacks as f64 / frames,
+            bound: 1.0,
+            unit: "readbacks/frame",
+        });
+
+        // And the holes still arrive: a faster path that lost them would be a
+        // regression against §26.
+        criteria.push(Criterion {
+            name: "the_gpu_path_keeps_the_holes",
+            claim: "external content is still a hole on the GPU path",
+            kind: Kind::Counter,
+            measured: frames - gpu.holes.min(gpu.frames) as f64,
+            bound: 1.0,
+            unit: "frames with no hole",
+        });
+    }
 
     criteria
 }

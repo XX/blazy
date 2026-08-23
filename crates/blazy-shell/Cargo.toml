@@ -25,14 +25,16 @@ bench = false
 default = ["window"]
 # A second rasteriser, so the choice at startup is a choice rather than a formality.
 # Off by default: it needs a graphics device, which a build machine may not have.
-vello = ["dep:masonry_imaging", "masonry_imaging/imaging_vello"]
+vello = ["dep:imaging_vello", "dep:imaging_wgpu", "dep:wgpu"]
 # Owner mode: our own window and event loop.
 window = ["dep:winit", "dep:softbuffer", "dep:ui-events-winit"]
 
 [dependencies]
 masonry = { workspace = true }
 imaging_vello_cpu = { workspace = true }
-masonry_imaging = { workspace = true, optional = true }
+imaging_vello = { workspace = true, optional = true }
+imaging_wgpu = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
 winit = { workspace = true, optional = true }
 softbuffer = { workspace = true, optional = true }
 ui-events-winit = { workspace = true, optional = true }

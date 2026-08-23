@@ -124,7 +124,11 @@ impl LinkLayer {
 
     /// Whether the recorded set has to be re-chosen for this viewport.
     pub(crate) fn needs_reselect(&self, visible_rect: Rect) -> bool {
-        !self.edges.is_empty() && (self.reselect || !self.region.is_some_and(|r| contains_rect(r, visible_rect)))
+        !self.edges.is_empty()
+            && (self.reselect
+                || !self
+                    .region
+                    .is_some_and(|region| crate::region_covers(region, visible_rect)))
     }
 
     /// Re-chooses the recorded set if [`needs_reselect`](Self::needs_reselect) says so.
@@ -161,11 +165,6 @@ impl LinkLayer {
         self.region = None;
         self.reselect = true;
     }
-}
-
-/// Whether `outer` fully contains `inner`.
-fn contains_rect(outer: Rect, inner: Rect) -> bool {
-    outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
 }
 
 /// The curve for one link, from the right edge of `from` to the left edge of `to`.
@@ -251,15 +250,18 @@ mod tests {
     #[test]
     fn a_drag_repaints_without_reselecting() {
         let mut layer = chain();
-        let region = Rect::new(0.0, 0.0, 1000.0, 1000.0);
-        layer.refresh(region, region, &[0, 1, 2]);
+        // The proportions a viewport really produces: the region is the visible rect
+        // plus half of it on each side.
+        let visible = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let region = visible.inflate(50.0, 50.0);
+        layer.refresh(region, visible, &[0, 1, 2]);
         layer.take_repaint();
         let refreshes = layer.refreshes();
 
         for _ in 0..10 {
             layer.node_moved(1);
             assert!(layer.take_repaint());
-            assert!(!layer.refresh(region, Rect::new(0.0, 0.0, 100.0, 100.0), &[0, 1, 2]));
+            assert!(!layer.refresh(region, visible, &[0, 1, 2]));
         }
         assert_eq!(layer.refreshes(), refreshes, "a drag re-chose the recorded set");
     }
@@ -269,13 +271,36 @@ mod tests {
     #[test]
     fn staying_inside_the_region_does_not_refresh() {
         let mut layer = chain();
-        let region = Rect::new(0.0, 0.0, 1000.0, 1000.0);
-        layer.refresh(region, Rect::new(0.0, 0.0, 100.0, 100.0), &[0, 1]);
+        let visible = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let region = visible.inflate(50.0, 50.0);
+        layer.refresh(region, visible, &[0, 1]);
         layer.take_repaint();
         let after_first = layer.refreshes();
 
         assert!(!layer.refresh(region, Rect::new(10.0, 10.0, 110.0, 110.0), &[0, 1]));
         assert_eq!(layer.refreshes(), after_first);
+    }
+
+    /// A region chosen while zoomed out must not outlive the zoom that produced it.
+    ///
+    /// It contains every viewport that follows, so containment alone would keep it
+    /// forever — and with it every edge it recorded. This is §28, and it is what made
+    /// a canvas stay slow after one look at the whole graph.
+    #[test]
+    fn zooming_back_in_re_chooses_the_set() {
+        let mut layer = chain();
+        let wide = Rect::new(-5000.0, -5000.0, 5000.0, 5000.0);
+        layer.refresh(wide, wide, &[0, 1, 2]);
+        layer.take_repaint();
+        assert_eq!(layer.recorded().len(), 3, "the whole graph is recorded");
+
+        let close = Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert!(
+            layer.needs_reselect(close),
+            "a region ten thousand times the viewport does not serve it"
+        );
+        assert!(layer.refresh(close.inflate(50.0, 50.0), close, &[0]));
+        assert_eq!(layer.recorded().len(), 1, "and the set shrank with the viewport");
     }
 
     #[test]

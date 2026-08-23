@@ -269,3 +269,60 @@ fn the_device_scale_does_not_reach_layout() {
     let _ = harness.redraw();
     assert!(layouts.get() > before, "resizing the window relayouts the tree");
 }
+
+// --- MARK: GPU PATH
+
+/// The frame path that keeps the frame on the GPU, checked where there is one.
+///
+/// Skipped rather than failed on a machine with no usable device: whether a runner has
+/// a GPU is a fact about the runner, and §27.5 says what that costs in coverage.
+#[cfg(feature = "vello")]
+#[test]
+fn the_gpu_path_draws_without_touching_main_memory() {
+    use masonry::dpi::PhysicalSize;
+
+    use crate::gpu::GpuFrames;
+
+    let Ok(mut frames) = GpuFrames::offscreen(PhysicalSize::new(200, 120)) else {
+        eprintln!("no graphics device here; skipping the GPU path");
+        return;
+    };
+
+    let mut harness = harness(ExternalContent::new(Size::new(200.0, 120.0)));
+    for _ in 0..4 {
+        harness.animate_ms(16);
+        let (plan, _) = harness.redraw();
+        frames.draw(&plan, Size::new(200.0, 120.0), 1.0).expect("the GPU draws");
+    }
+    frames.wait();
+
+    let counters = frames.counters();
+    assert_eq!(counters.frames, 4);
+    assert_eq!(counters.cpu_bytes, 0, "the frame went through main memory");
+    assert_eq!(counters.readbacks, 0, "the frame was copied back from the GPU");
+    assert_eq!(frames.holes().len(), 1, "holes survive the GPU path (§4.3)");
+}
+
+/// The device scale reaches the GPU path the same way it reaches the other one.
+#[cfg(feature = "vello")]
+#[test]
+fn the_gpu_texture_follows_the_device_scale() {
+    use masonry::dpi::PhysicalSize;
+
+    use crate::gpu::GpuFrames;
+
+    let Ok(mut frames) = GpuFrames::offscreen(PhysicalSize::new(200, 120)) else {
+        eprintln!("no graphics device here; skipping the GPU path");
+        return;
+    };
+
+    let mut harness = harness(Counting {
+        layouts: Rc::new(Cell::new(0)),
+        external: false,
+    });
+    let (plan, _) = harness.redraw();
+
+    frames.draw(&plan, Size::new(200.0, 120.0), 2.0).expect("the GPU draws");
+    assert_eq!(frames.size(), PhysicalSize::new(400, 240));
+    assert_eq!(frames.texture().width(), 400, "the texture was reallocated");
+}
