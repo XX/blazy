@@ -88,6 +88,17 @@ every measurement depends on being identical. `[lib]` and `[[bin]]` carry
 `examples/area-screen` depends on `examples/node-canvas` on purpose: reusing the graph
 model rather than copying it is what keeps the two sets of numbers comparable.
 
+**Where a benchmark lives is decided by what it needs, not by what it measures.** A
+measurement that only needs the crate's own mechanism lives in the crate:
+`crates/blazy-shell/benches/shell` defines the two widgets it draws in the bench file
+itself, because composition, the device scale and external holes do not care what is on
+screen. A measurement that needs an application lives with the application: the canvas
+numbers stand on `GraphNode`, `GraphModel` and `NodeEditor`, and `blazy-canvas` has no
+widgets of its own by design. Moving those into the crate would mean either a second
+node implementation to keep in step with the example's, or a crate dev-depending on its
+own example — and the first one also breaks the property the layout above exists for,
+that the window and the benchmark build the same scene from the same code.
+
 ## The measurement discipline
 
 This is the part that is easiest to break by accident.
