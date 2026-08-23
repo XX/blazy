@@ -41,3 +41,8 @@ node-canvas = { workspace = true }
 
 [dev-dependencies]
 bench-utils = { workspace = true }
+image = { workspace = true }
+# The host side of rendering: Masonry hands out a VisualLayerPlan in logical
+# coordinates and leaves applying the window scale factor to whoever owns the window.
+# Its own test harness does not, so these tests do it themselves (§23).
+imaging_vello_cpu = { workspace = true }

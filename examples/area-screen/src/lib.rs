@@ -24,6 +24,9 @@
 
 pub mod header;
 
+#[cfg(test)]
+mod tests;
+
 use blazy_areas::{AreaContent, AreaScreen, SplitTree};
 use masonry::core::{NewWidget, Widget};
 use masonry::peniko::Color;

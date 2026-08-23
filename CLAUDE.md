@@ -14,8 +14,8 @@ subsystems by measurement before building them out, because several of the load-
 assumptions turned out to be false when checked (§20.2, §22.1). Each phase asks one
 architectural question, answers it with numbers, and writes the answer into
 `rnd/architecture.md` as a numbered section. Phases 0 (node canvas), 0.5 (areas) and
-0.6 (regions and `ui_scale`) are done; their pass criteria run in CI on every push, so
-the answers keep holding rather than becoming folklore.
+0.6 (regions and `ui_scale`) and 1.1 (render and sharpness) are done; their checks run
+in CI on every push, so the answers keep holding rather than becoming folklore.
 
 Treat the examples as the current front line, not as demos: each one is where a
 subsystem is being worked out before it moves into a crate. That it is a library rather
@@ -70,7 +70,7 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy` | Facade — the crate an application depends on. Re-exports the rest. |
 | `crates/blazy-canvas` | Virtualised, zoomable canvas of freely positioned widgets. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
-| `crates/bench-utils` | Criteria as checkable assertions, verdict, JSON report. |
+| `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
 
@@ -145,6 +145,22 @@ drag.
 means re-running layout on every frame of a zoom. Four criteria and seven tests hold
 that line.
 
+**Sharpness is measured, not eyeballed (§23).** Magnifying by 4 must come out several
+times sharper than the same content upscaled bilinearly. Use the mean **squared**
+gradient: the sum of absolute differences is conserved under blurring and is blind to
+it by construction — that mistake was made once already. The metric cannot tell a
+redraw from a nearest-neighbour magnification, so it is paired with a check that the
+image differs from block magnification. Snapshots are a viable gate here because the
+harness pins its font, the rasteriser is CPU-side and the upstream rev is pinned;
+regenerate with `MASONRY_TEST_BLESS=1`.
+
+**The device scale factor is the host's job (§4.2, §23.4).** `VisualLayerPlan` comes
+out in logical coordinates and `TestHarness::render()` never applies a scale factor, so
+anything testing HiDPI has to replay the plan itself. Backend choice is compile-time in
+upstream, but `ImageRenderer` is object-safe and the backend modules are independently
+feature-gated, so a runtime choice is buildable here (§23.5) — it needs our own window
+layer, not an upstream patch.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget
@@ -188,5 +204,6 @@ both are already argued in §15.1 and §18:
 - `rnd/architecture.md` is the document of record, and §16 is the plan the work
   follows. Finishing a phase means adding a numbered section with the numbers, what was
   disproved, and what it changes in §16 — not just landing the code.
-- `issues/` holds open tasks, `issues/done/` closed ones with their outcome appended.
+- `issues/` holds tasks. When one is finished, append the outcome to the file **in
+  place** — moving it into `issues/done/` is the user's call, not yours.
 - Do not commit unless asked.

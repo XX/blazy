@@ -1,5 +1,9 @@
 **/target/
 
+# Transient output of a failed snapshot test; the blessed reference is committed.
+**/screenshots/*.new.png
+**/screenshots/*.diff.png
+
 Project.toml
 tmp/
 
