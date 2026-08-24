@@ -25,10 +25,20 @@ blazy = { path = "crates/blazy" }
 blazy-areas = { path = "crates/blazy-areas" }
 blazy-canvas = { path = "crates/blazy-canvas" }
 blazy-shape = { path = "crates/blazy-shape" }
+blazy-shell = { path = "crates/blazy-shell" }
 node-canvas = { path = "examples/node-canvas" }
 masonry = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144", default-features = false }
-masonry_winit = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144" }
+winit = "0.30"
+softbuffer = "0.4"
+tracing = "0.1"
+ui-events-winit = "0.3"
 clap = { version = "4.6", features = ["derive"] }
 image = { version = "0.25", default-features = false }
-imaging_vello_cpu = "0.0.1"
+imaging_vello_cpu = "0.0.2"
+# The GPU path. `wgpu` is pinned to the version `imaging_wgpu` selects by default: the
+# texture types have to come from the same crate version, and a mismatch is not a build
+# error in an obvious place but a type error inside someone else's interface (§27.1).
+imaging_vello = "0.0.2"
+imaging_wgpu = "0.0.2"
+wgpu = "29"
 strum = { version = "0.28", features = ["derive"] }

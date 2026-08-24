@@ -11,7 +11,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+# The shell's own features, forwarded. An application depends on `blazy`, so anything
+# it cannot turn on here it cannot have at all — the GPU frame path included.
+[features]
+# `window` comes with the shell's own defaults; `vello` is the one an application has
+# to ask for, exactly as it does when depending on the shell directly.
+default = []
+vello = ["blazy-shell/vello"]
+
 [dependencies]
 blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
 blazy-shape = { workspace = true }
+blazy-shell = { workspace = true }

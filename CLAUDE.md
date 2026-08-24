@@ -14,9 +14,9 @@ subsystems by measurement before building them out, because several of the load-
 assumptions turned out to be false when checked (§20.2, §22.1). Each phase asks one
 architectural question, answers it with numbers, and writes the answer into
 `rnd/architecture.md` as a numbered section. Phases 0 (node canvas), 0.5 (areas), 0.6
-(regions and `ui_scale`), 1.1 (render and sharpness) and the shape hit test (§25) are
-done; their checks run in CI on every push, so the answers keep holding rather than
-becoming folklore.
+(regions and `ui_scale`) and the whole of Phase 1 — render and sharpness (§23), the
+shape hit test (§25), the host (§26) — are done; their checks run in CI on every push,
+so the answers keep holding rather than becoming folklore.
 
 Treat the examples as the current front line, not as demos: each one is where a
 subsystem is being worked out before it moves into a crate. That it is a library rather
@@ -31,18 +31,20 @@ Everything goes through `cargo-make`. `cargo fmt` needs nightly; everything else
 stable.
 
 ```bash
-cargo make ci               # what CI runs: lint + tests + both benchmark gates
+cargo make ci               # what CI runs: lint + tests + deps rule + three benchmark gates
 cargo make lint             # fmt --check + clippy -D warnings
 cargo make fmt              # nightly rustfmt
 cargo make test             # cargo test --workspace
+cargo make deps-rule        # core crates must not depend on a window system (§3, §26.4)
 
 cargo make run-node-canvas  # Phase 0 window
 cargo make run-area-screen  # Phase 0.5/0.6 window
 
 cargo make bench-canvas     # Phase 0 measurements and criteria
 cargo make bench-areas      # Phase 0.5/0.6 measurements and criteria
-cargo make bench            # both
-cargo make bench-report     # both, plus JSON reports into target/
+cargo make bench-shell      # host measurements and criteria (§26)
+cargo make bench            # all three
+cargo make bench-report     # all three, plus JSON reports into target/
 ```
 
 **Pass arguments without a `--` separator.** cargo-make forwards the separator itself
@@ -72,6 +74,7 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy-canvas` | Virtualised, zoomable canvas: nodes, links, spatial index. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
 | `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
+| `crates/blazy-shell` | The host: window, event loop, composition, choice of rasteriser. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
@@ -84,6 +87,17 @@ every measurement depends on being identical. `[lib]` and `[[bin]]` carry
 
 `examples/area-screen` depends on `examples/node-canvas` on purpose: reusing the graph
 model rather than copying it is what keeps the two sets of numbers comparable.
+
+**Where a benchmark lives is decided by what it needs, not by what it measures.** A
+measurement that only needs the crate's own mechanism lives in the crate:
+`crates/blazy-shell/benches/shell` defines the two widgets it draws in the bench file
+itself, because composition, the device scale and external holes do not care what is on
+screen. A measurement that needs an application lives with the application: the canvas
+numbers stand on `GraphNode`, `GraphModel` and `NodeEditor`, and `blazy-canvas` has no
+widgets of its own by design. Moving those into the crate would mean either a second
+node implementation to keep in step with the example's, or a crate dev-depending on its
+own example — and the first one also breaks the property the layout above exists for,
+that the window and the benchmark build the same scene from the same code.
 
 ## The measurement discipline
 
@@ -137,6 +151,15 @@ on screen — conflating them walks the region once per frame.
 derived from the widest node rather than assumed to be one cell: a node wider than a
 cell would otherwise stop being drawn near the left edge, silently.
 
+**A recorded region has to shrink as well as grow (§28).** The link set and the
+far-field set are chosen for a region — the viewport plus half of it on each side — and
+"has the viewport left the region?" is only half the question: a region chosen at the
+overview zoom contains every viewport that follows, so the set never shrank again and
+the canvas kept drawing all 9857 edges at a zoom whose viewport held 96. `region_covers`
+asks for proportion as well as containment. The general lesson is in §28.4: counters
+that measure *work per frame* cannot see a defect that lives in the *size of what is
+held*, and a sweep that enters a state without leaving it tests half a switch.
+
 **Sweep endpoints are part of a criterion, at both ends.** The node sweep stopped at
 16 000 and the "frame cost does not follow graph size" criterion passed for months while
 a linear cost sat there — it only shows above 64 000 (§24.1). The picking sweep had the
@@ -183,12 +206,37 @@ image differs from block magnification. Snapshots are a viable gate here because
 harness pins its font, the rasteriser is CPU-side and the upstream rev is pinned;
 regenerate with `MASONRY_TEST_BLESS=1`.
 
-**The device scale factor is the host's job (§4.2, §23.4).** `VisualLayerPlan` comes
-out in logical coordinates and `TestHarness::render()` never applies a scale factor, so
-anything testing HiDPI has to replay the plan itself. Backend choice is compile-time in
-upstream, but `ImageRenderer` is object-safe and the backend modules are independently
-feature-gated, so a runtime choice is buildable here (§23.5) — it needs our own window
-layer, not an upstream patch.
+**The device scale factor is the host's job (§4.2, §23.4), and the host is now real
+(§26).** `VisualLayerPlan` comes out in logical coordinates; `blazy-shell`'s `Host`
+applies the scale as one `Affine` at composition, which is why a display change costs a
+frame and never a layout pass. Anything testing HiDPI goes through `Host`, not through
+`TestHarness::render()`, which applies no scale factor at all.
+
+**Runtime backend choice is a choice of rasteriser, not of the path to the screen
+(§26.2).** `ImageRenderer` is object-safe and renders into a caller-owned buffer, so
+`Box<dyn ImageRenderer>` picked at startup works. `TextureRenderer` has associated types
+and cannot be a trait object — so the seam that *is* ours is `Presenter`, and it sits
+after composition rather than around the rasteriser (§27.2).
+
+**Two paths to the screen, and the direct one is not always faster (§27.4).**
+`SwapchainPresenter` draws the scene into a texture and blits it into the swapchain;
+`BlitPresenter` rasterises into a buffer and copies it into the window, and is the
+fallback wherever there is no usable device. Measured: below about a megapixel the blit
+path wins (submission overhead dominates), above it the swapchain path wins by 2-3x, and
+at 3840x2400 the channel swap alone costs 17.4 ms — more than a 60 Hz frame. Both
+examples default to the GPU path; `--backend vello_cpu` selects the other one in a live
+window.
+
+**vello renders through a compute shader**, so the intermediate texture needs
+`STORAGE_BINDING`: without it the first frame fails wgpu validation rather than looking
+wrong (§27.3).
+
+**An external hole lives exactly one paint (§26.1).** `PaintCtx::set_paint_layer_mode`
+is public upstream now — §7.3 and §17 are out of date on that — but the mode is reset
+for every widget at the start of every paint pass, and a clean widget is not painted. A
+widget that wants to stay a host hole has to keep painting; `ExternalContent` does that
+through an animation frame, and a criterion counts frames in which the hole went
+missing.
 
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
@@ -201,12 +249,21 @@ will fail loudly if upstream ever grows a per-subtree scale.
 
 ## Upstream dependency
 
-`masonry` and `masonry_winit` are **git dependencies pinned to a commit** on purpose:
-the rendering IR `imaging`, `Widget::paint(&mut Painter)` and `VisualLayerPlan` exist
-only on git main, and the published 0.4.0 predates that migration. Living on two young
-crates' main branch is the project's declared main risk (§15.1). The pin is in the
-workspace `Cargo.toml`; a local checkout of the pinned tree is the fastest way to
-answer "does Masonry let us do X" and is usually the right first step.
+`masonry` is a **git dependency pinned to a commit** on purpose: the rendering IR `imaging`,
+`Widget::paint(&mut Painter)` and `VisualLayerPlan` exist only on git main, and the
+published 0.4.0 predates that migration. Living on a young crate's main branch is the
+project's declared main risk (§15.1). The pin is in the workspace `Cargo.toml`; a local
+checkout of the pinned tree is the fastest way to answer "does Masonry let us do X" and
+is usually the right first step.
+
+`masonry_winit` is **no longer a dependency**: `blazy-shell` runs its own winit loop
+over the public `RenderRoot`, because upstream's runner owns a compile-time rasteriser
+and keeps its event conversion private (§26.3). Input conversion is not reimplemented —
+`ui-events-winit` is the same public crate upstream uses. `masonry_imaging` went the
+same way in §27.3: it was there for one private helper, and twenty lines of our own
+device request cost less than a second pinned crate. The GPU path sits on the published
+`imaging_vello`, `imaging_wgpu` and `wgpu` instead, and `wgpu` is pinned to the version
+`imaging_wgpu` selects, because the texture types have to come from one crate version.
 
 Strategy towards upstream is **contribute, not fork** (§17). Nothing here patches
 Masonry.

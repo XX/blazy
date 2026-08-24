@@ -33,7 +33,9 @@ blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
 clap = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
-masonry_winit = { workspace = true }
+# With the GPU frame path: on any window worth the name it is the faster one, and
+# it falls back to the blit path on a machine without a device (§27.4).
+blazy-shell = { workspace = true, features = ["vello"] }
 # The area experiment measures many views of the graph Phase 0 already measured one
 # view of. Depending on that example rather than copying its model is what keeps the
 # two sets of numbers comparable.
@@ -42,7 +44,3 @@ node-canvas = { workspace = true }
 [dev-dependencies]
 bench-utils = { workspace = true }
 image = { workspace = true }
-# The host side of rendering: Masonry hands out a VisualLayerPlan in logical
-# coordinates and leaves applying the window scale factor to whoever owns the window.
-# Its own test harness does not, so these tests do it themselves (§23).
-imaging_vello_cpu = { workspace = true }

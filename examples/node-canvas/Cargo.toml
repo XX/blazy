@@ -41,7 +41,9 @@ blazy-canvas = { workspace = true }
 blazy-shape = { workspace = true }
 clap = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
-masonry_winit = { workspace = true }
+# With the GPU frame path: on any window worth the name it is the faster one, and
+# it falls back to the blit path on a machine without a device (§27.4).
+blazy-shell = { workspace = true, features = ["vello"] }
 
 [dev-dependencies]
 bench-utils = { workspace = true }

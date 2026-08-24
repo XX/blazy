@@ -16,12 +16,11 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use area_screen::{DEFAULT_AREAS, build_screen_staggered};
+use blazy_shell::window::{WindowConfig, run};
+use blazy_shell::{Backend, COMPILED};
 use clap::Parser;
 use masonry::core::NewWidget;
-use masonry::dpi::LogicalSize;
 use masonry::theme::default_property_set;
-use masonry_winit::app::{AppDriver, DriverCtx, NewWindow, WindowId};
-use masonry_winit::winit::window::Window;
 use node_canvas::DEFAULT_NODES;
 
 #[derive(Parser)]
@@ -45,40 +44,32 @@ struct Args {
     /// per-region `ui_scale` is easier to see than to read about.
     #[arg(long, value_name = "F")]
     ui_scale: Option<f64>,
-}
 
-struct Driver;
-
-impl AppDriver for Driver {
-    fn on_action(
-        &mut self,
-        _window_id: WindowId,
-        _ctx: &mut DriverCtx<'_, '_>,
-        _widget_id: masonry::core::WidgetId,
-        _action: masonry::core::ErasedAction,
-    ) {
-        // Controls inside nodes submit actions; this experiment is about areas and
-        // has nothing to do with them.
-    }
+    /// Which rasteriser to draw with (§26.2).
+    #[arg(long, value_name = "NAME")]
+    backend: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
+    let backend = args.backend.as_deref().map(|name| {
+        Backend::from_name(name).unwrap_or_else(|| {
+            let names: Vec<_> = COMPILED.iter().map(|backend| backend.name()).collect();
+            panic!("unknown backend {name:?}; this build has {}", names.join(", "))
+        })
+    });
+
     let (screen, _graph) = build_screen_staggered(args.areas.max(1), args.nodes, args.ui_scale);
 
-    let attributes = Window::default_attributes()
+    let config = WindowConfig::default()
         .with_title(format!(
             "blazy - Phase 0.5 area screen ({} areas, {} nodes)",
             args.areas, args.nodes
         ))
-        .with_resizable(true)
-        .with_min_inner_size(LogicalSize::new(640.0, 480.0))
-        .with_inner_size(LogicalSize::new(1400.0, 900.0));
+        .with_size(1400.0, 900.0)
+        .with_backend(backend);
 
-    masonry_winit::app::run(
-        vec![NewWindow::new(attributes, NewWidget::new(screen).erased())],
-        Driver,
-        default_property_set(),
-    )
-    .unwrap();
+    // Controls inside nodes submit actions; this experiment is about areas and has
+    // nothing to do with them.
+    run(config, NewWidget::new(screen).erased(), default_property_set(), ()).unwrap();
 }

@@ -5,6 +5,7 @@
 
 ```bash
 cargo make run-node-canvas             # интерактивное окно
+cargo make run-node-canvas --backend vello_cpu   # растеризатор выбирается при старте
 cargo make bench-canvas                # замеры headless и критерии
 cargo make bench-canvas --quick        # только сценарии, по которым решаются критерии
 cargo make bench-canvas --nodes 20000

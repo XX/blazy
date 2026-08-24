@@ -260,6 +260,13 @@ pub struct CanvasStats {
     pub detail: Option<Detail>,
     /// Current zoom factor.
     pub zoom: f64,
+    /// Nodes in the far-field recording, and therefore drawn on every repaint of it.
+    pub recorded_far: usize,
+    /// Link curves currently recorded, and therefore drawn on every repaint.
+    ///
+    /// Bounded by the region the set was chosen for rather than by the viewport, and
+    /// the two part company as soon as the view zooms out (§28).
+    pub recorded_links: usize,
     /// What the pointer was last found to be over, as of the last pointer move.
     ///
     /// One frame behind whatever moved the pointer, because it is recorded during
@@ -561,8 +568,26 @@ fn diff_sorted(
 }
 
 /// Whether `outer` fully contains `inner`.
-fn contains_rect(outer: Rect, inner: Rect) -> bool {
+pub(crate) fn contains_rect(outer: Rect, inner: Rect) -> bool {
     outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
+}
+
+/// How much larger than the viewport a recorded region may grow before it is redone.
+///
+/// A region is the viewport plus [`FAR_OVERSCAN`] on each side, so it starts out four
+/// times the viewport's area. Sixteen is that with room to spare: zooming in and out
+/// by a little must not re-record anything, and zooming in by four must.
+const REGION_SLACK: f64 = 16.0;
+
+/// Whether a region recorded earlier still serves this viewport.
+///
+/// Containment alone is not enough, and that was a real bug rather than a subtlety
+/// (§28): a region chosen while zoomed out contains every viewport that follows, so
+/// asking only "did the viewport leave it?" means the recorded set never shrinks
+/// again. Zoom out to see the whole graph, zoom back in, and the canvas keeps drawing
+/// every edge in it — measured at 9857 curves at a zoom whose viewport holds 96.
+pub(crate) fn region_covers(region: Rect, visible: Rect) -> bool {
+    contains_rect(region, visible) && region.area() <= visible.area() * REGION_SLACK
 }
 
 // --- MARK: CONTENT
@@ -967,7 +992,7 @@ impl CanvasContent {
     /// screen": it is bought with a larger scene, which the paint pass appends every
     /// frame either way, so it should be generous but not unbounded.
     fn refresh_far_region(&mut self) {
-        if self.far.region.is_some_and(|r| contains_rect(r, self.visible_rect)) {
+        if self.far.region.is_some_and(|r| region_covers(r, self.visible_rect)) {
             return;
         }
 
@@ -1647,6 +1672,8 @@ impl Widget for CanvasLayer {
             materialised: content.live.len(),
             detail: content.detail,
             zoom,
+            recorded_far: content.far.nodes.len(),
+            recorded_links: content.links.recorded().len(),
             hovered: content.hovered,
             counters: CanvasCounters {
                 content_layouts: content.layouts,

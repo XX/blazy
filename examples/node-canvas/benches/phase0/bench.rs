@@ -140,6 +140,11 @@ impl Report {
         delta as f64 / self.frames as f64
     }
 
+    /// Link curves recorded at the end of the scenario, and drawn on every repaint.
+    fn recorded_links(&self) -> f64 {
+        self.after.recorded_links as f64
+    }
+
     /// The plain-data form the report is built from.
     fn record(&self) -> ScenarioRecord {
         ScenarioRecord {
@@ -157,6 +162,7 @@ impl Report {
                 ("link_repaints_per_frame", self.link_repaints_per_frame()),
                 ("link_reselects_per_frame", self.link_reselects_per_frame()),
                 ("slot_visits_per_frame", self.slot_visits_per_frame()),
+                ("recorded_links", self.recorded_links()),
                 ("picks", self.picks() as f64),
                 ("node_tests_per_pick", self.node_tests_per_pick()),
                 ("curve_tests_per_pick", self.curve_tests_per_pick()),
@@ -204,6 +210,17 @@ fn pan_step(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::pan(&mut canvas, delta));
     });
+}
+
+/// Sets an absolute zoom about the centre of the viewport.
+fn zoom_to(harness: &mut TestHarness<NodeEditor>, target: f64) {
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            let zoom = canvas.widget.zoom();
+            CanvasLayer::zoom_around(&mut canvas, VIEWPORT_CENTRE, target / zoom);
+        });
+    });
+    let _ = harness.redraw();
 }
 
 /// A harness zoomed to `factor` about the centre of the viewport, already settled.
@@ -466,6 +483,21 @@ pub fn run(opts: &Options) -> Outcome {
     if !opts.quick {
         let mut harness = zoomed_harness(count, 0.11, false);
         reports.push(measure("pan, zoom 0.11", &mut harness, 40, |h, _| {
+            pan_step(h, PAN_STEP)
+        }));
+    }
+
+    // --- Scenario 6d: panning after a look at the whole graph.
+    //
+    // The same view as scenario 2, reached the way a user reaches it: zoom out far
+    // enough to see everything, then come back. A recorded region that could only
+    // grow made this permanently slower than the pan it should be identical to
+    // (§28), so the two are measured against each other.
+    {
+        let mut harness = new_harness(count);
+        zoom_to(&mut harness, 0.05);
+        zoom_to(&mut harness, 1.0);
+        reports.push(measure("pan after an overview", &mut harness, frames, |h, _| {
             pan_step(h, PAN_STEP)
         }));
     }
@@ -871,6 +903,21 @@ fn evaluate(
             measured: pan.slot_visits_per_frame(),
             bound: (count as f64 / 8.0).max(64.0),
             unit: "geometries examined/frame",
+        });
+    }
+
+    if let (Some(plain), Some(after)) = (find("pan"), find("pan after an overview")) {
+        // §28: a region that only ever grew left the whole graph's edges recorded, so
+        // the same view cost nine times more after one look at the overview. Counted
+        // rather than timed, because the curves are the cause and the milliseconds
+        // are only the symptom.
+        criteria.push(Criterion {
+            name: "an_overview_does_not_leave_the_graph_recorded",
+            claim: "returning from the overview zoom restores the recorded set",
+            kind: Kind::Counter,
+            measured: after.recorded_links(),
+            bound: plain.recorded_links() * 3.0 + 32.0,
+            unit: "link curves recorded",
         });
     }
 

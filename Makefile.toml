@@ -70,6 +70,20 @@ command = "cargo"
 toolchain = "stable"
 args = ["bench", "-p", "node-canvas", "--", "--report", "${BENCH_REPORT}", "${@}"]
 
+# `--features vello` so the GPU frame path is measured wherever the machine can run it.
+# On a machine without a graphics device the scenario simply does not run and its
+# criteria are absent, which is the honest answer rather than a failure (§27.5).
+[tasks.bench-shell]
+command = "cargo"
+toolchain = "stable"
+args = ["bench", "-p", "blazy-shell", "--features", "vello", "--", "${@}"]
+
+[tasks.bench-shell-report]
+env = { BENCH_REPORT = "${CARGO_MAKE_WORKING_DIRECTORY}/target/bench-shell-report.json" }
+command = "cargo"
+toolchain = "stable"
+args = ["bench", "-p", "blazy-shell", "--features", "vello", "--", "--report", "${BENCH_REPORT}", "${@}"]
+
 [tasks.bench-areas]
 command = "cargo"
 toolchain = "stable"
@@ -83,10 +97,33 @@ args = ["bench", "-p", "area-screen", "--", "--report", "${BENCH_REPORT}", "${@}
 
 [tasks.bench]
 clear = true
-dependencies = ["bench-canvas", "bench-areas"]
+dependencies = ["bench-canvas", "bench-areas", "bench-shell"]
 
 [tasks.bench-report]
-dependencies = ["bench-canvas-report", "bench-areas-report"]
+dependencies = ["bench-canvas-report", "bench-areas-report", "bench-shell-report"]
+
+# The fourth criterion of the shell task, and the one that is a fact about the
+# dependency graph rather than about a frame: everything that knows about a window
+# lives in `blazy-shell` (architecture §3). A criterion in a benchmark could not see
+# this — by the time a benchmark runs, the tree is already linked.
+[tasks.deps-rule]
+description = "Core crates must not depend on a window system."
+script_runner = "@shell"
+script = '''
+status=0
+for crate in blazy-areas blazy-canvas blazy-shape; do
+    found=$(cargo tree -e normal -p $crate 2>/dev/null | grep -Eo '^[^a-z]*(winit|wgpu|softbuffer|ui-events-winit) v[0-9.]+' | sort -u)
+    if [ -n "$found" ]; then
+        echo "$crate depends on a window system:"
+        echo "$found"
+        status=1
+    fi
+done
+if [ $status -eq 0 ]; then
+    echo "dependency rule holds: blazy-areas, blazy-canvas and blazy-shape know nothing about windows"
+fi
+exit $status
+'''
 
 [tasks.ci]
-dependencies = ["lint", "test", "bench-report"]
+dependencies = ["lint", "test", "deps-rule", "bench-report"]

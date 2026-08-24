@@ -12,12 +12,11 @@
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+use blazy_shell::window::{WindowConfig, run};
+use blazy_shell::{Backend, COMPILED};
 use clap::Parser;
 use masonry::core::NewWidget;
-use masonry::dpi::LogicalSize;
 use masonry::theme::default_property_set;
-use masonry_winit::app::{AppDriver, DriverCtx, NewWindow, WindowId};
-use masonry_winit::winit::window::Window;
 use node_canvas::editor::NodeEditor;
 use node_canvas::{DEFAULT_NODES, build_canvas};
 
@@ -31,39 +30,34 @@ struct Args {
     /// Number of nodes in the generated graph.
     #[arg(long, value_name = "N", default_value_t = DEFAULT_NODES)]
     nodes: usize,
-}
 
-struct Driver;
-
-impl AppDriver for Driver {
-    fn on_action(
-        &mut self,
-        _window_id: WindowId,
-        _ctx: &mut DriverCtx<'_, '_>,
-        _widget_id: masonry::core::WidgetId,
-        _action: masonry::core::ErasedAction,
-    ) {
-        // Sliders and checkboxes inside nodes submit actions. This experiment does
-        // not need to act on them — that they arrive at all is claim 3 holding.
-    }
+    /// Which rasteriser to draw with.
+    ///
+    /// The choice §16 item 1 asks for, and the reason this window goes through
+    /// `blazy-shell` rather than through `masonry_winit`: upstream picks the backend
+    /// with a cascade of `cfg` at compile time (§26.2).
+    #[arg(long, value_name = "NAME")]
+    backend: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
+    let backend = args.backend.as_deref().map(|name| {
+        Backend::from_name(name).unwrap_or_else(|| {
+            let names: Vec<_> = COMPILED.iter().map(|backend| backend.name()).collect();
+            panic!("unknown backend {name:?}; this build has {}", names.join(", "))
+        })
+    });
+
     let (canvas, _graph) = build_canvas(args.nodes);
     let editor = NodeEditor::new(canvas);
 
-    let window_size = LogicalSize::new(1100.0, 750.0);
-    let attributes = Window::default_attributes()
+    let config = WindowConfig::default()
         .with_title(format!("blazy - Phase 0 node canvas ({} nodes)", args.nodes))
-        .with_resizable(true)
-        .with_min_inner_size(LogicalSize::new(480.0, 320.0))
-        .with_inner_size(window_size);
+        .with_size(1100.0, 750.0)
+        .with_backend(backend);
 
-    masonry_winit::app::run(
-        vec![NewWindow::new(attributes, NewWidget::new(editor).erased())],
-        Driver,
-        default_property_set(),
-    )
-    .unwrap();
+    // Sliders and checkboxes inside nodes submit actions. This experiment does not
+    // need to act on them — that they arrive at all is claim 3 holding.
+    run(config, NewWidget::new(editor).erased(), default_property_set(), ()).unwrap();
 }
