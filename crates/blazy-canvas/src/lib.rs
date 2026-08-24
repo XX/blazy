@@ -520,6 +520,35 @@ pub trait NodeSource: 'static {
     /// so it should be drawn rather than built.
     fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget>;
 
+    /// Called once, when the canvas is in the widget tree, with the canvas's own id.
+    ///
+    /// A source usually belongs to one canvas, and several canvases over one model is
+    /// the normal arrangement rather than an exotic one (§21): the same graph shown in
+    /// two areas is two canvases, two sets of geometry and two widget trees over one
+    /// model. Knowing which canvas it serves is what lets a source tell the *others*
+    /// apart from itself when a change has to be broadcast — see [`moved`](Self::moved).
+    fn attached(&mut self, canvas: WidgetId) {
+        let _ = canvas;
+    }
+
+    /// The user has dragged node `index` to `pos`, and the canvas has already moved
+    /// its own copy of the geometry.
+    ///
+    /// Where the position goes back into the model. Node geometry is *state*, and by
+    /// §20.2 state lives in the model, not in the view — the widget does not exist
+    /// most of the time, and neither does the canvas's copy of the graph survive a
+    /// second view of it. Without this the two views of one graph drift apart on the
+    /// first drag, which is exactly what happened before §30.
+    ///
+    /// Push into `peers` the ids of the other canvases over the same model: the canvas
+    /// schedules the same move on each of them. The fan-out goes through the canvas
+    /// because a source holds no widget context and cannot reach another widget; the
+    /// canvas is handling an event and can. `peers` arrives empty and is a buffer the
+    /// canvas reuses, so pushing into it allocates nothing after the first drag.
+    fn moved(&mut self, index: usize, pos: Point, peers: &mut Vec<WidgetId>) {
+        let _ = (index, pos, peers);
+    }
+
     /// Draws node `index` when it is too small to deserve a widget.
     ///
     /// Below the [`Detail::Box`] threshold the canvas stops materialising widgets
@@ -1382,6 +1411,10 @@ pub struct CanvasLayer {
     budget: DetailBudget,
     /// Smallest and largest permitted zoom.
     zoom_limits: (f64, f64),
+    /// Whether the source has been told this canvas's id yet.
+    attached: bool,
+    /// Reused buffer for the peers a move has to be broadcast to.
+    peers: Vec<WidgetId>,
     /// Links handed to [`CanvasLayer::with_links`] before the canvas was in a tree.
     pending_links: Option<Vec<Link>>,
     link_style: LinkStyle,
@@ -1420,6 +1453,8 @@ impl CanvasLayer {
             controls_on_hover: false,
             thresholds: DetailThresholds::default(),
             budget: DetailBudget::default(),
+            attached: false,
+            peers: Vec::new(),
             zoom_limits: (0.02, 8.0),
             pending_links: None,
             link_style: LinkStyle::default(),
@@ -1579,6 +1614,31 @@ impl CanvasLayer {
         content.widget.store_child_pos(index, pos).apply(&mut content.ctx);
     }
 
+    /// Reaches node `index`'s widget, if it currently has one.
+    ///
+    /// The way a change in the model reaches a view that is already on screen. A node
+    /// widget is built from the model and then keeps its own copy — it has to, because
+    /// it is painted far more often than it is built — so a model change that happens
+    /// while the node is materialised has to be pushed into it.
+    ///
+    /// Returns `false` when the node has no widget: it is off screen, or the canvas is
+    /// in the far field. That is not a failure and needs no repair — a node without a
+    /// widget reads the model when it is next built. What a far-field canvas *draws*
+    /// comes from [`NodeSource::paint_far`], and if a change affects that drawing the
+    /// caller invalidates it by moving the node, not by this.
+    pub fn update_child(
+        this: &mut WidgetMut<'_, Self>,
+        index: usize,
+        f: impl FnOnce(WidgetMut<'_, dyn Widget>),
+    ) -> bool {
+        let mut content = this.ctx.get_mut(&mut this.widget.content);
+        let Some(pod) = content.widget.slots.get_mut(index).and_then(|slot| slot.pod.as_mut()) else {
+            return false;
+        };
+        f(content.ctx.get_mut(pod));
+        true
+    }
+
     /// The nodes that currently have a widget, as `(index, widget id)` pairs.
     ///
     /// Useful for tests and for apps that need to reach into a live node. The list
@@ -1637,10 +1697,35 @@ impl CanvasLayer {
         }
     }
 
-    /// Moves a child from an event handler.
+    /// Moves a child from an event handler — the drag, as opposed to the programmatic
+    /// [`move_child`](Self::move_child).
+    ///
+    /// The two differ in exactly one thing and it is the point of the split: a drag is
+    /// the *user* moving a node, so the model has to hear about it and so do the other
+    /// canvases showing the same model. A programmatic move is what those other
+    /// canvases then receive, and it must not bounce back out again.
     fn move_child_at(&mut self, index: usize, pos: Point, ctx: &mut EventCtx<'_>) {
-        let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
-        content.store_child_pos(index, pos).apply(&mut raw);
+        let mut peers = std::mem::take(&mut self.peers);
+        peers.clear();
+        {
+            let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+            let invalidate = content.store_child_pos(index, pos);
+            if invalidate != Invalidate::Nothing {
+                content.source.moved(index, pos, &mut peers);
+            }
+            invalidate.apply(&mut raw);
+        }
+        for &peer in &peers {
+            // A mutate callback rather than a direct reach: another canvas is not this
+            // widget's child, and the mutate pass is where a widget outside the current
+            // subtree may legally be changed. It runs before the next layout, so the
+            // other areas move in the same frame.
+            ctx.mutate_later(peer, move |mut widget| {
+                let mut canvas = widget.downcast::<Self>();
+                Self::move_child(&mut canvas, index, pos);
+            });
+        }
+        self.peers = peers;
     }
 
     /// How many screen pixels one canvas unit covers.
@@ -1829,6 +1914,16 @@ impl Widget for CanvasLayer {
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
         self.viewport = size;
+
+        // The first layout is the first moment this widget knows its own id and can
+        // hand it to the source. Construction is too early: a `CanvasLayer` is built
+        // before it is a widget, and the id is minted when it enters the tree.
+        if !self.attached {
+            self.attached = true;
+            let id = ctx.widget_id();
+            let (content, _) = ctx.get_raw_mut(&mut self.content);
+            content.source.attached(id);
+        }
 
         // Clip to the viewport so children panned out of view cannot paint over the
         // surrounding UI, and so Masonry excludes them from hit testing.

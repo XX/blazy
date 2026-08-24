@@ -196,6 +196,18 @@ Rectangles are **rounded to whole pixels**, and that is load-bearing rather than
 cosmetic — a fractional boundary makes every area count as resized on every frame of a
 drag.
 
+**Several canvases over one model is the normal case, and the model has to carry
+every field of a node's state (§30).** Node geometry included: a canvas keeps its own
+copy of the positions, so a drag that only moved the copy split two views of one graph
+apart permanently. The seams are `NodeSource::attached` (the canvas hands the source its
+own id), `NodeSource::moved` (the drag reaches the model, and the source names the other
+views) and `CanvasLayer::update_child` (a model change reaches a node that is already on
+screen); the fan-out goes through `mutate_later`, so the other areas show it in the same
+frame. Two consequences for tests: a shared model has to be tested with **two** views —
+with one, "the truth is in the model" and "the truth is in the view" are
+indistinguishable — and a toggle has to be clicked **twice**, because Masonry's
+`Checkbox` is a controlled component that never changes its own state.
+
 **Picking asks the model, not the widget tree (§25.3).** A node below the far-field
 threshold has no widget and a link never has one, so `find_widget_under_pointer` cannot
 answer for either; `CanvasLayer::hit_test` answers from the geometry and the recorded

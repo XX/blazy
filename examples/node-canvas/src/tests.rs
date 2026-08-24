@@ -174,6 +174,19 @@ fn controls_write_back_to_the_model() {
 
     let after = graph.borrow().node(index).checked;
     assert_ne!(before, after, "toggling the checkbox should have reached the model");
+
+    // Twice, because Masonry's `Checkbox` does not toggle itself: it emits
+    // `CheckboxToggled(!self.checked)` and leaves the state to whoever owns the source
+    // of truth (upstream says so in its own docs). A node that writes the model and
+    // forgets to tell the checkbox therefore emits the *same* target state on every
+    // click, and the model latches instead of alternating — which is what happened
+    // before the node started reloading itself from the model (§30).
+    harness.mouse_click_on(checkbox, Some(PointerButton::Primary));
+    assert_eq!(
+        graph.borrow().node(index).checked,
+        before,
+        "a second click should put the checkbox back where it started"
+    );
 }
 
 /// Zooms out far enough that the canvas switches to far-field painting.

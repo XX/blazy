@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use masonry::core::WidgetId;
 use masonry::kurbo::{Point, Size};
 use masonry::peniko::Color;
 
@@ -36,6 +37,15 @@ pub struct NodeState {
 #[derive(Debug)]
 pub struct GraphModel {
     nodes: Vec<NodeState>,
+    /// The canvases currently showing this graph.
+    ///
+    /// Strictly this is not model state — a document does not know what looks at it —
+    /// and in an application it would live in whatever owns the views. It is here
+    /// because everything that changes the graph already holds this handle and needs
+    /// the list in the same breath: a change has to reach the other views *in the same
+    /// frame*, and the only code able to do that is code holding a widget context, i.e.
+    /// the canvas and the node (§30).
+    views: Vec<WidgetId>,
 }
 
 impl GraphModel {
@@ -84,12 +94,43 @@ impl GraphModel {
                 }
             })
             .collect();
-        Self { nodes }
+        Self {
+            nodes,
+            views: Vec::new(),
+        }
     }
 
     /// Returns the state of a node.
     pub fn node(&self, index: usize) -> NodeState {
         self.nodes[index]
+    }
+
+    /// Records a node's new position.
+    ///
+    /// Position is state like any other, and by §20.2 state lives here rather than in
+    /// the view: a canvas keeps its own copy of the geometry, and a second canvas over
+    /// the same graph keeps another. Before this existed a drag moved one copy and the
+    /// other views kept the old position for good.
+    pub fn set_pos(&mut self, index: usize, pos: Point) {
+        if let Some(node) = self.nodes.get_mut(index) {
+            node.pos = pos;
+        }
+    }
+
+    /// Records that a canvas is showing this graph.
+    pub fn register_view(&mut self, canvas: WidgetId) {
+        if !self.views.contains(&canvas) {
+            self.views.push(canvas);
+        }
+    }
+
+    /// The canvases showing this graph, except `this` one.
+    ///
+    /// The exclusion is the caller's whole reason for asking: a view that has just
+    /// applied a change does not need it applied again, and re-applying it to the
+    /// widget the user is currently dragging is how a control loses its grip.
+    pub fn other_views(&self, this: Option<WidgetId>, out: &mut Vec<WidgetId>) {
+        out.extend(self.views.iter().copied().filter(|&id| Some(id) != this));
     }
 
     /// Records a slider change.

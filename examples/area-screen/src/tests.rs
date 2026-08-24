@@ -13,17 +13,20 @@
 //! harness; the third cannot, and §23 says why.
 
 use bench_utils::render::{block_magnified, differing_fraction, sharpness_gain};
-use blazy_areas::{AreaContent, RegionKind, UiScale};
+use blazy_areas::{AreaContent, AreaScreen, RegionKind, UiScale};
 use blazy_canvas::CanvasLayer;
 use blazy_shell::Host;
 use image::RgbaImage;
-use masonry::core::NewWidget;
+use masonry::core::{NewWidget, WidgetId};
 use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Point, Size};
+use masonry::kurbo::{Point, Size, Vec2};
 use masonry::peniko::Color;
 use masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
 use masonry::theme::default_property_set;
+use masonry::ui_events::pointer::PointerButton;
 use node_canvas::build_canvas;
+use node_canvas::model::SharedGraph;
+use node_canvas::node::GraphNode;
 
 use crate::build_screen;
 use crate::header::ScaledHeader;
@@ -216,4 +219,153 @@ fn the_snapshot_scales_are_the_ones_that_were_set() {
         .seen_scale();
     assert_eq!(seen, 2.0);
     assert_eq!(UiScale::default().0, 1.0);
+}
+
+// --- MARK: several views of one graph (§30)
+
+/// A screen of `areas` areas over one shared graph.
+fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, SharedGraph) {
+    let (screen, graph) = build_screen(areas, nodes);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(1400, 900),
+    );
+    let _ = harness.redraw();
+    (harness, graph)
+}
+
+/// The canvas region of one area.
+fn canvas_id(harness: &TestHarness<AreaScreen>, area: usize) -> WidgetId {
+    let area_id = harness.root_widget().area_ids()[area];
+    *harness
+        .get_widget_with_id(area_id)
+        .downcast::<AreaContent>()
+        .expect("every area holds a region stack")
+        .region_ids()
+        .last()
+        .expect("an area has regions")
+}
+
+fn child_pos(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> Point {
+    let id = canvas_id(harness, area);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut canvas = widget.downcast::<CanvasLayer>();
+        CanvasLayer::child_pos(&mut canvas, index).expect("the node exists")
+    })
+}
+
+fn live_nodes(harness: &mut TestHarness<AreaScreen>, area: usize) -> Vec<(usize, WidgetId)> {
+    let id = canvas_id(harness, area);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut canvas = widget.downcast::<CanvasLayer>();
+        CanvasLayer::live_children(&mut canvas)
+    })
+}
+
+/// Where a canvas-space point of area `area` lands in the window.
+fn to_window(harness: &TestHarness<AreaScreen>, area: usize, canvas_pos: Point) -> Point {
+    let canvas = harness
+        .get_widget_with_id(canvas_id(harness, area))
+        .downcast::<CanvasLayer>()
+        .expect("the main region is a canvas");
+    canvas.ctx().window_transform() * (canvas.view() * canvas_pos)
+}
+
+/// Dragging a node in one area moves it in every other view of the same graph.
+///
+/// Node geometry is state, and by §20.2 state belongs to the model: each canvas keeps
+/// its own copy of it, so a drag that only moved the copy split the two views apart
+/// permanently. The assertion on the model is half the test — a fix that synchronised
+/// the views but left the model behind would lose the move the moment a node scrolls
+/// out and back in.
+#[test]
+fn a_drag_in_one_area_moves_the_node_in_the_others() {
+    let (mut harness, graph) = screen_harness(2, 200);
+
+    let live = live_nodes(&mut harness, 0);
+    assert!(!live.is_empty(), "area 0 shows something to drag");
+    let index = live[live.len() / 2].0;
+    let before = child_pos(&mut harness, 0, index);
+    assert_eq!(child_pos(&mut harness, 1, index), before, "the views start together");
+
+    // Grab the node by its header strip, which carries no controls of its own.
+    let grab = to_window(&harness, 0, before + Vec2::new(80.0, 8.0));
+    harness.mouse_move(grab);
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    harness.mouse_move(grab + Vec2::new(30.0, 20.0));
+    harness.mouse_button_release(Some(PointerButton::Primary));
+    let _ = harness.redraw();
+
+    let moved = child_pos(&mut harness, 0, index);
+    assert_ne!(moved, before, "the drag has to have moved the node it grabbed");
+    assert_eq!(
+        child_pos(&mut harness, 1, index),
+        moved,
+        "the other area must follow the drag"
+    );
+    assert_eq!(
+        graph.borrow().node(index).pos,
+        moved,
+        "and the model must have recorded it"
+    );
+}
+
+/// Toggling a node's checkbox in one area reaches the same node in another.
+///
+/// Two things at once, and both were broken: the edit did not reach the other view,
+/// and it did not reach the checkbox that was clicked either — Masonry's `Checkbox`
+/// deliberately leaves its state to whoever owns the source of truth.
+#[test]
+fn a_control_edit_in_one_area_reaches_the_others() {
+    let (mut harness, graph) = screen_harness(2, 200);
+
+    let in_zero = live_nodes(&mut harness, 0);
+    let in_one = live_nodes(&mut harness, 1);
+    // A node both areas show, whose checkbox is not clipped by its area's viewport:
+    // a node at the edge of an area has a widget and no reachable control, and picking
+    // one would test the harness's patience rather than the propagation.
+    let (index, own, checkbox) = in_zero
+        .iter()
+        .filter(|(i, _)| in_one.iter().any(|(j, _)| j == i))
+        .find_map(|&(index, node)| {
+            let checkbox = harness
+                .get_widget_with_id(node)
+                .downcast::<GraphNode>()
+                .expect("a canvas child is a GraphNode")
+                .checkbox_id()?;
+            let widget = harness.get_widget_with_id(checkbox);
+            let centre = widget.ctx().window_transform() * widget.ctx().border_box().center();
+            let reachable = harness
+                .root_widget()
+                .as_dyn()
+                .find_widget_under_pointer(centre)
+                .map(|w| w.id())
+                == Some(checkbox);
+            reachable.then_some((index, node, checkbox))
+        })
+        .expect("some node is fully visible in both areas");
+    let peer = in_one
+        .iter()
+        .find_map(|&(i, id)| (i == index).then_some(id))
+        .expect("the shared node");
+
+    let before = graph.borrow().node(index).checked;
+    harness.mouse_click_on(checkbox, Some(PointerButton::Primary));
+    let _ = harness.redraw();
+
+    assert_eq!(
+        graph.borrow().node(index).checked,
+        !before,
+        "the model records the edit"
+    );
+    let shows = |harness: &TestHarness<AreaScreen>, id: WidgetId| {
+        harness
+            .get_widget_with_id(id)
+            .downcast::<GraphNode>()
+            .expect("a canvas child is a GraphNode")
+            .checked()
+    };
+    assert_eq!(shows(&harness, own), !before, "the node that was clicked shows it");
+    assert_eq!(shows(&harness, peer), !before, "and so does the other area's copy");
 }
