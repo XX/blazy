@@ -240,6 +240,7 @@ name = "bench-utils"
 version = "0.1.0"
 dependencies = [
  "image",
+ "masonry",
 ]
 
 [[package]]

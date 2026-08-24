@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord, ZoomRecord};
+use bench_utils::plan;
 use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, DetailBudget};
 use masonry::core::NewWidget;
 use masonry::dpi::PhysicalSize;
@@ -73,6 +74,15 @@ struct Report {
     worst: Duration,
     before: CanvasStats,
     after: CanvasStats,
+    /// Most draw commands the window's layer plan held in any frame of the scenario.
+    ///
+    /// The other half of what a frame costs (§31): the paint pass rebuilds the plan
+    /// every frame and re-appends every widget's cached scene into it, so a scene of
+    /// ten thousand commands is charged ten thousand times a frame whether or not
+    /// anything moved. Widgets cannot see it — in the far field there are none.
+    ///
+    /// The largest rather than the last, because it is a ceiling.
+    commands: usize,
 }
 
 impl Report {
@@ -149,6 +159,11 @@ impl Report {
         self.after.recorded_links as f64
     }
 
+    /// Link curves the last selection dropped as too short to see.
+    fn hidden_links(&self) -> f64 {
+        self.after.hidden_links as f64
+    }
+
     /// The plain-data form the report is built from.
     fn record(&self) -> ScenarioRecord {
         ScenarioRecord {
@@ -167,6 +182,8 @@ impl Report {
                 ("link_reselects_per_frame", self.link_reselects_per_frame()),
                 ("slot_visits_per_frame", self.slot_visits_per_frame()),
                 ("recorded_links", self.recorded_links()),
+                ("hidden_links", self.hidden_links()),
+                ("draw_commands", self.commands as f64),
                 ("level_switches_per_frame", self.level_switches_per_frame()),
                 ("picks", self.picks() as f64),
                 ("node_tests_per_pick", self.node_tests_per_pick()),
@@ -195,6 +212,10 @@ impl Report {
             self.link_repaints_per_frame(),
             self.link_reselects_per_frame(),
             self.slot_visits_per_frame(),
+        );
+        println!(
+            "{:<26}   draw commands {:<10} links recorded {:>6}  hidden {:>6}",
+            "", self.commands, self.after.recorded_links, self.after.hidden_links,
         );
         // Only the scenarios that move the pointer have anything to say here, and a
         // row of zeroes under every other one would bury the numbers that matter.
@@ -375,14 +396,19 @@ fn measure(
     let before = stats(harness);
     let mut total = Duration::ZERO;
     let mut worst = Duration::ZERO;
+    let mut commands = 0;
 
     for i in 0..frames {
         let start = Instant::now();
         step(harness, i);
         // `redraw` runs the rewrite passes and encodes the visual layer plan. That
         // is the frame, minus GPU submission.
-        let _ = harness.redraw();
+        let (layers, _) = harness.redraw();
         let elapsed = start.elapsed();
+        // Counted outside the clock: reading the plan is the measurement, not the
+        // frame. It is exact and machine-independent, which is what lets a criterion
+        // be bounded on it (§20.9).
+        commands = commands.max(plan::commands(&layers));
         total += elapsed;
         worst = worst.max(elapsed);
     }
@@ -394,6 +420,7 @@ fn measure(
         worst,
         before,
         after: stats(harness),
+        commands,
     }
 }
 
@@ -666,17 +693,21 @@ fn zoom_sweep(opts: &Options, count: usize, frames: usize, density: Option<f64>)
                 widgets: widgets_in_tree(&mut harness),
                 detail: format!("{:?}", after.detail),
                 level_switches_per_frame: (after.counters.level_switches - before) as f64 / frames as f64,
+                commands: report.commands,
+                hidden_links: after.hidden_links,
                 mean_ms: report.mean_ms(),
                 worst_ms: report.worst_ms(),
             };
             println!(
-                "  {:>6.3}x {:<3} {:<11} visible {:>5}  widgets {:>5}  {:>7.3} ms/frame  \
-                 worst {:>7.3} ms  level switches/frame {:>4.2}",
+                "  {:>6.3}x {:<3} {:<11} visible {:>5}  widgets {:>5}  commands {:>6}  \
+                 hidden links {:>5}  {:>7.3} ms/frame  worst {:>7.3} ms  switches/frame {:>4.2}",
                 point.zoom,
                 if returning { "up" } else { "out" },
                 point.detail,
                 point.visible,
                 point.widgets,
+                point.commands,
+                point.hidden_links,
                 point.mean_ms,
                 point.worst_ms,
                 point.level_switches_per_frame,
@@ -1280,6 +1311,61 @@ fn evaluate(
             measured: pan.level_switches_per_frame(),
             bound: 0.05,
             unit: "level switches/frame",
+        });
+    }
+
+    // --- What the frame costs when there are no widgets left to count (§31).
+    //
+    // The budget of §29 bounds the tree; below the far-field threshold the tree is
+    // three widgets and the canvas still fills the plan with the scene it painted.
+    // Draw commands are the unit that half of the frame is charged in — the paint
+    // pass rebuilds the plan every frame and re-appends every cached scene into it,
+    // so a command is paid for whether or not anything about it changed.
+    //
+    // The claim is that a far-field frame costs the number of *styles* on screen and
+    // not the number of nodes: six tints in six fills, the links in one stroke, and
+    // the editor's own furniture. Measured: 13, at every zoom in the far field and on
+    // both graphs, against 5000 visible nodes and ~8500 recorded curves. Break the
+    // batch — a fill per node, a stroke per link — and it is 13 000.
+    let far_commands = zooms
+        .iter()
+        .chain(dense_zooms)
+        .filter(|p| p.detail.contains("Box"))
+        .map(|p| p.commands)
+        .max();
+    if let Some(commands) = far_commands {
+        criteria.push(Criterion {
+            name: "a_far_field_frame_costs_styles_not_nodes",
+            claim: "the far field draws a command per colour, not per node",
+            kind: Kind::Counter,
+            measured: commands as f64,
+            bound: 64.0,
+            unit: "draw commands in the plan",
+        });
+    }
+
+    // --- The short-link rule stays where it belongs (§31.4).
+    //
+    // A link under two screen pixels is dropped when the set is chosen. The rule is
+    // keyed on the curve's own on-screen size and not on the detail level, precisely
+    // so that the widget budget never gets to decide whether the graph's structure is
+    // visible — and this is what says the two have not become entangled: at every
+    // sweep point where the canvas still materialises nodes, on both graphs and both
+    // legs, it hides nothing at all. Raise the threshold and it fires at `Simplified`.
+    let hidden_with_widgets = zooms
+        .iter()
+        .chain(dense_zooms)
+        .filter(|p| !p.detail.contains("Box"))
+        .map(|p| p.hidden_links)
+        .max();
+    if let Some(hidden) = hidden_with_widgets {
+        criteria.push(Criterion {
+            name: "the_short_link_rule_only_fires_in_the_far_field",
+            claim: "no link is hidden at a zoom whose nodes are still widgets",
+            kind: Kind::Counter,
+            measured: hidden as f64,
+            bound: 1.0,
+            unit: "links hidden while nodes are widgets",
         });
     }
 

@@ -105,6 +105,13 @@ pub struct ZoomRecord {
     pub widgets: usize,
     pub detail: String,
     pub level_switches_per_frame: f64,
+    /// Draw commands in the window's layer plan (`plan::commands`).
+    ///
+    /// The other half of what a frame costs, and the half widgets do not see: below
+    /// the far-field threshold the tree is empty and the scene is not (§31).
+    pub commands: usize,
+    /// Link curves the selection dropped as too short to see.
+    pub hidden_links: usize,
     pub mean_ms: f64,
     pub worst_ms: f64,
 }
@@ -238,7 +245,7 @@ impl Outcome {
                 out,
                 "    {{\"zoom\": {}, \"returning\": {}, \"nodes\": {}, \"visible\": {}, \
                  \"widgets\": {}, \"detail\": {}, \"level_switches_per_frame\": {}, \
-                 \"mean_ms\": {}, \"worst_ms\": {}}}",
+                 \"commands\": {}, \"hidden_links\": {}, \"mean_ms\": {}, \"worst_ms\": {}}}",
                 num(p.zoom),
                 p.returning,
                 p.nodes,
@@ -246,6 +253,8 @@ impl Outcome {
                 p.widgets,
                 quote(&p.detail),
                 num(p.level_switches_per_frame),
+                p.commands,
+                p.hidden_links,
                 num(p.mean_ms),
                 num(p.worst_ms),
             );

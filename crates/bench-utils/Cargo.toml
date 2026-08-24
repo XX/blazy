@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 image = { workspace = true }
+masonry = { workspace = true }

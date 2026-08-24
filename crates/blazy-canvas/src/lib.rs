@@ -14,7 +14,10 @@
 //! 2. **Culling is mandatory, not an optimisation.** Masonry's per-widget scene cache saves the `paint()` call, but the
 //!    paint pass still copies every visible widget's commands into the layer scene every frame (`passes/paint.rs`,
 //!    `Scene::append_transformed`). Frame cost is proportional to the volume of *visible* commands, so off-screen nodes
-//!    must be stashed to be skipped.
+//!    must be stashed to be skipped. The same sentence applies to the commands the canvas draws itself, and it is the
+//!    reason links and far-field nodes are batched rather than drawn one shape at a time: a command costs ~0.2-0.4 us
+//!    in every frame it sits in the scene, the same geometry inside a shared command ~0.03 us, and an idle canvas pays
+//!    that bill as surely as a busy one (§31).
 //!
 //! 3. **Ordinary widgets work inside nodes.** Masonry already inverts `window_transform` when routing pointer events,
 //!    so sliders and checkboxes inside a zoomed node need no special handling from us.
@@ -75,7 +78,7 @@ use masonry::core::{
 };
 use masonry::dpi::{LogicalPosition, PhysicalPosition};
 use masonry::imaging::Painter;
-use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
+use masonry::kurbo::{Affine, Axis, BezPath, Point, Rect, Shape, Size, Stroke, Vec2};
 use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
 use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerButton, PointerScrollEvent, PointerUpdate};
@@ -83,7 +86,7 @@ use strum::IntoStaticStr;
 
 use crate::index::SpatialIndex;
 pub use crate::links::Link;
-use crate::links::{LinkLayer, link_curve, link_path};
+use crate::links::{LinkLayer, link_curve, push_link};
 
 /// How much detail a canvas child should draw at the current zoom level.
 ///
@@ -328,7 +331,24 @@ pub struct LinkStyle {
     pub hover_color: Color,
     /// Stroke width in canvas units, so links thicken with the zoom like everything
     /// else the canvas draws.
+    ///
+    /// Canvas units and not a minimum in screen pixels, which is a decision rather
+    /// than an oversight (§31.3): a constant on-screen width means the *recorded*
+    /// width depends on the zoom, and the scene is recorded in canvas coordinates
+    /// precisely so that panning and zooming reuse it untouched. `imaging` has no
+    /// non-scaling stroke — the transform is prepended to the whole draw — so buying
+    /// a constant hairline means giving the scene a second axis of invalidation.
     pub width: f64,
+    /// Below this on-screen length, a link is not drawn at all, in **logical pixels**.
+    ///
+    /// A curve two pixels long carries no information and still costs a subpath in
+    /// every frame it is recorded for. Measured on the curve's bounding box, at
+    /// selection time rather than at paint time, so a link leaves the picture and the
+    /// pointer's reach in one action (§31.4).
+    ///
+    /// The rule needs no "only when zoomed out" clause: an on-screen length grows
+    /// with the zoom, so it stops firing on its own. Set to zero to switch it off.
+    pub min_screen_length: f64,
     /// How far the pointer may miss a link and still pick it, in **screen pixels**.
     ///
     /// Screen pixels rather than canvas units, because the tolerance is about the
@@ -344,6 +364,7 @@ impl Default for LinkStyle {
             color: Color::from_rgb8(0x8a, 0x8a, 0x96),
             hover_color: Color::from_rgb8(0xd8, 0xd8, 0xe4),
             width: 2.0,
+            min_screen_length: 2.0,
             slop: blazy_shape::DEFAULT_SLOP,
         }
     }
@@ -419,6 +440,12 @@ pub struct CanvasStats {
     /// Bounded by the region the set was chosen for rather than by the viewport, and
     /// the two part company as soon as the view zooms out (§28).
     pub recorded_links: usize,
+    /// Link curves the last selection dropped as too short to see.
+    ///
+    /// The output of [`LinkStyle::min_screen_length`], and the only way to tell a rule
+    /// that is doing nothing from one that is quietly deleting the graph's structure.
+    /// Zero at any zoom a node is still readable at.
+    pub hidden_links: usize,
     /// What the pointer was last found to be over, as of the last pointer move.
     ///
     /// One frame behind whatever moved the pointer, because it is recorded during
@@ -549,7 +576,7 @@ pub trait NodeSource: 'static {
         let _ = (index, pos, peers);
     }
 
-    /// Draws node `index` when it is too small to deserve a widget.
+    /// Draws the nodes that are too small to deserve widgets, all of them at once.
     ///
     /// Below the [`Detail::Box`] threshold the canvas stops materialising widgets
     /// entirely and paints the nodes itself, in one pass, into its own scene. A node
@@ -557,12 +584,19 @@ pub trait NodeSource: 'static {
     /// event route — it needs a filled rectangle, and a rectangle costs nanoseconds
     /// where a widget costs microseconds.
     ///
-    /// Every command drawn here is multiplied by the number of nodes in the recorded
-    /// region, so keep it to a few cheap shapes.
+    /// **The whole set rather than one node at a time, and that is the point.** What a
+    /// far-field frame costs is the number of *draw commands* in the recorded scene,
+    /// not the geometry in them: the paint pass re-appends the scene every frame, and
+    /// a command costs ~0.2 us there against ~0.014 us for the same rectangle inside a
+    /// shared one (§31.1). A per-node signature forces the expensive shape and gives
+    /// an implementation no way out; this one lets it group — by colour, by kind — and
+    /// pay for the groups instead. The example draws six tints in six commands where
+    /// it used to draw five thousand rectangles in five thousand.
     ///
-    /// `rect` is in canvas coordinates. The default draws nothing.
-    fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {
-        let _ = (index, rect, painter);
+    /// `nodes` is `(index, rect)` in canvas coordinates, ascending by index, and is a
+    /// buffer the canvas reuses. The default draws nothing.
+    fn paint_far(&mut self, nodes: &[(usize, Rect)], painter: &mut Painter<'_>) {
+        let _ = (nodes, painter);
     }
 
     /// Whether the canvas-space `point` is inside node `index`, whose rectangle is
@@ -823,11 +857,28 @@ pub struct CanvasContent {
     scratch_added: Vec<usize>,
     /// Reused buffer for index candidates, so culling allocates nothing either.
     scratch_candidates: Vec<usize>,
+    /// Reused paths for the two link batches, so a repaint allocates nothing.
+    ///
+    /// One holds every ordinary link, the other the hovered one; each is stroked with
+    /// a single command. `BezPath` has no `clear`, but `truncate(0)` keeps the
+    /// capacity, which is the whole reason these are fields.
+    scratch_links: BezPath,
+    scratch_hot_links: BezPath,
+    /// Reused buffer for the far-field batch handed to [`NodeSource::paint_far`].
+    scratch_far: Vec<(usize, Rect)>,
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
     /// Visible region in canvas coordinates, pushed down by the parent.
     visible_rect: Rect,
+    /// How many screen pixels one canvas unit covers, pushed down by the parent.
+    ///
+    /// The zoom only. The rest of the chain — a region's `ui_scale`, the device scale
+    /// — would need `window_transform`, which `LayoutCtx` does not offer; the pointer
+    /// path uses the full product because `EventCtx` does (see `hit_scale`). It
+    /// matters for one thing, [`LinkStyle::min_screen_length`], where the error is a
+    /// factor on a two-pixel threshold, and it is written down rather than hidden.
+    scale: f64,
     /// The coarsest level the zoom still makes readable, pushed down by the parent.
     ///
     /// Half of the decision. The other half is [`DetailBudget`], and it cannot be
@@ -878,8 +929,12 @@ impl CanvasContent {
             scratch_removed: Vec::new(),
             scratch_added: Vec::new(),
             scratch_candidates: Vec::new(),
+            scratch_links: BezPath::new(),
+            scratch_hot_links: BezPath::new(),
+            scratch_far: Vec::new(),
             pending: None,
             visible_rect: Rect::ZERO,
+            scale: 1.0,
             readable: None,
             budget: DetailBudget::default(),
             detail: None,
@@ -943,7 +998,7 @@ impl CanvasContent {
         found
     }
 
-    /// The topmost link under a point, or `None`.
+    /// A link under a point, or `None`.
     ///
     /// Candidates are the links the canvas has recorded for this viewport, so what
     /// can be picked is exactly what is drawn — the selection rule of §24.4 and its
@@ -963,9 +1018,14 @@ impl CanvasContent {
 
         let mut examined = 0_u64;
         let mut found = None;
-        // Reverse recorded order: the curves are stroked in ascending order, so the
-        // last one drawn is the one on top.
-        for &edge in self.links.recorded().iter().rev() {
+        // Any of the links under the pointer, not the topmost one: the curves are
+        // stroked batched by style, so recorded order is no longer drawing order and
+        // "the last one drawn" cannot be recovered from this list (§31.2). Declaring
+        // the order undefined is the cheap half of that trade — the alternative is a
+        // command per style change, which is the cost the batch exists to remove. What
+        // still holds is the property that matters: the candidates are exactly the
+        // links that are drawn.
+        for &edge in self.links.recorded() {
             let link = self.links.edge(edge);
             let (Some(from), Some(to)) = (self.slots.get(link.from as usize), self.slots.get(link.to as usize)) else {
                 continue;
@@ -1204,8 +1264,51 @@ impl CanvasContent {
         self.index.candidates(region, &mut candidates);
         self.visits += candidates.len() as u64;
         candidates.retain(|&i| Rect::from_origin_size(self.slots[i].pos, self.slots[i].size).overlaps(region));
-        self.links.refresh(region, self.visible_rect, &candidates);
+        let reselected = self.links.refresh(region, self.visible_rect, &candidates);
         self.scratch_candidates = candidates;
+        if reselected {
+            self.drop_short_links();
+        }
+    }
+
+    /// Drops the links too short to be seen at the current zoom.
+    ///
+    /// Here rather than in `paint`, and that placement is the design (§31.4). The set
+    /// chosen here is the one both the picture and the pointer read, so a link leaves
+    /// both at once and they cannot disagree — the property `link_curve` exists to
+    /// protect. It also adds no invalidation of its own: the threshold is evaluated
+    /// when the set is re-chosen anyway, and between selections it is simply a little
+    /// stale, which shows a hairline slightly longer than needed and costs a few
+    /// curves. There is no error in the other direction.
+    fn drop_short_links(&mut self) {
+        let min_screen = self.link_style.min_screen_length;
+        if min_screen <= 0.0 || self.scale <= f64::EPSILON {
+            return;
+        }
+        // Screen pixels into canvas units, the same conversion the pick tolerance
+        // makes and for the same reason: canvas units span a factor of 400 across the
+        // zoom range, so a threshold expressed in them would mean something different
+        // at each end (§25.2).
+        let min_canvas = min_screen / self.scale;
+        let slots = &self.slots;
+        self.links.retain_recorded(|link| {
+            let (Some(from), Some(to)) = (slots.get(link.from as usize), slots.get(link.to as usize)) else {
+                // An edge naming a node that does not exist is skipped when drawn.
+                // Keeping it here keeps "hidden" meaning "too short to see".
+                return true;
+            };
+            let bounds = link_curve(
+                Rect::from_origin_size(from.pos, from.size),
+                Rect::from_origin_size(to.pos, to.size),
+            )
+            .bounding_box()
+            .size();
+            // The diagonal of the box the curve occupies, not the chord: a link that
+            // bows away and comes back is visible even when its endpoints nearly
+            // coincide. It is also the conservative choice — never smaller than either
+            // side — and a rule that removes picture should err towards keeping it.
+            bounds.width.hypot(bounds.height) >= min_canvas
+        });
     }
 
     /// Re-records the far-field node set when the viewport leaves the painted region.
@@ -1295,37 +1398,64 @@ impl Widget for CanvasContent {
             self.link_repaints += 1;
             let stroke = Stroke::new(self.link_style.width);
             let hovered = self.hovered.and_then(CanvasHit::link);
+
+            // One path per style, and one command per path. The curves keep apart
+            // because each link starts a subpath; what they lose is their order
+            // relative to each other, which is why picking no longer claims to return
+            // the topmost link. Stroking each link on its own instead costs 15x per
+            // curve in every frame the scene is appended — which is every frame, idle
+            // or not (§31.1).
+            let mut plain = std::mem::take(&mut self.scratch_links);
+            let mut hot = std::mem::take(&mut self.scratch_hot_links);
+            plain.truncate(0);
+            hot.truncate(0);
             for &edge in self.links.recorded() {
                 let link = self.links.edge(edge);
                 let (Some(from), Some(to)) = (self.slots.get(link.from as usize), self.slots.get(link.to as usize))
                 else {
                     continue;
                 };
-                let path = link_path(
+                let path = if hovered == Some(edge as usize) {
+                    &mut hot
+                } else {
+                    &mut plain
+                };
+                push_link(
+                    path,
                     Rect::from_origin_size(from.pos, from.size),
                     Rect::from_origin_size(to.pos, to.size),
                 );
-                let color = if hovered == Some(edge as usize) {
-                    self.link_style.hover_color
-                } else {
-                    self.link_style.color
-                };
-                painter.stroke(&path, &stroke, color).draw();
             }
+            if !plain.is_empty() {
+                painter.stroke(&plain, &stroke, self.link_style.color).draw();
+            }
+            // Last, so the highlighted link is the one on top — the only ordering the
+            // batch still guarantees, and the only one that matters.
+            if !hot.is_empty() {
+                painter.stroke(&hot, &stroke, self.link_style.hover_color).draw();
+            }
+            self.scratch_links = plain;
+            self.scratch_hot_links = hot;
         }
 
         if !self.far.active {
             return;
         }
         self.far_repaints += 1;
-        // One pass over the visible nodes, straight into this widget's cached scene.
-        // The scene is in canvas coordinates, so panning and zooming re-use it via
-        // the layer transform without re-encoding anything.
-        for &index in &self.far.nodes {
+        // The whole set in one call, straight into this widget's cached scene, which
+        // is in canvas coordinates so panning and zooming re-use it via the layer
+        // transform without re-encoding anything. Handing over the set rather than
+        // calling per node is what lets the application group its fills: the frame
+        // costs commands, and a command's content is nearly free next to its
+        // existence (§31.1).
+        let mut batch = std::mem::take(&mut self.scratch_far);
+        batch.clear();
+        batch.extend(self.far.nodes.iter().map(|&index| {
             let slot = &self.slots[index];
-            let rect = Rect::from_origin_size(slot.pos, slot.size);
-            self.source.paint_far(index, rect, painter);
-        }
+            (index, Rect::from_origin_size(slot.pos, slot.size))
+        }));
+        self.source.paint_far(&batch, painter);
+        self.scratch_far = batch;
     }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
@@ -1930,9 +2060,10 @@ impl Widget for CanvasLayer {
         ctx.set_clip_path(Rect::from_origin_size(Point::ORIGIN, size));
 
         let visible_rect = self.visible_canvas_rect();
+        let zoom = self.zoom();
         // Only the readability half of the decision can be taken here: the cost half
         // needs the number of visible nodes, which the cull computes (§29.2).
-        let readable = self.thresholds.for_scale(self.zoom());
+        let readable = self.thresholds.for_scale(zoom);
         let view = self.view;
         let view_dirty = std::mem::take(&mut self.view_dirty);
 
@@ -1958,6 +2089,7 @@ impl Widget for CanvasLayer {
             content.link_style = self.link_style;
             content.controls_on_hover = self.controls_on_hover;
             content.visible_rect = visible_rect;
+            content.scale = zoom;
             content.readable = Some(readable);
             content.budget = self.budget;
             if view_dirty {
@@ -1984,7 +2116,6 @@ impl Widget for CanvasLayer {
         ctx.run_layout(&mut self.content, content_size);
         ctx.place_child(&mut self.content, Point::ORIGIN);
 
-        let zoom = self.zoom();
         let (content, _) = ctx.get_raw(&mut self.content);
         self.stats.set(CanvasStats {
             total: content.slots.len(),
@@ -1994,6 +2125,7 @@ impl Widget for CanvasLayer {
             zoom,
             recorded_far: content.far.nodes.len(),
             recorded_links: content.links.recorded().len(),
+            hidden_links: content.links.hidden(),
             hovered: content.hovered,
             counters: CanvasCounters {
                 content_layouts: content.layouts,
@@ -2118,6 +2250,11 @@ mod tests {
     /// from the model, so a widget tree would only add a way for the test to be
     /// about something else.
     fn content(rects: &[Rect], edges: Vec<Link>, visible: Rect) -> CanvasContent {
+        content_at_scale(rects, edges, visible, 1.0)
+    }
+
+    /// The same, at a given zoom — which is what the short-link rule reads.
+    fn content_at_scale(rects: &[Rect], edges: Vec<Link>, visible: Rect, scale: f64) -> CanvasContent {
         let size = rects.first().map_or(Size::ZERO, Rect::size);
         let slots = rects
             .iter()
@@ -2133,6 +2270,7 @@ mod tests {
         content.links.invalidate();
         content.detail = Some(Detail::Full);
         content.visible_rect = visible;
+        content.scale = scale;
         content.cull();
         content
     }
@@ -2366,5 +2504,182 @@ mod tests {
         // Affordable set, illegible zoom: readability decides.
         let readable = thresholds.for_scale(0.01);
         assert_eq!(readable.max(budget.level_for(1, None)), Detail::Box);
+    }
+
+    // --- MARK: SHORT LINKS
+
+    /// Room for the long link of the tests below, which reaches out to x = 2000.
+    const WIDE: Rect = Rect::new(-3000.0, -3000.0, 3000.0, 3000.0);
+
+    /// A curve too short to see is dropped when the set is chosen, not when it is
+    /// drawn — so it leaves the picture and the pointer's reach together.
+    ///
+    /// One link only, so "no link here" is unambiguous: with a second one on screen
+    /// the pick tolerance at this zoom (screen pixels divided by 0.01) reaches far
+    /// enough to find it, and the test would be measuring the tolerance instead.
+    #[test]
+    fn a_link_too_short_to_see_is_neither_drawn_nor_picked() {
+        let rects = [node_rect(0.0, 0.0), node_rect(120.0, 0.0)];
+        let mut canvas = content_at_scale(&rects, vec![Link::new(0, 1)], WIDE, 0.01);
+
+        assert!(
+            canvas.links.recorded().is_empty(),
+            "a curve under a pixel long should not be recorded"
+        );
+        assert_eq!(canvas.links.hidden(), 1);
+        // Between the two nodes, where the curve would run.
+        assert_eq!(canvas.hit(Point::new(110.0, 30.0), 0.01), None);
+    }
+
+    /// And it drops only the short one: the rule is a threshold, not an off switch.
+    #[test]
+    fn the_short_link_rule_keeps_the_links_that_are_visible() {
+        let rects = [
+            node_rect(0.0, 0.0),
+            node_rect(120.0, 0.0),
+            node_rect(0.0, 400.0),
+            node_rect(2000.0, 400.0),
+        ];
+        let edges = vec![Link::new(0, 1), Link::new(2, 3)];
+        let canvas = content_at_scale(&rects, edges, WIDE, 0.01);
+
+        assert_eq!(canvas.links.recorded(), &[1], "the long link survives");
+        assert_eq!(canvas.links.hidden(), 1);
+    }
+
+    /// The rule needs no "only when zoomed out" clause because an on-screen length
+    /// grows with the zoom. This is what says so: at a zoom anything is readable at,
+    /// it hides nothing at all.
+    #[test]
+    fn the_short_link_rule_is_silent_at_a_working_zoom() {
+        let rects = [node_rect(0.0, 0.0), node_rect(120.0, 0.0)];
+        let mut canvas = content_at_scale(&rects, vec![Link::new(0, 1)], EVERYTHING, 1.0);
+
+        assert_eq!(canvas.links.recorded(), &[0]);
+        assert_eq!(canvas.links.hidden(), 0);
+        assert!(matches!(
+            canvas.hit(Point::new(110.0, 30.0), 1.0),
+            Some(CanvasHit::Link { edge: 0, .. })
+        ));
+    }
+
+    // --- MARK: BATCHING
+
+    /// Strokes some curves, either as one path or as one command each.
+    ///
+    /// Two widgets' worth of behaviour in one, because the whole question is whether
+    /// the two are the same picture.
+    struct Curves {
+        links: Vec<(Rect, Rect)>,
+        batched: bool,
+    }
+
+    impl Widget for Curves {
+        type Action = NoAction;
+
+        fn measure(
+            &mut self,
+            _ctx: &mut MeasureCtx<'_>,
+            _props: &PropertiesRef<'_>,
+            _axis: Axis,
+            len_req: LenReq,
+            _cross: Option<Length>,
+        ) -> Length {
+            match len_req {
+                LenReq::MinContent | LenReq::MaxContent => Length::ZERO,
+                LenReq::FitContent(space) => space,
+            }
+        }
+
+        fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
+
+        fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+            let stroke = Stroke::new(3.0);
+            let colour = Color::from_rgb8(0xd0, 0xd0, 0xe0);
+            if self.batched {
+                let mut path = BezPath::new();
+                for &(from, to) in &self.links {
+                    push_link(&mut path, from, to);
+                }
+                if !path.is_empty() {
+                    painter.stroke(&path, &stroke, colour).draw();
+                }
+            } else {
+                for &(from, to) in &self.links {
+                    let mut path = BezPath::new();
+                    push_link(&mut path, from, to);
+                    painter.stroke(&path, &stroke, colour).draw();
+                }
+            }
+        }
+
+        fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
+
+        fn children_ids(&self) -> ChildrenIds {
+            ChildrenIds::new()
+        }
+
+        fn accessibility_role(&self) -> Role {
+            Role::GenericContainer
+        }
+
+        fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+    }
+
+    fn drawn(links: &[(Rect, Rect)], batched: bool) -> Vec<u8> {
+        let mut harness = masonry::testing::TestHarness::create_with_size(
+            masonry::theme::default_property_set(),
+            NewWidget::new(Curves {
+                links: links.to_vec(),
+                batched,
+            }),
+            masonry::dpi::PhysicalSize::new(400, 200),
+        );
+        harness.render().into_raw()
+    }
+
+    /// The claim the whole batch rests on: `move_to` starts a subpath, and separate
+    /// subpaths are stroked separately. If they were joined up, a segment would run
+    /// from the end of one link to the start of the next and these would differ.
+    #[test]
+    fn a_batched_stroke_draws_what_separate_strokes_draw() {
+        let links = [
+            (node_rect(20.0, 20.0), node_rect(240.0, 30.0)),
+            (node_rect(20.0, 120.0), node_rect(240.0, 130.0)),
+        ];
+        assert_eq!(
+            drawn(&links, true),
+            drawn(&links, false),
+            "one command with two subpaths must paint what two commands paint"
+        );
+
+        // And the space between the two links stays empty, which is the same claim
+        // read the other way round.
+        let empty = drawn(&[], true);
+        let batched = drawn(&links, true);
+        let midpoint = (100 * 400 + 200) * 4;
+        assert_eq!(
+            batched[midpoint..midpoint + 4],
+            empty[midpoint..midpoint + 4],
+            "no segment joins the end of one link to the start of the next"
+        );
+    }
+
+    /// Where the batch is *not* pixel-identical, and it is worth knowing which way.
+    ///
+    /// Two curves leaving the same point overlap, and their antialiased coverage is
+    /// composited once inside a shared command against twice as separate ones. It
+    /// moved 50 pixels of 46 800 in the `canvas_with_links` snapshot, by at most 25
+    /// of 255, all of them on curve overlaps — small, real, and not something to
+    /// discover later from a failing gate.
+    #[test]
+    fn overlapping_curves_composite_once_in_a_batch() {
+        let shared = node_rect(20.0, 90.0);
+        let links = [(shared, node_rect(240.0, 20.0)), (shared, node_rect(240.0, 150.0))];
+        assert_ne!(
+            drawn(&links, true),
+            drawn(&links, false),
+            "if this ever matches, the difference the snapshot records has gone away"
+        );
     }
 }

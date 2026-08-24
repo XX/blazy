@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use area_screen::header::ScaledHeader;
 use area_screen::{build_screen, build_screen_with};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
+use bench_utils::plan;
 use blazy_areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
 use blazy_canvas::CanvasLayer;
 use masonry::core::{NewWidget, WidgetId, WindowEvent};
@@ -80,6 +81,13 @@ struct Report {
     worst: Duration,
     before: Snapshot,
     after: Snapshot,
+    /// Most draw commands the window's layer plan held in any frame (§31).
+    ///
+    /// The window's total, which is the unit this cost belongs in: the paint pass
+    /// rebuilds one plan for the whole window every frame, so an area holding a huge
+    /// scene charges its neighbours for it exactly as an area holding widgets does —
+    /// and no single canvas can see the sum.
+    commands: usize,
 }
 
 impl Report {
@@ -257,11 +265,14 @@ fn measure(
     let mut total = Duration::ZERO;
     let mut worst = Duration::ZERO;
 
+    let mut commands = 0;
     for i in 0..frames {
         let start = Instant::now();
         step(harness, i);
-        let _ = harness.redraw();
+        let (layers, _) = harness.redraw();
         let elapsed = start.elapsed();
+        // Outside the clock: reading the plan is the measurement, not the frame.
+        commands = commands.max(plan::commands(&layers));
         total += elapsed;
         worst = worst.max(elapsed);
     }
@@ -273,6 +284,7 @@ fn measure(
         worst,
         before,
         after: snapshot(harness),
+        commands,
     }
 }
 
@@ -350,8 +362,9 @@ fn widgets_in_window(harness: &mut TestHarness<AreaScreen>) -> usize {
 /// Without a shared ceiling this is the arithmetic that breaks the screen: eight areas
 /// each honestly inside a canvas-sized budget put eight of them in one window.
 ///
-/// Returns the widgets held and the mean and worst frame while panning in area 0.
-fn overview_screen(opts: &Options, areas: usize, nodes: usize) -> (usize, f64, f64) {
+/// Returns the widgets held, the draw commands in the window's plan, and the mean and
+/// worst frame while panning in area 0.
+fn overview_screen(opts: &Options, areas: usize, nodes: usize) -> (usize, usize, f64, f64) {
     let frames = if opts.quick { 20 } else { 40 };
     let mut harness = new_harness(areas, nodes);
     for area in 0..areas {
@@ -365,12 +378,14 @@ fn overview_screen(opts: &Options, areas: usize, nodes: usize) -> (usize, f64, f
     let widgets = widgets_in_window(&mut harness);
     println!(
         "\nwindow budget: every area at zoom 0.06, panning in one\n  \
-         {widgets} widgets in the window, {:.3} ms/frame, worst {:.3} ms  (live nodes {})",
+         {widgets} widgets and {} draw commands in the window, {:.3} ms/frame, \
+         worst {:.3} ms  (live nodes {})",
+        report.commands,
         report.mean_ms(),
         report.worst_ms(),
         report.after.live,
     );
-    (widgets, report.mean_ms(), report.worst_ms())
+    (widgets, report.commands, report.mean_ms(), report.worst_ms())
 }
 
 /// Runs the scenarios, prints the numbers, and returns the evaluated criteria.
@@ -510,13 +525,21 @@ pub fn run(opts: &Options) -> Outcome {
 
     let sweep = area_sweep(opts, nodes);
     let regions = region_cost(opts, areas, nodes);
-    let (overview_widgets, ..) = overview_screen(opts, areas, nodes);
+    let (overview_widgets, overview_commands, ..) = overview_screen(opts, areas, nodes);
 
     let outcome = Outcome {
         nodes: areas,
         viewport: VIEWPORT,
         quick: opts.quick,
-        criteria: evaluate(&reports, &sweep, scale_misses, regions, overview_widgets, areas),
+        criteria: evaluate(
+            &reports,
+            &sweep,
+            scale_misses,
+            regions,
+            overview_widgets,
+            overview_commands,
+            areas,
+        ),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
         zoom_sweep: Vec::new(),
@@ -596,6 +619,7 @@ fn evaluate(
     scale_misses: u64,
     regions: (f64, f64),
     overview_widgets: usize,
+    overview_commands: usize,
     areas: usize,
 ) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
@@ -742,6 +766,26 @@ fn evaluate(
         measured: overview_widgets as f64,
         bound: blazy_canvas::DEFAULT_WIDGET_BUDGET as f64 + 10.0 * areas as f64,
         unit: "widgets in the window",
+    });
+
+    // --- The other half of the same frame (§31).
+    //
+    // Widgets are not what an overview area holds: below the far-field threshold it
+    // holds none and still fills the plan with the scene it painted. Before batching,
+    // eight areas at this zoom put 9384 rectangles and 18 768 curves into the window's
+    // plan and cost 13.12 ms a frame with 33 widgets in the tree — a ceiling in widgets
+    // cannot see that, and this is the counter that can.
+    //
+    // The bound is per area rather than absolute: what an area draws is a handful of
+    // commands per colour it uses, so the honest claim is that the window costs the
+    // number of *styles* on screen and not the number of nodes.
+    criteria.push(Criterion {
+        name: "the_window_plan_costs_styles_not_nodes",
+        claim: "an overview area fills the plan with colours, not with nodes",
+        kind: Kind::Counter,
+        measured: overview_commands as f64,
+        bound: 64.0 * areas as f64,
+        unit: "draw commands in the window",
     });
 
     criteria

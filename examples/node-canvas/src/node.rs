@@ -26,7 +26,7 @@ use masonry::core::{
     WidgetRef,
 };
 use masonry::imaging::Painter;
-use masonry::kurbo::{Axis, Point, Rect, RoundedRect, Size, Stroke};
+use masonry::kurbo::{Axis, BezPath, Point, Rect, RoundedRect, Shape, Size, Stroke};
 use masonry::layout::{LenReq, Length, SizeDef};
 use masonry::peniko::Color;
 use masonry::widgets::{Checkbox, CheckboxToggled, Slider, SliderMoved};
@@ -39,6 +39,12 @@ const HEADER_HEIGHT: f64 = 22.0;
 const RADIUS: f64 = 6.0;
 /// Padding around the node's controls.
 const PADDING: f64 = 8.0;
+/// Flattening tolerance for the far-field rounded corners, in canvas units.
+///
+/// Generous on purpose: in the far field a whole node is a few pixels across, so its
+/// corner arc is a fraction of one, and the elements this saves are elements the
+/// batch would carry in every frame.
+const FAR_TOLERANCE: f64 = 1.0;
 
 /// A graph node with a slider and a checkbox.
 ///
@@ -396,6 +402,8 @@ pub struct GraphSource {
     /// makes the exact test 15x cheaper than re-walking the path (§25.1), and it only
     /// pays if it survives between picks.
     body: ShapeHit,
+    /// One reusable path per tint, for the far field. See [`NodeSource::paint_far`].
+    far_batches: Vec<(Color, BezPath)>,
 }
 
 impl GraphSource {
@@ -405,6 +413,7 @@ impl GraphSource {
             graph,
             canvas: None,
             body: body_shape(crate::model::NODE_SIZE),
+            far_batches: Vec::new(),
         }
     }
 }
@@ -430,12 +439,43 @@ impl NodeSource for GraphSource {
         self.graph.borrow().other_views(self.canvas, peers);
     }
 
-    fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {
-        // The far field: no widget, no layout, no widget-tree hit route — one filled
-        // rounded rect per node, straight into the canvas's own scene. Picking still
-        // works, because the canvas asks `hit` rather than the tree.
-        let tint = self.graph.borrow().node(index).tint;
-        painter.fill(RoundedRect::from_rect(rect, RADIUS), tint).draw();
+    fn paint_far(&mut self, nodes: &[(usize, Rect)], painter: &mut Painter<'_>) {
+        // The far field: no widget, no layout, no widget-tree hit route — the nodes
+        // are shapes in the canvas's own scene. Picking still works, because the
+        // canvas asks `hit` rather than the tree.
+        //
+        // Grouped by tint and filled once per group. The generated graph has six
+        // tints, so five thousand nodes cost six commands instead of five thousand,
+        // and that is the difference between 5.27 ms and 1.40 ms a frame — a command
+        // is charged in every frame the scene is appended, which is every frame (§31).
+        // The grouping is a linear scan because six is the number: a map would cost
+        // more than it saves.
+        let graph = self.graph.borrow();
+        let mut batches = std::mem::take(&mut self.far_batches);
+        for (_, path) in &mut batches {
+            path.truncate(0);
+        }
+        for &(index, rect) in nodes {
+            let tint = graph.node(index).tint;
+            let batch = match batches.iter().position(|(colour, _)| *colour == tint) {
+                Some(at) => &mut batches[at],
+                None => {
+                    batches.push((tint, BezPath::new()));
+                    batches.last_mut().expect("just pushed")
+                },
+            };
+            // Each node is its own subpath, so the fill treats them as separate
+            // shapes; `move_to` is what keeps them from being joined up.
+            batch
+                .1
+                .extend(RoundedRect::from_rect(rect, RADIUS).path_elements(FAR_TOLERANCE));
+        }
+        for (tint, path) in &batches {
+            if !path.is_empty() {
+                painter.fill(path, *tint).draw();
+            }
+        }
+        self.far_batches = batches;
     }
 
     fn hit(&mut self, _index: usize, rect: Rect, point: Point) -> bool {

@@ -15,3 +15,6 @@ workspace = true
 blazy-shape = { workspace = true }
 masonry = { workspace = true }
 strum = { workspace = true }
+
+[dev-dependencies]
+masonry = { workspace = true, features = ["testing"] }

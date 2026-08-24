@@ -23,6 +23,26 @@
 //! bounding boxes would fix it, and would cost a second index whose cells degenerate
 //! as soon as one edge is long. The limitation is pinned by a test rather than left
 //! to be discovered.
+//!
+//! A link too short to see is dropped from the set as well — see
+//! [`retain_recorded`](LinkLayer::retain_recorded). It happens at selection time, so
+//! the same set answers "what is drawn" and "what can be picked" and no new
+//! invalidation is introduced.
+//!
+//! # How they are drawn, and what that costs the order
+//!
+//! All the recorded curves go into **one path per style** and are stroked with one
+//! command; a `move_to` per link is what keeps them apart, and each subpath is capped
+//! on its own (`kurbo::stroke` finishes the previous one on every `MoveTo`). A command
+//! costs ~0.4 us in every frame it sits in the scene against ~0.03 us for the same
+//! curve inside a shared one, and the paint pass re-appends the whole scene every
+//! frame whether or not anything changed — so N commands is the one thing a link layer
+//! must not be (§31).
+//!
+//! The price is that **the drawing order between links is not defined**. Curves are
+//! grouped by style, not by index, so two overlapping links stack by group. Picking
+//! is written to match: it takes any of the links under the pointer rather than
+//! claiming the topmost one.
 
 use masonry::kurbo::{BezPath, CubicBez, Point, Rect};
 
@@ -60,6 +80,11 @@ pub(crate) struct LinkLayer {
     repaint: bool,
     /// Set when the recorded *set* is no longer the right one.
     reselect: bool,
+    /// Links dropped by the last [`retain_recorded`](Self::retain_recorded).
+    ///
+    /// Published so the rule that drops them can be measured: a threshold nobody can
+    /// see the effect of is a threshold nobody can check for vacuity (§20.9).
+    hidden: usize,
     /// Times the set has been re-chosen.
     refreshes: u64,
 }
@@ -81,6 +106,7 @@ impl LinkLayer {
             recorded: Vec::new(),
             repaint: false,
             reselect: false,
+            hidden: 0,
             refreshes: 0,
         }
     }
@@ -99,6 +125,28 @@ impl LinkLayer {
 
     pub(crate) fn refreshes(&self) -> u64 {
         self.refreshes
+    }
+
+    /// Links the last selection dropped as too short to see.
+    pub(crate) fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    /// Drops recorded links that `keep` rejects.
+    ///
+    /// Meant to be called straight after [`refresh`](Self::refresh), so a filter that
+    /// depends on the zoom runs once per *selection* rather than once per frame. That
+    /// is the whole trick: the set is then slightly stale between selections — a link
+    /// that shrank below the threshold after the last one keeps being drawn for a
+    /// while — and that is the affordable direction of the error. It also keeps
+    /// drawing and picking honest for free, because both read this one set.
+    ///
+    /// `retain` preserves order, so `recorded` stays ascending.
+    pub(crate) fn retain_recorded(&mut self, mut keep: impl FnMut(Link) -> bool) {
+        let before = self.recorded.len();
+        let edges = &self.edges;
+        self.recorded.retain(|&edge| keep(edges[edge as usize]));
+        self.hidden = before - self.recorded.len();
     }
 
     /// Takes the "the scene must be redrawn" flag.
@@ -155,6 +203,7 @@ impl LinkLayer {
         self.recorded.dedup();
 
         self.region = Some(region);
+        self.hidden = 0;
         self.refreshes += 1;
         self.repaint = true;
         true
@@ -193,13 +242,16 @@ pub(crate) fn link_curve(from: Rect, to: Rect) -> CubicBez {
     )
 }
 
-/// The same curve as a path, for stroking.
-pub(crate) fn link_path(from: Rect, to: Rect) -> BezPath {
-    let mut path = BezPath::new();
+/// Appends one link to a path being built for the whole batch.
+///
+/// A `move_to` rather than a `line_to`, which is what makes this a **new subpath**
+/// instead of a continuation of the previous link: stroking finishes the subpath on
+/// every `MoveTo` and caps it, so the two links never grow a segment joining them.
+/// That is the only reason one command can carry thousands of unrelated curves.
+pub(crate) fn push_link(path: &mut BezPath, from: Rect, to: Rect) {
     let curve = link_curve(from, to);
     path.move_to(curve.p0);
     path.curve_to(curve.p1, curve.p2, curve.p3);
-    path
 }
 
 #[cfg(test)]
@@ -339,11 +391,47 @@ mod tests {
 
     #[test]
     fn the_curve_starts_and_ends_on_the_facing_edges() {
-        let path = link_path(rect(0.0, 0.0), rect(300.0, 100.0));
+        let mut path = BezPath::new();
+        push_link(&mut path, rect(0.0, 0.0), rect(300.0, 100.0));
         let start = path.elements()[0];
         assert!(
             matches!(start, masonry::kurbo::PathEl::MoveTo(p) if p == Point::new(100.0, 25.0)),
             "{start:?}"
         );
+    }
+
+    /// The property the batch stands on: every link starts a subpath of its own, so
+    /// nothing joins the end of one to the start of the next.
+    #[test]
+    fn a_batch_starts_a_new_subpath_per_link() {
+        let mut path = BezPath::new();
+        push_link(&mut path, rect(0.0, 0.0), rect(300.0, 0.0));
+        push_link(&mut path, rect(0.0, 900.0), rect(300.0, 900.0));
+
+        let moves = path
+            .elements()
+            .iter()
+            .filter(|el| matches!(el, masonry::kurbo::PathEl::MoveTo(_)))
+            .count();
+        assert_eq!(moves, 2, "two links, two subpaths");
+        assert_eq!(path.subpaths().count(), 2);
+    }
+
+    #[test]
+    fn a_short_link_can_be_dropped_from_the_recorded_set() {
+        let mut layer = chain();
+        let region = Rect::new(0.0, 0.0, 1000.0, 1000.0);
+        layer.refresh(region, region, &[0, 1, 2, 3, 4]);
+        assert_eq!(layer.recorded(), &[0, 1, 2, 3]);
+
+        layer.retain_recorded(|link| link.from % 2 == 0);
+        assert_eq!(layer.recorded(), &[0, 2], "ascending order survives the filter");
+        assert_eq!(layer.hidden(), 2);
+
+        // A fresh selection starts from nothing hidden, or the count would accumulate
+        // across zooms and stop meaning "hidden right now".
+        layer.invalidate();
+        layer.refresh(region, region, &[0, 1, 2, 3, 4]);
+        assert_eq!(layer.hidden(), 0);
     }
 }
