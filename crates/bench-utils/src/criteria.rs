@@ -86,6 +86,29 @@ pub struct SweepRecord {
     pub pan_ms: f64,
 }
 
+/// One point of a zoom sweep.
+///
+/// Separate from [`SweepRecord`] because the question is different: the scaling sweep
+/// asks what changes when the graph grows, and this one asks what the tree holds at
+/// each zoom — the quantity a cost budget is written in (§29).
+pub struct ZoomRecord {
+    pub zoom: f64,
+    /// Which leg: `false` on the way out, `true` coming back.
+    ///
+    /// Both are recorded because a sweep that only descends tests half a switch
+    /// (§28.4), and hysteresis makes the two legs legitimately different.
+    pub returning: bool,
+    pub nodes: usize,
+    /// Nodes inside the viewport, whether or not they have widgets.
+    pub visible: usize,
+    /// Widgets in the whole tree — what a frame actually walks.
+    pub widgets: usize,
+    pub detail: String,
+    pub level_switches_per_frame: f64,
+    pub mean_ms: f64,
+    pub worst_ms: f64,
+}
+
 /// Everything one benchmark run produced.
 pub struct Outcome {
     pub nodes: usize,
@@ -95,6 +118,8 @@ pub struct Outcome {
     pub criteria: Vec<Criterion>,
     pub scenarios: Vec<ScenarioRecord>,
     pub sweep: Vec<SweepRecord>,
+    /// Points of a zoom sweep, empty for a benchmark that does not do one.
+    pub zoom_sweep: Vec<ZoomRecord>,
 }
 
 impl Outcome {
@@ -205,6 +230,27 @@ impl Outcome {
             );
             out.push_str(sep(i, self.sweep.len()));
         }
+        out.push_str("  ],\n");
+
+        out.push_str("  \"zoom_sweep\": [\n");
+        for (i, p) in self.zoom_sweep.iter().enumerate() {
+            let _ = write!(
+                out,
+                "    {{\"zoom\": {}, \"returning\": {}, \"nodes\": {}, \"visible\": {}, \
+                 \"widgets\": {}, \"detail\": {}, \"level_switches_per_frame\": {}, \
+                 \"mean_ms\": {}, \"worst_ms\": {}}}",
+                num(p.zoom),
+                p.returning,
+                p.nodes,
+                p.visible,
+                p.widgets,
+                quote(&p.detail),
+                num(p.level_switches_per_frame),
+                num(p.mean_ms),
+                num(p.worst_ms),
+            );
+            out.push_str(sep(i, self.zoom_sweep.len()));
+        }
         out.push_str("  ]\n}\n");
         out
     }
@@ -275,6 +321,7 @@ mod tests {
             criteria,
             scenarios: Vec::new(),
             sweep: Vec::new(),
+            zoom_sweep: Vec::new(),
         }
     }
 

@@ -173,6 +173,17 @@ the viewport, the clip path and the view; `CanvasContent` carries the view trans
 and owns the placed children. A single widget holding both clip and view would zoom
 its own viewport clip along with the content.
 
+**Level of detail obeys two rules, and the stricter wins (§29).** A zoom threshold
+asks whether a control is still usable; `DetailBudget` asks whether the resulting tree
+is affordable, in **widgets** — a panned frame costs 6.5-8.5 us per widget in the tree
+whatever level produced them. The decision lives in `cull`, because only the cull knows
+how many nodes are visible. Two things measurement disproved along the way: a larger
+graph does *not* materialise more at a given zoom (the viewport bounds it) — density
+and node size do, which is why the criterion sweeps density; and the budget has to be
+divided between the canvases sharing a window (`DetailBudget::split`), because the
+frame walks the window's tree and an idle area at an overview zoom charges its
+neighbours for what it holds.
+
 **Below a readability threshold the canvas stops building widgets and paints the nodes
 itself (§20.6).** The far-field scene is recorded in canvas coordinates, so panning
 and zooming inside the recorded region reuse it untouched. Level of detail is a

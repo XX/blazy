@@ -28,6 +28,7 @@ pub mod header;
 mod tests;
 
 use blazy_areas::{AreaContent, AreaScreen, SplitTree};
+use blazy_canvas::DetailBudget;
 use masonry::core::{NewWidget, Widget};
 use masonry::peniko::Color;
 use node_canvas::canvas_over;
@@ -60,13 +61,31 @@ pub const STAGGERED_SCALES: [f64; 4] = [1.0, 1.25, 1.5, 1.75];
 /// them are untouched.
 pub fn build_screen_staggered(areas: usize, nodes: usize, forced: Option<f64>) -> (AreaScreen, SharedGraph) {
     let graph = share(GraphModel::generated(nodes));
+    let budget = window_budget(areas);
     let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
         let scale = forced.unwrap_or(STAGGERED_SCALES[area % STAGGERED_SCALES.len()]);
-        let content = AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), area_canvas(&graph, nodes))
-            .with_ui_scale(0, scale);
+        let content =
+            AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), area_canvas(&graph, nodes, budget))
+                .with_ui_scale(0, scale);
         NewWidget::new(content).erased()
     });
     (screen, graph)
+}
+
+/// The share of the window's widget budget one area gets.
+///
+/// The whole reason the budget is a public policy rather than a constant inside the
+/// canvas. A frame walks the window's widget tree, not any one canvas's (§20.2), so a
+/// screen of eight areas each independently obeying the default ceiling puts eight
+/// times that in one window — and no canvas is in a position to notice. Measured on
+/// this example: one idle area zoomed out to the worst point cost the *other* area
+/// sixteen times its frame (§29.1), which is what makes this an arithmetic problem
+/// rather than a tuning one.
+///
+/// Even shares, because what an area holds does not follow its size: a small area at a
+/// small zoom holds as much as a large one.
+pub fn window_budget(areas: usize) -> DetailBudget {
+    DetailBudget::default().split(areas)
 }
 
 /// As [`build_screen`], optionally without the header region.
@@ -76,8 +95,9 @@ pub fn build_screen_staggered(areas: usize, nodes: usize, forced: Option<f64>) -
 /// nothing else.
 pub fn build_screen_with(areas: usize, nodes: usize, with_header: bool) -> (AreaScreen, SharedGraph) {
     let graph = share(GraphModel::generated(nodes));
+    let budget = window_budget(areas);
     let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
-        let canvas = area_canvas(&graph, nodes);
+        let canvas = area_canvas(&graph, nodes, budget);
         if with_header {
             NewWidget::new(AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)).erased()
         } else {
@@ -87,9 +107,10 @@ pub fn build_screen_with(areas: usize, nodes: usize, with_header: bool) -> (Area
     (screen, graph)
 }
 
-/// The canvas inside an area, as a `dyn Widget`.
-pub fn area_canvas(graph: &SharedGraph, nodes: usize) -> NewWidget<dyn Widget> {
-    NewWidget::new(canvas_over(graph, nodes, false)).erased()
+/// The canvas inside an area, as a `dyn Widget`, holding `budget` of the window's
+/// widgets.
+pub fn area_canvas(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
+    NewWidget::new(canvas_over(graph, nodes, false).with_budget(budget)).erased()
 }
 
 /// The header of area `area`, tinted so the areas are told apart by eye.

@@ -4,7 +4,7 @@
 //! is *correct*, which is the harder half: a canvas that quietly loses the user's
 //! edits when a node scrolls off screen would post excellent numbers.
 
-use blazy_canvas::{CanvasHit, CanvasLayer};
+use blazy_canvas::{CanvasHit, CanvasLayer, DetailBudget};
 use masonry::core::{NewWidget, WidgetId, WidgetRef};
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Point, Vec2};
@@ -594,4 +594,126 @@ fn a_look_at_the_whole_graph_does_not_stay_expensive() {
         back.recorded_links
     );
     assert_eq!(back.recorded_far, 0, "and the far field let its nodes go");
+}
+
+// --- MARK: the widget budget (§29)
+
+/// A harness over a canvas with an explicit cost ceiling.
+fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEditor> {
+    let graph = crate::model::share(crate::model::GraphModel::generated(count));
+    let canvas = crate::canvas_over(&graph, count, false).with_budget(budget);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(NodeEditor::new(canvas)),
+        PhysicalSize::new(1100, 750),
+    );
+    let _ = harness.redraw();
+    harness
+}
+
+/// Widgets in the whole tree — the quantity §20.2 says a frame costs.
+fn widgets_in_tree(harness: &mut TestHarness<NodeEditor>) -> usize {
+    let mut n = 0;
+    harness.inspect_widgets(|_| n += 1);
+    n
+}
+
+/// A zoom that is perfectly readable can still be unaffordable, and then the budget
+/// decides (§29.2).
+///
+/// At zoom 1 the thresholds say `Full` without hesitation; 24 nodes with a slider and
+/// a checkbox each are 99 widgets, and a ceiling of 40 does not hold them.
+#[test]
+fn the_budget_overrules_a_readable_zoom() {
+    let budget = DetailBudget {
+        widgets: 40,
+        ..DetailBudget::default()
+    };
+    let mut harness = budgeted_harness(5000, budget);
+
+    let ids = live(&mut harness);
+    assert!(!ids.is_empty(), "nodes are still materialised, just without controls");
+    assert!(
+        ids.iter().all(|&(_, id)| !has_controls(&harness, id)),
+        "a node that does not fit the budget must be built without its controls"
+    );
+}
+
+/// The pair that proves it was the budget: same graph, same zoom, no ceiling.
+///
+/// Without it the previous test would pass just as well if the controls had been lost
+/// for some entirely different reason.
+#[test]
+fn an_unlimited_budget_keeps_the_controls() {
+    let mut harness = budgeted_harness(5000, DetailBudget::unlimited());
+    let ids = live(&mut harness);
+    assert!(
+        ids.iter().all(|&(_, id)| has_controls(&harness, id)),
+        "with no ceiling the zoom rule alone decides, and at zoom 1 it says Full"
+    );
+}
+
+/// The tree stays inside the ceiling at a zoom that used to blow through it, and it
+/// does so on two graph sizes — which is what the zoom thresholds could not do (§29.1).
+#[test]
+fn the_budget_holds_on_two_graph_sizes() {
+    let budget = DetailBudget::default();
+    for count in [5_000, 20_000] {
+        let mut harness = budgeted_harness(count, budget);
+        zoom_out(&mut harness, 0.1);
+        let widgets = widgets_in_tree(&mut harness);
+        assert!(
+            widgets <= budget.widgets,
+            "{count} nodes at zoom 0.1 put {widgets} widgets in the tree, over a budget of {}",
+            budget.widgets
+        );
+    }
+}
+
+/// Hysteresis: a set wobbling about the ceiling must not switch level on the wobble.
+///
+/// The stimulus is a zoom oscillating by 2% — a mouse wheel nudged back and forth, or
+/// a trackpad resting under a hand — which moves the visible count by about 3%. That
+/// is far inside the margin the default hysteresis leaves, so the level must not move
+/// at all after the first decision. Without the margin this switches on **every
+/// frame** (measured: 40 switches in 40 frames), and each switch rebuilds every
+/// visible node.
+///
+/// The budget is calibrated from the graph rather than guessed: the boundary has to
+/// land inside the wobble, or the test passes by never being near it.
+#[test]
+fn a_wobble_at_the_boundary_does_not_flap() {
+    let mut probe = budgeted_harness(5000, DetailBudget::unlimited());
+    zoom_out(&mut probe, 0.1);
+    let at_boundary = canvas_stats(&mut probe).visible;
+
+    let mut harness = budgeted_harness(5000, DetailBudget {
+        widgets: at_boundary,
+        ..DetailBudget::default()
+    });
+    zoom_out(&mut harness, 0.1);
+    let before = canvas_stats(&mut harness).counters.level_switches;
+    for i in 0..40 {
+        zoom_out(&mut harness, if i % 2 == 0 { 1.0 / 1.02 } else { 1.02 });
+    }
+    let switches = canvas_stats(&mut harness).counters.level_switches - before;
+    assert!(
+        switches <= 2,
+        "a 2% zoom wobble at the budget boundary switched detail level {switches} times in 40 frames"
+    );
+}
+
+/// Ordinary work must not reach the policy at all.
+#[test]
+fn panning_at_zoom_one_never_switches_level() {
+    let mut harness = budgeted_harness(5000, DetailBudget::default());
+    let before = canvas_stats(&mut harness).counters.level_switches;
+    for _ in 0..40 {
+        pan(&mut harness, Vec2::new(-6.0, -2.0));
+    }
+    assert_eq!(
+        canvas_stats(&mut harness).counters.level_switches - before,
+        0,
+        "a pan at zoom 1 is two orders of magnitude inside the budget"
+    );
 }

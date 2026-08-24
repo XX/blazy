@@ -15,7 +15,7 @@ use masonry::peniko::Color;
 pub const NODE_SIZE: Size = Size::new(160.0, 96.0);
 
 /// Spacing between nodes in the generated grid.
-const GRID_STEP: f64 = 220.0;
+pub const GRID_STEP: f64 = 220.0;
 /// Nodes per row in the generated grid.
 pub const GRID_COLS: usize = 80;
 
@@ -44,6 +44,18 @@ impl GraphModel {
     /// Deterministic on purpose: two benchmark runs must be comparable, so there is
     /// no randomness anywhere. The jitter is a cheap hash of the index, not an RNG.
     pub fn generated(count: usize) -> Self {
+        Self::generated_with_step(count, GRID_STEP)
+    }
+
+    /// As [`generated`](Self::generated), with the grid spacing given.
+    ///
+    /// Exists for one measurement, and it is a measurement the shape of the whole
+    /// level-of-detail policy rests on: what a zoom materialises is decided by how
+    /// many nodes fit the viewport, which is spacing and node size, and *not* by how
+    /// many nodes the graph has (§29.1). Halving the step is the only way to put four
+    /// times as many nodes under the same viewport at the same zoom without changing
+    /// anything else.
+    pub fn generated_with_step(count: usize, step: f64) -> Self {
         let nodes = (0..count)
             .map(|i| {
                 let col = i % GRID_COLS;
@@ -65,7 +77,7 @@ impl GraphModel {
                 };
 
                 NodeState {
-                    pos: Point::new(col as f64 * GRID_STEP + jitter_x, row as f64 * GRID_STEP + jitter_y),
+                    pos: Point::new(col as f64 * step + jitter_x, row as f64 * step + jitter_y),
                     tint,
                     value: ((h >> 5) % 100) as f64 / 100.0,
                     checked: h & 1 == 0,
