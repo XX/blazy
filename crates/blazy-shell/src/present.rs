@@ -16,7 +16,6 @@
 
 use masonry::app::VisualLayerPlan;
 use masonry::dpi::PhysicalSize;
-use masonry::kurbo::Size;
 
 use crate::compose::Hole;
 
@@ -71,8 +70,15 @@ pub trait Presenter {
 
     /// Composes the plan and puts the result on the screen.
     ///
-    /// `logical` is the window's logical size; `device_scale` is its scale factor.
-    fn present(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError>;
+    /// `frame` is the size the result has to cover, in physical pixels — the window's
+    /// own size, not a size derived from it. `device_scale` is the window's scale
+    /// factor, and it reaches the rasteriser as a transform rather than as a size.
+    fn present(
+        &mut self,
+        plan: &VisualLayerPlan,
+        frame: PhysicalSize<u32>,
+        device_scale: f64,
+    ) -> Result<(), PresentError>;
 
     /// The rectangles the last frame left for the host to fill (§4.3).
     fn holes(&self) -> &[Hole];

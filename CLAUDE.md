@@ -249,8 +249,7 @@ will fail loudly if upstream ever grows a per-subtree scale.
 
 ## Upstream dependency
 
-`masonry` (and `masonry_imaging`, behind an optional feature) are **git dependencies
-pinned to a commit** on purpose: the rendering IR `imaging`,
+`masonry` is a **git dependency pinned to a commit** on purpose: the rendering IR `imaging`,
 `Widget::paint(&mut Painter)` and `VisualLayerPlan` exist only on git main, and the
 published 0.4.0 predates that migration. Living on a young crate's main branch is the
 project's declared main risk (§15.1). The pin is in the workspace `Cargo.toml`; a local
@@ -260,7 +259,11 @@ is usually the right first step.
 `masonry_winit` is **no longer a dependency**: `blazy-shell` runs its own winit loop
 over the public `RenderRoot`, because upstream's runner owns a compile-time rasteriser
 and keeps its event conversion private (§26.3). Input conversion is not reimplemented —
-`ui-events-winit` is the same public crate upstream uses.
+`ui-events-winit` is the same public crate upstream uses. `masonry_imaging` went the
+same way in §27.3: it was there for one private helper, and twenty lines of our own
+device request cost less than a second pinned crate. The GPU path sits on the published
+`imaging_vello`, `imaging_wgpu` and `wgpu` instead, and `wgpu` is pinned to the version
+`imaging_wgpu` selects, because the texture types have to come from one crate version.
 
 Strategy towards upstream is **contribute, not fork** (§17). Nothing here patches
 Masonry.

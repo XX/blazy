@@ -48,7 +48,6 @@ use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, VisualLayerP
 use masonry::core::{DefaultProperties, ErasedAction, NewWidget, TextEvent, Widget, WidgetId, WindowEvent};
 use masonry::dpi::{LogicalSize, PhysicalSize};
 use masonry::imaging::RgbaImage;
-use masonry::kurbo::Size;
 use masonry::peniko::Color;
 use ui_events_winit::{WindowEventReducer, WindowEventTranslation};
 use winit::application::ApplicationHandler;
@@ -141,11 +140,15 @@ impl<F: FnMut(ErasedAction, WidgetId)> ShellDriver for F {
 #[derive(Debug)]
 pub enum Error {
     Backend(crate::BackendError),
+    /// A frame could not be composed, rasterised or shown.
+    ///
+    /// The platform's own error arrives as text rather than as its type: which crate
+    /// puts pixels on the screen is an implementation detail of a presenter, and a
+    /// library that leaks it into its public error type passes every upstream rename
+    /// on to everyone downstream (§15.1).
     Presented(PresentError),
     EventLoop(winit::error::EventLoopError),
     Os(winit::error::OsError),
-    Present(softbuffer::SoftBufferError),
-    Render(crate::HostError),
 }
 
 impl std::fmt::Display for Error {
@@ -155,8 +158,6 @@ impl std::fmt::Display for Error {
             Self::Presented(error) => write!(f, "{error}"),
             Self::EventLoop(error) => write!(f, "{error}"),
             Self::Os(error) => write!(f, "{error}"),
-            Self::Present(error) => write!(f, "{error}"),
-            Self::Render(error) => write!(f, "{error}"),
         }
     }
 }
@@ -187,18 +188,8 @@ pub fn run(
         signals: Rc::new(RefCell::new(Vec::new())),
         reducer: WindowEventReducer::default(),
         last_anim: Instant::now(),
-        counters: ShellCounters::default(),
     };
     event_loop.run_app(&mut app).map_err(Error::EventLoop)
-}
-
-/// The window's own statistics, for the benchmark and for anyone debugging a frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ShellCounters {
-    /// Frames composed, rasterised and presented.
-    pub frames: u64,
-    /// What the last frame cost on its way to the screen.
-    pub present: PresentCounters,
 }
 
 // --- MARK: BLIT
@@ -220,9 +211,10 @@ pub struct BlitPresenter {
 
 impl BlitPresenter {
     pub fn new(backend: Backend, window: Arc<Window>, background: Color) -> Result<Self, Error> {
+        let platform = |error: softbuffer::SoftBufferError| Error::Presented(PresentError::Platform(error.to_string()));
         let host = Host::new(backend).map_err(Error::Backend)?.with_background(background);
-        let context = softbuffer::Context::new(window.clone()).map_err(Error::Present)?;
-        let surface = softbuffer::Surface::new(&context, window).map_err(Error::Present)?;
+        let context = softbuffer::Context::new(window.clone()).map_err(platform)?;
+        let surface = softbuffer::Surface::new(&context, window).map_err(platform)?;
         Ok(Self {
             host,
             backend,
@@ -238,20 +230,31 @@ impl Presenter for BlitPresenter {
         "blit"
     }
 
-    fn present(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
+    fn present(
+        &mut self,
+        plan: &VisualLayerPlan,
+        frame: PhysicalSize<u32>,
+        device_scale: f64,
+    ) -> Result<(), PresentError> {
         self.host.set_device_scale(device_scale);
-        let frame = self.host.render(plan, logical).map_err(PresentError::Host)?;
+        let frame = self.host.render_sized(plan, frame).map_err(PresentError::Host)?;
 
         self.holes.clear();
         self.holes.extend_from_slice(&frame.holes);
+        blit(&mut self.surface, &frame.image)?;
+
+        // Counted after the frame reached the window, so a frame that failed on the
+        // way is not in the denominator of a per-frame criterion.
         self.counters.frames += 1;
         self.counters.holes += frame.holes.len() as u64;
-        self.counters.cpu_bytes += u64::from(frame.image.width) * u64::from(frame.image.height) * 4;
+        // Read from the host rather than recomputed: the bytes exist because the host
+        // made them, and a second place that works them out is a second place to be
+        // wrong (§27.4).
+        self.counters.cpu_bytes = self.host.counters().image_bytes;
         // A GPU rasteriser on this path has to copy its result out of video memory
         // once per frame; a CPU one wrote into main memory to begin with.
         self.counters.readbacks += u64::from(self.backend.needs_device());
-
-        blit(&mut self.surface, &frame.image).map_err(|error| PresentError::Platform(error.to_string()))
+        Ok(())
     }
 
     fn holes(&self) -> &[Hole] {
@@ -285,7 +288,6 @@ struct ShellApp {
     reducer: WindowEventReducer,
     /// When the last animation frame ran, for the interval the next one gets.
     last_anim: Instant,
-    counters: ShellCounters,
 }
 
 impl ShellApp {
@@ -340,14 +342,21 @@ impl ShellApp {
             }
         }
 
-        let backend = match self.config.backend {
-            Some(backend) => backend,
-            None => crate::backend::COMPILED
-                .iter()
-                .copied()
-                .find(|backend| !backend.needs_device())
-                .unwrap_or(Backend::VelloCpu),
-        };
+        // Whatever was asked for, the fallback has to be a rasteriser that does not
+        // need a device: arriving here after the GPU path failed usually means there
+        // is no usable device, and answering "no GPU" by asking for one again is how
+        // a promise of "starts without a GPU" turns into a window that never opens.
+        let backend = self
+            .config
+            .backend
+            .filter(|backend| !backend.needs_device())
+            .or_else(|| {
+                crate::backend::COMPILED
+                    .iter()
+                    .copied()
+                    .find(|backend| !backend.needs_device())
+            })
+            .unwrap_or(Backend::VelloCpu);
         Ok(Box::new(BlitPresenter::new(backend, window.clone(), base)?))
     }
 
@@ -372,17 +381,17 @@ impl ShellApp {
 
         let (plan, _tree_update) = root.redraw();
 
-        let scale = window.scale_factor();
-        let physical = root.size();
-        let logical = Size::new(physical.width as f64 / scale, physical.height as f64 / scale);
-        presenter.present(&plan, logical, scale).map_err(Error::Presented)?;
+        // The window's size in physical pixels is what the frame has to cover, and it
+        // is known exactly; the scale factor goes along separately because it belongs
+        // to the drawing rather than to the size (§9).
+        presenter
+            .present(&plan, root.size(), window.scale_factor())
+            .map_err(Error::Presented)?;
 
         // Holes are reported rather than drawn: the host owns what goes in them, and
         // for an application without external content there are none (§4.3).
         report_holes(presenter.holes());
 
-        self.counters.frames += 1;
-        self.counters.present = presenter.counters();
         window.set_cursor(root.cursor_icon());
         Ok(())
     }
@@ -435,17 +444,18 @@ fn report_holes(holes: &[Hole]) {
 /// One pass over the pixels to drop alpha and reorder the channels, which is what a
 /// CPU presentation path costs. §26.2 explains why the frame arrives as pixels rather
 /// than as a texture, and §26.5 what it would take for it not to.
-fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &RgbaImage) -> Result<(), Error> {
+fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &RgbaImage) -> Result<(), PresentError> {
+    let platform = |error: softbuffer::SoftBufferError| PresentError::Platform(error.to_string());
     let (Some(width), Some(height)) = (NonZeroU32::new(image.width), NonZeroU32::new(image.height)) else {
         return Ok(());
     };
-    surface.resize(width, height).map_err(Error::Present)?;
+    surface.resize(width, height).map_err(platform)?;
 
-    let mut buffer = surface.buffer_mut().map_err(Error::Present)?;
+    let mut buffer = surface.buffer_mut().map_err(platform)?;
     for (out, pixel) in buffer.iter_mut().zip(image.data.chunks_exact(4)) {
         *out = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
     }
-    buffer.present().map_err(Error::Present)
+    buffer.present().map_err(platform)
 }
 
 impl ApplicationHandler for ShellApp {

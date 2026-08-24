@@ -140,12 +140,12 @@ impl Report {
         delta as f64 / self.frames as f64
     }
 
-    /// The plain-data form the report is built from.
     /// Link curves recorded at the end of the scenario, and drawn on every repaint.
     fn recorded_links(&self) -> f64 {
         self.after.recorded_links as f64
     }
 
+    /// The plain-data form the report is built from.
     fn record(&self) -> ScenarioRecord {
         ScenarioRecord {
             name: self.name,

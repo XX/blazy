@@ -272,6 +272,7 @@ fn measure<W: Widget>(
             layers: after.layers - before.layers,
             scenes: after.scenes - before.scenes,
             holes: after.holes - before.holes,
+            image_bytes: after.image_bytes - before.image_bytes,
         },
         layouts: layouts.get() - layouts_before,
         declared: declared(harness) - declared_before,
@@ -327,7 +328,7 @@ struct PresentRow {
 /// into a presentation buffer — the platform's own copy is not included, so the number
 /// is a floor rather than the whole cost. The GPU path is submitted and waited on,
 /// because timing a submission alone would measure the driver's queue.
-fn presentation_table(opts: &Options) {
+fn presentation_table(opts: &Options) -> Vec<PresentRow> {
     let sizes: &[(u32, u32)] = if opts.quick {
         &PRESENT_SIZES[..1]
     } else {
@@ -338,7 +339,7 @@ fn presentation_table(opts: &Options) {
     } else {
         &PRESENT_SCALES
     };
-    let frames = 10;
+    let frames = 10_u64;
 
     println!("\npresentation: drawing and showing, separately");
     let mut rows = Vec::new();
@@ -365,7 +366,7 @@ fn presentation_table(opts: &Options) {
             host.set_device_scale(scale);
             let mut draw = Duration::ZERO;
             let mut show = Duration::ZERO;
-            let mut cpu_bytes = 0;
+            let before = host.counters().image_bytes;
             for _ in 0..frames {
                 let start = Instant::now();
                 let frame = host.render(&plan, logical).expect("the host renders");
@@ -377,14 +378,17 @@ fn presentation_table(opts: &Options) {
                     *out = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
                 }
                 show += start.elapsed();
-                cpu_bytes = u64::from(frame.image.width) * u64::from(frame.image.height) * 4;
             }
+            // The host's own count of what it turned into pixels, not a second sum of
+            // the same thing: that is what makes the criterion below check the code
+            // rather than this loop's arithmetic.
+            let cpu_bytes = (host.counters().image_bytes - before) / frames;
             rows.push(PresentRow {
                 path: "blit",
                 size: (width, height),
                 scale,
-                draw_ms: draw.as_secs_f64() * 1000.0 / f64::from(frames),
-                show_ms: show.as_secs_f64() * 1000.0 / f64::from(frames),
+                draw_ms: draw.as_secs_f64() * 1000.0 / frames as f64,
+                show_ms: show.as_secs_f64() * 1000.0 / frames as f64,
                 cpu_bytes,
             });
 
@@ -407,7 +411,7 @@ fn presentation_table(opts: &Options) {
                     path: "swapchain",
                     size: (width, height),
                     scale,
-                    draw_ms: draw.as_secs_f64() * 1000.0 / f64::from(frames),
+                    draw_ms: draw.as_secs_f64() * 1000.0 / frames as f64,
                     // The blit into the swapchain is a GPU copy inside the same
                     // submission; there is no separate cost to attribute here, and
                     // the honest thing is to say so rather than to invent one.
@@ -424,6 +428,7 @@ fn presentation_table(opts: &Options) {
             row.path, row.size.0, row.size.1, row.scale, row.draw_ms, row.show_ms, row.cpu_bytes,
         );
     }
+    rows
 }
 
 /// What the GPU path did over a run of frames, where a device exists.
@@ -536,7 +541,7 @@ pub fn run(opts: &Options) -> Outcome {
         count
     };
 
-    presentation_table(opts);
+    let present_rows = presentation_table(opts);
     #[cfg(feature = "vello")]
     let gpu = gpu_counters(frames);
     #[cfg(not(feature = "vello"))]
@@ -568,6 +573,7 @@ pub fn run(opts: &Options) -> Outcome {
             &scale_frames,
             transparent,
             gpu,
+            &present_rows,
         ),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep: Vec::new(),
@@ -588,6 +594,7 @@ fn evaluate(
     scale_frames: &[(f64, u32, f64)],
     transparent: usize,
     gpu: Option<blazy_shell::PresentCounters>,
+    present_rows: &[PresentRow],
 ) -> Vec<Criterion> {
     let mut criteria = Vec::new();
 
@@ -658,7 +665,14 @@ fn evaluate(
         let frames = gpu.frames.max(1) as f64;
 
         // What the task is for: the frame is drawn and shown without ever existing as
-        // bytes in main memory. The blit path in the same table moves megabytes.
+        // bytes in main memory.
+        //
+        // Zero on this path is structural — nothing in `GpuFrames` can produce frame
+        // bytes — so on its own this criterion could never fail, which is the one
+        // thing a criterion must not be. It is paired with
+        // `the_frame_byte_counter_is_not_a_stub` below: that one fails if the counter
+        // stops reporting the bytes the blit path really does move, and together they
+        // say "the number works, and on this path it is zero".
         criteria.push(Criterion {
             name: "swapchain_frame_stays_on_the_gpu",
             claim: "the GPU frame path moves no frame data through memory",
@@ -677,6 +691,21 @@ fn evaluate(
             measured: gpu.readbacks as f64 / frames,
             bound: 1.0,
             unit: "readbacks/frame",
+        });
+
+        // The other half of the pair above: the same counter, on the path that has to
+        // report megabytes. Counted from the failing side, as always — rows that
+        // reported nothing.
+        criteria.push(Criterion {
+            name: "the_frame_byte_counter_is_not_a_stub",
+            claim: "the blit path reports the frame bytes it moves",
+            kind: Kind::Counter,
+            measured: present_rows
+                .iter()
+                .filter(|row| row.path == "blit" && row.cpu_bytes == 0)
+                .count() as f64,
+            bound: 1.0,
+            unit: "rows reporting no bytes",
         });
 
         // And the holes still arrive: a faster path that lost them would be a

@@ -6,6 +6,7 @@
 //! through it rather than through a copy of it.
 
 use masonry::app::VisualLayerPlan;
+use masonry::dpi::PhysicalSize;
 use masonry::imaging::RgbaImage;
 use masonry::imaging::render::{ImageRenderer, ImageRendererError};
 use masonry::kurbo::Size;
@@ -58,6 +59,13 @@ pub struct HostCounters {
     /// Compared against what the widgets declared, this is what says whether a hole
     /// was lost on the way (§26.1).
     pub holes: u64,
+    /// Bytes of frame that became pixels in main memory.
+    ///
+    /// Counted here because here is where it happens: a rasterised frame *is* this
+    /// many bytes, and anything downstream that moves them is moving these. A path
+    /// that never asks the host for an image never adds to it, which is what the
+    /// criteria of §27.4 are about.
+    pub image_bytes: u64,
 }
 
 /// Composes plans and rasterises them, with the backend chosen at startup.
@@ -138,13 +146,25 @@ impl Host {
     /// `size` is the window's logical size; the frame comes out at that size times
     /// the device scale, redrawn rather than resampled.
     pub fn render(&mut self, plan: &VisualLayerPlan, size: Size) -> Result<Frame, HostError> {
-        let composition = Composition::new(plan, self.device_scale);
         let (width, height) = self.physical_size(size);
+        self.render_sized(plan, PhysicalSize::new(width, height))
+    }
+
+    /// Composes a plan and rasterises it at an exact frame size.
+    ///
+    /// What a window uses, because it already knows the size in physical pixels: going
+    /// through the logical size and back would divide by the scale factor and multiply
+    /// again, and on a fractional factor — 1.1458 on the machine this was written on —
+    /// that round trip can land a pixel away from the surface it has to cover.
+    pub fn render_sized(&mut self, plan: &VisualLayerPlan, size: PhysicalSize<u32>) -> Result<Frame, HostError> {
+        let (width, height) = (size.width.max(1), size.height.max(1));
+        let composition = Composition::new(plan, self.device_scale);
 
         self.counters.frames += 1;
         self.counters.layers += composition.layers as u64;
         self.counters.scenes += composition.scenes as u64;
         self.counters.holes += composition.holes.len() as u64;
+        self.counters.image_bytes += u64::from(width) * u64::from(height) * 4;
 
         let composition = match self.background {
             Some(color) => composition.on_background(color, width, height),
@@ -255,6 +275,7 @@ mod tests {
             layers: 2,
             scenes: 2,
             holes: 0,
+            image_bytes: 10 * 10 * 4 * 2,
         });
     }
 }

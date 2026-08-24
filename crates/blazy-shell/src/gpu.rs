@@ -150,7 +150,17 @@ impl GpuFrames {
     /// are `frames` and `holes` only, which is what the criteria check.
     pub fn draw(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
         let (width, height) = Composition::physical_size(logical, device_scale);
-        self.resize(PhysicalSize::new(width, height));
+        self.draw_sized(plan, PhysicalSize::new(width, height), device_scale)
+    }
+
+    /// The same, at an exact frame size. See [`Host::render_sized`](crate::Host::render_sized).
+    pub fn draw_sized(
+        &mut self,
+        plan: &VisualLayerPlan,
+        frame: PhysicalSize<u32>,
+        device_scale: f64,
+    ) -> Result<(), PresentError> {
+        self.resize(frame);
 
         let composition = Composition::new(plan, device_scale);
         let composition = match self.background {
@@ -265,9 +275,17 @@ fn create_target(device: &wgpu::Device, size: PhysicalSize<u32>) -> (wgpu::Textu
 pub struct SwapchainPresenter {
     gpu: GpuFrames,
     window: std::sync::Arc<winit::window::Window>,
+    /// Kept because a lost surface is recreated from it rather than mourned.
+    instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     blitter: wgpu::util::TextureBlitter,
+    /// Set when the surface said the image it handed out no longer matches it.
+    ///
+    /// Acted on at the start of the next frame rather than immediately: the image is
+    /// still ours until it is presented, and reconfiguring while holding it means
+    /// asking for a second one, which is a validation error.
+    reconfigure: bool,
 }
 
 #[cfg(feature = "window")]
@@ -347,9 +365,11 @@ impl SwapchainPresenter {
         Ok(Self {
             gpu,
             window,
+            instance,
             surface,
             config,
             blitter,
+            reconfigure: false,
         })
     }
 
@@ -357,25 +377,76 @@ impl SwapchainPresenter {
         self.surface.configure(self.gpu.device(), &self.config);
     }
 
-    /// The swapchain texture, reconfiguring once if the surface went stale.
+    /// Points the surface and the frame texture at a new size.
+    fn set_size(&mut self, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.configure();
+        // A reconfigure asked for by the previous frame has just happened anyway.
+        self.reconfigure = false;
+        self.gpu.resize(size);
+    }
+
+    /// The swapchain texture, or `None` for a frame that cannot be shown.
     ///
-    /// A stale surface after a resize is routine rather than exceptional — on X11 and
-    /// Xwayland with NVIDIA drivers it happens while the window is being dragged —
-    /// so one retry is part of the normal path, not error handling.
+    /// Every outcome `wgpu` distinguishes means something different, and treating them
+    /// as one is how a window ends up either panicking or permanently blank:
+    ///
+    /// * `Suboptimal` **hands over a usable image** and asks for a reconfigure. It has to be presented and the
+    ///   reconfigure deferred — reconfiguring here would re-acquire the surface while this image is still held, which
+    ///   is a validation error, and by default an uncaptured validation error panics. A stale surface during a drag is
+    ///   routine on X11 and Xwayland with NVIDIA drivers, so this is the normal path rather than the exceptional one.
+    /// * `Outdated` hands over nothing: reconfigure and ask again.
+    /// * `Occluded` and `Timeout` are ordinary — a minimised window is occluded every frame, and logging that as an
+    ///   error would fill the log with the fact that nobody is looking.
+    /// * `Lost` means the surface must be built again, which is why the instance is kept. Without this the window stays
+    ///   blank for the rest of the session after a compositor restart.
     fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(texture) => Some(texture),
-            CurrentSurfaceTexture::Suboptimal(_) | CurrentSurfaceTexture::Outdated => {
+            CurrentSurfaceTexture::Suboptimal(texture) => {
+                self.reconfigure = true;
+                Some(texture)
+            },
+            CurrentSurfaceTexture::Outdated => {
                 self.configure();
-                match self.surface.get_current_texture() {
-                    CurrentSurfaceTexture::Success(texture) | CurrentSurfaceTexture::Suboptimal(texture) => {
-                        Some(texture)
+                self.acquire_again()
+            },
+            CurrentSurfaceTexture::Occluded | CurrentSurfaceTexture::Timeout => None,
+            CurrentSurfaceTexture::Lost => {
+                tracing::warn!("swapchain lost; rebuilding the surface");
+                match self.instance.create_surface(self.window.clone()) {
+                    Ok(surface) => {
+                        self.surface = surface;
+                        self.configure();
+                        self.acquire_again()
                     },
-                    _ => None,
+                    Err(error) => {
+                        tracing::error!("the surface could not be rebuilt: {error}");
+                        None
+                    },
                 }
             },
             other => {
                 tracing::error!("no swapchain texture: {other:?}");
+                None
+            },
+        }
+    }
+
+    /// One retry after reconfiguring. A second failure is this frame's answer.
+    fn acquire_again(&mut self) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(texture) => Some(texture),
+            CurrentSurfaceTexture::Suboptimal(texture) => {
+                self.reconfigure = true;
+                Some(texture)
+            },
+            other => {
+                tracing::debug!("no swapchain texture after reconfiguring: {other:?}");
                 None
             },
         }
@@ -388,8 +459,22 @@ impl crate::present::Presenter for SwapchainPresenter {
         "swapchain"
     }
 
-    fn present(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
-        self.gpu.draw(plan, logical, device_scale)?;
+    fn present(
+        &mut self,
+        plan: &VisualLayerPlan,
+        frame: PhysicalSize<u32>,
+        device_scale: f64,
+    ) -> Result<(), PresentError> {
+        // The surface follows the frame rather than the window event that announced
+        // it: one source of truth for the size means the blit can never be asked to
+        // stretch a frame into a swapchain image of another size.
+        if self.config.width != frame.width.max(1) || self.config.height != frame.height.max(1) {
+            self.set_size(frame);
+        } else if std::mem::take(&mut self.reconfigure) {
+            // Asked for by the previous frame, once its image was presented.
+            self.configure();
+        }
+        self.gpu.draw_sized(plan, frame, device_scale)?;
 
         let Some(surface_texture) = self.acquire() else {
             // The frame is drawn and simply not shown; the next redraw will show one.
@@ -425,13 +510,7 @@ impl crate::present::Presenter for SwapchainPresenter {
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        self.config.width = size.width;
-        self.config.height = size.height;
-        self.configure();
-        self.gpu.resize(size);
+        self.set_size(size);
     }
 }
 
