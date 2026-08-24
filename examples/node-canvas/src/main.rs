@@ -12,6 +12,7 @@
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+use blazy_canvas::{DEFAULT_WIDGET_BUDGET, DetailBudget};
 use blazy_shell::window::{WindowConfig, run};
 use blazy_shell::{Backend, COMPILED};
 use clap::Parser;
@@ -30,6 +31,9 @@ struct Args {
     /// Number of nodes in the generated graph.
     #[arg(long, value_name = "N", default_value_t = DEFAULT_NODES)]
     nodes: usize,
+
+    #[arg(long, short = 'w', value_name = "W", default_value_t = DEFAULT_WIDGET_BUDGET)]
+    budget_widgets: usize,
 
     /// Which rasteriser to draw with.
     ///
@@ -50,6 +54,10 @@ fn main() {
     });
 
     let (canvas, _graph) = build_canvas(args.nodes);
+    let canvas = canvas.with_budget(DetailBudget {
+        widgets: args.budget_widgets,
+        ..Default::default()
+    });
     let editor = NodeEditor::new(canvas);
 
     let config = WindowConfig::default()

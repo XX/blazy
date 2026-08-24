@@ -17,7 +17,7 @@
 
 use std::any::TypeId;
 
-use blazy_canvas::{CanvasDetail, Detail, NodeSource};
+use blazy_canvas::{CanvasDetail, CanvasLayer, Detail, NodeSource};
 use blazy_shape::ShapeHit;
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::{
@@ -49,6 +49,12 @@ const PADDING: f64 = 8.0;
 pub struct GraphNode {
     /// The graph this node belongs to.
     graph: SharedGraph,
+    /// The canvas this node was built for.
+    ///
+    /// Needed to tell the *other* views of the same graph apart from this one when an
+    /// edit is broadcast: re-applying an edit to the node the user is currently
+    /// dragging would be work at best and a lost pointer grip at worst.
+    canvas: Option<WidgetId>,
     /// This node's index in the graph.
     index: usize,
     /// Header tint, used to tell nodes apart at a glance when zoomed out.
@@ -90,14 +96,23 @@ impl GraphNode {
         self.built_value
     }
 
-    /// The id of this node's checkbox, for driving it from tests.
-    #[cfg(test)]
+    /// The slider value this node is currently showing.
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// The checkbox state this node is currently showing.
+    pub fn checked(&self) -> bool {
+        self.checked
+    }
+
+    /// The id of this node's checkbox, for driving it from a test or a script.
     pub fn checkbox_id(&self) -> Option<WidgetId> {
         self.controls.as_ref().map(|c| c.checkbox.id())
     }
 
     /// Builds the widget for node `index`, reading its current state from the model.
-    pub fn build(graph: &SharedGraph, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
+    pub fn build(graph: &SharedGraph, canvas: Option<WidgetId>, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
         let state = graph.borrow().node(index);
         let controls = (detail == Detail::Full).then(|| Controls {
             slider: WidgetPod::new(Slider::new(0.0, 1.0, state.value)),
@@ -105,6 +120,7 @@ impl GraphNode {
         });
         NewWidget::new(Self {
             graph: graph.clone(),
+            canvas,
             index,
             tint: state.tint,
             controls,
@@ -114,6 +130,62 @@ impl GraphNode {
             hit: body_shape(Size::ZERO),
         })
         .erased()
+    }
+}
+
+impl GraphNode {
+    /// Pushes this node's new state into every other view of the same graph.
+    ///
+    /// Writing the model is not enough on its own: a node widget reads the model when
+    /// it is *built* and then keeps its own copy, because it is painted far more often
+    /// than it is built. A view already showing this node therefore has to be told.
+    /// Views that are not showing it need nothing — they will read the model when the
+    /// node next scrolls in.
+    fn broadcast(&self, ctx: &mut ActionCtx<'_>) {
+        // This node first. Masonry's `Checkbox` deliberately does not toggle itself —
+        // it emits `CheckboxToggled` and leaves the state to whoever owns the source of
+        // truth — so the same reload that carries the edit to the other views is also
+        // what makes this one show it.
+        ctx.mutate_self_later(|mut widget| Self::reload(&mut widget.downcast::<Self>()));
+
+        let mut peers = Vec::new();
+        self.graph.borrow().other_views(self.canvas, &mut peers);
+        let index = self.index;
+        for peer in peers {
+            // The mutate pass is where a widget outside this subtree may legally be
+            // changed, and it runs before the next layout — so the other areas show the
+            // new value in the same frame.
+            ctx.mutate_later(peer, move |mut widget| {
+                let mut canvas = widget.downcast::<CanvasLayer>();
+                CanvasLayer::update_child(&mut canvas, index, |mut node| {
+                    let mut node = node.downcast::<Self>();
+                    Self::reload(&mut node);
+                });
+            });
+        }
+    }
+
+    /// Re-reads this node's state from the model.
+    ///
+    /// The receiving half of [`broadcast`](Self::broadcast). Also the reason a node
+    /// keeps `value` and `checked` of its own: at `Simplified` there are no control
+    /// widgets and the values are painted, so both copies have to be refreshed.
+    fn reload(this: &mut masonry::core::WidgetMut<'_, Self>) {
+        let state = this.widget.graph.borrow().node(this.widget.index);
+        this.widget.value = state.value;
+        this.widget.checked = state.checked;
+        this.widget.tint = state.tint;
+        if let Some(controls) = this.widget.controls.as_mut() {
+            {
+                let mut slider = this.ctx.get_mut(&mut controls.slider);
+                Slider::set_value(&mut slider, state.value);
+            }
+            let mut checkbox = this.ctx.get_mut(&mut controls.checkbox);
+            Checkbox::set_checked(&mut checkbox, state.checked);
+        }
+        // The painted stand-ins are this widget's own drawing, so they need a repaint
+        // of their own even when the control widgets asked for theirs.
+        this.ctx.request_paint_only();
     }
 }
 
@@ -251,10 +323,12 @@ impl Widget for GraphNode {
         if let Some(moved) = action.downcast_ref::<SliderMoved>() {
             self.value = moved.value;
             self.graph.borrow_mut().set_value(self.index, moved.value);
+            self.broadcast(ctx);
             ctx.set_handled();
         } else if let Some(toggled) = action.downcast_ref::<CheckboxToggled>() {
             self.checked = toggled.0;
             self.graph.borrow_mut().set_checked(self.index, toggled.0);
+            self.broadcast(ctx);
             ctx.set_handled();
         }
     }
@@ -314,6 +388,8 @@ fn body_shape(size: Size) -> ShapeHit {
 /// [`NodeSource::paint_far`] and [`NodeSource::hit`].
 pub struct GraphSource {
     graph: SharedGraph,
+    /// The canvas this source builds for, once it is in the tree.
+    canvas: Option<WidgetId>,
     /// One shape for every node, because every node is the same size.
     ///
     /// Kept here rather than built per pick: the flattened cache inside it is what
@@ -327,6 +403,7 @@ impl GraphSource {
     pub fn new(graph: SharedGraph) -> Self {
         Self {
             graph,
+            canvas: None,
             body: body_shape(crate::model::NODE_SIZE),
         }
     }
@@ -334,7 +411,23 @@ impl GraphSource {
 
 impl NodeSource for GraphSource {
     fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
-        GraphNode::build(&self.graph, index, detail)
+        GraphNode::build(&self.graph, self.canvas, index, detail)
+    }
+
+    /// Registers this canvas as one of the graph's views.
+    ///
+    /// Done here rather than at construction because a canvas has no id until it is in
+    /// the tree, and doing it here keeps every constructor in this crate unchanged: a
+    /// canvas over a shared graph is a view of it by the fact of existing.
+    fn attached(&mut self, canvas: WidgetId) {
+        self.canvas = Some(canvas);
+        self.graph.borrow_mut().register_view(canvas);
+    }
+
+    /// Records a drag in the model and names the other views that have to follow it.
+    fn moved(&mut self, index: usize, pos: Point, peers: &mut Vec<WidgetId>) {
+        self.graph.borrow_mut().set_pos(index, pos);
+        self.graph.borrow().other_views(self.canvas, peers);
     }
 
     fn paint_far(&mut self, index: usize, rect: Rect, painter: &mut Painter<'_>) {

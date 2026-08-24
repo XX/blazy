@@ -12,8 +12,8 @@
 
 use std::time::{Duration, Instant};
 
-use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
-use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats};
+use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord, ZoomRecord};
+use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, DetailBudget};
 use masonry::core::NewWidget;
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Affine, Point, Vec2};
@@ -21,7 +21,7 @@ use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 use node_canvas::build_canvas_with;
 use node_canvas::editor::NodeEditor;
-use node_canvas::model::NODE_SIZE;
+use node_canvas::model::{GRID_STEP, GraphModel, NODE_SIZE, share};
 
 /// Viewport used for all scenarios.
 const VIEWPORT: (u32, u32) = (1100, 750);
@@ -97,6 +97,10 @@ impl Report {
         self.per_frame(self.after.counters.child_layouts - self.before.counters.child_layouts)
     }
 
+    fn level_switches_per_frame(&self) -> f64 {
+        self.per_frame(self.after.counters.level_switches - self.before.counters.level_switches)
+    }
+
     fn builds_per_frame(&self) -> f64 {
         self.per_frame(self.after.counters.builds - self.before.counters.builds)
     }
@@ -163,6 +167,7 @@ impl Report {
                 ("link_reselects_per_frame", self.link_reselects_per_frame()),
                 ("slot_visits_per_frame", self.slot_visits_per_frame()),
                 ("recorded_links", self.recorded_links()),
+                ("level_switches_per_frame", self.level_switches_per_frame()),
                 ("picks", self.picks() as f64),
                 ("node_tests_per_pick", self.node_tests_per_pick()),
                 ("curve_tests_per_pick", self.curve_tests_per_pick()),
@@ -300,6 +305,64 @@ fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEd
     // Settle the first layout and paint so the measurements do not include startup.
     let _ = harness.redraw();
     harness
+}
+
+/// A harness over a graph of the same size packed `times` more densely.
+///
+/// The variable that actually decides what a zoom materialises. A larger graph does
+/// not put more nodes under the viewport — the generated grid has one density, so
+/// beyond the point where the viewport is full the extra nodes are simply off screen
+/// (§29.1). Halving the spacing does: four times the nodes at the same zoom, the same
+/// node count, nothing else changed.
+fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
+    let graph = share(GraphModel::generated_with_step(count, GRID_STEP / times.sqrt()));
+    let canvas = node_canvas::canvas_over(&graph, count, false);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(NodeEditor::new(canvas)),
+        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+    );
+    let _ = harness.redraw();
+    harness
+}
+
+/// A harness over a canvas with an explicit cost ceiling.
+fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEditor> {
+    let graph = share(GraphModel::generated(count));
+    let canvas = node_canvas::canvas_over(&graph, count, false).with_budget(budget);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(NodeEditor::new(canvas)),
+        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+    );
+    let _ = harness.redraw();
+    harness
+}
+
+/// Widgets in the whole tree.
+///
+/// The quantity §20.2 says a frame costs, and the one the budget is written in — so
+/// the criterion is bounded on the tree itself rather than on the canvas's estimate
+/// of it. Deterministic, which is what lets the bound be tight (§20.9).
+fn widgets_in_tree(harness: &mut TestHarness<NodeEditor>) -> usize {
+    let mut widgets = 0;
+    harness.inspect_widgets(|_| widgets += 1);
+    widgets
+}
+
+/// Puts a canvas-space point under the centre of the viewport at a given zoom.
+///
+/// The sweep sets the view outright rather than zooming by a factor and panning,
+/// because the pan inside each point would otherwise accumulate: at zoom 0.02 a pan
+/// of six pixels is three hundred canvas units, and after a few points the viewport
+/// has left the graph and the rest of the sweep measures empty space. That mistake
+/// was made once, and it made the return leg look free.
+fn look_at(harness: &mut TestHarness<NodeEditor>, anchor: Point, zoom: f64) {
+    let view = Affine::translate(VIEWPORT_CENTRE - (Affine::scale(zoom) * anchor)) * Affine::scale(zoom);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::set_view(&mut canvas, view));
+    });
+    let _ = harness.redraw();
 }
 
 /// Times `frames` iterations of `step`, each followed by a full redraw.
@@ -523,17 +586,146 @@ pub fn run(opts: &Options) -> Outcome {
     let links = link_sweep(opts, count);
     let picks = pick_sweep(opts);
     let zoom_picks = zoom_pick_sweep(opts);
+    // Two graph sizes, because a ceiling that quietly follows the graph is exactly
+    // what the zoom thresholds did (§29.1) and the criterion has to be able to see it.
+    let frames = if opts.quick { 8 } else { 16 };
+    let mut zooms = zoom_sweep(opts, count, frames, None);
+    // The same sweep over a graph four times as dense. This is the comparison the
+    // budget exists for: a zoom threshold is a constant tuned for one node size, and
+    // the denser graph is the same interface under a different one.
+    let dense = zoom_sweep(opts, count, frames, Some(4.0));
+    let wobble = boundary_wobble(opts, count);
 
+    let criteria = evaluate(
+        &reports, count, &sweep, &links, &picks, zoom_picks, &zooms, &dense, wobble,
+    );
+    zooms.extend(dense);
     let outcome = Outcome {
         nodes: count,
         viewport: VIEWPORT,
         quick: opts.quick,
-        criteria: evaluate(&reports, count, &sweep, &links, &picks, zoom_picks),
+        criteria,
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
+        zoom_sweep: zooms,
     };
     outcome.report("Phase 0 criteria");
     outcome
+}
+
+/// Zooms the range end to end and back, recording what the tree holds at each stop.
+///
+/// The sweep the widget budget is judged on (§29.3). Three things about its shape are
+/// load-bearing:
+///
+/// * **It returns.** A sweep that only zooms out enters every state and leaves none, which tests half a switch (§28.4).
+///   It is also the only way to see the hysteresis: the same zoom legitimately carries a different level depending on
+///   which side it was reached from.
+/// * **It looks at a fixed point of the graph.** Each stop sets the view outright, so a stop measures a zoom rather
+///   than however far the previous stops have drifted.
+/// * **The endpoints are part of the criterion.** 0.02 is where the far field holds the whole graph and 4.0 is where it
+///   holds one node; a sweep that stopped at 0.1 would report a tree that never misbehaves because it never got large
+///   (§24.1).
+fn zoom_sweep(opts: &Options, count: usize, frames: usize, density: Option<f64>) -> Vec<ZoomRecord> {
+    const ZOOMS: [f64; 9] = [4.0, 1.0, 0.3, 0.21, 0.15, 0.1, 0.06, 0.04, 0.02];
+    const QUICK_ZOOMS: [f64; 5] = [1.0, 0.21, 0.1, 0.04, 0.02];
+
+    let zooms: &[f64] = if opts.quick { &QUICK_ZOOMS } else { &ZOOMS };
+
+    let mut harness = match density {
+        Some(times) => dense_harness(count, times),
+        None => new_harness(count),
+    };
+    let anchor = node_rect(&mut harness, count / 2).origin();
+    let mut points = Vec::new();
+
+    let what = match density {
+        Some(times) => format!("{count} nodes packed {times}x denser"),
+        None => format!("{count} nodes"),
+    };
+    println!("\nzoom: what the tree holds at each zoom ({what}, out and back)");
+    for returning in [false, true] {
+        let order: Vec<f64> = if returning {
+            zooms.iter().rev().copied().collect()
+        } else {
+            zooms.to_vec()
+        };
+        for zoom in order {
+            look_at(&mut harness, anchor, zoom);
+            let before = stats(&mut harness).counters.level_switches;
+            let report = measure("zoom point", &mut harness, frames, |h, i| {
+                // Oscillates about the stop rather than drifting away from it.
+                pan_step(h, if i < frames / 2 { PAN_STEP } else { -PAN_STEP });
+            });
+            let after = stats(&mut harness);
+            let point = ZoomRecord {
+                zoom: after.zoom,
+                returning,
+                nodes: count,
+                visible: after.visible,
+                widgets: widgets_in_tree(&mut harness),
+                detail: format!("{:?}", after.detail),
+                level_switches_per_frame: (after.counters.level_switches - before) as f64 / frames as f64,
+                mean_ms: report.mean_ms(),
+                worst_ms: report.worst_ms(),
+            };
+            println!(
+                "  {:>6.3}x {:<3} {:<11} visible {:>5}  widgets {:>5}  {:>7.3} ms/frame  \
+                 worst {:>7.3} ms  level switches/frame {:>4.2}",
+                point.zoom,
+                if returning { "up" } else { "out" },
+                point.detail,
+                point.visible,
+                point.widgets,
+                point.mean_ms,
+                point.worst_ms,
+                point.level_switches_per_frame,
+            );
+            points.push(point);
+        }
+    }
+    points
+}
+
+/// How often the level changes when the visible set wobbles about the ceiling.
+///
+/// The stimulus is a zoom oscillating by 2%, which moves the visible count by about
+/// 3% — a wheel nudged back and forth. The budget is *calibrated* from the graph
+/// rather than assumed: it is set to the number of nodes visible at the test zoom, so
+/// the boundary is guaranteed to sit inside the wobble. A criterion that missed the
+/// boundary would pass by never being near it.
+///
+/// Returns level switches per frame. Without hysteresis this is 1.00 — every frame
+/// rebuilds every visible node; with the default margin it is one switch in the whole
+/// run.
+fn boundary_wobble(opts: &Options, count: usize) -> f64 {
+    let frames = if opts.quick { 20 } else { 40 };
+
+    let mut probe = budgeted_harness(count, DetailBudget::unlimited());
+    zoom_to(&mut probe, 0.1);
+    let at_boundary = stats(&mut probe).visible;
+
+    let mut harness = budgeted_harness(count, DetailBudget {
+        widgets: at_boundary,
+        ..DetailBudget::default()
+    });
+    zoom_to(&mut harness, 0.1);
+    let before = stats(&mut harness).counters.level_switches;
+    for i in 0..frames {
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                let factor = if i % 2 == 0 { 1.0 / 1.02 } else { 1.02 };
+                CanvasLayer::zoom_around(&mut canvas, VIEWPORT_CENTRE, factor);
+            });
+        });
+        let _ = harness.redraw();
+    }
+    let switches = stats(&mut harness).counters.level_switches - before;
+    println!(
+        "\nhysteresis: a 2% zoom wobble with the ceiling set to the {at_boundary} nodes on screen\n  \
+         {switches} level switches in {frames} frames"
+    );
+    switches as f64 / frames as f64
 }
 
 /// Measures frame cost against total node count, with the visible count held fixed.
@@ -786,6 +978,7 @@ fn zoom_pick_sweep(opts: &Options) -> (usize, usize) {
 /// stops holding, and stay silent through ordinary tuning. A criterion whose scenario
 /// did not run is simply absent — that is how the quick set drops the ones it cannot
 /// decide, rather than passing them by default.
+#[allow(clippy::too_many_arguments)]
 fn evaluate(
     reports: &[Report],
     count: usize,
@@ -793,6 +986,9 @@ fn evaluate(
     links: &[SweepRecord],
     picks: &[PickRecord],
     zoom_picks: (usize, usize),
+    zooms: &[ZoomRecord],
+    dense_zooms: &[ZoomRecord],
+    wobble: f64,
 ) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
@@ -1023,6 +1219,67 @@ fn evaluate(
             measured: changes as f64,
             bound: 1.0,
             unit: "verdicts changed",
+        });
+    }
+
+    // --- The widget budget (§29).
+
+    let budget = DetailBudget::default();
+    let widest = |points: &[ZoomRecord]| points.iter().map(|p| p.widgets).max().unwrap_or(0) as f64;
+
+    if !zooms.is_empty() {
+        // What the whole task is for. Before the budget the same sweep peaked at 4507
+        // widgets and 31 ms a frame, at a zoom the readability rule was perfectly
+        // happy with. The bound leaves a fifth over the ceiling: the canvas budgets in
+        // nodes times a per-level cost, and the tree also holds the canvas's own three
+        // widgets and whatever the application wraps it in.
+        criteria.push(Criterion {
+            name: "tree_stays_within_the_widget_budget",
+            claim: "no zoom puts more widgets in the tree than the budget",
+            kind: Kind::Counter,
+            measured: widest(zooms),
+            bound: budget.widgets as f64 * 1.2,
+            unit: "widgets in tree",
+        });
+    }
+
+    if !dense_zooms.is_empty() {
+        // The failure a zoom threshold cannot avoid: it is a constant tuned for one
+        // node size. Four times the density is four times the tree at every zoom, and
+        // only a rule stated in widgets holds both. Bounded against the sparse sweep
+        // rather than against the ceiling, so it keeps meaning the same thing if the
+        // budget is retuned.
+        criteria.push(Criterion {
+            name: "the_budget_does_not_follow_node_density",
+            claim: "a four-times denser graph holds no more widgets",
+            kind: Kind::Counter,
+            measured: widest(dense_zooms),
+            bound: widest(zooms) * 1.5 + 8.0,
+            unit: "widgets in tree",
+        });
+    }
+
+    // Hysteresis. Measured at one switch in forty frames; without the margin it is
+    // one per frame, and each one rebuilds every visible node.
+    criteria.push(Criterion {
+        name: "a_wobble_at_the_boundary_does_not_reswitch",
+        claim: "a zoom wobble at the budget boundary does not flip level",
+        kind: Kind::Counter,
+        measured: wobble,
+        bound: 0.2,
+        unit: "level switches/frame",
+    });
+
+    if let Some(pan) = find("pan") {
+        // The other end of the policy: ordinary work at zoom 1 is two orders of
+        // magnitude inside the budget, so the policy must not be in the loop at all.
+        criteria.push(Criterion {
+            name: "ordinary_work_does_not_reach_the_policy",
+            claim: "panning at zoom 1 never switches detail level",
+            kind: Kind::Counter,
+            measured: pan.level_switches_per_frame(),
+            bound: 0.05,
+            unit: "level switches/frame",
         });
     }
 

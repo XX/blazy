@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use masonry::core::WidgetId;
 use masonry::kurbo::{Point, Size};
 use masonry::peniko::Color;
 
@@ -15,7 +16,7 @@ use masonry::peniko::Color;
 pub const NODE_SIZE: Size = Size::new(160.0, 96.0);
 
 /// Spacing between nodes in the generated grid.
-const GRID_STEP: f64 = 220.0;
+pub const GRID_STEP: f64 = 220.0;
 /// Nodes per row in the generated grid.
 pub const GRID_COLS: usize = 80;
 
@@ -36,6 +37,15 @@ pub struct NodeState {
 #[derive(Debug)]
 pub struct GraphModel {
     nodes: Vec<NodeState>,
+    /// The canvases currently showing this graph.
+    ///
+    /// Strictly this is not model state — a document does not know what looks at it —
+    /// and in an application it would live in whatever owns the views. It is here
+    /// because everything that changes the graph already holds this handle and needs
+    /// the list in the same breath: a change has to reach the other views *in the same
+    /// frame*, and the only code able to do that is code holding a widget context, i.e.
+    /// the canvas and the node (§30).
+    views: Vec<WidgetId>,
 }
 
 impl GraphModel {
@@ -44,6 +54,18 @@ impl GraphModel {
     /// Deterministic on purpose: two benchmark runs must be comparable, so there is
     /// no randomness anywhere. The jitter is a cheap hash of the index, not an RNG.
     pub fn generated(count: usize) -> Self {
+        Self::generated_with_step(count, GRID_STEP)
+    }
+
+    /// As [`generated`](Self::generated), with the grid spacing given.
+    ///
+    /// Exists for one measurement, and it is a measurement the shape of the whole
+    /// level-of-detail policy rests on: what a zoom materialises is decided by how
+    /// many nodes fit the viewport, which is spacing and node size, and *not* by how
+    /// many nodes the graph has (§29.1). Halving the step is the only way to put four
+    /// times as many nodes under the same viewport at the same zoom without changing
+    /// anything else.
+    pub fn generated_with_step(count: usize, step: f64) -> Self {
         let nodes = (0..count)
             .map(|i| {
                 let col = i % GRID_COLS;
@@ -65,19 +87,50 @@ impl GraphModel {
                 };
 
                 NodeState {
-                    pos: Point::new(col as f64 * GRID_STEP + jitter_x, row as f64 * GRID_STEP + jitter_y),
+                    pos: Point::new(col as f64 * step + jitter_x, row as f64 * step + jitter_y),
                     tint,
                     value: ((h >> 5) % 100) as f64 / 100.0,
                     checked: h & 1 == 0,
                 }
             })
             .collect();
-        Self { nodes }
+        Self {
+            nodes,
+            views: Vec::new(),
+        }
     }
 
     /// Returns the state of a node.
     pub fn node(&self, index: usize) -> NodeState {
         self.nodes[index]
+    }
+
+    /// Records a node's new position.
+    ///
+    /// Position is state like any other, and by §20.2 state lives here rather than in
+    /// the view: a canvas keeps its own copy of the geometry, and a second canvas over
+    /// the same graph keeps another. Before this existed a drag moved one copy and the
+    /// other views kept the old position for good.
+    pub fn set_pos(&mut self, index: usize, pos: Point) {
+        if let Some(node) = self.nodes.get_mut(index) {
+            node.pos = pos;
+        }
+    }
+
+    /// Records that a canvas is showing this graph.
+    pub fn register_view(&mut self, canvas: WidgetId) {
+        if !self.views.contains(&canvas) {
+            self.views.push(canvas);
+        }
+    }
+
+    /// The canvases showing this graph, except `this` one.
+    ///
+    /// The exclusion is the caller's whole reason for asking: a view that has just
+    /// applied a change does not need it applied again, and re-applying it to the
+    /// widget the user is currently dragging is how a control loses its grip.
+    pub fn other_views(&self, this: Option<WidgetId>, out: &mut Vec<WidgetId>) {
+        out.extend(self.views.iter().copied().filter(|&id| Some(id) != this));
     }
 
     /// Records a slider change.

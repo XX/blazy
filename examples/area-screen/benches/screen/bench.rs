@@ -332,6 +332,47 @@ fn zoom_area(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
     });
 }
 
+/// Widgets in the whole window — what a frame walks (§20.2).
+///
+/// Counted from the tree rather than summed from the canvases' own numbers, because
+/// the claim is about the window and every area contributes its own furniture to it.
+fn widgets_in_window(harness: &mut TestHarness<AreaScreen>) -> usize {
+    let mut widgets = 0;
+    harness.inspect_widgets(|_| widgets += 1);
+    widgets
+}
+
+/// Every area zoomed out to an overview, and work going on in one of them.
+///
+/// The scenario the reconnaissance in §29.1 was written from, at its worst point. An
+/// area zoomed out holds its largest tree and pays nothing for it — no layout, no
+/// rebuild, no repaint — while every frame the *other* areas cause walks it anyway.
+/// Without a shared ceiling this is the arithmetic that breaks the screen: eight areas
+/// each honestly inside a canvas-sized budget put eight of them in one window.
+///
+/// Returns the widgets held and the mean and worst frame while panning in area 0.
+fn overview_screen(opts: &Options, areas: usize, nodes: usize) -> (usize, f64, f64) {
+    let frames = if opts.quick { 20 } else { 40 };
+    let mut harness = new_harness(areas, nodes);
+    for area in 0..areas {
+        zoom_area(&mut harness, area, 0.06);
+    }
+    let _ = harness.redraw();
+
+    let report = measure("overview in every area", &mut harness, frames, |h, _| {
+        pan_area(h, 0, PAN_STEP);
+    });
+    let widgets = widgets_in_window(&mut harness);
+    println!(
+        "\nwindow budget: every area at zoom 0.06, panning in one\n  \
+         {widgets} widgets in the window, {:.3} ms/frame, worst {:.3} ms  (live nodes {})",
+        report.mean_ms(),
+        report.worst_ms(),
+        report.after.live,
+    );
+    (widgets, report.mean_ms(), report.worst_ms())
+}
+
 /// Runs the scenarios, prints the numbers, and returns the evaluated criteria.
 pub fn run(opts: &Options) -> Outcome {
     let areas = opts.areas.max(1);
@@ -469,14 +510,16 @@ pub fn run(opts: &Options) -> Outcome {
 
     let sweep = area_sweep(opts, nodes);
     let regions = region_cost(opts, areas, nodes);
+    let (overview_widgets, ..) = overview_screen(opts, areas, nodes);
 
     let outcome = Outcome {
         nodes: areas,
         viewport: VIEWPORT,
         quick: opts.quick,
-        criteria: evaluate(&reports, &sweep, scale_misses, regions),
+        criteria: evaluate(&reports, &sweep, scale_misses, regions, overview_widgets, areas),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
+        zoom_sweep: Vec::new(),
     };
     outcome.report("Phase 0.5/0.6 criteria");
     outcome
@@ -547,7 +590,14 @@ fn region_cost(opts: &Options, areas: usize, nodes: usize) -> (f64, f64) {
 }
 
 /// The Phase 0.5 and 0.6 criteria, evaluated against the numbers just measured.
-fn evaluate(reports: &[Report], sweep: &[SweepRecord], scale_misses: u64, regions: (f64, f64)) -> Vec<Criterion> {
+fn evaluate(
+    reports: &[Report],
+    sweep: &[SweepRecord],
+    scale_misses: u64,
+    regions: (f64, f64),
+    overview_widgets: usize,
+    areas: usize,
+) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
 
@@ -677,6 +727,22 @@ fn evaluate(reports: &[Report], sweep: &[SweepRecord], scale_misses: u64, region
             unit: "x slower",
         });
     }
+
+    // --- The window's share of the widget budget (§29).
+    //
+    // A canvas budget is a per-canvas number, and a screen of areas is where that
+    // stops adding up: what a frame walks is the window's tree. Every area is at the
+    // zoom that holds the most, so this is the worst the screen can be asked for.
+    // The bound is the window budget with room for the furniture — headers, region
+    // stacks and the split tree itself, which is a handful of widgets per area.
+    criteria.push(Criterion {
+        name: "the_window_stays_within_one_widget_budget",
+        claim: "areas share one widget budget rather than one each",
+        kind: Kind::Counter,
+        measured: overview_widgets as f64,
+        bound: blazy_canvas::DEFAULT_WIDGET_BUDGET as f64 + 10.0 * areas as f64,
+        unit: "widgets in the window",
+    });
 
     criteria
 }

@@ -577,6 +577,7 @@ pub fn run(opts: &Options) -> Outcome {
         ),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep: Vec::new(),
+        zoom_sweep: Vec::new(),
     };
     outcome.report("blazy-shell criteria");
     outcome

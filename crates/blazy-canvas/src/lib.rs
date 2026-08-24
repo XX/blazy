@@ -38,6 +38,20 @@
 //! is therefore an associated function taking a [`WidgetMut`], which is the normal
 //! Masonry idiom.
 //!
+//! # Level of detail
+//!
+//! Two rules decide what a node is built as, and the stricter one wins (§29):
+//!
+//! * [`DetailThresholds`] asks whether the zoom still leaves a control large enough to use. Readability, and it is what
+//!   the level meant until §29.
+//! * [`DetailBudget`] asks whether the resulting tree is affordable, in widgets. A zoom threshold is a constant tuned
+//!   for one node size and one density; at four times the density the same zoom puts four times the tree in the window,
+//!   which is how a canvas ends up holding 4507 widgets and a 31 ms frame at a zoom nothing looked wrong at.
+//!
+//! An application tiling several canvases in one window should divide one budget
+//! between them ([`DetailBudget::split`]): the frame walks the window's tree, not any
+//! single canvas's.
+//!
 //! # What is missing
 //!
 //! Not a finished node editor yet. Virtualisation, level of detail, the link layer
@@ -128,6 +142,133 @@ impl DetailThresholds {
         } else {
             Detail::Box
         }
+    }
+}
+
+/// Widgets one canvas may keep in the tree, and how a level is chosen to stay under it.
+///
+/// The second half of the level-of-detail decision, and the one derived from a
+/// measurement rather than from how a node looks. [`DetailThresholds`] asks whether a
+/// control is still large enough to use; this asks whether the tree that would result
+/// is still affordable. Both rules apply and the **stricter one wins**, because they
+/// guard against different failures: a slider three pixels tall is useless however
+/// cheap it is, and four thousand widgets are unaffordable however legible they are.
+///
+/// **Why widgets and not nodes.** §20.2 measured the frame as the cost of walking the
+/// widget tree, and a node is not one widget: at [`Detail::Full`] the example's node
+/// carries a slider and a checkbox (which carries a label) and costs four, at
+/// [`Detail::Simplified`] it costs one. Measured across the whole zoom range and two
+/// graph sizes, a panned frame costs 6.5–8.5 us per widget in the tree and does not
+/// otherwise care which level produced them (§29.1) — so widgets are the unit the
+/// ceiling belongs in, and the per-level cost is what converts a node count into it.
+///
+/// **Why the costs are given rather than counted.** The canvas builds a node through
+/// [`NodeSource`] and never looks inside the result; how many widgets a level costs is
+/// the application's knowledge, like the thresholds themselves (§20.7). The defaults
+/// are the example's 4 and 1.
+///
+/// **The budget is a window quantity, not a canvas one.** What a frame walks is the
+/// whole window's tree, and a screen of areas holds one canvas per area (§21, §29.1):
+/// eight canvases each honestly inside a budget of their own put eight times that in
+/// one window, and no canvas can see it happening. An application that tiles canvases
+/// should divide one window budget between them — see [`DetailBudget::split`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetailBudget {
+    /// Widgets this canvas may put in the tree.
+    pub widgets: usize,
+    /// Widgets one node costs at [`Detail::Full`].
+    pub full_cost: usize,
+    /// Widgets one node costs at [`Detail::Simplified`].
+    pub simplified_cost: usize,
+    /// How far under the budget the estimate has to fall before a finer level is
+    /// taken up again, as a fraction of it.
+    ///
+    /// Without it the visible set's own jitter drives the switch: a pan moves nodes
+    /// in and out at the viewport edge, and the count wobbles by 10–22% from frame to
+    /// frame at every zoom worth budgeting (§29.1). A policy that flips level on each
+    /// wobble rebuilds every visible node twice a second and costs more than the
+    /// widgets it saves, so the margin is taken from that measured spread rather than
+    /// picked.
+    pub hysteresis: f64,
+}
+
+/// Widgets one canvas may hold by default.
+///
+/// Derived, not chosen: a panned frame costs 6.5–8.5 us per widget in the tree
+/// (§29.1), so 1200 widgets is about 8–9 ms — half a 60 Hz frame, leaving the rest for
+/// the far field, the links and everything else in the window. The bottom end matters
+/// as much as the top: ordinary work at zoom 1–2 holds 50–100 widgets, two orders
+/// below the ceiling, so the policy never touches it.
+pub const DEFAULT_WIDGET_BUDGET: usize = 1200;
+
+impl Default for DetailBudget {
+    fn default() -> Self {
+        Self {
+            widgets: DEFAULT_WIDGET_BUDGET,
+            full_cost: 4,
+            simplified_cost: 1,
+            hysteresis: 0.25,
+        }
+    }
+}
+
+impl DetailBudget {
+    /// A budget that never binds, leaving the zoom thresholds as the only rule.
+    pub const fn unlimited() -> Self {
+        Self {
+            widgets: usize::MAX,
+            full_cost: 4,
+            simplified_cost: 1,
+            hysteresis: 0.0,
+        }
+    }
+
+    /// This budget divided between `ways` canvases sharing one window.
+    ///
+    /// The honest way to spend a window budget on a screen of areas: the frame walks
+    /// the window's tree, so the sum is what has to fit, and dividing it is the
+    /// smallest thing that makes each canvas's decision add up to the window's
+    /// (§29.1). Even shares because an area's cost does not depend on its size — a
+    /// small area at a small zoom holds as much as a large one.
+    pub fn split(self, ways: usize) -> Self {
+        Self {
+            widgets: self.widgets / ways.max(1),
+            ..self
+        }
+    }
+
+    /// Widgets one node costs at `level`.
+    pub fn cost_of(&self, level: Detail) -> usize {
+        match level {
+            Detail::Full => self.full_cost,
+            Detail::Simplified => self.simplified_cost,
+            // The far field builds no widgets at all; its cost is a scene, and the
+            // budget cannot bid it lower — there is no coarser level to fall to
+            // (§29.4).
+            Detail::Box => 0,
+        }
+    }
+
+    /// The finest level whose widgets fit, given how many nodes are on screen.
+    ///
+    /// `current` is the level in force, and it is what makes this hysteretic: staying
+    /// where we are only has to fit the budget, while moving to a finer level has to
+    /// clear it by [`hysteresis`](Self::hysteresis).
+    pub fn level_for(&self, visible: usize, current: Option<Detail>) -> Detail {
+        let margin = 1.0 - self.hysteresis.clamp(0.0, 1.0);
+        for level in [Detail::Full, Detail::Simplified] {
+            // `Detail` is ordered finest-first, so `level < cur` is "finer than now".
+            let finer = current.is_some_and(|cur| level < cur);
+            let ceiling = if finer {
+                (self.widgets as f64 * margin) as usize
+            } else {
+                self.widgets
+            };
+            if visible.saturating_mul(self.cost_of(level)) <= ceiling {
+                return level;
+            }
+        }
+        Detail::Box
     }
 }
 
@@ -256,7 +397,18 @@ pub struct CanvasStats {
     /// viewport, not by the graph. Zero in far-field mode, where nodes are painted
     /// rather than materialised — they are on screen but they are not widgets.
     pub materialised: usize,
+    /// Nodes inside the visible rect, whether or not they have a widget.
+    ///
+    /// The number the budget is decided on, and it is not the same as
+    /// [`materialised`](Self::materialised): in the far field every node on screen is
+    /// visible and none is a widget. Published because a policy nobody can see the
+    /// input of cannot be checked — the criteria in §29.3 are written on this and on
+    /// [`CanvasCounters::level_switches`].
+    pub visible: usize,
     /// Detail level applied at the last layout.
+    ///
+    /// The stricter of the two rules that choose it: readability by zoom
+    /// ([`DetailThresholds`]) and cost by widgets ([`DetailBudget`]).
     pub detail: Option<Detail>,
     /// Current zoom factor.
     pub zoom: f64,
@@ -316,6 +468,14 @@ pub struct CanvasCounters {
     /// the work; neither must dragging a node, which moves its own curves without
     /// changing which curves are on screen. Only leaving the region should.
     pub link_reselects: u64,
+    /// Times the effective detail level actually changed.
+    ///
+    /// The counter the hysteresis is judged on. A pan near the budget boundary jitters
+    /// the visible set by a fifth (§29.1), and a policy without a margin answers every
+    /// wobble with a rebuild of every visible node — which is more expensive than the
+    /// widgets it saves. Zero while panning at zoom 1–2 is the other half of the
+    /// claim: ordinary work must not reach the policy at all.
+    pub level_switches: u64,
     /// Times the far-field scene has been re-recorded.
     ///
     /// The scene is in canvas coordinates, so panning and zooming inside the painted
@@ -359,6 +519,35 @@ pub trait NodeSource: 'static {
     /// still costs a visit in every pass. A control a few pixels tall cannot be used,
     /// so it should be drawn rather than built.
     fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget>;
+
+    /// Called once, when the canvas is in the widget tree, with the canvas's own id.
+    ///
+    /// A source usually belongs to one canvas, and several canvases over one model is
+    /// the normal arrangement rather than an exotic one (§21): the same graph shown in
+    /// two areas is two canvases, two sets of geometry and two widget trees over one
+    /// model. Knowing which canvas it serves is what lets a source tell the *others*
+    /// apart from itself when a change has to be broadcast — see [`moved`](Self::moved).
+    fn attached(&mut self, canvas: WidgetId) {
+        let _ = canvas;
+    }
+
+    /// The user has dragged node `index` to `pos`, and the canvas has already moved
+    /// its own copy of the geometry.
+    ///
+    /// Where the position goes back into the model. Node geometry is *state*, and by
+    /// §20.2 state lives in the model, not in the view — the widget does not exist
+    /// most of the time, and neither does the canvas's copy of the graph survive a
+    /// second view of it. Without this the two views of one graph drift apart on the
+    /// first drag, which is exactly what happened before §30.
+    ///
+    /// Push into `peers` the ids of the other canvases over the same model: the canvas
+    /// schedules the same move on each of them. The fan-out goes through the canvas
+    /// because a source holds no widget context and cannot reach another widget; the
+    /// canvas is handling an event and can. `peers` arrives empty and is a buffer the
+    /// canvas reuses, so pushing into it allocates nothing after the first drag.
+    fn moved(&mut self, index: usize, pos: Point, peers: &mut Vec<WidgetId>) {
+        let _ = (index, pos, peers);
+    }
 
     /// Draws node `index` when it is too small to deserve a widget.
     ///
@@ -639,12 +828,21 @@ pub struct CanvasContent {
     pending: Option<Vec<usize>>,
     /// Visible region in canvas coordinates, pushed down by the parent.
     visible_rect: Rect,
-    /// Detail level pushed down by the parent.
+    /// The coarsest level the zoom still makes readable, pushed down by the parent.
+    ///
+    /// Half of the decision. The other half is [`DetailBudget`], and it cannot be
+    /// taken by the parent because it needs the number of visible nodes, which only
+    /// the cull knows.
+    readable: Option<Detail>,
+    /// Cost ceiling, pushed down by the parent.
+    budget: DetailBudget,
+    /// Effective level, decided in `cull` as the stricter of the two rules.
     detail: Option<Detail>,
     layouts: u64,
     child_layouts: u64,
     composes: u64,
     builds: u64,
+    level_switches: u64,
     far_repaints: u64,
     visits: u64,
     link_repaints: u64,
@@ -682,11 +880,14 @@ impl CanvasContent {
             scratch_candidates: Vec::new(),
             pending: None,
             visible_rect: Rect::ZERO,
+            readable: None,
+            budget: DetailBudget::default(),
             detail: None,
             layouts: 0,
             child_layouts: 0,
             composes: 0,
             builds: 0,
+            level_switches: 0,
             far_repaints: 0,
             visits: 0,
             link_repaints: 0,
@@ -925,11 +1126,34 @@ impl CanvasContent {
         self.visits += candidates.len() as u64;
         self.scratch_candidates = candidates;
 
+        // The level is decided here rather than by the parent, and this is the only
+        // place it can be: the cost rule needs the number of visible nodes, and that
+        // number is what the loop above has just computed. Deciding it earlier, from
+        // the zoom alone, is what tied the tree's size to the graph's density —
+        // 442 nodes at zoom 0.21 on 5000 nodes, 224 on 20 000, same zoom, same
+        // decision, twice the tree (§29.1). Nothing here costs an extra pass: the
+        // estimate is a multiplication, and the set it changes is computed below.
+        //
+        // The two rules are independent and the coarser wins. `Detail` is ordered
+        // finest-first, so that is `max`.
+        let readable = self.readable.unwrap_or(Detail::Full);
+        let affordable = self.budget.level_for(visible.len(), self.detail);
+        let level = readable.max(affordable);
+        if self.detail != Some(level) {
+            // Only a change between two known levels is a switch; the first layout is
+            // not one, or every canvas would report one before it has shown anything.
+            if self.detail.is_some() {
+                self.level_switches += 1;
+            }
+            self.detail = Some(level);
+            self.detail_dirty = true;
+        }
+
         // Below the box threshold the canvas paints nodes itself, so nothing is
         // materialised. This is what keeps a fully zoomed-out graph affordable: the
         // visible set stops bounding the cost, so the cost must stop depending on
         // widgets. See `paint`.
-        let far_field = self.detail.unwrap_or(Detail::Full) == Detail::Box;
+        let far_field = level == Detail::Box;
         let desired: Vec<usize> = if far_field { Vec::new() } else { visible.clone() };
 
         self.visible = visible;
@@ -1181,10 +1405,16 @@ pub struct CanvasLayer {
     drag: Drag,
     /// Whether only the node under the pointer gets interactive controls.
     controls_on_hover: bool,
-    /// Where the detail levels switch over.
+    /// Where the detail levels switch over for readability.
     thresholds: DetailThresholds,
+    /// What the tree may cost, in widgets.
+    budget: DetailBudget,
     /// Smallest and largest permitted zoom.
     zoom_limits: (f64, f64),
+    /// Whether the source has been told this canvas's id yet.
+    attached: bool,
+    /// Reused buffer for the peers a move has to be broadcast to.
+    peers: Vec<WidgetId>,
     /// Links handed to [`CanvasLayer::with_links`] before the canvas was in a tree.
     pending_links: Option<Vec<Link>>,
     link_style: LinkStyle,
@@ -1222,6 +1452,9 @@ impl CanvasLayer {
             drag: Drag::None,
             controls_on_hover: false,
             thresholds: DetailThresholds::default(),
+            budget: DetailBudget::default(),
+            attached: false,
+            peers: Vec::new(),
             zoom_limits: (0.02, 8.0),
             pending_links: None,
             link_style: LinkStyle::default(),
@@ -1264,6 +1497,32 @@ impl CanvasLayer {
     pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
         self.controls_on_hover = enabled;
         self
+    }
+
+    /// Sets where the detail levels switch over for readability.
+    ///
+    /// Policy, and the application's: how small a control may get before it stops
+    /// being usable depends on how the node is drawn (§20.7).
+    pub fn with_thresholds(mut self, thresholds: DetailThresholds) -> Self {
+        self.thresholds = thresholds;
+        self
+    }
+
+    /// Sets the ceiling on widgets this canvas may keep in the tree.
+    ///
+    /// The other half of the level decision, and the one that does not follow the
+    /// zoom: see [`DetailBudget`]. An application tiling several canvases in one
+    /// window should hand each of them a share of one window budget
+    /// ([`DetailBudget::split`]), because the frame walks the window's tree and not
+    /// any single canvas's.
+    pub fn with_budget(mut self, budget: DetailBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// The cost ceiling in force.
+    pub fn budget(&self) -> DetailBudget {
+        self.budget
     }
 
     /// The canvas-space to viewport-space transform.
@@ -1355,6 +1614,31 @@ impl CanvasLayer {
         content.widget.store_child_pos(index, pos).apply(&mut content.ctx);
     }
 
+    /// Reaches node `index`'s widget, if it currently has one.
+    ///
+    /// The way a change in the model reaches a view that is already on screen. A node
+    /// widget is built from the model and then keeps its own copy — it has to, because
+    /// it is painted far more often than it is built — so a model change that happens
+    /// while the node is materialised has to be pushed into it.
+    ///
+    /// Returns `false` when the node has no widget: it is off screen, or the canvas is
+    /// in the far field. That is not a failure and needs no repair — a node without a
+    /// widget reads the model when it is next built. What a far-field canvas *draws*
+    /// comes from [`NodeSource::paint_far`], and if a change affects that drawing the
+    /// caller invalidates it by moving the node, not by this.
+    pub fn update_child(
+        this: &mut WidgetMut<'_, Self>,
+        index: usize,
+        f: impl FnOnce(WidgetMut<'_, dyn Widget>),
+    ) -> bool {
+        let mut content = this.ctx.get_mut(&mut this.widget.content);
+        let Some(pod) = content.widget.slots.get_mut(index).and_then(|slot| slot.pod.as_mut()) else {
+            return false;
+        };
+        f(content.ctx.get_mut(pod));
+        true
+    }
+
     /// The nodes that currently have a widget, as `(index, widget id)` pairs.
     ///
     /// Useful for tests and for apps that need to reach into a live node. The list
@@ -1413,10 +1697,35 @@ impl CanvasLayer {
         }
     }
 
-    /// Moves a child from an event handler.
+    /// Moves a child from an event handler — the drag, as opposed to the programmatic
+    /// [`move_child`](Self::move_child).
+    ///
+    /// The two differ in exactly one thing and it is the point of the split: a drag is
+    /// the *user* moving a node, so the model has to hear about it and so do the other
+    /// canvases showing the same model. A programmatic move is what those other
+    /// canvases then receive, and it must not bounce back out again.
     fn move_child_at(&mut self, index: usize, pos: Point, ctx: &mut EventCtx<'_>) {
-        let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
-        content.store_child_pos(index, pos).apply(&mut raw);
+        let mut peers = std::mem::take(&mut self.peers);
+        peers.clear();
+        {
+            let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+            let invalidate = content.store_child_pos(index, pos);
+            if invalidate != Invalidate::Nothing {
+                content.source.moved(index, pos, &mut peers);
+            }
+            invalidate.apply(&mut raw);
+        }
+        for &peer in &peers {
+            // A mutate callback rather than a direct reach: another canvas is not this
+            // widget's child, and the mutate pass is where a widget outside the current
+            // subtree may legally be changed. It runs before the next layout, so the
+            // other areas move in the same frame.
+            ctx.mutate_later(peer, move |mut widget| {
+                let mut canvas = widget.downcast::<Self>();
+                Self::move_child(&mut canvas, index, pos);
+            });
+        }
+        self.peers = peers;
     }
 
     /// How many screen pixels one canvas unit covers.
@@ -1606,12 +1915,24 @@ impl Widget for CanvasLayer {
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
         self.viewport = size;
 
+        // The first layout is the first moment this widget knows its own id and can
+        // hand it to the source. Construction is too early: a `CanvasLayer` is built
+        // before it is a widget, and the id is minted when it enters the tree.
+        if !self.attached {
+            self.attached = true;
+            let id = ctx.widget_id();
+            let (content, _) = ctx.get_raw_mut(&mut self.content);
+            content.source.attached(id);
+        }
+
         // Clip to the viewport so children panned out of view cannot paint over the
         // surrounding UI, and so Masonry excludes them from hit testing.
         ctx.set_clip_path(Rect::from_origin_size(Point::ORIGIN, size));
 
         let visible_rect = self.visible_canvas_rect();
-        let detail = self.thresholds.for_scale(self.zoom());
+        // Only the readability half of the decision can be taken here: the cost half
+        // needs the number of visible nodes, which the cull computes (§29.2).
+        let readable = self.thresholds.for_scale(self.zoom());
         let view = self.view;
         let view_dirty = std::mem::take(&mut self.view_dirty);
 
@@ -1637,10 +1958,8 @@ impl Widget for CanvasLayer {
             content.link_style = self.link_style;
             content.controls_on_hover = self.controls_on_hover;
             content.visible_rect = visible_rect;
-            if content.detail != Some(detail) {
-                content.detail = Some(detail);
-                content.detail_dirty = true;
-            }
+            content.readable = Some(readable);
+            content.budget = self.budget;
             if view_dirty {
                 raw.set_transform(view);
             }
@@ -1670,6 +1989,7 @@ impl Widget for CanvasLayer {
         self.stats.set(CanvasStats {
             total: content.slots.len(),
             materialised: content.live.len(),
+            visible: content.visible.len(),
             detail: content.detail,
             zoom,
             recorded_far: content.far.nodes.len(),
@@ -1680,6 +2000,7 @@ impl Widget for CanvasLayer {
                 child_layouts: content.child_layouts,
                 composes: content.composes,
                 builds: content.builds,
+                level_switches: content.level_switches,
                 far_repaints: content.far_repaints,
                 slot_visits: content.visits,
                 link_repaints: content.link_repaints,
@@ -1968,5 +2289,82 @@ mod tests {
         };
         assert_eq!(thresholds.for_scale(0.4), Detail::Simplified);
         assert_eq!(thresholds.for_scale(0.1), Detail::Box);
+    }
+
+    // --- MARK: budget
+
+    /// The budget picks the most detailed level that fits, and nothing finer.
+    #[test]
+    fn the_budget_takes_the_finest_level_that_fits() {
+        let budget = DetailBudget {
+            widgets: 1000,
+            full_cost: 4,
+            simplified_cost: 1,
+            hysteresis: 0.0,
+        };
+        // 100 nodes cost 400 widgets in full; 300 cost 1200 and do not fit, but the
+        // same 300 cost 300 simplified.
+        assert_eq!(budget.level_for(100, None), Detail::Full);
+        assert_eq!(budget.level_for(300, None), Detail::Simplified);
+        assert_eq!(budget.level_for(1001, None), Detail::Box);
+    }
+
+    /// An unlimited budget leaves the zoom thresholds as the only rule.
+    #[test]
+    fn an_unlimited_budget_never_binds() {
+        let budget = DetailBudget::unlimited();
+        assert_eq!(budget.level_for(1_000_000, None), Detail::Full);
+    }
+
+    /// Coming back up costs more than staying put, which is what stops the flapping.
+    ///
+    /// The gap is the measured jitter of the visible set during a pan (§29.1): with
+    /// the two thresholds equal, a set wobbling between 249 and 251 nodes switches
+    /// level twice a second and rebuilds every visible node each time.
+    #[test]
+    fn the_budget_is_hysteretic() {
+        let budget = DetailBudget {
+            widgets: 1000,
+            full_cost: 4,
+            simplified_cost: 1,
+            hysteresis: 0.25,
+        };
+        // 240 nodes cost 960 widgets: inside the budget, so `Full` holds...
+        assert_eq!(budget.level_for(240, Some(Detail::Full)), Detail::Full);
+        // ...but is not reached from below, where the ceiling is 750.
+        assert_eq!(budget.level_for(240, Some(Detail::Simplified)), Detail::Simplified);
+        // Well clear of the margin, it is reached.
+        assert_eq!(budget.level_for(180, Some(Detail::Simplified)), Detail::Full);
+    }
+
+    /// A window budget divided between the canvases sharing the window.
+    #[test]
+    fn a_split_budget_shares_one_ceiling() {
+        let budget = DetailBudget::default().split(8);
+        assert_eq!(budget.widgets, DEFAULT_WIDGET_BUDGET / 8);
+        assert_eq!(budget.full_cost, DetailBudget::default().full_cost);
+        // Dividing by nothing is the whole budget rather than a panic.
+        assert_eq!(DetailBudget::default().split(0).widgets, DEFAULT_WIDGET_BUDGET);
+    }
+
+    /// Readability and cost are separate rules and the stricter one decides.
+    ///
+    /// Both directions matter: a zoom too small for a slider cannot be rescued by a
+    /// generous budget, and a graph too dense cannot be rescued by a legible zoom.
+    #[test]
+    fn the_stricter_of_the_two_rules_wins() {
+        let thresholds = DetailThresholds::default();
+        let budget = DetailBudget {
+            widgets: 1000,
+            full_cost: 4,
+            simplified_cost: 1,
+            hysteresis: 0.0,
+        };
+        // Legible zoom, unaffordable set: cost decides.
+        let readable = thresholds.for_scale(1.0);
+        assert_eq!(readable.max(budget.level_for(400, None)), Detail::Simplified);
+        // Affordable set, illegible zoom: readability decides.
+        let readable = thresholds.for_scale(0.01);
+        assert_eq!(readable.max(budget.level_for(1, None)), Detail::Box);
     }
 }
