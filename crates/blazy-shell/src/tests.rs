@@ -303,6 +303,50 @@ fn the_gpu_path_draws_without_touching_main_memory() {
     assert_eq!(frames.holes().len(), 1, "holes survive the GPU path (§4.3)");
 }
 
+/// The instrument a benchmark checks its own GPU timings with (§32.4).
+///
+/// Two claims, and the raster table leans on both: what comes back is the frame that
+/// was drawn, and reading it back is *counted* — the zero in
+/// `the_gpu_path_does_not_read_the_frame_back` says something only because this
+/// number moves when a readback really happens.
+#[cfg(feature = "vello")]
+#[test]
+fn a_frame_read_back_is_the_frame_that_was_drawn() {
+    use crate::gpu::GpuFrames;
+
+    let Ok(mut frames) = GpuFrames::offscreen(PhysicalSize::new(200, 120)) else {
+        eprintln!("no graphics device here; skipping the GPU path");
+        return;
+    };
+
+    let mut harness = harness(Counting {
+        layouts: Rc::new(Cell::new(0)),
+        external: false,
+    });
+    let (plan, _) = harness.redraw();
+    frames.draw(&plan, Size::new(200.0, 120.0), 1.0).expect("the GPU draws");
+
+    let pixels = frames.read_pixels();
+    assert_eq!(pixels.len(), 200 * 120 * 4, "tightly packed, padding dropped");
+    assert!(
+        pixels.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        "the frame came back empty"
+    );
+    assert_eq!(frames.counters().readbacks, 1, "a readback went uncounted");
+
+    // A strip is the same pixels, which is what lets a per-frame check read half a
+    // megabyte instead of thirteen.
+    let row = 200 * 4;
+    let strip = frames.read_rows(10, 4);
+    assert_eq!(strip, pixels[10 * row..14 * row], "a strip is part of the frame");
+    assert_eq!(frames.counters().readbacks, 2);
+
+    // Rows past the end are clamped rather than panicking: a caller reading a strip
+    // does not want to know the texture's height.
+    assert!(frames.read_rows(119, 8).len() == row);
+    assert!(frames.read_rows(200, 4).is_empty());
+}
+
 /// The device scale reaches the GPU path the same way it reaches the other one.
 #[cfg(feature = "vello")]
 #[test]

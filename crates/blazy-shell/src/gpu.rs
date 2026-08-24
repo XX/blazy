@@ -182,6 +182,89 @@ impl GpuFrames {
             .map_err(|error| PresentError::Platform(format!("vello into texture: {error}")))
     }
 
+    /// Copies part of the frame out of the texture, as tightly packed RGBA8.
+    ///
+    /// A strip rather than the whole frame, for a caller that only needs to know
+    /// *whether* this frame was drawn: at 2200x1500 the frame is 13 MB and a strip of
+    /// it is half a megabyte, which is the difference between a check that can run
+    /// after every frame and one that cannot. Rows outside the texture are clamped
+    /// away; asking for none gives none.
+    ///
+    /// Counts as a readback, for the same reason [`Self::read_pixels`] does.
+    pub fn read_rows(&mut self, y: u32, rows: u32) -> Vec<u8> {
+        let (width, height) = (self.size.width, self.size.height);
+        let y = y.min(height);
+        let rows = rows.min(height - y);
+        if rows == 0 || width == 0 {
+            return Vec::new();
+        }
+
+        let row_bytes = width * 4;
+        // `copy_texture_to_buffer` wants each row aligned; the padding is dropped on
+        // the way out, so the caller gets an image and not a layout to reason about.
+        let padded = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blazy frame readback"),
+            size: u64::from(padded) * u64::from(rows),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(rows),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut pixels = Vec::with_capacity((row_bytes * rows) as usize);
+        for row in 0..rows {
+            let start = (row * padded) as usize;
+            pixels.extend_from_slice(&mapped[start..start + row_bytes as usize]);
+        }
+        drop(mapped);
+        buffer.unmap();
+
+        self.counters.readbacks += 1;
+        pixels
+    }
+
+    /// Copies the frame out of the texture, as tightly packed RGBA8.
+    ///
+    /// **Not part of the frame path**, and the counter says so: this bumps
+    /// `readbacks`, which is the number `gpu_frames_are_not_read_back` gates at zero
+    /// (§27.4). It is here for a test, a screenshot, or a benchmark that has to know
+    /// whether the frame it just timed contains anything — a frame that failed is
+    /// *fast*, and no clock can tell that from a frame that was drawn (§32.4).
+    ///
+    /// Blocks until the GPU has finished and the buffer is mapped.
+    pub fn read_pixels(&mut self) -> Vec<u8> {
+        self.read_rows(0, self.size.height)
+    }
+
     /// Waits for the GPU to finish the frame.
     ///
     /// Only a benchmark needs this: a submitted frame is otherwise timed as the cost

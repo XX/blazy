@@ -17,7 +17,7 @@ use masonry::core::{
 };
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::Painter;
-use masonry::kurbo::{Axis, Rect, Size};
+use masonry::kurbo::{Axis, BezPath, CubicBez, Point, Rect, Size, Stroke};
 use masonry::layout::{LenReq, Length};
 use masonry::peniko::Color;
 use masonry::testing::TestHarness;
@@ -131,6 +131,118 @@ impl Widget for Panel {
             let y = box_rect.y0 + (i / 12) as f64 * 64.0 + 8.0;
             let tint = Color::from_rgb8(0x40 + (i * 7 % 0x80) as u8, 0x50, 0x90);
             painter.fill(Rect::new(x, y, x + 72.0, y + 48.0), tint).draw();
+        }
+    }
+
+    fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
+
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::new()
+    }
+
+    fn accessibility_role(&self) -> Role {
+        Role::GenericContainer
+    }
+
+    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+}
+
+/// A far-field scene: many curves, stroked in a chosen number of commands.
+///
+/// The scene §31 is about, reduced to what a rasteriser can see. The geometry does
+/// not depend on `groups` at all — every row of the raster table draws the same ink —
+/// which is what makes "how many commands" and "how many pixels" two axes rather than
+/// one. Built here rather than imported from the canvas example for the reason the
+/// crate layout gives: this measurement needs a rasteriser and a device, and from a
+/// graph it needs nothing but a command count and a coverage.
+struct FarField {
+    /// Curves drawn.
+    count: usize,
+    /// Stroke commands the same curves are split into.
+    ///
+    /// 1 is the batch §31 landed, `count` is the command-per-link scene it replaced,
+    /// and everything between is there to say whether the rasteriser cares.
+    groups: usize,
+    /// Stroke width in logical pixels: the coverage axis, at a fixed command count.
+    width: f64,
+    /// What the curves are stroked with.
+    ///
+    /// Two of these alternate frame by frame in the raster table, so that a frame the
+    /// GPU never drew cannot pass for the frame before it (§32.4).
+    tint: Color,
+}
+
+/// One curve of the far field, in the widget's own coordinates.
+///
+/// Deterministic in `i` — the same hash gives the same curve in every row — and
+/// shaped like a link: a cubic with horizontal handles, which is what the canvas
+/// draws (`blazy_canvas::links::link_curve`).
+fn far_curve(i: usize, area: Rect) -> CubicBez {
+    let unit = |salt: u64| {
+        let mut hash = (i as u64)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(salt.wrapping_mul(0xbf58_476d_1ce4_e5b9));
+        hash ^= hash >> 31;
+        hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 29;
+        (hash >> 11) as f64 / (1_u64 << 53) as f64
+    };
+
+    let start = Point::new(area.x0 + unit(1) * area.width(), area.y0 + unit(2) * area.height());
+    // Short, like a link at an overview zoom: a canvas grid of 220 units seen at 0.04
+    // puts neighbouring nodes about nine pixels apart, and a viewport holding
+    // thousands of links is holding small ones. A curve spanning the window instead
+    // would cover the frame many times over and measure overdraw, not the far field.
+    let end = Point::new(start.x + 8.0 + unit(3) * 16.0, start.y + (unit(4) - 0.5) * 40.0);
+    let reach = ((end.x - start.x).abs() * 0.5).max(1.0);
+    CubicBez::new(
+        start,
+        Point::new(start.x + reach, start.y),
+        Point::new(end.x - reach, end.y),
+        end,
+    )
+}
+
+impl Widget for FarField {
+    type Action = NoAction;
+
+    fn measure(
+        &mut self,
+        _ctx: &mut MeasureCtx<'_>,
+        _props: &PropertiesRef<'_>,
+        _axis: Axis,
+        len_req: LenReq,
+        _cross: Option<Length>,
+    ) -> Length {
+        match len_req {
+            LenReq::MinContent | LenReq::MaxContent => Length::px(200.0),
+            LenReq::FitContent(space) => space,
+        }
+    }
+
+    fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
+
+    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        let box_rect = ctx.content_box();
+        painter.fill(box_rect, Color::from_rgb8(0x1c, 0x1c, 0x20)).draw();
+
+        // One path per command, curves dealt round-robin between them: the split is
+        // by index and not by region, so no group gets a smaller bounding box than
+        // another and the only thing that changes across the sweep is the count.
+        let groups = self.groups.clamp(1, self.count.max(1));
+        let mut paths = vec![BezPath::new(); groups];
+        for i in 0..self.count {
+            let curve = far_curve(i, box_rect);
+            let path = &mut paths[i % groups];
+            path.move_to(curve.p0);
+            path.curve_to(curve.p1, curve.p2, curve.p3);
+        }
+
+        // One brush and one stroke for every group. Same style, different commands —
+        // which is precisely the thing §31 collapsed, and the thing this measures.
+        let stroke = Stroke::new(self.width);
+        for path in &paths {
+            painter.stroke(path, &stroke, self.tint).draw();
         }
     }
 
@@ -431,6 +543,485 @@ fn presentation_table(opts: &Options) -> Vec<PresentRow> {
     rows
 }
 
+/// Curves in the far-field scene the raster table draws.
+///
+/// The order of magnitude §31.5 measured on 5000 nodes: ~8500 link curves recorded
+/// for one canvas at an overview zoom.
+const RASTER_CURVES: usize = 8000;
+/// Commands the same curves are split into, from the batch to one per curve.
+const RASTER_GROUPS: [usize; 6] = [1, 8, 64, 512, 2048, RASTER_CURVES];
+/// Stroke widths, in logical pixels: coverage at a fixed command count.
+///
+/// `LinkStyle::width` is 2 **canvas** units, so a link at the far-field zoom of 0.04
+/// is 0.08 px wide and at 0.2 it is 0.4 — the far field lives at the thin end of this
+/// sweep, and the thick end is there to say what ink costs when there is a lot of it.
+const RASTER_WIDTHS: [f64; 4] = [0.1, 0.5, 2.0, 8.0];
+/// Device scales the raster table walks. x2 is x4 the pixels (§27.4).
+const RASTER_SCALES: [f64; 2] = [1.0, 2.0];
+/// Widths the command sweep is run at, so the answer is not read off one ink level.
+const RASTER_SWEEP_WIDTHS: [f64; 2] = [0.5, 2.0];
+/// The two tints the raster table alternates between, frame by frame.
+///
+/// Far apart in luma on purpose: the check below compares a frame against both of
+/// them, and the further apart they are the less room there is for a stale frame to
+/// look like a fresh one.
+const RASTER_TINTS: [Color; 2] = [Color::from_rgb8(0x28, 0x30, 0x78), Color::from_rgb8(0xf0, 0xe4, 0xb0)];
+/// Rows of the frame read back to check that a frame was drawn.
+const RASTER_STRIP: u32 = 32;
+/// Ink a row has to have before its time means anything, as a fraction of the frame.
+///
+/// The blit path is the reference every other row is checked against, so nothing
+/// checks *it* — except this: a rasteriser that drew nothing leaves an empty frame,
+/// and an empty frame is very fast.
+const RASTER_MIN_INK: f64 = 0.01;
+
+/// One row of the raster table: a scene, a path to the screen, and both halves of it.
+struct RasterRow {
+    path: &'static str,
+    groups: usize,
+    width: f64,
+    scale: f64,
+    /// Draw commands in the layer plan (`bench_utils::plan::commands`) — §31's counter.
+    commands: usize,
+    /// Draw objects in the encoding vello would rasterise, where it can be built.
+    objects: usize,
+    /// Path segments in the same encoding.
+    segments: u64,
+    /// Fraction of the frame that is not the panel's own fill: the ink.
+    coverage: f64,
+    /// The worst a frame's strip differed from what the CPU rasteriser drew.
+    ///
+    /// A timing row for a frame nobody looked at is worth nothing: a frame that
+    /// failed, was skipped or overflowed an allocator is *fast*, and no clock can
+    /// tell that from a frame that was drawn (§32.4).
+    difference: f64,
+    /// Frames of this row that did not come out as the picture that was asked for.
+    unverified: usize,
+    /// Passes and plan assembly — the half §31 measured.
+    plan_ms: f64,
+    /// Turning that plan into pixels, or into a texture — the half it did not.
+    raster_ms: f64,
+}
+
+impl RasterRow {
+    /// Whether this row may be quoted: every frame in it was the picture asked for.
+    fn verified(&self) -> bool {
+        self.unverified == 0
+    }
+}
+
+/// What vello is asked to draw, counted before anything draws it.
+///
+/// The answer to the task's first question, and it is better than the task hoped for:
+/// `imaging_vello` re-exports `vello` and its `VelloSceneSink` is public, so a scene
+/// can be **encoded without a device** and the encoding read out — `draw_tags` is one
+/// entry per draw object, `n_path_segments` one per curve. Both are exact and
+/// machine-independent, which is what a criterion needs (§20.9), and unlike every
+/// other GPU number here they exist on a runner with no GPU at all.
+///
+/// The CPU rasteriser has no equivalent: `imaging_vello_cpu` exposes a renderer and
+/// nothing about the work inside it, so on that path only the clock can answer.
+#[cfg(feature = "vello")]
+fn encoded(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>) -> (usize, u64) {
+    use masonry::imaging::record::replay;
+
+    let composition = blazy_shell::Composition::new(plan, scale);
+    let mut native = imaging_vello::vello::Scene::new();
+    let bounds = Rect::new(0.0, 0.0, f64::from(frame.width), f64::from(frame.height));
+    let mut sink = imaging_vello::VelloSceneSink::new(&mut native, bounds);
+    replay(&composition.scene, &mut sink);
+    sink.finish().expect("the composed scene encodes");
+
+    let encoding = native.encoding();
+    (encoding.draw_tags.len(), u64::from(encoding.n_path_segments))
+}
+
+#[cfg(not(feature = "vello"))]
+fn encoded(_plan: &masonry::app::VisualLayerPlan, _scale: f64, _frame: PhysicalSize<u32>) -> (usize, u64) {
+    (0, 0)
+}
+
+/// Ink in a frame: the fraction of pixels that are not the background.
+fn ink(pixels: &[u8], panel: Color) -> f64 {
+    let base = panel.to_rgba8();
+    let count = pixels
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] != base.r || pixel[1] != base.g || pixel[2] != base.b)
+        .count();
+    count as f64 / (pixels.len() / 4) as f64
+}
+
+/// `rows` rows of an RGBA image, starting at `first`.
+fn strip(pixels: &[u8], width: u32, first: u32, rows: u32) -> &[u8] {
+    let row_bytes = (width * 4) as usize;
+    let start = first as usize * row_bytes;
+    &pixels[start..start + rows as usize * row_bytes]
+}
+
+/// Mean absolute luma difference between two frames of the same size, over 255.
+///
+/// Not `bench_utils::render::differing_fraction`, which asks whether *any* pixel
+/// changed: two rasterisers antialias differently and disagree about nearly every
+/// edge pixel by one or two levels, so that fraction is near 1 for two frames that
+/// look identical. What matters here is whether the ink is in the same places.
+fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
+    if a.len() != b.len() {
+        return 1.0;
+    }
+    let luma = |pixel: &[u8]| 0.299 * f64::from(pixel[0]) + 0.587 * f64::from(pixel[1]) + 0.114 * f64::from(pixel[2]);
+    let total: f64 = a
+        .chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .map(|(p, q)| (luma(p) - luma(q)).abs())
+        .sum();
+    total / (a.len() / 4) as f64 / 255.0
+}
+
+/// The GPU path, opened once for the whole table.
+///
+/// One device rather than one per row. `GpuFrames::draw` resizes its own texture, so
+/// a single one serves every size here — and a device per row would put twenty driver
+/// initialisations inside a measurement, which is a variable nobody asked for.
+struct GpuPath {
+    #[cfg(feature = "vello")]
+    frames: Option<blazy_shell::gpu::GpuFrames>,
+}
+
+impl GpuPath {
+    #[cfg(feature = "vello")]
+    fn open(panel: Color) -> Self {
+        Self {
+            frames: blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(SIZE.0, SIZE.1))
+                .ok()
+                .map(|gpu| gpu.with_background(panel)),
+        }
+    }
+
+    #[cfg(not(feature = "vello"))]
+    fn open(_panel: Color) -> Self {
+        Self {}
+    }
+
+    /// Frames this path copied back out of the texture, for the counter's own check.
+    fn readbacks(&self) -> u64 {
+        #[cfg(feature = "vello")]
+        {
+            self.frames.as_ref().map_or(0, |gpu| gpu.counters().readbacks)
+        }
+        #[cfg(not(feature = "vello"))]
+        {
+            0
+        }
+    }
+}
+
+/// One scene at one device scale, on both paths.
+///
+/// `groups` and `width` are the two axes: the first changes how many commands the
+/// same ink arrives in, the second how much ink there is at the same command count.
+///
+/// The scene is drawn in **two tints, alternating frame by frame**, and that is not
+/// decoration. vello can fail to draw a frame and report nothing (§32.4); the target
+/// then keeps whatever was in it, which is the *previous* frame — so a check that only
+/// asks "is there ink in the texture" passes on a frame that was never drawn. Two
+/// tints make the last frame identifiable, and the check runs after every frame
+/// rather than once at the end.
+fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames: usize) -> Vec<RasterRow> {
+    let panel = Color::from_rgb8(0x1c, 0x1c, 0x20);
+    let mut harnesses: Vec<_> = RASTER_TINTS
+        .iter()
+        .map(|&tint| {
+            let mut harness = TestHarness::create_with_size(
+                default_property_set(),
+                NewWidget::new(FarField {
+                    count: RASTER_CURVES,
+                    groups,
+                    width,
+                    tint,
+                }),
+                PhysicalSize::new(SIZE.0, SIZE.1),
+            );
+            let _ = harness.redraw();
+            harness
+        })
+        .collect();
+
+    // The CPU half, in the same shape as `measure`: animate, then rebuild the plan.
+    let mut plan_total = Duration::ZERO;
+    for frame in 0..frames {
+        let harness = &mut harnesses[frame % RASTER_TINTS.len()];
+        harness.animate_ms(16);
+        let start = Instant::now();
+        let _ = harness.redraw();
+        plan_total += start.elapsed();
+    }
+    let plan_ms = plan_total.as_secs_f64() * 1000.0 / frames as f64;
+
+    let plans: Vec<_> = harnesses.iter_mut().map(|harness| harness.redraw().0).collect();
+    let commands = bench_utils::plan::commands(&plans[0]);
+    let frame_size = {
+        let (w, h) = (f64::from(SIZE.0) * scale, f64::from(SIZE.1) * scale);
+        PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
+    };
+    let (objects, segments) = encoded(&plans[0], scale, frame_size);
+    let mut rows = Vec::new();
+
+    // --- The blit path: compose and rasterise on the CPU. The channel swap that
+    // follows it is measured in §27.4 and does not depend on what is drawn, so it is
+    // left out here rather than counted twice.
+    let mut host = Host::any().expect("some backend opens").with_background(panel);
+    host.set_device_scale(scale);
+    let references: Vec<_> = plans
+        .iter()
+        .map(|plan| host.render(plan, logical_size()).expect("the host renders").image)
+        .collect();
+    let coverage = ink(&references[0].data, panel);
+
+    let start = Instant::now();
+    for frame in 0..frames {
+        let _ = host
+            .render(&plans[frame % plans.len()], logical_size())
+            .expect("the host renders");
+    }
+    let raster_ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    rows.push(RasterRow {
+        path: "blit",
+        groups,
+        width,
+        scale,
+        commands,
+        objects,
+        segments,
+        coverage,
+        difference: 0.0,
+        unverified: 0,
+        plan_ms,
+        raster_ms,
+    });
+
+    // --- The GPU path, where there is a device for it.
+    #[cfg(feature = "vello")]
+    if let Some(gpu) = gpu.frames.as_mut() {
+        let rows_read = RASTER_STRIP.min(frame_size.height);
+        let first_row = frame_size.height.saturating_sub(rows_read) / 2;
+        let strips: Vec<_> = references
+            .iter()
+            .map(|image| strip(&image.data, image.width, first_row, rows_read).to_vec())
+            .collect();
+
+        // The first frame pays for pipelines, allocations and any resize; nobody
+        // wants it in the average.
+        gpu.draw(&plans[0], logical_size(), scale).expect("the GPU draws");
+        gpu.wait();
+
+        let (mut total, mut worst, mut unverified) = (Duration::ZERO, 0.0_f64, 0);
+        for frame in 0..frames {
+            let tint = frame % plans.len();
+            let start = Instant::now();
+            gpu.draw(&plans[tint], logical_size(), scale).expect("the GPU draws");
+            // Waiting per frame rather than submitting the run and waiting once:
+            // this is a claim about what one frame costs, and a window submits one
+            // frame and shows it. §27.4 batched deliberately — it was asking about
+            // throughput.
+            gpu.wait();
+            total += start.elapsed();
+
+            // Untimed, and half a megabyte rather than thirteen.
+            //
+            // No tolerance to choose: the frame is compared against *both* tints and
+            // has to be closer to the one that was asked for. A frame that was never
+            // drawn holds the frame before it, which was the other tint — and a
+            // threshold on "close enough" would have had to be looser than the
+            // difference between two rasterisers' antialiasing and tighter than the
+            // difference between two tints, which at a half-pixel stroke width is not
+            // a gap you can put a number in (it was tried; it missed three rows).
+            let drawn = gpu.read_rows(first_row, rows_read);
+            let difference = frame_difference(&strips[tint], &drawn);
+            let other = frame_difference(&strips[(tint + 1) % strips.len()], &drawn);
+            worst = worst.max(difference);
+            if difference >= other {
+                unverified += 1;
+            }
+        }
+
+        rows.push(RasterRow {
+            path: "swapchain",
+            groups,
+            width,
+            scale,
+            commands,
+            objects,
+            segments,
+            coverage: ink(&gpu.read_pixels(), panel),
+            difference: worst,
+            unverified,
+            plan_ms,
+            raster_ms: total.as_secs_f64() * 1000.0 / frames as f64,
+        });
+    }
+    #[cfg(not(feature = "vello"))]
+    let _ = gpu;
+
+    rows
+}
+
+/// Both halves of a far-field frame, over both axes and both paths.
+///
+/// The table §31.6 asked for: §31 measured the plan and this measures what a
+/// rasteriser then does with it, in one row so that neither half can be quoted
+/// without the other.
+///
+/// The device scale is the **outer** loop, so the frame size changes twice in a run
+/// rather than forty times. That is not tidiness: alternating the target size makes
+/// the GPU path hand back empty frames on this machine (§32.4), and a benchmark that
+/// provokes a defect it is not measuring reports noise instead of an answer.
+struct RasterReport {
+    rows: Vec<RasterRow>,
+    /// Readbacks the table made, which is what checks the readback counter itself.
+    readbacks: u64,
+}
+
+fn raster_table(opts: &Options) -> RasterReport {
+    let frames = if opts.quick { 6 } else { 12 };
+    // Both scales even in the quick set: one of the criteria compares a scene's
+    // encoding across scales, and with a single scale it would have nothing to
+    // compare and would pass by having nothing to say.
+    let scales: &[f64] = &RASTER_SCALES;
+    let groups: &[usize] = if opts.quick {
+        &[RASTER_GROUPS[0], RASTER_GROUPS[5]]
+    } else {
+        &RASTER_GROUPS
+    };
+    let sweep_widths: &[f64] = if opts.quick {
+        &RASTER_SWEEP_WIDTHS[..1]
+    } else {
+        &RASTER_SWEEP_WIDTHS
+    };
+    let widths: &[f64] = if opts.quick {
+        &RASTER_WIDTHS[1..2]
+    } else {
+        &RASTER_WIDTHS
+    };
+
+    let mut gpu = GpuPath::open(Color::from_rgb8(0x1c, 0x1c, 0x20));
+    println!(
+        "\nrasterisation: {RASTER_CURVES} curves, the same ink in a different number of commands\n  \
+         (plan = passes and plan assembly, raster = pixels or texture)"
+    );
+    let mut rows = Vec::new();
+    for &scale in scales {
+        for &width in sweep_widths {
+            for &count in groups {
+                rows.extend(raster_case(&mut gpu, count, width, scale, frames));
+            }
+        }
+    }
+    print_raster(&rows);
+
+    println!("\nrasterisation: one command, the same curves, more ink");
+    let mut coverage_rows = Vec::new();
+    for &width in widths {
+        coverage_rows.extend(raster_case(&mut gpu, 1, width, scales[0], frames));
+    }
+    print_raster(&coverage_rows);
+    rows.extend(coverage_rows);
+
+    let undrawn: usize = rows.iter().map(|row| row.unverified).sum();
+    if undrawn > 0 {
+        println!(
+            "\n  {undrawn} frames marked `!` were never drawn: the GPU path reported success and left\n               the previous frame in the texture (§32.4). Their times are not frame times."
+        );
+    }
+
+    RasterReport {
+        readbacks: gpu.readbacks(),
+        rows,
+    }
+}
+
+/// The rows the JSON report archives, so the two halves can be diffed across commits.
+///
+/// One scene at one scale on each path, at both ends of the command sweep — the four
+/// numbers §32 is argued from. The rest of the table is printed and not archived: a
+/// report is for diffing a claim, not for keeping every row ever measured.
+fn raster_records(rows: &[RasterRow]) -> Vec<ScenarioRecord> {
+    let pick = |path: &str, groups: usize| {
+        rows.iter().find(|row| {
+            row.path == path && row.groups == groups && row.scale == 1.0 && (row.width - 0.5).abs() < f64::EPSILON
+        })
+    };
+
+    [
+        ("far field batched, cpu", "blit", 1),
+        ("far field per curve, cpu", "blit", RASTER_CURVES),
+        ("far field batched, gpu", "swapchain", 1),
+        ("far field per curve, gpu", "swapchain", RASTER_CURVES),
+    ]
+    .into_iter()
+    .filter_map(|(name, path, groups)| {
+        let row = pick(path, groups)?;
+        Some(ScenarioRecord {
+            name,
+            frames: 1,
+            mean_ms: row.plan_ms + row.raster_ms,
+            worst_ms: 0.0,
+            materialised: 0,
+            detail: String::new(),
+            child_layouts_per_frame: 0.0,
+            builds_per_frame: 0.0,
+            far_repaints_per_frame: 0.0,
+            extra: vec![
+                ("commands", row.commands as f64),
+                ("draw_objects", row.objects as f64),
+                ("path_segments", row.segments as f64),
+                ("coverage", row.coverage),
+                ("plan_ms", row.plan_ms),
+                ("raster_ms", row.raster_ms),
+                ("frames_not_drawn", row.unverified as f64),
+            ],
+        })
+    })
+    .collect()
+}
+
+fn print_raster(rows: &[RasterRow]) {
+    println!(
+        "  {:<10} {:>8} {:>6} {:>5}  {:>8} {:>8} {:>9} {:>7}  {:>8}  {:>9} {:>9}",
+        "path",
+        "commands",
+        "width",
+        "scale",
+        "objects",
+        "segments",
+        "coverage",
+        "differs",
+        "plan ms",
+        "raster ms",
+        "frame ms",
+    );
+    for row in rows {
+        println!(
+            "  {:<10} {:>8} {:>6.1} {:>5.1}  {:>8} {:>8} {:>8.1}% {:>6.3}{:<3}  {:>8.3}  {:>9.3} {:>9.3}",
+            row.path,
+            row.commands,
+            row.width,
+            row.scale,
+            row.objects,
+            row.segments,
+            row.coverage * 100.0,
+            row.difference,
+            if row.verified() {
+                "  ".to_string()
+            } else {
+                format!("!{}", row.unverified)
+            },
+            row.plan_ms,
+            row.raster_ms,
+            row.plan_ms + row.raster_ms,
+        );
+    }
+}
+
 /// What the GPU path did over a run of frames, where a device exists.
 #[cfg(feature = "vello")]
 fn gpu_counters(frames: usize) -> Option<blazy_shell::PresentCounters> {
@@ -542,6 +1133,7 @@ pub fn run(opts: &Options) -> Outcome {
     };
 
     let present_rows = presentation_table(opts);
+    let raster = raster_table(opts);
     #[cfg(feature = "vello")]
     let gpu = gpu_counters(frames);
     #[cfg(not(feature = "vello"))]
@@ -566,16 +1158,22 @@ pub fn run(opts: &Options) -> Outcome {
         nodes: 0,
         viewport: SIZE,
         quick: opts.quick,
-        criteria: evaluate(
-            &reports[external],
-            &backends,
-            scale_layouts.get(),
-            &scale_frames,
+        criteria: evaluate(&Measured {
+            external: &reports[external],
+            backends: &backends,
+            scale_layouts: scale_layouts.get(),
+            scale_frames: &scale_frames,
             transparent,
             gpu,
-            &present_rows,
-        ),
-        scenarios: reports.iter().map(Report::record).collect(),
+            present_rows: &present_rows,
+            raster_rows: &raster.rows,
+            raster_readbacks: raster.readbacks,
+        }),
+        scenarios: reports
+            .iter()
+            .map(Report::record)
+            .chain(raster_records(&raster.rows))
+            .collect(),
         sweep: Vec::new(),
         zoom_sweep: Vec::new(),
     };
@@ -588,15 +1186,35 @@ pub fn run(opts: &Options) -> Outcome {
 /// Three of the four the task set; the fourth — that the crates below the host do not
 /// depend on a window — is a fact about the dependency graph rather than about a
 /// frame, and is checked by `cargo make deps-rule` instead (§26.4).
-fn evaluate(
-    external: &Report,
-    backends: &BackendReport,
+struct Measured<'a> {
+    external: &'a Report,
+    backends: &'a BackendReport,
+    /// Layout passes the tree ran while the same plan was composed at four scales.
     scale_layouts: u64,
-    scale_frames: &[(f64, u32, f64)],
+    /// Scale, frame width, milliseconds — one entry per scale composed.
+    scale_frames: &'a [(f64, u32, f64)],
+    /// Pixels of a frame that were left translucent.
     transparent: usize,
+    /// The GPU path's own counters, absent where there is no device.
     gpu: Option<blazy_shell::PresentCounters>,
-    present_rows: &[PresentRow],
-) -> Vec<Criterion> {
+    present_rows: &'a [PresentRow],
+    raster_rows: &'a [RasterRow],
+    /// Readbacks the raster table made, which is what checks the readback counter.
+    raster_readbacks: u64,
+}
+
+fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
+    let Measured {
+        external,
+        backends,
+        scale_layouts,
+        scale_frames,
+        transparent,
+        gpu,
+        present_rows,
+        raster_rows,
+        raster_readbacks,
+    } = *measured;
     let mut criteria = Vec::new();
 
     // The registry is the whole of "choose the backend at startup": a backend that is
@@ -660,6 +1278,92 @@ fn evaluate(
         unit: "pixels not opaque",
     });
 
+    // --- The rasteriser (§32). What §31 counted in the plan, counted again in the
+    // units the rasteriser actually works in.
+
+    // The bridge between the two halves: `plan::commands` is worth counting only if a
+    // command is what the rasteriser is handed. It is — exactly one draw object each.
+    // Absent without the `vello` feature, where nothing can be encoded.
+    if raster_rows.iter().any(|row| row.objects > 0) {
+        criteria.push(Criterion {
+            name: "a_command_is_a_draw_object",
+            claim: "every draw command in the plan is one draw object for the rasteriser",
+            kind: Kind::Counter,
+            measured: raster_rows.iter().filter(|row| row.objects != row.commands).count() as f64,
+            bound: 1.0,
+            unit: "rows where the two disagree",
+        });
+
+        // §31 in the rasteriser's units: the far field arrives as a handful of draw
+        // objects however many curves are in it. Broken by taking the batch apart,
+        // which is what the sweep's other end measures: 8001.
+        let batched = raster_rows.iter().filter(|row| row.groups == 1).map(|row| row.objects);
+        criteria.push(Criterion {
+            name: "the_far_field_is_a_handful_of_draw_objects",
+            claim: "a batched far field is a few draw objects, not one per curve",
+            kind: Kind::Counter,
+            measured: batched.max().unwrap_or(0) as f64,
+            bound: 64.0,
+            unit: "draw objects",
+        });
+
+        // §9 and §23.4 in the same units: the device scale is a transform at
+        // composition, so the rasteriser is asked to draw the same thing at every
+        // scale. A host that re-encoded per scale would show up here as a different
+        // number of objects or segments for the same scene.
+        let mut re_encoded = 0;
+        for row in raster_rows {
+            let same_scene = raster_rows
+                .iter()
+                .find(|other| other.groups == row.groups && (other.width - row.width).abs() < f64::EPSILON);
+            if let Some(first) = same_scene
+                && (first.objects != row.objects || first.segments != row.segments)
+            {
+                re_encoded += 1;
+            }
+        }
+        criteria.push(Criterion {
+            name: "the_device_scale_does_not_re_encode",
+            claim: "the rasteriser is asked to draw the same scene at every device scale",
+            kind: Kind::Counter,
+            measured: f64::from(re_encoded),
+            bound: 1.0,
+            unit: "rows re-encoded",
+        });
+    }
+
+    // The whole table is timings, and a rasteriser that drew nothing is fast. The
+    // CPU path is the reference every GPU row is checked against, so this is what
+    // checks the reference.
+    if !raster_rows.is_empty() {
+        criteria.push(Criterion {
+            name: "every_measured_frame_has_ink",
+            claim: "every frame the raster table timed has something in it",
+            kind: Kind::Counter,
+            measured: raster_rows.iter().filter(|row| row.coverage < RASTER_MIN_INK).count() as f64,
+            bound: 1.0,
+            unit: "rows with an empty frame",
+        });
+
+        // The claim §32 rests on, and the one that decides what is worth optimising
+        // next: a far-field frame is the rasteriser's time, not the plan's. Timing,
+        // because there is no counter for "what a rasteriser did" (§32.1) — and with
+        // the margin that kind demands: measured at 0.002 against a bound of 0.5.
+        if let Some(row) = raster_rows
+            .iter()
+            .find(|row| row.path == "blit" && row.groups == 1 && row.raster_ms > 0.0)
+        {
+            criteria.push(Criterion {
+                name: "the_far_field_frame_is_rasterisation",
+                claim: "assembling a far-field plan costs a fraction of drawing it",
+                kind: Kind::Timing,
+                measured: row.plan_ms / row.raster_ms,
+                bound: 0.5,
+                unit: "plan per raster",
+            });
+        }
+    }
+
     // --- The GPU frame path (§27). Absent where there is no device to measure it on,
     // which is the honest answer on a runner without one.
     if let Some(gpu) = gpu {
@@ -707,6 +1411,20 @@ fn evaluate(
                 .count() as f64,
             bound: 1.0,
             unit: "rows reporting no bytes",
+        });
+
+        // The partner of `gpu_frames_are_not_read_back`, in the shape of
+        // `the_frame_byte_counter_is_not_a_stub`: zero readbacks on the frame path
+        // means something only if the counter reports one when a readback does
+        // happen. The raster table reads frames back on purpose (§32.4), so a
+        // benchmark run that reports none of them has a counter that is not looking.
+        criteria.push(Criterion {
+            name: "the_readback_counter_is_not_a_stub",
+            claim: "reading a frame back is counted as a readback",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(raster_readbacks == 0)),
+            bound: 1.0,
+            unit: "counters not reporting",
         });
 
         // And the holes still arrive: a faster path that lost them would be a
