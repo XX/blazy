@@ -230,7 +230,7 @@ fn set_header_scale(harness: &mut TestHarness<AreaScreen>, area: usize, scale: f
 }
 
 fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
-    let (screen, _graph) = build_screen(areas, nodes);
+    let (screen, _graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
@@ -244,7 +244,7 @@ fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 
 /// A screen of one region per area: the canvas, with no header above it.
 fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
-    let (screen, _graph) = build_screen_with(areas, nodes, false);
+    let (screen, _graph) = build_screen_with(areas, nodes, None, false);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),

@@ -45,6 +45,9 @@ struct Args {
     #[arg(long, value_name = "F")]
     ui_scale: Option<f64>,
 
+    #[arg(long, short = 'w', value_name = "W")]
+    budget_widgets: Option<usize>,
+
     /// Which rasteriser to draw with (§26.2).
     #[arg(long, value_name = "NAME")]
     backend: Option<String>,
@@ -59,7 +62,7 @@ fn main() {
         })
     });
 
-    let (screen, _graph) = build_screen_staggered(args.areas.max(1), args.nodes, args.ui_scale);
+    let (screen, _graph) = build_screen_staggered(args.areas.max(1), args.nodes, args.budget_widgets, args.ui_scale);
 
     let config = WindowConfig::default()
         .with_title(format!(

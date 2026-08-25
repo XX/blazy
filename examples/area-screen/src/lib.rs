@@ -46,8 +46,8 @@ pub const DEFAULT_AREAS: usize = 8;
 ///
 /// The graph is returned alongside so a caller can hold it: the canvases keep only
 /// a shared borrow, and the model is the source of truth that outlives every view.
-pub fn build_screen(areas: usize, nodes: usize) -> (AreaScreen, SharedGraph) {
-    build_screen_with(areas, nodes, true)
+pub fn build_screen(areas: usize, nodes: usize, budget_widgets: Option<usize>) -> (AreaScreen, SharedGraph) {
+    build_screen_with(areas, nodes, budget_widgets, true)
 }
 
 /// Interface scales handed out by [`build_screen_staggered`], cycled over the areas.
@@ -59,9 +59,14 @@ pub const STAGGERED_SCALES: [f64; 4] = [1.0, 1.25, 1.5, 1.75];
 /// per-region `ui_scale` means more directly than any number does: the same header,
 /// built from the same widget, at four sizes in one window, while the canvases below
 /// them are untouched.
-pub fn build_screen_staggered(areas: usize, nodes: usize, forced: Option<f64>) -> (AreaScreen, SharedGraph) {
+pub fn build_screen_staggered(
+    areas: usize,
+    nodes: usize,
+    budget_widgets: Option<usize>,
+    forced: Option<f64>,
+) -> (AreaScreen, SharedGraph) {
     let graph = share(GraphModel::generated(nodes));
-    let budget = window_budget(areas);
+    let budget = window_budget(budget_widgets, areas);
     let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
         let scale = forced.unwrap_or(STAGGERED_SCALES[area % STAGGERED_SCALES.len()]);
         let content =
@@ -84,8 +89,13 @@ pub fn build_screen_staggered(areas: usize, nodes: usize, forced: Option<f64>) -
 ///
 /// Even shares, because what an area holds does not follow its size: a small area at a
 /// small zoom holds as much as a large one.
-pub fn window_budget(areas: usize) -> DetailBudget {
-    DetailBudget::default().split(areas)
+pub fn window_budget(widgets: Option<usize>, areas: usize) -> DetailBudget {
+    widgets
+        .map(|widgets| DetailBudget {
+            widgets,
+            ..Default::default()
+        })
+        .unwrap_or_else(|| DetailBudget::default().split(areas))
 }
 
 /// As [`build_screen`], optionally without the header region.
@@ -93,9 +103,14 @@ pub fn window_budget(areas: usize) -> DetailBudget {
 /// The headerless form is what the sweep over region counts compares against: one
 /// region per area, so the difference between the two is the price of a region and
 /// nothing else.
-pub fn build_screen_with(areas: usize, nodes: usize, with_header: bool) -> (AreaScreen, SharedGraph) {
+pub fn build_screen_with(
+    areas: usize,
+    nodes: usize,
+    budget_widgets: Option<usize>,
+    with_header: bool,
+) -> (AreaScreen, SharedGraph) {
     let graph = share(GraphModel::generated(nodes));
-    let budget = window_budget(areas);
+    let budget = window_budget(budget_widgets, areas);
     let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
         let canvas = area_canvas(&graph, nodes, budget);
         if with_header {

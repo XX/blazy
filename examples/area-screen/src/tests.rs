@@ -169,7 +169,7 @@ fn assert_redrawn_not_repeated(small: &RgbaImage, big: &RgbaImage) {
 /// Regenerate with `MASONRY_TEST_BLESS=1 cargo make test`.
 #[test]
 fn screen_appearance() {
-    let (screen, _graph) = build_screen(4, 200);
+    let (screen, _graph) = build_screen(4, 200, None);
     let mut harness = TestHarness::create_with(
         default_property_set(),
         NewWidget::new(screen),
@@ -225,7 +225,7 @@ fn the_snapshot_scales_are_the_ones_that_were_set() {
 
 /// A screen of `areas` areas over one shared graph.
 fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, SharedGraph) {
-    let (screen, graph) = build_screen(areas, nodes);
+    let (screen, graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
