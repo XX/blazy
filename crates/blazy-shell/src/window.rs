@@ -400,7 +400,7 @@ impl ShellApp {
                     tracing::info!("the scene fits the rasteriser again");
                 }
             },
-            Err(error @ PresentError::SceneTooLarge { .. }) => {
+            Err(error @ (PresentError::SceneTooLarge { .. } | PresentError::SceneTooDeep { .. })) => {
                 if !self.refusing {
                     self.refusing = true;
                     tracing::warn!("frame not drawn: {error}; the window keeps the last frame it had");

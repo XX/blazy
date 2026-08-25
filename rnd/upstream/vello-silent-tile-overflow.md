@@ -89,7 +89,7 @@ path between the two.
                                                   162 paths draw nothing (2101464)
 ```
 
-## The same failure, closer to home: nested blend layers
+## The same failure, closer to home: nested layers
 
 The tile buffer needs hundreds of large paths, which is a lot. `blend_spill` (`1 << 20`
 words) needs almost nothing: a tile deeper than `BLEND_STACK_SPLIT` (4) spills
@@ -105,8 +105,41 @@ nesting alone, not about what is inside. **Five nested layers on a HiDPI window*
 an exotic scene for a UI: an opacity animation inside a popover inside a modal gets there
 without trying, and the failure is the same silent empty frame.
 
-Plain clip layers (`push_clip_layer`) are unaffected — checked to depth 8 at both sizes,
-which is worth knowing because clipping is what a toolkit does constantly.
+### What charges a tile, and what does not
+
+The interesting part is that `push_clip_layer` behaves completely differently from
+`push_layer`, even though both encode a `DRAWTAG_BEGIN_CLIP` and `coarse.wgsl` counts
+both into `render_blend_depth`. The difference is one line earlier:
+
+```wgsl
+let is_blend     = blend != BLEND_CLIP;
+let include_tile = n_segs != 0u || (backdrop_clear == is_clip) || is_blend;
+```
+
+A blend layer is included in every tile of its box; a clip is included only where its
+path has segments — the tiles its **outline** crosses. Tiles inside the clip keep the
+depth they had, and tiles outside take the `clip_zero` branch, which charges nothing.
+
+Measured (same machine, vello 0.10; `vello-silent-blend-overflow.rs` alongside this
+file walks all of it):
+
+| nesting | 1100x750 | 2200x1500 |
+|---|---|---|
+| `push_layer` (groups) | draws at 5, empty at 6 | draws at 4, empty at 5 |
+| `push_clip_layer`, screen-sized rect | draws at 30, empty at 40 | draws at 21, empty at 22 |
+| `push_clip_layer`, rect inset by 32 | draws at 40 | draws at 22, empty at 23 |
+| `push_clip_layer`, zigzag crossing every tile row | draws at 5, empty at 6 | draws at 4, empty at 5 |
+| a rect clip around every group | draws at 5, empty at 6 | draws at 4, empty at 5 |
+
+So a clip is **not** free, and a clip whose outline crosses the frame costs exactly what
+a blend layer costs — the last row also shows that interleaving clips between groups
+moves nothing. What makes ordinary clipping survive is that a rectangle's outline touches
+only tiles along its edges: the boundaries above put the charge at about `columns + rows`
+tiles of the clip's box — half its ring — rather than at its full perimeter.
+
+That distinction is worth documenting whichever way #606 goes, because from the outside
+"clip layers are cheap, blend layers are not" is a rule a toolkit can build on, and today
+it can only be found by bisecting frame loss on a GPU.
 
 A third buffer, `ptcl`, is handled differently again: `alloc_cmd` in `coarse.wgsl` points
 every further allocation at offset 0 with the comment "This sets us up for technical UB,

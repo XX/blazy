@@ -149,9 +149,10 @@ impl GpuFrames {
     /// No pixel buffer is created and nothing is read back: the counters this bumps
     /// are `frames` and `holes` only, which is what the criteria check.
     ///
-    /// Returns [`PresentError::SceneTooLarge`] for a scene the rasteriser cannot
-    /// take, and draws nothing — see [`crate::tiles`] for why a frame that *is* sent
-    /// in that case comes back looking like the frame before it.
+    /// Returns [`PresentError::SceneTooLarge`] or [`PresentError::SceneTooDeep`] for a
+    /// scene the rasteriser cannot take, and draws nothing — see [`crate::tiles`] for
+    /// why a frame that *is* sent in that case comes back looking like the frame
+    /// before it.
     pub fn draw(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
         let (width, height) = Composition::physical_size(logical, device_scale);
         self.draw_sized(plan, PhysicalSize::new(width, height), device_scale)
@@ -198,14 +199,15 @@ impl GpuFrames {
             None => composition,
         };
 
-        // Before anything is submitted: a scene over the rasteriser's fixed tile
-        // budget is not drawn, and vello does not say so (§33). Cheap next to the
-        // frame it guards — one pass over the composed scene's bounding boxes.
-        if checked && let Some(tiles) = crate::tiles::tiles_over_budget(&composition.scene, self.size) {
+        // Before anything is submitted: a scene over one of the rasteriser's fixed
+        // buffers is not drawn, and vello does not say so (§33, §34). Cheap next to
+        // the frame it guards — two counts over the command stream, and a pass over
+        // the composed scene's bounding boxes only when one of them is inconclusive.
+        if checked && let Some(overflow) = crate::tiles::over_budget(&composition.scene, self.size) {
             self.counters.frames_refused += 1;
-            return Err(PresentError::SceneTooLarge {
-                tiles,
-                budget: crate::tiles::TILE_BUDGET,
+            return Err(match overflow {
+                crate::tiles::Overflow::Tiles { tiles, budget } => PresentError::SceneTooLarge { tiles, budget },
+                crate::tiles::Overflow::Blend { words, budget } => PresentError::SceneTooDeep { words, budget },
             });
         }
 

@@ -369,3 +369,56 @@ fn a_control_edit_in_one_area_reaches_the_others() {
     assert_eq!(shows(&harness, own), !before, "the node that was clicked shows it");
     assert_eq!(shows(&harness, peer), !before, "and so does the other area's copy");
 }
+
+// --- MARK: what a real frame asks the rasteriser for (§34)
+
+/// A real frame is nowhere near either of the rasteriser's ceilings, and the guard in
+/// front of it costs nothing to say so.
+///
+/// The point of measuring this here rather than in `blazy-shell`: the crate can only
+/// build the scenes it invents, and what matters is what an *application* nests. Eight
+/// areas over one graph, at a HiDPI scale, come out at one clip deep and no groups at
+/// all — so `over_budget` answers from the command stream and never walks the geometry
+/// (§34.3). An application that wraps widgets in opacity groups is the one that has to
+/// watch the depth, and §34.2 says at what number.
+#[test]
+fn a_real_frame_is_far_from_both_ceilings() {
+    use blazy_shell::Composition;
+    use masonry::imaging::record::Command;
+
+    let (mut harness, _graph) = screen_harness(8, 5000);
+    let (plan, _tree) = harness.redraw();
+    let composed = Composition::new(&plan, 2.0);
+    let frame = PhysicalSize::new(2800, 1800);
+
+    let groups = composed
+        .scene
+        .commands()
+        .iter()
+        .filter(|command| matches!(command, Command::PushGroup(_)))
+        .count();
+    let depth = blazy_shell::nesting_depth(&composed.scene);
+    let demand = blazy_shell::demand(&composed.scene, frame);
+    println!(
+        "eight areas over 5000 nodes: {} commands, {groups} groups, {depth} deep, \
+         {} tiles of {}, {} words of {}",
+        composed.scene.commands().len(),
+        demand.tiles,
+        blazy_shell::TILE_BUDGET,
+        demand.blend_words,
+        blazy_shell::BLEND_BUDGET,
+    );
+
+    // One clip per area and nothing nested inside it: four levels are free, so the
+    // frame asks for no blend scratch at all.
+    assert!(depth <= 4, "a real frame nests {depth} deep");
+    assert_eq!(demand.blend_words, 0);
+    // And an order of magnitude of headroom in tiles, which is the §33.4 claim
+    // measured on the real scene rather than on diagonals.
+    assert!(
+        demand.tiles * 10 < blazy_shell::TILE_BUDGET,
+        "a real frame wants {} of {} tiles",
+        demand.tiles,
+        blazy_shell::TILE_BUDGET
+    );
+}

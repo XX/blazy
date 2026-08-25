@@ -16,7 +16,7 @@ use masonry::core::{
     AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef, RegisterCtx, Widget,
 };
 use masonry::dpi::PhysicalSize;
-use masonry::imaging::Painter;
+use masonry::imaging::{GroupRef, Painter};
 use masonry::kurbo::{Axis, BezPath, CubicBez, Point, Rect, Size, Stroke};
 use masonry::layout::{LenReq, Length};
 use masonry::peniko::Color;
@@ -680,10 +680,11 @@ fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
     total / (a.len() / 4) as f64 / 255.0
 }
 
-/// What the guard in front of the GPU path costs per frame (§33.3).
+/// What the guard in front of the GPU path costs per frame (§33.3, §34.3).
 ///
-/// Measured rather than asserted to be small: it walks the composed scene once, and a
-/// scene can hold thousands of curves inside a single path.
+/// Measured rather than asserted to be small: two cheap counts, and behind them a walk
+/// over the composed scene — which for a deeply nested one also builds a map of the
+/// frame's tiles.
 #[cfg(feature = "vello")]
 fn tile_check_cost(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>, frames: usize) -> f64 {
     let composed = blazy_shell::Composition::new(plan, scale).scene;
@@ -691,7 +692,7 @@ fn tile_check_cost(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: Phys
     for _ in 0..frames {
         // What the frame path really pays, cheap answer included — not the exact walk,
         // which it reaches only for a scene that could plausibly be over budget.
-        let _ = blazy_shell::tiles_over_budget(&composed, frame);
+        let _ = blazy_shell::over_budget(&composed, frame);
     }
     start.elapsed().as_secs_f64() * 1000.0 / frames as f64
 }
@@ -1144,6 +1145,253 @@ fn print_raster(rows: &[RasterRow]) {
     }
 }
 
+// --- MARK: nesting, and the second buffer (§34)
+
+/// Nesting depths the sweep walks.
+///
+/// The switch has to be crossed in both directions to be tested (§28.4), and the two
+/// device scales put the crossing in two places: a 1100x750 frame survives five nested
+/// groups and is lost at six, a 2200x1500 one is lost at five. So the same four depths
+/// measure both sides at one scale and only the far side at the other.
+const NEST_DEPTHS: [usize; 4] = [1, 4, 5, 6];
+
+/// A frame whose only load is nesting: `depth` groups that change nothing at all.
+///
+/// The scene an application builds without meaning to — a stack of opacity groups
+/// around a panel — and the one vello's blend scratch runs out on long before its tile
+/// buffer does (§34). Every group here is a visual no-op, so any difference between
+/// two depths is the rasteriser losing the frame rather than the picture changing.
+struct Nested {
+    depth: usize,
+    /// What the content is drawn in; two of these alternate frame by frame, so a frame
+    /// the GPU never drew cannot pass for the frame before it (§32.4).
+    tint: Color,
+}
+
+impl Widget for Nested {
+    type Action = NoAction;
+
+    fn measure(
+        &mut self,
+        _ctx: &mut MeasureCtx<'_>,
+        _props: &PropertiesRef<'_>,
+        _axis: Axis,
+        len_req: LenReq,
+        _cross: Option<Length>,
+    ) -> Length {
+        match len_req {
+            LenReq::MinContent | LenReq::MaxContent => Length::px(200.0),
+            LenReq::FitContent(space) => space,
+        }
+    }
+
+    fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
+
+    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        let box_rect = ctx.content_box();
+        painter.fill(box_rect, Color::from_rgb8(0x1c, 0x1c, 0x20)).draw();
+
+        for _ in 0..self.depth {
+            painter.push_group(GroupRef::new());
+        }
+        // Enough ink to tell one tint from the other in a strip of the frame, and
+        // spread over the frame so that no crop of it is blank.
+        for i in 0..12 {
+            let x = box_rect.x0 + box_rect.width() * f64::from(i) / 12.0;
+            painter
+                .fill(
+                    Rect::new(
+                        x + 4.0,
+                        box_rect.y0 + 8.0,
+                        x + box_rect.width() / 14.0,
+                        box_rect.y1 - 8.0,
+                    ),
+                    self.tint,
+                )
+                .draw();
+        }
+        for _ in 0..self.depth {
+            painter.pop_group();
+        }
+    }
+
+    fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
+
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::new()
+    }
+
+    fn accessibility_role(&self) -> Role {
+        Role::GenericContainer
+    }
+
+    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+}
+
+/// One nesting depth at one device scale, on the GPU path.
+struct NestRow {
+    depth: usize,
+    scale: f64,
+    /// Words of blend scratch the check says this frame needs.
+    words: u64,
+    /// Whether a device was there to draw it: without one there is nothing to check.
+    on_gpu: bool,
+    /// The check refused the scene before anything was submitted.
+    refused: bool,
+    /// It was refused and would have drawn anyway — the paranoid failure.
+    false_refusal: bool,
+    /// Frames whose scene was accepted and whose picture never arrived — the blind
+    /// failure, and the one §33 was written to make impossible.
+    unverified: usize,
+    /// What asking the question costs, per frame.
+    check_ms: f64,
+}
+
+fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> NestRow {
+    let panel = Color::from_rgb8(0x1c, 0x1c, 0x20);
+    let mut harnesses: Vec<_> = RASTER_TINTS
+        .iter()
+        .map(|&tint| {
+            let mut harness = TestHarness::create_with_size(
+                default_property_set(),
+                NewWidget::new(Nested { depth, tint }),
+                PhysicalSize::new(SIZE.0, SIZE.1),
+            );
+            let _ = harness.redraw();
+            harness
+        })
+        .collect();
+    let plans: Vec<_> = harnesses.iter_mut().map(|harness| harness.redraw().0).collect();
+    let frame_size = {
+        let (w, h) = (f64::from(SIZE.0) * scale, f64::from(SIZE.1) * scale);
+        PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
+    };
+    let words = blazy_shell::blend_demand(&blazy_shell::Composition::new(&plans[0], scale).scene, frame_size);
+
+    let mut row = NestRow {
+        depth,
+        scale,
+        words,
+        on_gpu: false,
+        refused: false,
+        false_refusal: false,
+        unverified: 0,
+        check_ms: tile_check_cost(&plans[0], scale, frame_size, frames.max(1)),
+    };
+
+    // The pictures the frames are judged against, from the CPU rasteriser, which has
+    // no such ceiling (§33.5).
+    let mut host = Host::any().expect("some backend opens").with_background(panel);
+    host.set_device_scale(scale);
+    let references: Vec<_> = plans
+        .iter()
+        .map(|plan| host.render(plan, logical_size()).expect("the host renders").image)
+        .collect();
+
+    #[cfg(feature = "vello")]
+    if let Some(gpu) = gpu.frames.as_mut() {
+        row.on_gpu = true;
+        let rows_read = RASTER_STRIP.min(frame_size.height);
+        let first_row = frame_size.height.saturating_sub(rows_read) / 2;
+        let strips: Vec<_> = references
+            .iter()
+            .map(|image| strip(&image.data, image.width, first_row, rows_read).to_vec())
+            .collect();
+
+        if let Err(error) = gpu.draw(&plans[0], logical_size(), scale) {
+            assert!(
+                matches!(error, blazy_shell::PresentError::SceneTooDeep { .. }),
+                "the GPU path refused a nested scene for a reason this table does not handle: {error}"
+            );
+            row.refused = true;
+
+            // The same question the tile sweep asks (§33.4): forced past the check,
+            // does the frame arrive? Judged against a blank frame put in the texture
+            // first, because every row of this sweep draws the same ink and the row
+            // before would otherwise pass for a successful draw.
+            gpu.draw_unchecked(&blank(), frame_size, scale)
+                .expect("a blank frame draws");
+            gpu.wait();
+            let blank_strip = gpu.read_rows(first_row, rows_read);
+
+            gpu.draw_unchecked(&plans[0], frame_size, scale)
+                .expect("the GPU draws anyway");
+            gpu.wait();
+            let drawn = gpu.read_rows(first_row, rows_read);
+            row.false_refusal = frame_difference(&strips[0], &drawn) < frame_difference(&blank_strip, &drawn);
+            return row;
+        }
+        gpu.wait();
+
+        for frame in 0..frames {
+            let tint = frame % plans.len();
+            gpu.draw(&plans[tint], logical_size(), scale)
+                .expect("the GPU draws: the first frame already passed the check");
+            gpu.wait();
+            let drawn = gpu.read_rows(first_row, rows_read);
+            if frame_difference(&strips[tint], &drawn) >= frame_difference(&strips[(tint + 1) % strips.len()], &drawn) {
+                row.unverified += 1;
+            }
+        }
+    }
+    #[cfg(not(feature = "vello"))]
+    let _ = (gpu, frames);
+
+    row
+}
+
+/// Nesting depth against the blend scratch, at two frame sizes.
+///
+/// The device scale is the outer loop for the reason `raster_table` gives: alternating
+/// the target size provokes the defect of §32.4, and a benchmark that provokes a defect
+/// it is not measuring reports noise.
+fn nest_table(opts: &Options) -> Vec<NestRow> {
+    let frames = if opts.quick { 4 } else { 8 };
+    let mut gpu = GpuPath::open(Color::from_rgb8(0x1c, 0x1c, 0x20));
+    println!(
+        "\nnesting: groups that change nothing, against the rasteriser's blend scratch\n  \
+         (budget {} words; a clip is charged along its edges, a group over its whole box)",
+        blazy_shell::BLEND_BUDGET
+    );
+    let mut rows = Vec::new();
+    for &scale in &RASTER_SCALES {
+        for &depth in &NEST_DEPTHS {
+            rows.push(nest_case(&mut gpu, depth, scale, frames));
+        }
+    }
+    print_nest(&rows);
+    rows
+}
+
+fn print_nest(rows: &[NestRow]) {
+    println!(
+        "  {:>5}  {:>5}  {:>12}  {:>9}  {:>8}  note",
+        "depth", "scale", "words", "check ms", "state"
+    );
+    for row in rows {
+        let state = if !row.on_gpu {
+            "-"
+        } else if row.refused {
+            "refused"
+        } else if row.unverified > 0 {
+            "!"
+        } else {
+            "drawn"
+        };
+        let note = if row.false_refusal {
+            "would have drawn"
+        } else if row.unverified > 0 {
+            "frames that never arrived"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>5}  x{:<4}  {:>12}  {:>9.3}  {state:>8}  {note}",
+            row.depth, row.scale, row.words, row.check_ms
+        );
+    }
+}
+
 /// What the GPU path did over a run of frames, where a device exists.
 #[cfg(feature = "vello")]
 fn gpu_counters(frames: usize) -> Option<blazy_shell::PresentCounters> {
@@ -1256,6 +1504,7 @@ pub fn run(opts: &Options) -> Outcome {
 
     let present_rows = presentation_table(opts);
     let raster = raster_table(opts);
+    let nest_rows = nest_table(opts);
     #[cfg(feature = "vello")]
     let gpu = gpu_counters(frames);
     #[cfg(not(feature = "vello"))]
@@ -1290,6 +1539,7 @@ pub fn run(opts: &Options) -> Outcome {
             present_rows: &present_rows,
             raster_rows: &raster.rows,
             raster_readbacks: raster.readbacks,
+            nest_rows: &nest_rows,
         }),
         scenarios: reports
             .iter()
@@ -1323,6 +1573,8 @@ struct Measured<'a> {
     raster_rows: &'a [RasterRow],
     /// Readbacks the raster table made, which is what checks the readback counter.
     raster_readbacks: u64,
+    /// The nesting sweep: what the blend-scratch guard did, row by row (§34).
+    nest_rows: &'a [NestRow],
 }
 
 fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
@@ -1336,6 +1588,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         present_rows,
         raster_rows,
         raster_readbacks,
+        nest_rows,
     } = *measured;
     let mut criteria = Vec::new();
 
@@ -1526,6 +1779,43 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
                 unit: "plan per raster",
             });
         }
+    }
+
+    // --- The blend scratch (§34). The same three criteria as the tile budget, on the
+    // buffer a user interface reaches first, and absent where there is no device.
+    if nest_rows.iter().any(|row| row.on_gpu) {
+        // The blind failure: a scene the guard let through whose frame never arrived.
+        criteria.push(Criterion {
+            name: "no_nested_frame_is_lost_in_silence",
+            claim: "every nested scene the check accepted was drawn",
+            kind: Kind::Counter,
+            measured: nest_rows.iter().map(|row| row.unverified).sum::<usize>() as f64,
+            bound: 1.0,
+            unit: "frames that never arrived",
+        });
+
+        // The paranoid failure: a frame refused that the rasteriser would have drawn.
+        // This is the one that costs a user something the silent version did not — a
+        // frame that could have been shown and was not.
+        criteria.push(Criterion {
+            name: "the_blend_budget_check_is_not_paranoid",
+            claim: "every nested scene the check refused really does not draw",
+            kind: Kind::Counter,
+            measured: nest_rows.iter().filter(|row| row.false_refusal).count() as f64,
+            bound: 1.0,
+            unit: "scenes refused for nothing",
+        });
+
+        // Both of the above pass on a sweep that never nests deep enough to matter, so
+        // the sweep has to reach the ceiling. Counted from the failing side (§20.9).
+        criteria.push(Criterion {
+            name: "the_blend_budget_check_is_exercised",
+            claim: "the sweep contains a scene over the rasteriser's blend budget",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!nest_rows.iter().any(|row| row.refused))),
+            bound: 1.0,
+            unit: "sweeps that never reach the budget",
+        });
     }
 
     // --- The GPU frame path (§27). Absent where there is no device to measure it on,

@@ -67,6 +67,19 @@ pub enum PresentError {
         /// Tiles the rasteriser can allocate.
         budget: u64,
     },
+    /// The scene nests layers deeper than the rasteriser's blend scratch allows (§34).
+    ///
+    /// The sibling of [`Self::SceneTooLarge`], in the second of vello's six fixed
+    /// buffers, and the one a user interface reaches first: five nested groups over a
+    /// HiDPI window are enough. Not sent to the GPU either, and for the same reason —
+    /// the frame would come back missing with `Ok`. The caller can flatten the
+    /// nesting, make the window smaller, or fall back to the CPU rasteriser.
+    SceneTooDeep {
+        /// Words of blend scratch the scene asks for.
+        words: u64,
+        /// Words the rasteriser can allocate.
+        budget: u64,
+    },
     /// The platform refused the buffer or the surface.
     Platform(String),
 }
@@ -78,6 +91,10 @@ impl std::fmt::Display for PresentError {
             Self::SceneTooLarge { tiles, budget } => write!(
                 f,
                 "the scene needs {tiles} tiles and the rasteriser can allocate {budget}"
+            ),
+            Self::SceneTooDeep { words, budget } => write!(
+                f,
+                "the scene nests deep enough to need {words} words of blend scratch and the rasteriser can allocate {budget}"
             ),
             Self::Platform(message) => f.write_str(message),
         }
