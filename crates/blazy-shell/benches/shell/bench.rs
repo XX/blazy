@@ -597,17 +597,20 @@ struct RasterRow {
     difference: f64,
     /// Frames of this row that did not come out as the picture that was asked for.
     unverified: usize,
+    /// Whether the rasteriser refused this scene before drawing it (§33).
+    refused: bool,
+    /// Whether a refused scene, drawn anyway, came out right after all.
+    ///
+    /// The other half of the check: a guard that refuses frames the rasteriser could
+    /// have drawn is as wrong as one that lets a silent failure through, and only
+    /// forcing the frame can tell the two apart.
+    false_refusal: bool,
+    /// What the tile check costs before the frame is sent (§33.3).
+    check_ms: f64,
     /// Passes and plan assembly — the half §31 measured.
     plan_ms: f64,
     /// Turning that plan into pixels, or into a texture — the half it did not.
     raster_ms: f64,
-}
-
-impl RasterRow {
-    /// Whether this row may be quoted: every frame in it was the picture asked for.
-    fn verified(&self) -> bool {
-        self.unverified == 0
-    }
 }
 
 /// What vello is asked to draw, counted before anything draws it.
@@ -675,6 +678,40 @@ fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
         .map(|(p, q)| (luma(p) - luma(q)).abs())
         .sum();
     total / (a.len() / 4) as f64 / 255.0
+}
+
+/// What the guard in front of the GPU path costs per frame (§33.3).
+///
+/// Measured rather than asserted to be small: it walks the composed scene once, and a
+/// scene can hold thousands of curves inside a single path.
+#[cfg(feature = "vello")]
+fn tile_check_cost(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>, frames: usize) -> f64 {
+    let composed = blazy_shell::Composition::new(plan, scale).scene;
+    let start = Instant::now();
+    for _ in 0..frames {
+        // What the frame path really pays, cheap answer included — not the exact walk,
+        // which it reaches only for a scene that could plausibly be over budget.
+        let _ = blazy_shell::tiles_over_budget(&composed, frame);
+    }
+    start.elapsed().as_secs_f64() * 1000.0 / frames as f64
+}
+
+#[cfg(not(feature = "vello"))]
+fn tile_check_cost(
+    _plan: &masonry::app::VisualLayerPlan,
+    _scale: f64,
+    _frame: PhysicalSize<u32>,
+    _frames: usize,
+) -> f64 {
+    0.0
+}
+
+/// A plan with nothing in it, which composes to the background and nothing else.
+///
+/// What the texture holds after a frame that was not drawn — the baseline a forced
+/// draw of a refused scene is judged against.
+fn blank() -> masonry::app::VisualLayerPlan {
+    masonry::app::VisualLayerPlan { layers: Vec::new() }
 }
 
 /// The GPU path, opened once for the whole table.
@@ -764,6 +801,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
         PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
     };
     let (objects, segments) = encoded(&plans[0], scale, frame_size);
+    let check_ms = tile_check_cost(&plans[0], scale, frame_size, frames);
     let mut rows = Vec::new();
 
     // --- The blit path: compose and rasterise on the CPU. The channel swap that
@@ -795,6 +833,9 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
         coverage,
         difference: 0.0,
         unverified: 0,
+        refused: false,
+        false_refusal: false,
+        check_ms,
         plan_ms,
         raster_ms,
     });
@@ -810,15 +851,59 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
             .collect();
 
         // The first frame pays for pipelines, allocations and any resize; nobody
-        // wants it in the average.
-        gpu.draw(&plans[0], logical_size(), scale).expect("the GPU draws");
+        // wants it in the average. It is also where a scene over the tile budget is
+        // refused (§33), and a refused scene has no frame time to report — what it
+        // has instead is a question: would it have drawn?
+        if let Err(error) = gpu.draw(&plans[0], logical_size(), scale) {
+            assert!(
+                matches!(error, blazy_shell::PresentError::SceneTooLarge { .. }),
+                "the GPU path failed for a reason this table does not handle: {error}"
+            );
+
+            // Forced through the check, and judged against a texture that is known
+            // not to hold the picture already. The two tints are not enough here:
+            // every row of this sweep draws the *same ink* — only the grouping
+            // changes — so the frame left behind by the previous row would pass for a
+            // successful forced draw. So: put a blank frame in the texture, force the
+            // scene, and ask which of the two the result is closer to.
+            gpu.draw_unchecked(&blank(), frame_size, scale)
+                .expect("a blank frame draws");
+            gpu.wait();
+            let blank_strip = gpu.read_rows(first_row, rows_read);
+
+            gpu.draw_unchecked(&plans[0], frame_size, scale)
+                .expect("the GPU draws anyway");
+            gpu.wait();
+            let drawn = gpu.read_rows(first_row, rows_read);
+            let false_refusal = frame_difference(&strips[0], &drawn) < frame_difference(&blank_strip, &drawn);
+
+            rows.push(RasterRow {
+                path: "swapchain",
+                groups,
+                width,
+                scale,
+                commands,
+                objects,
+                segments,
+                coverage: ink(&gpu.read_pixels(), panel),
+                difference: 0.0,
+                unverified: 0,
+                refused: true,
+                false_refusal,
+                check_ms,
+                plan_ms,
+                raster_ms: 0.0,
+            });
+            return rows;
+        }
         gpu.wait();
 
         let (mut total, mut worst, mut unverified) = (Duration::ZERO, 0.0_f64, 0);
         for frame in 0..frames {
             let tint = frame % plans.len();
             let start = Instant::now();
-            gpu.draw(&plans[tint], logical_size(), scale).expect("the GPU draws");
+            gpu.draw(&plans[tint], logical_size(), scale)
+                .expect("the GPU draws: the first frame already passed the check");
             // Waiting per frame rather than submitting the run and waiting once:
             // this is a claim about what one frame costs, and a window submits one
             // frame and shows it. §27.4 batched deliberately — it was asking about
@@ -855,6 +940,9 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
             coverage: ink(&gpu.read_pixels(), panel),
             difference: worst,
             unverified,
+            refused: false,
+            false_refusal: false,
+            check_ms,
             plan_ms,
             raster_ms: total.as_secs_f64() * 1000.0 / frames as f64,
         });
@@ -887,8 +975,11 @@ fn raster_table(opts: &Options) -> RasterReport {
     // encoding across scales, and with a single scale it would have nothing to
     // compare and would pass by having nothing to say.
     let scales: &[f64] = &RASTER_SCALES;
+    // 512 is in the quick set on purpose: at the larger scale it is the scene the
+    // rasteriser refuses (§33), and without it the criteria about the refusal would
+    // pass by having nothing to look at.
     let groups: &[usize] = if opts.quick {
-        &[RASTER_GROUPS[0], RASTER_GROUPS[5]]
+        &[RASTER_GROUPS[0], RASTER_GROUPS[3], RASTER_GROUPS[5]]
     } else {
         &RASTER_GROUPS
     };
@@ -929,7 +1020,37 @@ fn raster_table(opts: &Options) -> RasterReport {
     let undrawn: usize = rows.iter().map(|row| row.unverified).sum();
     if undrawn > 0 {
         println!(
-            "\n  {undrawn} frames marked `!` were never drawn: the GPU path reported success and left\n               the previous frame in the texture (§32.4). Their times are not frame times."
+            "\n  {undrawn} frames marked `!` were never drawn: the GPU path reported success and left\n  \
+             the previous frame in the texture (§32.4). Their times are not frame times."
+        );
+    }
+    if let Some(worst) = rows
+        .iter()
+        .max_by(|a, b| a.check_ms.total_cmp(&b.check_ms))
+        .filter(|row| row.check_ms > 0.0)
+    {
+        let batched = rows
+            .iter()
+            .filter(|row| row.groups == 1)
+            .max_by(|a, b| a.check_ms.total_cmp(&b.check_ms));
+        println!(
+            "\n  the tile check (§33.3) costs at most {:.3} ms here, on the scene of {} commands\n  \
+             whose frame takes {:.1} ms to rasterise{}",
+            worst.check_ms,
+            worst.commands,
+            worst.raster_ms,
+            match batched {
+                Some(row) => format!("; on the batched far field, {:.3} ms.", row.check_ms),
+                None => ".".to_string(),
+            },
+        );
+    }
+    let refused = rows.iter().filter(|row| row.refused).count();
+    if refused > 0 {
+        let paranoid = rows.iter().filter(|row| row.false_refusal).count();
+        println!(
+            "\n  {refused} scenes marked `ref` need more tiles than the rasteriser can allocate and were\n  \
+             refused before being drawn (§33). Forced through, {paranoid} of them produced the picture."
         );
     }
 
@@ -1001,7 +1122,7 @@ fn print_raster(rows: &[RasterRow]) {
     );
     for row in rows {
         println!(
-            "  {:<10} {:>8} {:>6.1} {:>5.1}  {:>8} {:>8} {:>8.1}% {:>6.3}{:<3}  {:>8.3}  {:>9.3} {:>9.3}",
+            "  {:<10} {:>8} {:>6.1} {:>5.1}  {:>8} {:>8} {:>8.1}% {:>6.3}{:<5}  {:>8.3}  {:>9.3} {:>9.3}",
             row.path,
             row.commands,
             row.width,
@@ -1010,10 +1131,11 @@ fn print_raster(rows: &[RasterRow]) {
             row.segments,
             row.coverage * 100.0,
             row.difference,
-            if row.verified() {
-                "  ".to_string()
-            } else {
-                format!("!{}", row.unverified)
+            match (row.refused, row.false_refusal, row.unverified) {
+                (true, true, _) => "REF!".to_string(),
+                (true, false, _) => "ref ".to_string(),
+                (false, _, 0) => "    ".to_string(),
+                (false, _, undrawn) => format!("!{undrawn}  "),
             },
             row.plan_ms,
             row.raster_ms,
@@ -1334,16 +1456,58 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
 
     // The whole table is timings, and a rasteriser that drew nothing is fast. The
     // CPU path is the reference every GPU row is checked against, so this is what
-    // checks the reference.
+    // checks the reference. A refused row is exempt: it has no frame by construction,
+    // and the empty picture it reports is the forced draw that proved the refusal
+    // right (§33.3).
     if !raster_rows.is_empty() {
         criteria.push(Criterion {
             name: "every_measured_frame_has_ink",
             claim: "every frame the raster table timed has something in it",
             kind: Kind::Counter,
-            measured: raster_rows.iter().filter(|row| row.coverage < RASTER_MIN_INK).count() as f64,
+            measured: raster_rows
+                .iter()
+                .filter(|row| !row.refused && row.coverage < RASTER_MIN_INK)
+                .count() as f64,
             bound: 1.0,
             unit: "rows with an empty frame",
         });
+
+        // §33, both halves. The silent failure this replaced: a frame vello reports
+        // as drawn and did not draw. After the check there should be none, because
+        // the scenes that would have failed are refused before they are timed.
+        criteria.push(Criterion {
+            name: "no_frame_is_reported_as_drawn_when_it_was_not",
+            claim: "no timing here was measured over a frame the rasteriser skipped",
+            kind: Kind::Counter,
+            measured: raster_rows.iter().filter(|row| row.unverified > 0).count() as f64,
+            bound: 1.0,
+            unit: "rows with an undrawn frame",
+        });
+
+        // And the other half: a guard that refuses frames the rasteriser could have
+        // drawn is as wrong as one that lets the silent failure through. Every
+        // refusal in the sweep is forced through and looked at.
+        criteria.push(Criterion {
+            name: "the_tile_budget_check_is_not_paranoid",
+            claim: "every scene the check refused really does not draw",
+            kind: Kind::Counter,
+            measured: raster_rows.iter().filter(|row| row.false_refusal).count() as f64,
+            bound: 1.0,
+            unit: "scenes refused for nothing",
+        });
+
+        // Both of the above pass trivially on a sweep that never crosses the budget,
+        // so the sweep has to cross it. Counted from the failing side, as always.
+        if raster_rows.iter().any(|row| row.path == "swapchain") {
+            criteria.push(Criterion {
+                name: "the_tile_budget_check_is_exercised",
+                claim: "the sweep contains a scene over the rasteriser's tile budget",
+                kind: Kind::Counter,
+                measured: f64::from(u8::from(!raster_rows.iter().any(|row| row.refused))),
+                bound: 1.0,
+                unit: "sweeps that never reach the budget",
+            });
+        }
 
         // The claim §32 rests on, and the one that decides what is worth optimising
         // next: a far-field frame is the rasteriser's time, not the plan's. Timing,

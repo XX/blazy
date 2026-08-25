@@ -30,6 +30,8 @@ mod external;
 pub mod gpu;
 mod host;
 mod present;
+#[cfg(feature = "vello")]
+mod tiles;
 
 #[cfg(feature = "window")]
 pub mod window;
@@ -42,3 +44,5 @@ pub use crate::compose::{Composition, Hole};
 pub use crate::external::ExternalContent;
 pub use crate::host::{Frame, Host, HostCounters, HostError};
 pub use crate::present::{PresentCounters, PresentError, Presenter};
+#[cfg(feature = "vello")]
+pub use crate::tiles::{TILE_BUDGET, tile_demand, tiles_over_budget};

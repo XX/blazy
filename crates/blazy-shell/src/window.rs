@@ -188,6 +188,7 @@ pub fn run(
         signals: Rc::new(RefCell::new(Vec::new())),
         reducer: WindowEventReducer::default(),
         last_anim: Instant::now(),
+        refusing: false,
     };
     event_loop.run_app(&mut app).map_err(Error::EventLoop)
 }
@@ -288,6 +289,11 @@ struct ShellApp {
     reducer: WindowEventReducer,
     /// When the last animation frame ran, for the interval the next one gets.
     last_anim: Instant,
+    /// Whether the last frame was refused by the rasteriser (§33).
+    ///
+    /// Kept so the warning is logged when the state changes rather than sixty times a
+    /// second: a scene over the tile budget stays over it while nothing moves.
+    refusing: bool,
 }
 
 impl ShellApp {
@@ -384,9 +390,25 @@ impl ShellApp {
         // The window's size in physical pixels is what the frame has to cover, and it
         // is known exactly; the scale factor goes along separately because it belongs
         // to the drawing rather than to the size (§9).
-        presenter
-            .present(&plan, root.size(), window.scale_factor())
-            .map_err(Error::Presented)?;
+        // A scene the rasteriser cannot take is not a reason to close the window: the
+        // frame is skipped, the window keeps what it had, and — unlike the silent
+        // version this replaces (§33) — somebody is told.
+        match presenter.present(&plan, root.size(), window.scale_factor()) {
+            Ok(()) => {
+                if self.refusing {
+                    self.refusing = false;
+                    tracing::info!("the scene fits the rasteriser again");
+                }
+            },
+            Err(error @ PresentError::SceneTooLarge { .. }) => {
+                if !self.refusing {
+                    self.refusing = true;
+                    tracing::warn!("frame not drawn: {error}; the window keeps the last frame it had");
+                }
+                return Ok(());
+            },
+            Err(error) => return Err(Error::Presented(error)),
+        }
 
         // Holes are reported rather than drawn: the host owns what goes in them, and
         // for an application without external content there are none (§4.3).

@@ -148,6 +148,10 @@ impl GpuFrames {
     ///
     /// No pixel buffer is created and nothing is read back: the counters this bumps
     /// are `frames` and `holes` only, which is what the criteria check.
+    ///
+    /// Returns [`PresentError::SceneTooLarge`] for a scene the rasteriser cannot
+    /// take, and draws nothing — see [`crate::tiles`] for why a frame that *is* sent
+    /// in that case comes back looking like the frame before it.
     pub fn draw(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
         let (width, height) = Composition::physical_size(logical, device_scale);
         self.draw_sized(plan, PhysicalSize::new(width, height), device_scale)
@@ -160,6 +164,32 @@ impl GpuFrames {
         frame: PhysicalSize<u32>,
         device_scale: f64,
     ) -> Result<(), PresentError> {
+        self.draw_checked(plan, frame, device_scale, true)
+    }
+
+    /// Draws a plan without asking whether the rasteriser can take it.
+    ///
+    /// The door the benchmark needs and an application should not use: the check in
+    /// [`Self::draw_sized`] is arithmetic about somebody else's buffer sizes (§33.3),
+    /// and the only way to show it is neither blind nor paranoid is to draw the
+    /// frames it refuses and look at them. A frame drawn through here can silently be
+    /// the previous frame.
+    pub fn draw_unchecked(
+        &mut self,
+        plan: &VisualLayerPlan,
+        frame: PhysicalSize<u32>,
+        device_scale: f64,
+    ) -> Result<(), PresentError> {
+        self.draw_checked(plan, frame, device_scale, false)
+    }
+
+    fn draw_checked(
+        &mut self,
+        plan: &VisualLayerPlan,
+        frame: PhysicalSize<u32>,
+        device_scale: f64,
+        checked: bool,
+    ) -> Result<(), PresentError> {
         self.resize(frame);
 
         let composition = Composition::new(plan, device_scale);
@@ -167,6 +197,17 @@ impl GpuFrames {
             Some(color) => composition.on_background(color, self.size.width, self.size.height),
             None => composition,
         };
+
+        // Before anything is submitted: a scene over the rasteriser's fixed tile
+        // budget is not drawn, and vello does not say so (§33). Cheap next to the
+        // frame it guards — one pass over the composed scene's bounding boxes.
+        if checked && let Some(tiles) = crate::tiles::tiles_over_budget(&composition.scene, self.size) {
+            self.counters.frames_refused += 1;
+            return Err(PresentError::SceneTooLarge {
+                tiles,
+                budget: crate::tiles::TILE_BUDGET,
+            });
+        }
 
         self.holes.clear();
         self.holes.extend_from_slice(&composition.holes);

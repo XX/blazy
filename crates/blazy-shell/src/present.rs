@@ -41,6 +41,13 @@ pub struct PresentCounters {
     pub readbacks: u64,
     /// Holes reported to the host, summed.
     pub holes: u64,
+    /// Frames the path refused to draw because the rasteriser could not take them.
+    ///
+    /// vello sizes its tile buffer with a constant and drops the frame in silence
+    /// when a scene needs more (§33). A refused frame is the same missing frame — but
+    /// counted, logged and returned as an error, instead of a window that quietly
+    /// shows what it showed last.
+    pub frames_refused: u64,
 }
 
 /// Errors from putting a frame on the screen.
@@ -48,6 +55,18 @@ pub struct PresentCounters {
 pub enum PresentError {
     /// The frame could not be composed or rasterised.
     Host(crate::HostError),
+    /// The scene needs more tiles than the rasteriser can allocate (§33).
+    ///
+    /// Not sent to the GPU at all: submitting it would return `Ok` and leave the
+    /// previous frame in the target, which is the failure this variant exists to make
+    /// visible. The caller can simplify the scene, make the window smaller, or fall
+    /// back to the CPU rasteriser, which has no such limit.
+    SceneTooLarge {
+        /// Tiles the scene asks for.
+        tiles: u64,
+        /// Tiles the rasteriser can allocate.
+        budget: u64,
+    },
     /// The platform refused the buffer or the surface.
     Platform(String),
 }
@@ -56,6 +75,10 @@ impl std::fmt::Display for PresentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Host(error) => write!(f, "{error}"),
+            Self::SceneTooLarge { tiles, budget } => write!(
+                f,
+                "the scene needs {tiles} tiles and the rasteriser can allocate {budget}"
+            ),
             Self::Platform(message) => f.write_str(message),
         }
     }
