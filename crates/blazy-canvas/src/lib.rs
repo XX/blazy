@@ -503,12 +503,21 @@ pub struct CanvasCounters {
     /// widgets it saves. Zero while panning at zoom 1–2 is the other half of the
     /// claim: ordinary work must not reach the policy at all.
     pub level_switches: u64,
-    /// Times the far-field scene has been re-recorded.
+    /// Times the far-field scene has been re-emitted into the widget's scene.
     ///
-    /// The scene is in canvas coordinates, so panning and zooming inside the painted
-    /// region reuse it untouched. If this climbs while panning, the region is too
-    /// tight and the recording is being thrown away every frame.
+    /// Rises whenever the content widget repaints for any reason, so it measures work
+    /// done rather than a decision made — the same relation `link_repaints` has to
+    /// `link_reselects`. Informational; the decision is
+    /// [`far_records`](Self::far_records).
     pub far_repaints: u64,
+    /// Times the canvas has re-chosen *which* nodes the far field records.
+    ///
+    /// This is the one to bound, and it is the counter the overscan trades against
+    /// (§35.2): the recorded scene is in canvas coordinates, so panning and zooming
+    /// inside the region reuse it untouched and only leaving the region costs a new
+    /// selection. A wider margin buys fewer of these with a bigger scene — and the
+    /// scene is what the rasteriser is charged for in every frame (§32.3).
+    pub far_records: u64,
     /// Picks performed: pointer moves, button presses, explicit hit tests.
     ///
     /// The denominator of the two counters below. On its own it says only how often
@@ -595,8 +604,17 @@ pub trait NodeSource: 'static {
     ///
     /// `nodes` is `(index, rect)` in canvas coordinates, ascending by index, and is a
     /// buffer the canvas reuses. The default draws nothing.
-    fn paint_far(&mut self, nodes: &[(usize, Rect)], painter: &mut Painter<'_>) {
-        let _ = (nodes, painter);
+    ///
+    /// **`scale` is how many screen pixels a canvas unit is worth** when the scene is
+    /// recorded, and it is here because the other half of a far-field frame is charged
+    /// in *path segments* (§32.3, §35): a rounded rectangle is eight of them and a
+    /// plain one is four, so what an implementation draws at a given size is worth as
+    /// much as how many commands it draws it in. The recorded scene is in canvas
+    /// coordinates and survives a pan untouched (§20.6a), so this value is the scale at
+    /// recording time and goes slightly stale between re-recordings — the same trade
+    /// the short-link rule makes and for the same reason (§31.4).
+    fn paint_far(&mut self, nodes: &[(usize, Rect)], scale: f64, painter: &mut Painter<'_>) {
+        let _ = (nodes, scale, painter);
     }
 
     /// Whether the canvas-space `point` is inside node `index`, whose rectangle is
@@ -677,9 +695,17 @@ const DEFAULT_OVERSCAN: f64 = 0.02;
 ///
 /// Larger than [`DEFAULT_OVERSCAN`] because the trade is different: a bigger recorded
 /// scene costs more to append every frame, but re-recording it is what a pan must
-/// avoid entirely. Half a screen of margin turns "every frame" into "every few
-/// hundred".
-const FAR_OVERSCAN: f64 = 0.5;
+/// avoid entirely.
+///
+/// **A quarter, measured rather than guessed (§35.2).** It started at a half, from the
+/// reasoning above and nothing else; once the frame could be counted in path segments
+/// the trade turned out to be priced steeply. At a far zoom over a graph that carries
+/// on past the viewport, a half records 47 502 segments and a quarter 27 580 — a fifth
+/// to a quarter of the frame's rasterisation — and the re-selections it buys back are
+/// 0.02 per frame against 0.00, which is one every fifty. Tighter still is cheaper
+/// again, and 0.10 crosses the line where a pan starts re-choosing the link set often
+/// enough for `pan_does_not_reselect_links` to see it.
+const FAR_OVERSCAN: f64 = 0.25;
 
 /// Zoom changes smaller than this are treated as no change at all.
 const ZOOM_EPSILON: f64 = 1e-9;
@@ -795,12 +821,23 @@ pub(crate) fn contains_rect(outer: Rect, inner: Rect) -> bool {
     outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
 }
 
-/// How much larger than the viewport a recorded region may grow before it is redone.
+/// How far the viewport may zoom *in* on a recorded region before it is redone.
 ///
-/// A region is the viewport plus [`FAR_OVERSCAN`] on each side, so it starts out four
-/// times the viewport's area. Sixteen is that with room to spare: zooming in and out
-/// by a little must not re-record anything, and zooming in by four must.
-const REGION_SLACK: f64 = 16.0;
+/// Four times the area, that is two times the zoom. The rule cannot be an absolute
+/// multiple of the viewport, and that took a measurement to notice (§35.3): the region
+/// starts out `(1 + 2 * overscan)^2` times the viewport, so a fixed ceiling means a
+/// tighter margin tolerates *more* zooming before it re-records — the recorded set goes
+/// staler as the margin gets smaller, which is backwards. Narrowing the default margin
+/// from a half to a quarter left 1015 link curves hidden at a zoom whose nodes were
+/// widgets again, and it was this constant, not the margin, that was wrong.
+const ZOOM_SLACK: f64 = 4.0;
+
+/// How much larger than the viewport a region recorded with this margin may be before
+/// it is redone.
+pub(crate) fn region_slack(far_overscan: f64) -> f64 {
+    let recorded = (1.0 + 2.0 * far_overscan).powi(2);
+    recorded * ZOOM_SLACK
+}
 
 /// Whether a region recorded earlier still serves this viewport.
 ///
@@ -809,8 +846,8 @@ const REGION_SLACK: f64 = 16.0;
 /// asking only "did the viewport leave it?" means the recorded set never shrinks
 /// again. Zoom out to see the whole graph, zoom back in, and the canvas keeps drawing
 /// every edge in it — measured at 9857 curves at a zoom whose viewport holds 96.
-pub(crate) fn region_covers(region: Rect, visible: Rect) -> bool {
-    contains_rect(region, visible) && region.area() <= visible.area() * REGION_SLACK
+pub(crate) fn region_covers(region: Rect, visible: Rect, slack: f64) -> bool {
+    contains_rect(region, visible) && region.area() <= visible.area() * slack
 }
 
 // --- MARK: CONTENT
@@ -840,6 +877,9 @@ pub struct CanvasContent {
     links: LinkLayer,
     /// How links are stroked.
     link_style: LinkStyle,
+    /// How far past the viewport the far field and the link set are recorded, pushed
+    /// down by the parent.
+    far_overscan: f64,
     /// The node the pointer is on, if any. Only meaningful with `controls_on_hover`.
     active: Option<usize>,
     /// What the pointer is over, node or link. Repainted, never relaid out.
@@ -895,6 +935,7 @@ pub struct CanvasContent {
     builds: u64,
     level_switches: u64,
     far_repaints: u64,
+    far_records: u64,
     visits: u64,
     link_repaints: u64,
     hit_queries: u64,
@@ -921,6 +962,7 @@ impl CanvasContent {
             far: FarField::default(),
             links: LinkLayer::default(),
             link_style: LinkStyle::default(),
+            far_overscan: FAR_OVERSCAN,
             active: None,
             hovered: None,
             controls_on_hover: false,
@@ -944,6 +986,7 @@ impl CanvasContent {
             builds: 0,
             level_switches: 0,
             far_repaints: 0,
+            far_records: 0,
             visits: 0,
             link_repaints: 0,
             hit_queries: 0,
@@ -1253,8 +1296,8 @@ impl CanvasContent {
             return;
         }
         let region = self.visible_rect.inflate(
-            self.visible_rect.width() * FAR_OVERSCAN,
-            self.visible_rect.height() * FAR_OVERSCAN,
+            self.visible_rect.width() * self.far_overscan,
+            self.visible_rect.height() * self.far_overscan,
         );
         if !self.links.needs_reselect(self.visible_rect) {
             return;
@@ -1319,15 +1362,20 @@ impl CanvasContent {
     /// screen": it is bought with a larger scene, which the paint pass appends every
     /// frame either way, so it should be generous but not unbounded.
     fn refresh_far_region(&mut self) {
-        if self.far.region.is_some_and(|r| region_covers(r, self.visible_rect)) {
+        if self
+            .far
+            .region
+            .is_some_and(|r| region_covers(r, self.visible_rect, region_slack(self.far_overscan)))
+        {
             return;
         }
 
         let region = self.visible_rect.inflate(
-            self.visible_rect.width() * FAR_OVERSCAN,
-            self.visible_rect.height() * FAR_OVERSCAN,
+            self.visible_rect.width() * self.far_overscan,
+            self.visible_rect.height() * self.far_overscan,
         );
 
+        self.far_records += 1;
         let mut candidates = std::mem::take(&mut self.scratch_candidates);
         self.index.candidates(region, &mut candidates);
         self.far.nodes.clear();
@@ -1454,7 +1502,7 @@ impl Widget for CanvasContent {
             let slot = &self.slots[index];
             (index, Rect::from_origin_size(slot.pos, slot.size))
         }));
-        self.source.paint_far(&batch, painter);
+        self.source.paint_far(&batch, self.scale, painter);
         self.scratch_far = batch;
     }
 
@@ -1529,6 +1577,8 @@ pub struct CanvasLayer {
     /// means a huge screen margin when zoomed in and a sliver when zoomed out, which
     /// is backwards.
     overscan: f64,
+    /// How far past the viewport the far-field scene and the link set are recorded.
+    far_overscan: f64,
     /// Mirror of the content's counters, refreshed at the end of each layout.
     stats: Cell<CanvasStats>,
     /// Current pointer gesture.
@@ -1575,6 +1625,7 @@ impl CanvasLayer {
             view_dirty: true,
             viewport: Size::ZERO,
             overscan: DEFAULT_OVERSCAN,
+            far_overscan: FAR_OVERSCAN,
             stats: Cell::new(CanvasStats {
                 zoom: 1.0,
                 ..CanvasStats::default()
@@ -1619,6 +1670,22 @@ impl CanvasLayer {
     }
 
     /// Restyles the links.
+    /// Sets how far past the viewport the far field and the link set are recorded, as
+    /// a fraction of the viewport.
+    ///
+    /// The margin that turns "re-record every frame" into "re-record every few hundred"
+    /// (§20.6a). It is bought with a bigger recorded scene, and the scene is what the
+    /// rasteriser is charged for every frame (§32.3), so the two sides of the trade are
+    /// re-recordings and path segments. [`FAR_OVERSCAN`](Self::DEFAULT_FAR_OVERSCAN) is
+    /// what §35.2 measured the trade at.
+    pub fn with_far_overscan(mut self, fraction: f64) -> Self {
+        self.far_overscan = fraction.max(0.0);
+        self
+    }
+
+    /// The default of [`Self::with_far_overscan`]: half a viewport on each side.
+    pub const DEFAULT_FAR_OVERSCAN: f64 = FAR_OVERSCAN;
+
     pub fn with_link_style(mut self, style: LinkStyle) -> Self {
         self.link_style = style;
         self
@@ -2087,6 +2154,8 @@ impl Widget for CanvasLayer {
                 content.links.invalidate();
             }
             content.link_style = self.link_style;
+            content.far_overscan = self.far_overscan;
+            content.links.set_slack(region_slack(self.far_overscan));
             content.controls_on_hover = self.controls_on_hover;
             content.visible_rect = visible_rect;
             content.scale = zoom;
@@ -2134,6 +2203,7 @@ impl Widget for CanvasLayer {
                 builds: content.builds,
                 level_switches: content.level_switches,
                 far_repaints: content.far_repaints,
+                far_records: content.far_records,
                 slot_visits: content.visits,
                 link_repaints: content.link_repaints,
                 link_reselects: content.links.refreshes(),

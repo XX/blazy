@@ -98,6 +98,50 @@ pub fn build_canvas_linked(count: usize, links: Vec<Link>) -> (CanvasLayer, Shar
     (canvas, graph)
 }
 
+/// The far-field knobs the §35 measurements sweep.
+///
+/// Not a public API of the library — knobs of *this example*, so that the levers
+/// `blazy-canvas` offers (the recorded margin) and the ones an application owns (how
+/// coarsely it draws a node) can be priced in the same table.
+#[derive(Clone, Copy, Debug)]
+pub struct FarTuning {
+    /// Fraction of the viewport recorded on each side. `CanvasLayer::with_far_overscan`.
+    pub overscan: f64,
+    /// Corner size on screen, in pixels, below which nodes are drawn as plain
+    /// rectangles. Zero rounds always.
+    pub min_radius_px: f64,
+    /// `LinkStyle::min_screen_length`: how long a link must be on screen to be drawn.
+    pub min_link_px: f64,
+}
+
+impl Default for FarTuning {
+    fn default() -> Self {
+        Self {
+            overscan: CanvasLayer::DEFAULT_FAR_OVERSCAN,
+            min_radius_px: crate::node::FAR_MIN_RADIUS_PX,
+            min_link_px: blazy_canvas::LinkStyle::default().min_screen_length,
+        }
+    }
+}
+
+/// A canvas over a generated graph, with the far-field knobs set.
+pub fn build_canvas_tuned(count: usize, links: Vec<Link>, tuning: FarTuning) -> (CanvasLayer, SharedGraph) {
+    let graph = share(GraphModel::generated(count));
+    let geometry = {
+        let graph = graph.clone();
+        move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
+    };
+    let source = GraphSource::new(graph.clone()).with_far_min_radius(tuning.min_radius_px);
+    let canvas = CanvasLayer::new(count, geometry, source)
+        .with_links(links)
+        .with_far_overscan(tuning.overscan)
+        .with_link_style(blazy_canvas::LinkStyle {
+            min_screen_length: tuning.min_link_px,
+            ..blazy_canvas::LinkStyle::default()
+        });
+    (canvas, graph)
+}
+
 pub fn canvas_over(graph: &SharedGraph, count: usize, controls_on_hover: bool) -> CanvasLayer {
     let geometry = {
         let graph = graph.clone();

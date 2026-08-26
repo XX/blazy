@@ -87,6 +87,9 @@ pub(crate) struct LinkLayer {
     hidden: usize,
     /// Times the set has been re-chosen.
     refreshes: u64,
+    /// How much larger than the viewport the recorded region may be before the set is
+    /// re-chosen. Follows the margin the canvas records with (`crate::region_slack`).
+    slack: f64,
 }
 
 impl LinkLayer {
@@ -108,6 +111,7 @@ impl LinkLayer {
             reselect: false,
             hidden: 0,
             refreshes: 0,
+            slack: crate::region_slack(crate::FAR_OVERSCAN),
         }
     }
 
@@ -176,7 +180,13 @@ impl LinkLayer {
             && (self.reselect
                 || !self
                     .region
-                    .is_some_and(|region| crate::region_covers(region, visible_rect)))
+                    .is_some_and(|region| crate::region_covers(region, visible_rect, self.slack)))
+    }
+
+    /// Sets how much larger than the viewport the recorded region may be, which follows
+    /// the margin it is recorded with (`crate::region_slack`).
+    pub(crate) fn set_slack(&mut self, slack: f64) {
+        self.slack = slack;
     }
 
     /// Re-chooses the recorded set if [`needs_reselect`](Self::needs_reselect) says so.

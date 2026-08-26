@@ -112,6 +112,12 @@ pub struct ZoomRecord {
     pub commands: usize,
     /// Link curves the selection dropped as too short to see.
     pub hidden_links: usize,
+    /// Path segments in the scene vello would be asked to draw (§35).
+    ///
+    /// The unit the *other* half of the frame is charged in: draw commands are what
+    /// assembling the plan costs, segments are what rasterising it costs, and §32
+    /// measured the two to be independent. Zero where the run had no encoder.
+    pub segments: u64,
     pub mean_ms: f64,
     pub worst_ms: f64,
 }
@@ -245,7 +251,7 @@ impl Outcome {
                 out,
                 "    {{\"zoom\": {}, \"returning\": {}, \"nodes\": {}, \"visible\": {}, \
                  \"widgets\": {}, \"detail\": {}, \"level_switches_per_frame\": {}, \
-                 \"commands\": {}, \"hidden_links\": {}, \"mean_ms\": {}, \"worst_ms\": {}}}",
+                 \"commands\": {}, \"hidden_links\": {}, \"segments\": {}, \"mean_ms\": {}, \"worst_ms\": {}}}",
                 num(p.zoom),
                 p.returning,
                 p.nodes,
@@ -255,6 +261,7 @@ impl Outcome {
                 num(p.level_switches_per_frame),
                 p.commands,
                 p.hidden_links,
+                p.segments,
                 num(p.mean_ms),
                 num(p.worst_ms),
             );

@@ -616,27 +616,17 @@ struct RasterRow {
 /// What vello is asked to draw, counted before anything draws it.
 ///
 /// The answer to the task's first question, and it is better than the task hoped for:
-/// `imaging_vello` re-exports `vello` and its `VelloSceneSink` is public, so a scene
-/// can be **encoded without a device** and the encoding read out — `draw_tags` is one
-/// entry per draw object, `n_path_segments` one per curve. Both are exact and
-/// machine-independent, which is what a criterion needs (§20.9), and unlike every
-/// other GPU number here they exist on a runner with no GPU at all.
+/// a scene can be **encoded without a device** and the encoding read out. The counting
+/// lives in `blazy_shell::encoded` (§35.1) because the canvas benchmark needs the same
+/// number and cannot reach `imaging_vello` from where it sits; here it is one call.
 ///
 /// The CPU rasteriser has no equivalent: `imaging_vello_cpu` exposes a renderer and
 /// nothing about the work inside it, so on that path only the clock can answer.
 #[cfg(feature = "vello")]
 fn encoded(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>) -> (usize, u64) {
-    use masonry::imaging::record::replay;
-
     let composition = blazy_shell::Composition::new(plan, scale);
-    let mut native = imaging_vello::vello::Scene::new();
-    let bounds = Rect::new(0.0, 0.0, f64::from(frame.width), f64::from(frame.height));
-    let mut sink = imaging_vello::VelloSceneSink::new(&mut native, bounds);
-    replay(&composition.scene, &mut sink);
-    sink.finish().expect("the composed scene encodes");
-
-    let encoding = native.encoding();
-    (encoding.draw_tags.len(), u64::from(encoding.n_path_segments))
+    let counts = blazy_shell::encoded(&composition.scene, frame);
+    (counts.objects, counts.segments)
 }
 
 #[cfg(not(feature = "vello"))]

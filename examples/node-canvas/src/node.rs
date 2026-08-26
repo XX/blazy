@@ -45,6 +45,14 @@ const PADDING: f64 = 8.0;
 /// corner arc is a fraction of one, and the elements this saves are elements the
 /// batch would carry in every frame.
 const FAR_TOLERANCE: f64 = 1.0;
+/// How large a corner must be on screen, in pixels, before the far field bothers
+/// rounding it.
+///
+/// Half a pixel: below that the arc is inside one pixel of coverage and the rounding
+/// is a matter of antialiasing rather than of shape. It is not free — a rounded
+/// rectangle is eight path segments against four (§35.1) — and the far field draws
+/// thousands of them.
+pub(crate) const FAR_MIN_RADIUS_PX: f64 = 0.5;
 
 /// A graph node with a slider and a checkbox.
 ///
@@ -402,6 +410,11 @@ pub struct GraphSource {
     /// makes the exact test 15x cheaper than re-walking the path (§25.1), and it only
     /// pays if it survives between picks.
     body: ShapeHit,
+    /// How large a corner must be on screen before the far field rounds it.
+    ///
+    /// A field rather than the constant alone so the benchmark can price the rule:
+    /// zero rounds always, a large value never (§35.2).
+    far_min_radius_px: f64,
     /// One reusable path per tint, for the far field. See [`NodeSource::paint_far`].
     far_batches: Vec<(Color, BezPath)>,
 }
@@ -413,8 +426,16 @@ impl GraphSource {
             graph,
             canvas: None,
             body: body_shape(crate::model::NODE_SIZE),
+            far_min_radius_px: FAR_MIN_RADIUS_PX,
             far_batches: Vec::new(),
         }
+    }
+
+    /// Sets how large a corner must be on screen before the far field rounds it.
+    #[must_use]
+    pub fn with_far_min_radius(mut self, px: f64) -> Self {
+        self.far_min_radius_px = px;
+        self
     }
 }
 
@@ -439,7 +460,7 @@ impl NodeSource for GraphSource {
         self.graph.borrow().other_views(self.canvas, peers);
     }
 
-    fn paint_far(&mut self, nodes: &[(usize, Rect)], painter: &mut Painter<'_>) {
+    fn paint_far(&mut self, nodes: &[(usize, Rect)], scale: f64, painter: &mut Painter<'_>) {
         // The far field: no widget, no layout, no widget-tree hit route — the nodes
         // are shapes in the canvas's own scene. Picking still works, because the
         // canvas asks `hit` rather than the tree.
@@ -451,6 +472,7 @@ impl NodeSource for GraphSource {
         // The grouping is a linear scan because six is the number: a map would cost
         // more than it saves.
         let graph = self.graph.borrow();
+        let rounded = RADIUS * scale >= self.far_min_radius_px;
         let mut batches = std::mem::take(&mut self.far_batches);
         for (_, path) in &mut batches {
             path.truncate(0);
@@ -466,9 +488,22 @@ impl NodeSource for GraphSource {
             };
             // Each node is its own subpath, so the fill treats them as separate
             // shapes; `move_to` is what keeps them from being joined up.
-            batch
-                .1
-                .extend(RoundedRect::from_rect(rect, RADIUS).path_elements(FAR_TOLERANCE));
+            //
+            // Rounded only while the rounding is visible. The corner is `RADIUS`
+            // canvas units, so at the far field's own zooms it is a fraction of a
+            // pixel — and it costs four of the node's eight path segments, which is
+            // the unit the second half of the frame is charged in (§32.3, §35.2).
+            // Keyed on the corner's own on-screen size rather than on the detail
+            // level, for the reason §31.4 gives: a rule about what can be seen belongs
+            // next to what it is about, and it switches itself off when someone
+            // configures a coarser threshold.
+            if rounded {
+                batch
+                    .1
+                    .extend(RoundedRect::from_rect(rect, RADIUS).path_elements(FAR_TOLERANCE));
+            } else {
+                batch.1.extend(rect.path_elements(FAR_TOLERANCE));
+            }
         }
         for (tint, path) in &batches {
             if !path.is_empty() {

@@ -25,6 +25,8 @@
 
 mod backend;
 mod compose;
+#[cfg(feature = "vello")]
+mod encode;
 mod external;
 #[cfg(feature = "vello")]
 pub mod gpu;
@@ -41,6 +43,8 @@ mod tests;
 
 pub use crate::backend::{Backend, BackendError, COMPILED, open_any};
 pub use crate::compose::{Composition, Hole};
+#[cfg(feature = "vello")]
+pub use crate::encode::{Encoded, encoded, segments};
 pub use crate::external::ExternalContent;
 pub use crate::host::{Frame, Host, HostCounters, HostError};
 pub use crate::present::{PresentCounters, PresentError, Presenter};
