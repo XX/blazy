@@ -57,17 +57,30 @@ pub struct LayerCounters {
     pub walks: u64,
     /// Bytes of texture the cache is holding.
     pub bytes: u64,
+    /// Textures dropped to stay inside the ceiling.
+    ///
+    /// An eviction is not a fault — it costs the layer a redraw on the frame it comes
+    /// back — but it is the difference between a cache that is bounded and one that
+    /// grows with whatever an application registers (§37.2).
+    pub evictions: u64,
 }
 
 /// A texture and the scene it was drawn from, per layer.
 pub(crate) struct LayerCache {
     wanted: HashSet<WidgetId>,
     entries: HashMap<WidgetId, Entry>,
+    /// Bytes of texture the cache may hold before it starts evicting.
+    budget: u64,
+    /// Ticks once per store or reuse, so "least recently used" is a number rather than
+    /// a guess. A frame counter would do as well; this one does not need the frame.
+    clock: u64,
     counters: LayerCounters,
 }
 
 struct Entry {
     texture: wgpu::Texture,
+    /// When this entry was last kept or refilled, by [`LayerCache::clock`].
+    used: u64,
     /// The scene this texture was drawn from. Compared, not hashed: equality is exact,
     /// and §36.3 measures what it costs.
     scene: Scene,
@@ -114,6 +127,8 @@ impl LayerCache {
         Self {
             wanted: HashSet::new(),
             entries: HashMap::new(),
+            budget: u64::MAX,
+            clock: 0,
             counters: LayerCounters::default(),
         }
     }
@@ -123,6 +138,41 @@ impl LayerCache {
         self.wanted = ids.into_iter().collect();
         self.entries.retain(|id, _| self.wanted.contains(id));
         self.recount();
+    }
+
+    /// Sets how many bytes of texture the cache may hold.
+    ///
+    /// The natural ceiling is a few frames' worth: cached layers **tile** the window, so
+    /// their pixels add up to about one frame however many areas there are — 4.9 MiB for
+    /// eight areas of a 1400x900 window, which is that window (§37.2). A ceiling above
+    /// that covers a resize, where the old textures live until their layers are stored
+    /// again, and bounds the damage from a caller that registers overlapping layers
+    /// against the precondition.
+    pub(crate) fn set_budget(&mut self, bytes: u64) {
+        self.budget = bytes;
+        self.evict_to_fit(None);
+    }
+
+    /// Drops least-recently-used textures until the cache is inside its ceiling.
+    ///
+    /// `keep` is the entry that has just been filled, which is never worth evicting: it
+    /// is the most recently used by definition, and dropping it would mean drawing it
+    /// again next frame for nothing.
+    fn evict_to_fit(&mut self, keep: Option<WidgetId>) {
+        while self.counters.bytes > self.budget {
+            let oldest = self
+                .entries
+                .iter()
+                .filter(|(id, _)| Some(**id) != keep)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(id, _)| *id);
+            let Some(id) = oldest else {
+                return;
+            };
+            self.entries.remove(&id);
+            self.counters.evictions += 1;
+            self.recount();
+        }
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -151,11 +201,15 @@ impl LayerCache {
     /// where a layer sits means walking its whole scene, and a layer that has not
     /// changed sits where it sat. Same scene and same transform is enough — the
     /// rectangle is a function of both.
-    pub(crate) fn reusable(&self, id: WidgetId, scene: &Scene, transform: Affine) -> Option<PixelRect> {
-        self.entries
-            .get(&id)
-            .filter(|entry| entry.transform == transform && entry.scene == *scene)
-            .map(|entry| entry.rect)
+    pub(crate) fn reusable(&mut self, id: WidgetId, scene: &Scene, transform: Affine) -> Option<PixelRect> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.transform == transform && entry.scene == *scene)?;
+        entry.used = clock;
+        Some(entry.rect)
     }
 
     pub(crate) fn note_offered(&mut self, count: u64) {
@@ -210,17 +264,22 @@ impl LayerCache {
             });
             self.entries.insert(id, Entry {
                 texture,
+                used: 0,
                 scene: Scene::new(),
                 transform,
                 rect,
             });
         }
+        self.clock += 1;
+        let clock = self.clock;
         let entry = self.entries.get_mut(&id).expect("just inserted or already there");
         entry.scene.clone_from(scene);
         entry.transform = transform;
         entry.rect = rect;
+        entry.used = clock;
         if !fits {
             self.recount();
+            self.evict_to_fit(Some(id));
         }
     }
 }

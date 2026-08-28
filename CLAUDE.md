@@ -290,7 +290,9 @@ Two things are load-bearing. The layer lives one paint, exactly like a hole, so 
 asks the layer owners to repaint on frames that are happening anyway
 (`ShellDriver::layers`) rather than through an animation frame, which would stop the
 window from ever idling. And a cached layer **owns its rectangle** — nothing else may
-draw into it — which the host cannot check and therefore asks for.
+draw into it — which the host cannot check and therefore asks for. The cache is bounded:
+the layers tile the window, so all of them together are about one frame of pixels, and the
+default ceiling is two frames with eviction by least recent use (§37.2).
 
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The

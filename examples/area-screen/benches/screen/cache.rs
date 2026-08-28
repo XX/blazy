@@ -36,12 +36,33 @@ pub(crate) struct CacheRow {
     /// must not touch any layer's geometry, and that is a fact about the code rather
     /// than about the machine.
     pub(crate) walks: f64,
-    /// What deciding costs: the rectangle of each layer plus a scene comparison.
-    pub(crate) decide_ms: f64,
+    /// What deciding costs, split into its two halves: comparing the scene with the one
+    /// from last frame, and — only for a layer that changed — working out where it sits.
+    ///
+    /// Split because the answer decides whether a cheap pre-filter before the comparison
+    /// is worth building (§37.1): a filter can only speed up scenes that differ, and an
+    /// idle screen's scenes are all equal.
+    pub(crate) compare_ms: f64,
+    pub(crate) walk_ms: f64,
     /// The frame on the GPU path.
     pub(crate) gpu_ms: f64,
     /// Texture the cache is holding, in KiB.
     pub(crate) kib: u64,
+    /// The ceiling this row ran under, and how many textures it dropped to stay inside
+    /// it (§37.2).
+    pub(crate) budget_kib: u64,
+    pub(crate) evictions: f64,
+}
+
+/// Asks every area to repaint, the way the shell does before a frame (§36.1).
+///
+/// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
+/// loop does it for the ids `ShellDriver::layers` returns — and a library method that
+/// exists only so a harness can imitate the host is a second way to say one thing.
+fn keep_layers(harness: &mut TestHarness<AreaScreen>) {
+    for id in harness.root_widget().area_ids() {
+        harness.edit_widget_with_id(id, |mut widget| widget.ctx.request_paint_only());
+    }
 }
 
 /// A screen whose areas declare scene layers, at a zoom where the frame is expensive.
@@ -70,11 +91,13 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 /// — nothing at all, for the uncached ones.
 #[derive(Clone, Copy)]
 struct CacheCase {
-    pub(crate) what: &'static str,
+    what: &'static str,
     areas: usize,
     nodes: usize,
     /// Whether the host is told it may keep this screen's areas.
-    pub(crate) cached: bool,
+    cached: bool,
+    /// Bytes of texture the cache may hold, or `None` for what the frame size gives.
+    budget: Option<u64>,
 }
 
 fn cache_case(
@@ -87,8 +110,11 @@ fn cache_case(
         areas,
         nodes,
         cached,
+        budget,
     } = case;
     let mut harness = layered_harness(areas, nodes);
+    let budget = budget.unwrap_or_else(|| gpu.default_cache_budget());
+    gpu.cache_budget(budget);
     gpu.cache_layers(if cached {
         harness.root_widget().area_ids()
     } else {
@@ -98,7 +124,7 @@ fn cache_case(
 
     // One frame to fill the cache, so the sweep measures the steady state rather than
     // the first frame of it.
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
     gpu.draw(&plan, logical, 1.0).ok()?;
     gpu.wait();
@@ -106,18 +132,18 @@ fn cache_case(
     let before = gpu.layer_counters();
     let mut total = Duration::ZERO;
     let mut layers = 0;
-    let mut decide = Duration::ZERO;
+    let mut compare = Duration::ZERO;
+    let mut walk = Duration::ZERO;
     let mut previous: Vec<masonry::imaging::record::Scene> = Vec::new();
     for i in 0..CACHE_FRAMES {
         step(&mut harness, i);
-        harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+        keep_layers(&mut harness);
         let (plan, _) = harness.redraw();
         layers = plan.layers.len();
 
         // The cache's own decision, timed on its own rather than inferred from the
         // difference between two paths: the rectangle a layer occupies, and whether its
         // scene is the one from last frame.
-        let start = Instant::now();
         previous.resize_with(plan.layers.len(), masonry::imaging::record::Scene::new);
         for (index, layer) in plan.layers.iter().enumerate() {
             let masonry::app::VisualLayerKind::Scene(scene) = &layer.kind else {
@@ -125,16 +151,20 @@ fn cache_case(
             };
             // What the cache does and in the order it does it: compare first, and only
             // work out where a changed layer sits — the walk is the expensive half.
-            if previous[index] != *scene {
+            let start = Instant::now();
+            let changed = previous[index] != *scene;
+            compare += start.elapsed();
+            if changed {
+                let start = Instant::now();
                 let _ = blazy_shell::layers::scene_bounds(
                     scene,
                     layer.transform,
                     PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
                 );
+                walk += start.elapsed();
                 previous[index].clone_from(scene);
             }
         }
-        decide += start.elapsed();
 
         let start = Instant::now();
         gpu.draw(&plan, logical, 1.0).ok()?;
@@ -151,9 +181,12 @@ fn cache_case(
         reused: (counters.reused - before.reused) as f64 / frames,
         drawn: (counters.drawn - before.drawn) as f64 / frames,
         walks: (counters.walks - before.walks) as f64 / frames,
-        decide_ms: decide.as_secs_f64() * 1000.0 / frames,
+        compare_ms: compare.as_secs_f64() * 1000.0 / frames,
+        walk_ms: walk.as_secs_f64() * 1000.0 / frames,
         gpu_ms: total.as_secs_f64() * 1000.0 / frames,
         kib: counters.bytes / 1024,
+        budget_kib: budget / 1024,
+        evictions: (counters.evictions - before.evictions) as f64 / frames,
     })
 }
 
@@ -172,6 +205,7 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
             areas,
             nodes,
             cached,
+            budget: None,
         };
         rows.extend(cache_case(&mut gpu, case("nothing changes"), |_, _| {}));
         rows.extend(cache_case(&mut gpu, case("one area pans"), |h, _| {
@@ -184,6 +218,18 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
                 pan_area(h, area, PAN_STEP);
             }
         }));
+        // A ceiling two areas wide, so the cache has to drop textures to stay inside it.
+        // Without this row the criterion that says it does would pass by never being
+        // asked (§20.9).
+        rows.extend(cache_case(
+            &mut gpu,
+            CacheCase {
+                what: "under a small ceiling",
+                budget: Some(u64::from(VIEWPORT.0) * u64::from(VIEWPORT.1) * 4 / 4),
+                ..case("")
+            },
+            |_, _| {},
+        ));
     }
     print_cache(&rows);
     rows
@@ -195,21 +241,35 @@ fn print_cache(rows: &[CacheRow]) {
         return;
     }
     println!(
-        "  {:<18} {:>7} {:>7} {:>8} {:>8} {:>8} {:>10} {:>9} {:>8}",
-        "gesture", "cache", "layers", "reused/f", "drawn/f", "walks/f", "decide ms", "gpu ms", "KiB"
+        "  {:<20} {:>5} {:>6} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8}",
+        "gesture",
+        "cache",
+        "layers",
+        "reused/f",
+        "drawn/f",
+        "walks/f",
+        "evict/f",
+        "cmp ms",
+        "walk ms",
+        "gpu ms",
+        "KiB",
+        "max KiB"
     );
     for row in rows {
         println!(
-            "  {:<18} {:>7} {:>7} {:>8.2} {:>8.2} {:>8.2} {:>10.3} {:>9.2} {:>8}",
+            "  {:<20} {:>5} {:>6} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>7.3} {:>7.3} {:>8.2} {:>7} {:>8}",
             row.what,
             if row.cached { "on" } else { "off" },
             row.layers,
             row.reused,
             row.drawn,
             row.walks,
-            row.decide_ms,
+            row.evictions,
+            row.compare_ms,
+            row.walk_ms,
             row.gpu_ms,
             row.kib,
+            row.budget_kib,
         );
     }
 }

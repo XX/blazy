@@ -879,6 +879,36 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
 
     if !cache.is_empty() {
+        // §37.2: the cache is bounded. Cached layers tile the window, so what they hold
+        // adds up to about one frame however many of them there are — but a caller that
+        // registers more than that, or a window that has just resized, must not be able
+        // to grow it without limit.
+        criteria.push(Criterion {
+            name: "the_layer_cache_stays_inside_its_ceiling",
+            claim: "the cache never holds more texture than its ceiling",
+            kind: Kind::Counter,
+            measured: cache
+                .iter()
+                .filter(|row| row.cached)
+                .map(|row| row.kib.saturating_sub(row.budget_kib))
+                .max()
+                .unwrap_or(0) as f64,
+            bound: 1.0,
+            unit: "KiB over the ceiling",
+        });
+
+        // And the partner: a sweep that never fills the cache says nothing about what
+        // happens when it does.
+        criteria.push(Criterion {
+            name: "the_cache_ceiling_is_exercised",
+            claim: "the sweep contains a frame in which the cache had to evict",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!cache.iter().any(|row| row.cached && row.evictions > 0.5))),
+            bound: 1.0,
+            unit: "sweeps that never evict",
+        });
+    }
+    if !cache.is_empty() {
         // Both criteria above pass on a sweep where nothing ever changes, so the sweep
         // has to contain a frame in which everything does. Counted from the failing
         // side, as always.

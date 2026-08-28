@@ -100,7 +100,11 @@ impl GpuFrames {
             background: None,
             holes: Vec::new(),
             counters: PresentCounters::default(),
-            cache: LayerCache::new(),
+            cache: {
+                let mut cache = LayerCache::new();
+                cache.set_budget(default_cache_budget(size));
+                cache
+            },
         })
     }
 
@@ -120,6 +124,21 @@ impl GpuFrames {
     /// What the layer cache has been doing.
     pub fn layer_counters(&self) -> LayerCounters {
         self.cache.counters()
+    }
+
+    /// Sets how many bytes of texture the layer cache may hold before it evicts (§37.2).
+    ///
+    /// The default follows the frame — [`CACHE_FRAMES_OF_TEXTURE`] frames' worth, reset
+    /// whenever the window resizes — because cached layers tile the window and their
+    /// pixels therefore add up to about one frame however many of them there are. A
+    /// caller with a different arrangement can say so.
+    pub fn cache_budget(&mut self, bytes: u64) {
+        self.cache.set_budget(bytes);
+    }
+
+    /// The ceiling this frame size gets unless a caller says otherwise.
+    pub fn default_cache_budget(&self) -> u64 {
+        default_cache_budget(self.size)
     }
 
     pub fn with_background(mut self, color: Color) -> Self {
@@ -165,6 +184,7 @@ impl GpuFrames {
         self.target = target;
         self.view = view;
         self.size = size;
+        self.cache.set_budget(default_cache_budget(size));
     }
 
     /// Composes a plan and draws it into the texture.
@@ -783,6 +803,18 @@ fn choose_blit(
     } else {
         (CompositeAlphaMode::Auto, TextureBlitter::new(device, format))
     }
+}
+
+/// Frames' worth of texture the layer cache may hold by default.
+///
+/// Two, not eight: the layers a caller may cache own disjoint rectangles (§36), so all
+/// of them together are one frame of pixels, and the second frame is the slack a resize
+/// needs while the old textures wait to be replaced.
+const CACHE_FRAMES_OF_TEXTURE: u64 = 2;
+
+/// The default ceiling for a frame of this size.
+fn default_cache_budget(size: PhysicalSize<u32>) -> u64 {
+    u64::from(size.width) * u64::from(size.height) * 4 * CACHE_FRAMES_OF_TEXTURE
 }
 
 /// What the frame owes the cache once it is drawn (§36.2).

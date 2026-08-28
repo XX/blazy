@@ -425,11 +425,21 @@ fn a_real_frame_is_far_from_both_ceilings() {
 
 // --- MARK: layers per area (§36)
 
+/// Asks every area to repaint, the way the shell does before a frame (§36.1).
+///
+/// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
+/// loop does it for the ids `ShellDriver::layers` returns — and a library method that
+/// exists only so a harness can imitate the host is a second way to say one thing.
+fn keep_layers(harness: &mut TestHarness<AreaScreen>) {
+    for id in harness.root_widget().area_ids() {
+        harness.edit_widget_with_id(id, |mut widget| widget.ctx.request_paint_only());
+    }
+}
 /// What a screen of areas looks like to a host that wants to cache them.
 ///
 /// Two numbers the design rests on, measured rather than assumed: how many layers the
 /// plan carries when every area declares one, and what happens on the frame after —
-/// the frame a cache exists for. `AreaScreen::keep_layers` is what keeps the second
+/// the frame a cache exists for. Asking the areas to repaint is what keeps the second
 /// number equal to the first (§26.1).
 #[test]
 fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
@@ -450,7 +460,7 @@ fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
     let idle = plan.layers.len();
 
     // The same frame, with the areas asked to repaint first.
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
     let kept = plan.layers.len();
 
@@ -493,7 +503,7 @@ fn a_kept_layer_is_the_same_picture() {
     let ids = harness.root_widget().area_ids();
 
     let logical = Size::new(f64::from(size.width), f64::from(size.height));
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
 
     // The *same* plan through both paths, and twice through the caching one: the
@@ -569,7 +579,7 @@ fn a_changed_layer_is_drawn_again() {
     let logical = Size::new(f64::from(size.width), f64::from(size.height));
 
     // A frame to fill the cache.
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
     gpu.draw(&plan, logical, 1.0).expect("the frame draws");
     gpu.wait();
@@ -580,7 +590,7 @@ fn a_changed_layer_is_drawn_again() {
         let mut canvas = widget.downcast::<CanvasLayer>();
         CanvasLayer::pan(&mut canvas, Vec2::new(-40.0, -25.0));
     });
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
 
     // The cached frame first, while the cache still holds the frame before the pan;
