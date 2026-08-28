@@ -28,7 +28,7 @@
 //! scenes is cheap, working out where a layer sits walks its whole scene, and a layer
 //! that has not changed sits where it sat (§36.3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use masonry::core::WidgetId;
 use masonry::dpi::PhysicalSize;
@@ -56,7 +56,7 @@ pub struct LayerCounters {
 
 /// A texture and the scene it was drawn from, per layer.
 pub(crate) struct LayerCache {
-    wanted: Vec<WidgetId>,
+    wanted: HashSet<WidgetId>,
     entries: HashMap<WidgetId, Entry>,
     counters: LayerCounters,
 }
@@ -84,6 +84,11 @@ pub struct PixelRect {
 }
 
 impl PixelRect {
+    /// The top-left corner, which is what a texture copy takes.
+    pub fn origin(self) -> (u32, u32) {
+        (self.x, self.y)
+    }
+
     /// The pixels a bounding box covers, rounded outwards and clipped to the frame.
     fn of(bounds: Rect, frame: PhysicalSize<u32>) -> Option<Self> {
         let x0 = bounds.x0.floor().max(0.0) as u32;
@@ -102,7 +107,7 @@ impl PixelRect {
 impl LayerCache {
     pub(crate) fn new() -> Self {
         Self {
-            wanted: Vec::new(),
+            wanted: HashSet::new(),
             entries: HashMap::new(),
             counters: LayerCounters::default(),
         }
@@ -110,9 +115,9 @@ impl LayerCache {
 
     /// Registers the layers whose pixels may be kept. Empty turns the cache off.
     pub(crate) fn set_wanted(&mut self, ids: Vec<WidgetId>) {
-        self.wanted = ids;
+        self.wanted = ids.into_iter().collect();
         self.entries.retain(|id, _| self.wanted.contains(id));
-        self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
+        self.recount();
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -121,6 +126,12 @@ impl LayerCache {
 
     pub(crate) fn wants(&self, id: WidgetId) -> bool {
         self.wanted.contains(&id)
+    }
+
+    /// Re-adds up what the textures cost. Called where the set of them changes, which
+    /// is the only time it can move.
+    fn recount(&mut self) {
+        self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
     }
 
     pub(crate) fn counters(&self) -> LayerCounters {
@@ -168,7 +179,7 @@ impl LayerCache {
         transform: Affine,
         rect: PixelRect,
         format: wgpu::TextureFormat,
-    ) -> &wgpu::Texture {
+    ) {
         let fits = self
             .entries
             .get(&id)
@@ -199,8 +210,9 @@ impl LayerCache {
         entry.scene.clone_from(scene);
         entry.transform = transform;
         entry.rect = rect;
-        self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
-        &self.entries.get(&id).expect("just stored").texture
+        if !fits {
+            self.recount();
+        }
     }
 }
 

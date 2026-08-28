@@ -34,7 +34,6 @@ mod host;
 #[cfg(feature = "vello")]
 mod layers;
 mod present;
-#[cfg(feature = "vello")]
 mod tiles;
 
 #[cfg(feature = "window")]
@@ -52,7 +51,6 @@ pub use crate::host::{Frame, Host, HostCounters, HostError};
 #[cfg(feature = "vello")]
 pub use crate::layers::{LayerCounters, PixelRect, scene_bounds};
 pub use crate::present::{PresentCounters, PresentError, Presenter};
-#[cfg(feature = "vello")]
 pub use crate::tiles::{
     BLEND_BUDGET, Demand, Overflow, TILE_BUDGET, blend_demand, demand, nesting_depth, over_budget, tile_demand,
 };

@@ -439,6 +439,64 @@ const FAR_ZOOMS: [f64; 2] = [0.02, 0.10];
 /// Few, because each one is tens of milliseconds — that being the finding (§32.3).
 const FAR_RASTER_FRAMES: usize = 6;
 
+/// The two paths to pixels, opened once for a whole table.
+///
+/// One device per table rather than one per row, for the reason the host benchmark
+/// gives: a driver initialisation inside a measurement is a variable nobody asked for,
+/// and §32.4 found that churning the target provokes frames the GPU never draws.
+struct Rasterisers {
+    /// `false` in the quick set, where the tables are read for counters and not times.
+    timed: bool,
+    host: Option<blazy_shell::Host>,
+    gpu: Option<blazy_shell::gpu::GpuFrames>,
+}
+
+impl Rasterisers {
+    fn open(timed: bool) -> Self {
+        Self {
+            timed,
+            host: timed.then(|| blazy_shell::Host::any().ok()).flatten(),
+            gpu: timed
+                .then(|| blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)).ok())
+                .flatten(),
+        }
+    }
+
+    /// Rasterises the plan on the blit path and returns milliseconds per frame.
+    fn blit_ms(&mut self, plan: &masonry::app::VisualLayerPlan) -> f64 {
+        let Some(host) = self.host.as_mut() else {
+            return 0.0;
+        };
+        let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+        let _ = host.render(plan, size);
+        let start = Instant::now();
+        for _ in 0..FAR_RASTER_FRAMES {
+            let _ = host.render(plan, size);
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / FAR_RASTER_FRAMES as f64
+    }
+
+    /// The same on the GPU path, where a device opened. Zero where none did.
+    fn gpu_ms(&mut self, plan: &masonry::app::VisualLayerPlan) -> f64 {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return 0.0;
+        };
+        let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+        if gpu.draw(plan, size, 1.0).is_err() {
+            return 0.0;
+        }
+        gpu.wait();
+        let start = Instant::now();
+        for _ in 0..FAR_RASTER_FRAMES {
+            if gpu.draw(plan, size, 1.0).is_err() {
+                return 0.0;
+            }
+            gpu.wait();
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / FAR_RASTER_FRAMES as f64
+    }
+}
+
 /// One far-field configuration: what it records, and what that costs.
 struct FarRow {
     what: &'static str,
@@ -480,7 +538,7 @@ fn far_case(
     links: Vec<blazy_canvas::Link>,
     tuning: node_canvas::FarTuning,
     frames: usize,
-    raster: bool,
+    paths: &mut Rasterisers,
 ) -> FarRow {
     let (canvas, _graph) = node_canvas::build_canvas_tuned(count, links, tuning);
     let mut harness = TestHarness::create_with_size(
@@ -504,9 +562,9 @@ fn far_case(
     let encoded = blazy_shell::encoded(&composed, frame);
 
     let (mut cpu_ms, mut gpu_ms) = (0.0, 0.0);
-    if raster {
-        cpu_ms = time_raster(&plan);
-        gpu_ms = time_gpu(&plan);
+    if paths.timed {
+        cpu_ms = paths.blit_ms(&plan);
+        gpu_ms = paths.gpu_ms(&plan);
     }
 
     FarRow {
@@ -526,47 +584,13 @@ fn far_case(
     }
 }
 
-/// Rasterises the plan on the blit path and returns milliseconds per frame.
-fn time_raster(plan: &masonry::app::VisualLayerPlan) -> f64 {
-    let Ok(mut host) = blazy_shell::Host::any() else {
-        return 0.0;
-    };
-    let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
-    let _ = host.render(plan, size);
-    let start = Instant::now();
-    for _ in 0..FAR_RASTER_FRAMES {
-        let _ = host.render(plan, size);
-    }
-    start.elapsed().as_secs_f64() * 1000.0 / FAR_RASTER_FRAMES as f64
-}
-
-/// The same on the GPU path, where a device opens. Zero where none does.
-fn time_gpu(plan: &masonry::app::VisualLayerPlan) -> f64 {
-    let Ok(mut gpu) = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)) else {
-        return 0.0;
-    };
-    let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
-    if gpu.draw(plan, size, 1.0).is_err() {
-        return 0.0;
-    }
-    gpu.wait();
-    let start = Instant::now();
-    for _ in 0..FAR_RASTER_FRAMES {
-        if gpu.draw(plan, size, 1.0).is_err() {
-            return 0.0;
-        }
-        gpu.wait();
-    }
-    start.elapsed().as_secs_f64() * 1000.0 / FAR_RASTER_FRAMES as f64
-}
-
 /// What a far-field frame is made of, and what each lever takes off it.
 ///
 /// The table §35 is argued from. Every row is the same graph at the same zoom; what
 /// changes is one decision at a time.
 fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> {
     let frames = opts.frames();
-    let raster = !opts.quick;
+    let mut paths = Rasterisers::open(!opts.quick);
     let links = node_canvas::generated_links(count);
     let default = node_canvas::FarTuning::default();
     let with = |overscan: f64| node_canvas::FarTuning { overscan, ..default };
@@ -584,13 +608,37 @@ fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> {
                 ..default
             },
             frames,
-            raster,
+            &mut paths,
         ),
-        far_case("plain nodes", count, zoom, links.clone(), default, frames, raster),
-        far_case("plain, no links", count, zoom, Vec::new(), default, frames, raster),
-        far_case("overscan 0.50", count, zoom, links.clone(), with(0.50), frames, raster),
-        far_case("overscan 0.10", count, zoom, links.clone(), with(0.10), frames, raster),
-        far_case("overscan 0.00", count, zoom, links.clone(), with(0.0), frames, raster),
+        far_case("plain nodes", count, zoom, links.clone(), default, frames, &mut paths),
+        far_case("plain, no links", count, zoom, Vec::new(), default, frames, &mut paths),
+        far_case(
+            "overscan 0.50",
+            count,
+            zoom,
+            links.clone(),
+            with(0.50),
+            frames,
+            &mut paths,
+        ),
+        far_case(
+            "overscan 0.10",
+            count,
+            zoom,
+            links.clone(),
+            with(0.10),
+            frames,
+            &mut paths,
+        ),
+        far_case(
+            "overscan 0.00",
+            count,
+            zoom,
+            links.clone(),
+            with(0.0),
+            frames,
+            &mut paths,
+        ),
         far_case(
             "links >= 4 px",
             count,
@@ -598,9 +646,9 @@ fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> {
             links.clone(),
             links_at(4.0),
             frames,
-            raster,
+            &mut paths,
         ),
-        far_case("links >= 8 px", count, zoom, links, links_at(8.0), frames, raster),
+        far_case("links >= 8 px", count, zoom, links, links_at(8.0), frames, &mut paths),
     ];
     print_far(&rows);
     rows

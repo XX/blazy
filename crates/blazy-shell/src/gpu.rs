@@ -346,12 +346,12 @@ impl GpuFrames {
         });
         for (id, rect) in &reuse {
             if let Some(texture) = self.cache.texture_of(*id) {
-                copy_rect(&mut encoder, texture, ORIGIN, &self.target, *rect, *rect);
+                copy_rect(&mut encoder, texture, CORNER, &self.target, rect.origin(), *rect);
             }
         }
         for (_, id, _, rect) in &store {
             if let Some(texture) = self.cache.texture_of(*id) {
-                copy_rect(&mut encoder, &self.target, *rect, texture, ORIGIN, *rect);
+                copy_rect(&mut encoder, &self.target, rect.origin(), texture, CORNER, *rect);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -819,20 +819,15 @@ fn choose_blit(
 }
 
 /// The corner of a cache texture: it holds one rectangle and nothing else.
-const ORIGIN: PixelRect = PixelRect {
-    x: 0,
-    y: 0,
-    width: 0,
-    height: 0,
-};
+const CORNER: (u32, u32) = (0, 0);
 
 /// One rectangle from one texture into another, pixel for pixel.
 fn copy_rect(
     encoder: &mut wgpu::CommandEncoder,
     from: &wgpu::Texture,
-    from_at: PixelRect,
+    from_at: (u32, u32),
     to: &wgpu::Texture,
-    to_at: PixelRect,
+    to_at: (u32, u32),
     size: PixelRect,
 ) {
     encoder.copy_texture_to_texture(
@@ -840,8 +835,8 @@ fn copy_rect(
             texture: from,
             mip_level: 0,
             origin: wgpu::Origin3d {
-                x: from_at.x,
-                y: from_at.y,
+                x: from_at.0,
+                y: from_at.1,
                 z: 0,
             },
             aspect: wgpu::TextureAspect::All,
@@ -850,8 +845,8 @@ fn copy_rect(
             texture: to,
             mip_level: 0,
             origin: wgpu::Origin3d {
-                x: to_at.x,
-                y: to_at.y,
+                x: to_at.0,
+                y: to_at.1,
                 z: 0,
             },
             aspect: wgpu::TextureAspect::All,

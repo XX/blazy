@@ -429,20 +429,25 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 }
 
 /// One gesture, on one path.
+///
+/// The device comes from the caller and serves the whole table: a driver initialisation
+/// per row would sit inside the measurement, and §32.4 found that churning the target
+/// provokes frames the GPU never draws. A row differs by what the cache is told to keep
+/// — nothing at all, for the uncached ones.
 fn cache_case(
+    gpu: &mut blazy_shell::gpu::GpuFrames,
     what: &'static str,
     areas: usize,
     nodes: usize,
     cached: bool,
     mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
 ) -> Option<CacheRow> {
-    let mut gpu = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
-        .ok()?
-        .with_background(masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
     let mut harness = layered_harness(areas, nodes);
-    if cached {
-        gpu.cache_layers(harness.root_widget().area_ids());
-    }
+    gpu.cache_layers(if cached {
+        harness.root_widget().area_ids()
+    } else {
+        Vec::new()
+    });
     let logical = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
 
     // One frame to fill the cache, so the sweep measures the steady state rather than
@@ -505,18 +510,30 @@ fn cache_case(
 fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<CacheRow> {
     let mut rows = Vec::new();
     println!("\nlayer cache: {areas} areas over one graph, canvases at an overview zoom");
+    let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)) else {
+        print_cache(&rows);
+        return rows;
+    };
+    let mut gpu = gpu.with_background(masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
     for cached in [false, true] {
-        rows.extend(cache_case("nothing changes", areas, nodes, cached, |_, _| {}));
-        rows.extend(cache_case("one area pans", areas, nodes, cached, |h, _| {
+        rows.extend(cache_case(&mut gpu, "nothing changes", areas, nodes, cached, |_, _| {}));
+        rows.extend(cache_case(&mut gpu, "one area pans", areas, nodes, cached, |h, _| {
             pan_area(h, 0, PAN_STEP);
         }));
         // In the quick set too: it is the row that keeps the two criteria above from
         // passing on a sweep where nothing ever changes (§20.9).
-        rows.extend(cache_case("every area pans", areas, nodes, cached, move |h, _| {
-            for area in 0..areas {
-                pan_area(h, area, PAN_STEP);
-            }
-        }));
+        rows.extend(cache_case(
+            &mut gpu,
+            "every area pans",
+            areas,
+            nodes,
+            cached,
+            move |h, _| {
+                for area in 0..areas {
+                    pan_area(h, area, PAN_STEP);
+                }
+            },
+        ));
     }
     print_cache(&rows);
     rows
