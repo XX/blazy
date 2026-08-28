@@ -1,83 +1,45 @@
 //! What vello will try to allocate for a frame, worked out before the frame is sent.
 //!
-//! `rnd/architecture.md` §33: vello sizes its bump-allocated buffers with numbers
-//! that do not depend on the scene at all — `vello_encoding::BufferSizes::new` calls
-//! them "hand picked to accommodate the vello test scenes" — and overflowing one is
-//! silent. The robust read-back of the bump allocators is compiled in only with
-//! vello's `debug_layers` feature, so `render_to_texture` returns `Ok`, `fine.wgsl`
-//! sees the failure flag of an earlier stage and returns without drawing, and the
-//! target keeps whatever was in it — the previous frame, or nothing at all.
+//! vello sizes its bump-allocated buffers with constants that do not depend on the
+//! scene, and a scene that needs more is dropped in silence: `render_to_texture`
+//! returns `Ok`, `fine.wgsl` sees the failure flag of an earlier stage and returns
+//! without drawing, and the target keeps the frame before it. Two of the six buffers
+//! are modelled here so a host can refuse such a frame out loud instead. Why it is
+//! silent, where it is filed upstream and the boundaries this arithmetic was checked
+//! against: `rnd/architecture.md` §33 and §34.
 //!
-//! That is not a defect this crate can fix (§33.2 says where it is filed), but it is
-//! one it can *see coming*. Two of the six buffers are modelled here, both from
-//! arithmetic checked against vello itself.
-//!
-//! # Tiles
-//!
-//! The tile buffer holds `1 << 21` entries and the demand is
+//! # The two demands
 //!
 //! ```text
-//! sum over paths of  tiles(bbox of the path, clipped to the frame)
+//! tiles  = sum over paths of  tiles(bbox of the path, clipped to the frame)
+//! blend  = sum over tiles of  max(0, deepest nesting over this tile - 4) * 256 words
 //! ```
 //!
-//! with 16x16 tiles. Measured against vello directly, the boundary is exact to the
-//! path: at 1100x750, 646 screen-spanning paths draw and 647 do not; at 2200x1500,
-//! 161 draw and 162 do not (§33.1). The clipping matters and was checked rather than
-//! assumed — paths three times the size of the frame move the boundary not at all.
+//! The first is per path, the second per **tile**, and the difference is not a detail:
+//! what nests over a tile is not what nests in the scene. `coarse.wgsl` includes a
+//! layer in a tile when `n_segs != 0 || (backdrop_clear == is_clip) || is_blend`, so
 //!
-//! # The blend stack
+//! * a **group** is a blend layer and charges every tile of its box;
+//! * a **clip** charges only the tiles its *outline* crosses. Tiles inside keep the depth they had; tiles outside take
+//!   the `clip_zero` branch and charge nothing.
 //!
-//! `blend_spill` holds `1 << 20` words, and a tile nested deeper than
-//! `BLEND_STACK_SPLIT` (4) spills one word per pixel — 256 — for every level beyond
-//! it (`coarse.wgsl`, `blend_ix = atomicAdd(&bump.blend, scratch_size)`). So the
-//! demand is per *tile*, not per path:
+//! That is why an area tree and a canvas viewport, which clip with rectangles, do not
+//! go near this ceiling, while an application nesting a few opacity groups does (§34.2).
 //!
-//! ```text
-//! sum over tiles of  max(0, deepest nesting over this tile - 4) * 256
-//! ```
-//!
-//! **What nests over a tile is not what nests in the scene**, and that is the whole of
-//! §34. `coarse.wgsl` decides per tile:
-//!
-//! ```text
-//! include_tile = n_segs != 0 || (backdrop_clear == is_clip) || is_blend
-//! ```
-//!
-//! * a **group** is a blend layer (`is_blend`), so it is included in every tile of its bbox and charges all of them;
-//! * a **clip** is included only where its path has segments — the tiles its *outline* crosses. Tiles inside it carry
-//!   on at the depth they had; tiles outside take the `clip_zero` branch, which suppresses everything nested inside and
-//!   charges nothing.
-//!
-//! Measured, and this is what §33.7 got half right (§34.1): a clip is not free, a
-//! *rectangular* clip is nearly free. Twelve nested screen-sized rectangular clips draw
-//! fine on a 2200x1500 frame — but twelve nested clips whose outline is a zigzag across
-//! the frame lose it at six, exactly like six nested groups. That is why the area tree
-//! and the canvas viewport (§20.3) do not go near this ceiling, while an application
-//! nesting half a dozen opacity groups walks straight into it.
-//!
-//! How much a rectangular clip charges was measured rather than derived: on a
-//! 2200x1500 frame nested screen-sized clips draw at 21 and vanish at 22, and inset
-//! ones draw at 22 and vanish at 23. Both boundaries put the charge at **about half the
-//! ring** — `columns + rows` tiles of the clip's box, not its whole perimeter. This
-//! module charges the box's far column and far row, which is that count exactly; the
-//! *count* is what the measurements pin down, and where along the outline those tiles
-//! sit is a modelling choice that reproduces every boundary in §34.2.
-//!
-//! # What this counts, and what it approximates
+//! # What this counts, and which way it errs
 //!
 //! Fills, strokes and clip shapes are counted from their bounding boxes, which is what
-//! vello bins on. Glyphs are charged a square of the font size each, because a glyph
-//! is a path and its outline fits in its em box. Image draws are not counted.
+//! vello bins on; a glyph is charged its em box; image draws are not counted. A
+//! rectangular clip is charged the far column and far row of its box — the count the
+//! measurements pin down, placed where the model puts it (§34.3). Every approximation
+//! is deliberately **generous**: charging too much refuses a frame that would have
+//! drawn, which is visible and reportable, while charging too little brings back the
+//! silent one. The two places that shows: a clip that is not a rectangle charges its
+//! whole box, and a group with no clip of its own charges the whole frame, because
+//! that is what `imaging_vello` pushes it against (`scene_sink.rs`, `surface_clip`).
 //!
-//! Every approximation here is deliberately on the **generous** side: charging too
-//! much refuses a frame that would have drawn, and that is a visible, reportable
-//! failure. Charging too little brings back the silent one. Two places where that
-//! shows:
-//!
-//! * a clip that is not a rectangle charges its whole bbox rather than the tiles its outline really crosses — the
-//!   zigzag above is that case, and for it the two agree;
-//! * a group with no clip of its own charges the whole frame, because that is what `imaging_vello` pushes it against
-//!   (`scene_sink.rs`, `surface_clip`).
+//! The boundaries themselves live in the tests below, which is where they are checked
+//! rather than restated.
 
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::record::{Command, Glyph, Scene, replay};
@@ -155,11 +117,9 @@ pub enum Overflow {
 /// * a tile cannot nest deeper than the scene nests, and nesting is visible in the command stream alone — no geometry,
 ///   no bounding boxes.
 ///
-/// For anything a user interface actually draws both are already far under: a far-field
-/// canvas frame is a dozen commands nested two deep, and a dozen frames' worth of tiles
-/// is 8% of what vello can allocate. So the exact walk — proportional to the geometry,
-/// and measured at 1.8 ms on a scene of 8000 curves (§33.3) — runs only for scenes that
-/// could plausibly be over.
+/// Both are far under for anything a user interface actually draws, so the exact walk —
+/// proportional to the geometry, and the expensive half of this — runs only for a scene
+/// that could plausibly be over (§33.3).
 pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> {
     let ceiling = (scene.commands().len() as u64).saturating_mul(frame_tiles(frame));
     let deep = nesting_depth(scene) > BLEND_STACK_SPLIT;
@@ -335,8 +295,8 @@ struct Open {
 enum Charge {
     /// Every tile of the box: a group, or a clip whose outline is not a rectangle.
     Whole(TileBox),
-    /// The far column and the far row of the box: `columns + rows - 1` tiles, which is
-    /// what a rectangular clip was measured to charge (§34.2).
+    /// The far column and the far row of the box: `columns + rows - 1` tiles, the count
+    /// a rectangular clip was measured to charge (§34.2, §34.3).
     Edges(TileBox),
 }
 

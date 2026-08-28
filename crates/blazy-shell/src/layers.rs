@@ -1,20 +1,19 @@
 //! Keeping the pixels of an area that did not change.
 //!
-//! `rnd/architecture.md` §7.3 calls this level B and §32.7 gave it a price: the paint
-//! pass rebuilds the layer plan every frame and re-appends every widget's cached scene
-//! into it, so a rasteriser redraws an idle area exactly as often as a working one. On
-//! a screen of eight areas over one graph (§30) that is seven areas' worth of work
-//! thrown away every frame.
+//! The paint pass rebuilds the layer plan every frame and re-appends every widget's
+//! cached scene into it, so a rasteriser redraws an idle area exactly as often as a
+//! working one — seven areas' worth of wasted work on a screen of eight (§30, §32.7).
+//! This is the level B of §7.3: a texture per layer, and a layer that did not change is
+//! copied instead of drawn. What it saves and what it costs is §36.
 //!
-//! The mechanism is a texture per layer, and three things make it simple enough to be
-//! worth having:
+//! Three things make it simple enough to be worth having:
 //!
-//! * Masonry already hands the host a **layer per widget that asked for one** — `VisualLayer` carries the owner's
-//!   [`WidgetId`] and the layer's transform (§26.1);
-//! * a layer that did not change is recognisable without cooperation from the application: its `Scene` compares equal
-//!   to the one kept from last frame;
-//! * putting the kept pixels back needs no shader and no resampling — the frame texture and the cache texture have the
-//!   same format, so it is `copy_texture_to_texture`.
+//! * Masonry hands the host a layer per widget that asked for one, with the owner's [`WidgetId`] and the layer's
+//!   transform (§26.1);
+//! * a layer that did not change is recognisable without help from the application: its `Scene` compares equal to the
+//!   one kept from last frame;
+//! * putting the pixels back needs no shader and no resampling — frame and cache have the same format, so it is
+//!   `copy_texture_to_texture`, pixel for pixel.
 //!
 //! # What a caller has to promise
 //!
@@ -22,14 +21,12 @@
 //! Blender-style areas, which tile the window and paint opaque backgrounds, and it does
 //! not hold for a popup over an area. The host cannot check it — the plan carries no
 //! bounds, only scenes — so it is asked for rather than inferred: a caller registers the
-//! layers it knows to be disjoint through [`GpuFrames::cache_layers`](crate::gpu::GpuFrames::cache_layers).
+//! layers it knows to be disjoint through
+//! [`GpuFrames::cache_layers`](crate::gpu::GpuFrames::cache_layers).
 //!
-//! # What it costs
-//!
-//! Two things, both measured rather than assumed (§36.3): comparing the previous scene
-//! with the current one, and computing the rectangle a dirty layer occupies. Both are
-//! paid only for layers that are actually dirty, which is the case that is already
-//! paying for rasterisation.
+//! The order the decision is made in is load-bearing rather than incidental: comparing
+//! scenes is cheap, working out where a layer sits walks its whole scene, and a layer
+//! that has not changed sits where it sat (§36.3).
 
 use std::collections::HashMap;
 
@@ -214,7 +211,7 @@ fn texture_bytes(texture: &wgpu::Texture) -> u64 {
 /// The pixels a layer's scene covers, in physical coordinates.
 ///
 /// The union of every drawn shape's bounding box, transformed and clipped to the frame
-/// — the same arithmetic [`crate::tiles`] charges tiles with, for the same reason: the
+/// — the same arithmetic the `tiles` module charges tiles with, for the same reason: the
 /// plan carries scenes and no bounds, so a host that wants a rectangle has to work it
 /// out from what is drawn.
 pub fn scene_bounds(scene: &Scene, transform: Affine, frame: PhysicalSize<u32>) -> Option<PixelRect> {
@@ -239,10 +236,9 @@ struct Bounds {
     ///
     /// Tracked rather than ignored, and that took a measurement to justify: a stroke at
     /// the edge of an area inflates its bounding box by half a stroke width, so a box
-    /// that ignores the clip spills over the neighbouring area — and a rectangle copied
-    /// over a neighbour's edge is 149 pixels of the wrong picture (§36.2). The clip is
-    /// where the true edge of an area is, and it is already a whole number of pixels
-    /// because §21 rounds area rectangles.
+    /// that ignores the clip spills over the neighbouring area and the copy lands on the
+    /// wrong pixels (§36.2). The clip is where the true edge of an area is, and it is
+    /// already a whole number of pixels because §21 rounds area rectangles.
     clips: Vec<Rect>,
 }
 

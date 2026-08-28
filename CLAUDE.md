@@ -152,13 +152,15 @@ derived from the widest node rather than assumed to be one cell: a node wider th
 cell would otherwise stop being drawn near the left edge, silently.
 
 **A recorded region has to shrink as well as grow (§28).** The link set and the
-far-field set are chosen for a region — the viewport plus half of it on each side — and
-"has the viewport left the region?" is only half the question: a region chosen at the
-overview zoom contains every viewport that follows, so the set never shrank again and
-the canvas kept drawing all 9857 edges at a zoom whose viewport held 96. `region_covers`
-asks for proportion as well as containment. The general lesson is in §28.4: counters
-that measure *work per frame* cannot see a defect that lives in the *size of what is
-held*, and a sweep that enters a state without leaving it tests half a switch.
+far-field set are chosen for a region — the viewport plus a quarter of it on each side,
+measured down from a half in §35.2 — and "has the viewport left the region?" is only
+half the question: a region chosen at the overview zoom contains every viewport that
+follows, so the set never shrank again and the canvas kept drawing all 9857 edges at a
+zoom whose viewport held 96. `region_covers` asks for proportion as well as containment,
+and the slack it allows is derived from that margin rather than fixed (§35.3). The
+general lesson is in §28.4: counters that measure *work per frame* cannot see a defect
+that lives in the *size of what is held*, and a sweep that enters a state without
+leaving it tests half a switch.
 
 **Sweep endpoints are part of a criterion, at both ends.** The node sweep stopped at
 16 000 and the "frame cost does not follow graph size" criterion passed for months while
@@ -261,6 +263,35 @@ widget that wants to stay a host hole has to keep painting; `ExternalContent` do
 through an animation frame, and a criterion counts frames in which the hole went
 missing.
 
+**The rasteriser has fixed buffers and overflows them in silence (§33, §34).** vello
+sizes six bump-allocated buffers with constants that do not depend on the scene, and a
+scene that needs more is dropped with `Ok` and no diagnostic — the window keeps the frame
+before it. Two of the six are modelled in `blazy-shell`, and the arithmetic is checked
+against vello itself rather than reasoned about: tiles are per path, blend scratch is per
+*tile*, and what nests over a tile is not what nests in the scene — a group charges every
+tile of its box, a rectangular clip only the tiles along its outline. Four levels of
+nesting are free; the fifth costs a HiDPI frame. The guard answers from the command
+stream and reaches the geometry only for a scene that could plausibly be over, which is
+why it costs 0.000 ms on a real frame.
+
+**A far-field frame is charged in path segments, and they are not equal (§32, §35).**
+Rasterisation does not follow the number of draw commands at all — the batch of §31
+made the plan eighty times cheaper and left the pixels alone. It follows segments: a
+node is four of them (eight if its corners are rounded, which is why they are not below
+half a pixel), a stroked link is two — and a stroked segment costs seven times a filled
+one. So an overview frame *is* its links, and the levers that matter are the ones that
+draw fewer curves, not simpler ones: a straight line costs exactly what a cubic costs.
+
+**An idle area can keep its pixels (§36).** An area that declares
+`PaintLayerMode::IsolatedScene` becomes its own layer in the plan, and `GpuFrames` keeps
+a texture per layer: a layer whose `Scene` and transform are the ones from last frame is
+copied rather than drawn. Eight areas over one graph cost a third of a frame that way.
+Two things are load-bearing. The layer lives one paint, exactly like a hole, so the host
+asks the layer owners to repaint on frames that are happening anyway
+(`ShellDriver::layers`) rather than through an animation frame, which would stop the
+window from ever idling. And a cached layer **owns its rectangle** — nothing else may
+draw into it — which the host cannot check and therefore asks for.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget
@@ -311,8 +342,14 @@ both are already argued in §15.1 and §18:
   Several of them record a measurement that contradicted an assumption; do not delete
   those when refactoring the code around them.
 - `rnd/architecture.md` is the document of record, and §16 is the plan the work
-  follows. Finishing a phase means adding a numbered section with the numbers, what was
-  disproved, and what it changes in §16 — not just landing the code.
+  follows — kept current in place, not reconstructed from the "what this changes in §16"
+  notes. §19 maps the result sections. Finishing a phase means adding a numbered section
+  with the numbers, what was disproved, and what it changes in §16 — not just landing the
+  code.
+- **A measured number lives in one place.** The argument, the sweep and the figures go
+  into `rnd/architecture.md`; a module doc says what the module does, what a caller has
+  to promise, and which way its approximations err, then points at the section. Two
+  copies of a number drift, and the copy in the code is the one nobody re-measures.
 - `issues/` holds tasks. When one is finished, append the outcome to the file **in
   place** — moving it into `issues/done/` is the user's call, not yours.
 - Do not commit unless asked.
