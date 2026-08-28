@@ -283,7 +283,7 @@ fn tiles_of(frame: Rect, transform: Affine, bounds: Rect) -> TileBox {
     TileBox::of(transform.transform_rect_bbox(bounds).intersect(frame))
 }
 
-fn shape_bounds(shape: &GeometryRef<'_>) -> Rect {
+pub(crate) fn shape_bounds(shape: &GeometryRef<'_>) -> Rect {
     match shape {
         GeometryRef::Rect(rect) => rect.bounding_box(),
         GeometryRef::RoundedRect(rect) => rect.bounding_box(),

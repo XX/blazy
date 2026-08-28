@@ -29,6 +29,52 @@ struct Counting {
     external: bool,
 }
 
+/// A widget that declares itself an isolated scene layer whenever it paints.
+struct Layered {
+    /// Paints performed, so a test can tell "did not paint" from "painted inline".
+    paints: Rc<Cell<u64>>,
+}
+
+impl Widget for Layered {
+    type Action = NoAction;
+
+    fn measure(
+        &mut self,
+        _ctx: &mut MeasureCtx<'_>,
+        _props: &PropertiesRef<'_>,
+        _axis: Axis,
+        len_req: LenReq,
+        _cross: Option<Length>,
+    ) -> Length {
+        match len_req {
+            LenReq::MinContent | LenReq::MaxContent => Length::px(50.0),
+            LenReq::FitContent(space) => space,
+        }
+    }
+
+    fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
+
+    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        self.paints.set(self.paints.get() + 1);
+        ctx.set_paint_layer_mode(PaintLayerMode::IsolatedScene);
+        painter
+            .fill(ctx.content_box(), Color::from_rgb8(0x20, 0x40, 0x60))
+            .draw();
+    }
+
+    fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
+
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::new()
+    }
+
+    fn accessibility_role(&self) -> Role {
+        Role::GenericContainer
+    }
+
+    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+}
+
 impl Widget for Counting {
     type Action = NoAction;
 
@@ -369,4 +415,30 @@ fn the_gpu_texture_follows_the_device_scale() {
     frames.draw(&plan, Size::new(200.0, 120.0), 2.0).expect("the GPU draws");
     assert_eq!(frames.size(), PhysicalSize::new(400, 240));
     assert_eq!(frames.texture().width(), 400, "the texture was reallocated");
+}
+
+/// The trap of §26.1, on the mode per-area caching is built out of (§36.1).
+///
+/// `PaintLayerMode::IsolatedScene` lives exactly one paint, like `External` — the paint
+/// pass sets every widget's mode back to `Inline` before deciding whether to paint it at
+/// all, and a clean widget is not painted. So the layer a cache would key on **vanishes
+/// on the first frame in which its owner has nothing to redraw**, which is precisely the
+/// frame the cache exists for. Measured here rather than argued: one layer on the frame
+/// it painted in, none on the next.
+#[test]
+fn an_isolated_layer_lasts_one_paint() {
+    let paints = Rc::new(Cell::new(0));
+    let mut harness = harness(Layered { paints: paints.clone() });
+
+    harness.edit_root_widget(|mut root| root.ctx.request_paint_only());
+    let (plan, _) = harness.redraw();
+    let painted = plan.layers.len();
+
+    let before = paints.get();
+    let (plan, _) = harness.redraw();
+    let clean = plan.layers.len();
+
+    assert_eq!(painted, 1, "the frame it painted in has its layer");
+    assert_eq!(clean, 1, "a plan always has at least the root layer");
+    assert_eq!(paints.get(), before, "the clean frame did not paint it");
 }

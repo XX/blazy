@@ -64,6 +64,7 @@ pub fn build_screen_staggered(
     nodes: usize,
     budget_widgets: Option<usize>,
     forced: Option<f64>,
+    isolated: bool,
 ) -> (AreaScreen, SharedGraph) {
     let graph = share(GraphModel::generated(nodes));
     let budget = window_budget(budget_widgets, areas);
@@ -71,7 +72,8 @@ pub fn build_screen_staggered(
         let scale = forced.unwrap_or(STAGGERED_SCALES[area % STAGGERED_SCALES.len()]);
         let content =
             AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), area_canvas(&graph, nodes, budget))
-                .with_ui_scale(0, scale);
+                .with_ui_scale(0, scale)
+                .with_isolated_layer(isolated);
         NewWidget::new(content).erased()
     });
     (screen, graph)
@@ -109,15 +111,32 @@ pub fn build_screen_with(
     budget_widgets: Option<usize>,
     with_header: bool,
 ) -> (AreaScreen, SharedGraph) {
+    build_screen_layered(areas, nodes, budget_widgets, with_header, false)
+}
+
+/// As [`build_screen_with`], with every area optionally asking to be its own scene
+/// layer (§36).
+///
+/// A flag rather than the default because the layer is only worth its price to a host
+/// that caches layers, and the price — a repaint request per area per frame — is paid
+/// whether or not anyone caches.
+pub fn build_screen_layered(
+    areas: usize,
+    nodes: usize,
+    budget_widgets: Option<usize>,
+    with_header: bool,
+    isolated: bool,
+) -> (AreaScreen, SharedGraph) {
     let graph = share(GraphModel::generated(nodes));
     let budget = window_budget(budget_widgets, areas);
     let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
         let canvas = area_canvas(&graph, nodes, budget);
-        if with_header {
-            NewWidget::new(AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)).erased()
+        let content = if with_header {
+            AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)
         } else {
-            NewWidget::new(AreaContent::new(vec![(blazy_areas::RegionKind::Main, 0.0, canvas)])).erased()
-        }
+            AreaContent::new(vec![(blazy_areas::RegionKind::Main, 0.0, canvas)])
+        };
+        NewWidget::new(content.with_isolated_layer(isolated)).erased()
     });
     (screen, graph)
 }

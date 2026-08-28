@@ -422,3 +422,197 @@ fn a_real_frame_is_far_from_both_ceilings() {
         blazy_shell::TILE_BUDGET
     );
 }
+
+// --- MARK: layers per area (§36)
+
+/// What a screen of areas looks like to a host that wants to cache them.
+///
+/// Two numbers the design rests on, measured rather than assumed: how many layers the
+/// plan carries when every area declares one, and what happens on the frame after —
+/// the frame a cache exists for. `AreaScreen::keep_layers` is what keeps the second
+/// number equal to the first (§26.1).
+#[test]
+fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
+    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(1400, 900),
+    );
+    let (plan, _) = harness.redraw();
+    let first = plan.layers.len();
+
+    // A frame in which nothing at all happened.
+    let (plan, _) = harness.redraw();
+    let idle = plan.layers.len();
+
+    // The same frame, with the areas asked to repaint first.
+    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    let (plan, _) = harness.redraw();
+    let kept = plan.layers.len();
+
+    println!("layers: first frame {first}, idle frame {idle}, idle frame kept {kept}");
+    // The harness has already painted once by the time it hands the tree over, so the
+    // frame this test asks for is already a clean one: one layer, every area's content
+    // merged back into it.
+    assert_eq!(first, 1, "a clean frame carries no area layers");
+    assert_eq!(idle, 1, "and neither does the next one");
+    assert_eq!(kept, 9, "asking the areas to repaint gives eight layers plus the root");
+}
+
+/// The picture a kept layer produces is the picture drawing it would have produced.
+///
+/// The claim the whole mechanism stands on, checked pixel for pixel rather than by
+/// reasoning about copies: the same screen is drawn twice, once from scratch and once
+/// with every area's pixels kept from the frame before, and the two frames have to be
+/// identical. Skipped where there is no graphics device, like every GPU claim here
+/// (§27.5).
+#[test]
+fn a_kept_layer_is_the_same_picture() {
+    let size = PhysicalSize::new(1400, 900);
+    // With a background on both, because that is what a window presents (§26.4) and
+    // because a transparent pixel's colour channels are not part of the picture: without
+    // it the two paths differ in the RGB of fully transparent pixels, which is nothing.
+    let panel = Color::from_rgb8(0x14, 0x14, 0x18);
+    let Ok(plain) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
+        eprintln!("no graphics device: skipping");
+        return;
+    };
+    let mut plain = plain.with_background(panel);
+    let mut cached = blazy_shell::gpu::GpuFrames::offscreen(size)
+        .expect("a second device opens")
+        .with_background(panel);
+
+    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
+    let ids = harness.root_widget().area_ids();
+    cached.cache_layers(ids);
+
+    let logical = Size::new(f64::from(size.width), f64::from(size.height));
+    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    let (plan, _) = harness.redraw();
+
+    // The *same* plan through both paths, and twice through the caching one: the
+    // second time is the frame the cache answers from. One plan rather than one frame
+    // each, because two consecutive frames of a live tree are not obliged to be the
+    // same picture, and this test is about the cache and not about the tree.
+    plain.draw(&plan, logical, 1.0).expect("the frame draws");
+    plain.wait();
+    let reference = plain.read_pixels();
+    // The rasteriser is deterministic here — the same plan twice is the same bytes —
+    // so any difference below belongs to the cache and not to the GPU.
+    plain.draw(&plan, logical, 1.0).expect("the frame draws");
+    plain.wait();
+    let twice = plain.read_pixels();
+    assert_eq!(
+        reference.iter().zip(twice.iter()).filter(|(a, b)| a != b).count(),
+        0,
+        "the rasteriser is not deterministic, so this test cannot say anything"
+    );
+
+    cached.draw(&plan, logical, 1.0).expect("the frame draws");
+    cached.wait();
+    cached.draw(&plan, logical, 1.0).expect("the frame draws");
+    cached.wait();
+    let kept = cached.read_pixels();
+
+    let counters = cached.layer_counters();
+    println!(
+        "layer cache: offered {}, reused {}, drawn {}, {} KiB",
+        counters.offered,
+        counters.reused,
+        counters.drawn,
+        counters.bytes / 1024
+    );
+    assert_eq!(counters.reused, 8, "the second frame should have kept all eight areas");
+
+    let differing = reference.iter().zip(kept.iter()).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        differing, 0,
+        "a kept frame differs from a drawn one in {differing} bytes"
+    );
+}
+
+/// And the other direction of the same switch (§28.4): a layer that *did* change is
+/// drawn again.
+///
+/// Without this the picture test above passes on a cache that never invalidates
+/// anything — checked by breaking it that way, which is how this test came to exist.
+#[test]
+fn a_changed_layer_is_drawn_again() {
+    let size = PhysicalSize::new(1400, 900);
+    let panel = Color::from_rgb8(0x14, 0x14, 0x18);
+    let Ok(plain) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
+        eprintln!("no graphics device: skipping");
+        return;
+    };
+    let mut plain = plain.with_background(panel);
+    let mut cached = blazy_shell::gpu::GpuFrames::offscreen(size)
+        .expect("a second device opens")
+        .with_background(panel);
+
+    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
+    cached.cache_layers(harness.root_widget().area_ids());
+    let logical = Size::new(f64::from(size.width), f64::from(size.height));
+
+    // A frame to fill the cache.
+    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    let (plan, _) = harness.redraw();
+    cached.draw(&plan, logical, 1.0).expect("the frame draws");
+    cached.wait();
+
+    // Now move one area's canvas, so exactly one layer is different.
+    let canvas = canvas_id(&harness, 0);
+    harness.edit_widget_with_id(canvas, |mut widget| {
+        let mut canvas = widget.downcast::<CanvasLayer>();
+        CanvasLayer::pan(&mut canvas, Vec2::new(-40.0, -25.0));
+    });
+    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    let (plan, _) = harness.redraw();
+
+    plain.draw(&plan, logical, 1.0).expect("the frame draws");
+    plain.wait();
+    let reference = plain.read_pixels();
+    // The rasteriser is deterministic here — the same plan twice is the same bytes —
+    // so any difference below belongs to the cache and not to the GPU.
+    plain.draw(&plan, logical, 1.0).expect("the frame draws");
+    plain.wait();
+    let twice = plain.read_pixels();
+    assert_eq!(
+        reference.iter().zip(twice.iter()).filter(|(a, b)| a != b).count(),
+        0,
+        "the rasteriser is not deterministic, so this test cannot say anything"
+    );
+
+    cached.draw(&plan, logical, 1.0).expect("the frame draws");
+    cached.wait();
+    let kept = cached.read_pixels();
+
+    let counters = cached.layer_counters();
+    println!(
+        "after a pan in one area: reused {}, drawn {}",
+        counters.reused, counters.drawn
+    );
+    let mut worst = 0_u8;
+    let mut differing = 0;
+    for (a, b) in reference.iter().zip(kept.iter()) {
+        if a != b {
+            differing += 1;
+            worst = worst.max(a.abs_diff(*b));
+        }
+    }
+    println!("a redrawn area next to kept ones: {differing} bytes differ, worst by {worst}");
+
+    // The moved area is really redrawn — a cache that never invalidated would differ by
+    // hundreds of thousands of bytes here, which is how this test was checked.
+    assert!(
+        differing < 8,
+        "the moved area was not redrawn: {differing} bytes differ"
+    );
+    // What is left is the seam: a pixel on the boundary between two areas is drawn by
+    // both of them in a single-pass frame and copied from one of them here, so one
+    // channel can land a level apart. Measured at one byte of five million on this
+    // screen, and pinned rather than waved away.
+    assert!(worst <= 1, "a kept frame differs by {worst} levels, not by rounding");
+}

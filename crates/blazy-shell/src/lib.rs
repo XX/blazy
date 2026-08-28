@@ -31,6 +31,8 @@ mod external;
 #[cfg(feature = "vello")]
 pub mod gpu;
 mod host;
+#[cfg(feature = "vello")]
+mod layers;
 mod present;
 #[cfg(feature = "vello")]
 mod tiles;
@@ -47,6 +49,8 @@ pub use crate::compose::{Composition, Hole};
 pub use crate::encode::{Encoded, encoded, segments};
 pub use crate::external::ExternalContent;
 pub use crate::host::{Frame, Host, HostCounters, HostError};
+#[cfg(feature = "vello")]
+pub use crate::layers::{LayerCounters, PixelRect, scene_bounds};
 pub use crate::present::{PresentCounters, PresentError, Presenter};
 #[cfg(feature = "vello")]
 pub use crate::tiles::{

@@ -388,6 +388,164 @@ fn overview_screen(opts: &Options, areas: usize, nodes: usize) -> (usize, usize,
     (widgets, report.commands, report.mean_ms(), report.worst_ms())
 }
 
+// --- MARK: the layer cache (§36)
+
+/// Frames each cache scenario is timed over. Few: each one is a whole GPU frame.
+const CACHE_FRAMES: usize = 8;
+
+/// What one gesture costs a screen of areas, with and without kept layers.
+struct CacheRow {
+    what: &'static str,
+    cached: bool,
+    /// Layers the plan carried on the last frame.
+    layers: usize,
+    /// Per frame: layers copied instead of drawn, and layers drawn.
+    reused: f64,
+    drawn: f64,
+    /// What deciding costs: the rectangle of each layer plus a scene comparison.
+    decide_ms: f64,
+    /// The frame on the GPU path.
+    gpu_ms: f64,
+    /// Texture the cache is holding, in KiB.
+    kib: u64,
+}
+
+/// A screen whose areas declare scene layers, at a zoom where the frame is expensive.
+fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+    let (screen, _graph) = area_screen::build_screen_layered(areas, nodes, None, true, true);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+    );
+    let _ = harness.redraw();
+    // Every canvas out at an overview zoom: the far field is what makes a frame cost
+    // tens of milliseconds (§35.5), and therefore what a kept layer saves.
+    for area in 0..areas {
+        zoom_area(&mut harness, area, 0.05);
+    }
+    let _ = harness.redraw();
+    harness
+}
+
+/// One gesture, on one path.
+fn cache_case(
+    what: &'static str,
+    areas: usize,
+    nodes: usize,
+    cached: bool,
+    mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
+) -> Option<CacheRow> {
+    let mut gpu = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
+        .ok()?
+        .with_background(masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
+    let mut harness = layered_harness(areas, nodes);
+    if cached {
+        gpu.cache_layers(harness.root_widget().area_ids());
+    }
+    let logical = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+
+    // One frame to fill the cache, so the sweep measures the steady state rather than
+    // the first frame of it.
+    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    let (plan, _) = harness.redraw();
+    gpu.draw(&plan, logical, 1.0).ok()?;
+    gpu.wait();
+
+    let before = gpu.layer_counters();
+    let mut total = Duration::ZERO;
+    let mut layers = 0;
+    let mut decide = Duration::ZERO;
+    let mut previous: Vec<masonry::imaging::record::Scene> = Vec::new();
+    for i in 0..CACHE_FRAMES {
+        step(&mut harness, i);
+        harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+        let (plan, _) = harness.redraw();
+        layers = plan.layers.len();
+
+        // The cache's own decision, timed on its own rather than inferred from the
+        // difference between two paths: the rectangle a layer occupies, and whether its
+        // scene is the one from last frame.
+        let start = Instant::now();
+        previous.resize_with(plan.layers.len(), masonry::imaging::record::Scene::new);
+        for (index, layer) in plan.layers.iter().enumerate() {
+            let masonry::app::VisualLayerKind::Scene(scene) = &layer.kind else {
+                continue;
+            };
+            // What the cache does and in the order it does it: compare first, and only
+            // work out where a changed layer sits — the walk is the expensive half.
+            if previous[index] != *scene {
+                let _ = blazy_shell::scene_bounds(scene, layer.transform, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1));
+                previous[index].clone_from(scene);
+            }
+        }
+        decide += start.elapsed();
+
+        let start = Instant::now();
+        gpu.draw(&plan, logical, 1.0).ok()?;
+        gpu.wait();
+        total += start.elapsed();
+    }
+
+    let counters = gpu.layer_counters();
+    let frames = CACHE_FRAMES as f64;
+    Some(CacheRow {
+        what,
+        cached,
+        layers,
+        reused: (counters.reused - before.reused) as f64 / frames,
+        drawn: (counters.drawn - before.drawn) as f64 / frames,
+        decide_ms: decide.as_secs_f64() * 1000.0 / frames,
+        gpu_ms: total.as_secs_f64() * 1000.0 / frames,
+        kib: counters.bytes / 1024,
+    })
+}
+
+/// What keeping the pixels of idle areas is worth, and what it costs.
+fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<CacheRow> {
+    let mut rows = Vec::new();
+    println!("\nlayer cache: {areas} areas over one graph, canvases at an overview zoom");
+    for cached in [false, true] {
+        rows.extend(cache_case("nothing changes", areas, nodes, cached, |_, _| {}));
+        rows.extend(cache_case("one area pans", areas, nodes, cached, |h, _| {
+            pan_area(h, 0, PAN_STEP);
+        }));
+        // In the quick set too: it is the row that keeps the two criteria above from
+        // passing on a sweep where nothing ever changes (§20.9).
+        rows.extend(cache_case("every area pans", areas, nodes, cached, move |h, _| {
+            for area in 0..areas {
+                pan_area(h, area, PAN_STEP);
+            }
+        }));
+    }
+    print_cache(&rows);
+    rows
+}
+
+fn print_cache(rows: &[CacheRow]) {
+    if rows.is_empty() {
+        println!("  no graphics device: the layer cache is not measured here");
+        return;
+    }
+    println!(
+        "  {:<18} {:>7} {:>7} {:>8} {:>8} {:>10} {:>9} {:>8}",
+        "gesture", "cache", "layers", "reused/f", "drawn/f", "decide ms", "gpu ms", "KiB"
+    );
+    for row in rows {
+        println!(
+            "  {:<18} {:>7} {:>7} {:>8.2} {:>8.2} {:>10.3} {:>9.2} {:>8}",
+            row.what,
+            if row.cached { "on" } else { "off" },
+            row.layers,
+            row.reused,
+            row.drawn,
+            row.decide_ms,
+            row.gpu_ms,
+            row.kib,
+        );
+    }
+}
+
 /// Runs the scenarios, prints the numbers, and returns the evaluated criteria.
 pub fn run(opts: &Options) -> Outcome {
     let areas = opts.areas.max(1);
@@ -526,20 +684,22 @@ pub fn run(opts: &Options) -> Outcome {
     let sweep = area_sweep(opts, nodes);
     let regions = region_cost(opts, areas, nodes);
     let (overview_widgets, overview_commands, ..) = overview_screen(opts, areas, nodes);
+    let cache = cache_table(opts, areas, nodes);
 
     let outcome = Outcome {
         nodes: areas,
         viewport: VIEWPORT,
         quick: opts.quick,
-        criteria: evaluate(
-            &reports,
-            &sweep,
+        criteria: evaluate(&Measured {
+            reports: &reports,
+            sweep: &sweep,
             scale_misses,
             regions,
             overview_widgets,
             overview_commands,
             areas,
-        ),
+            cache: &cache,
+        }),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
         zoom_sweep: Vec::new(),
@@ -613,15 +773,37 @@ fn region_cost(opts: &Options, areas: usize, nodes: usize) -> (f64, f64) {
 }
 
 /// The Phase 0.5 and 0.6 criteria, evaluated against the numbers just measured.
-fn evaluate(
-    reports: &[Report],
-    sweep: &[SweepRecord],
+/// Everything the criteria are decided from.
+///
+/// A struct rather than eight arguments, for the reason the host benchmark has one
+/// (§26.4): a criterion list that grows an argument per measurement stops being
+/// readable long before the compiler complains.
+struct Measured<'a> {
+    reports: &'a [Report],
+    sweep: &'a [SweepRecord],
+    /// `ui_scale` changes a region's layout never saw.
     scale_misses: u64,
+    /// Idle milliseconds with one region per area and with two.
     regions: (f64, f64),
+    /// Widgets and draw commands in the window at an overview zoom.
     overview_widgets: usize,
     overview_commands: usize,
     areas: usize,
-) -> Vec<Criterion> {
+    /// What the layer cache did, row by row (§36).
+    cache: &'a [CacheRow],
+}
+
+fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
+    let Measured {
+        reports,
+        sweep,
+        scale_misses,
+        regions,
+        overview_widgets,
+        overview_commands,
+        areas,
+        cache,
+    } = *measured;
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
 
@@ -787,6 +969,60 @@ fn evaluate(
         bound: 64.0 * areas as f64,
         unit: "draw commands in the window",
     });
+
+    // --- §36: keeping the pixels of areas that did not change.
+    //
+    // Counted in layers rather than in milliseconds, for the usual reason (§20.9): a
+    // layer either was rasterised or was not, on any machine. Absent where there is no
+    // graphics device, like every GPU claim here (§27.5).
+    let cached_row = |what: &str| cache.iter().find(|row| row.cached && row.what == what);
+    if let Some(idle) = cached_row("nothing changes") {
+        criteria.push(Criterion {
+            name: "an_idle_screen_rasterises_no_area",
+            claim: "a frame in which nothing changed draws no area",
+            kind: Kind::Counter,
+            measured: idle.drawn,
+            bound: 0.5,
+            unit: "areas drawn/frame",
+        });
+    }
+    if let Some(one) = cached_row("one area pans") {
+        // The claim §7.3 wrote down and §36 measured: dragging in one editor leaves the
+        // other seven alone. Two rather than one as the bound, because the number that
+        // matters is "not eight".
+        criteria.push(Criterion {
+            name: "a_working_area_does_not_redraw_its_neighbours",
+            claim: "panning one area of eight draws one area",
+            kind: Kind::Counter,
+            measured: one.drawn,
+            bound: 2.0,
+            unit: "areas drawn/frame",
+        });
+
+        // And nothing falls between the two stools: every area is either kept or drawn.
+        criteria.push(Criterion {
+            name: "every_area_is_accounted_for",
+            claim: "each area is either kept or drawn, every frame",
+            kind: Kind::Counter,
+            measured: (areas as f64 - (one.reused + one.drawn)).abs(),
+            bound: 0.5,
+            unit: "areas unaccounted for",
+        });
+    }
+    if !cache.is_empty() {
+        // Both criteria above pass on a sweep where nothing ever changes, so the sweep
+        // has to contain a frame in which everything does. Counted from the failing
+        // side, as always.
+        let redrew_everything = cache.iter().any(|row| row.cached && row.drawn >= areas as f64 - 0.5);
+        criteria.push(Criterion {
+            name: "the_layer_cache_is_exercised",
+            claim: "the sweep contains a frame in which every area is drawn",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!redrew_everything)),
+            bound: 1.0,
+            unit: "sweeps that never redraw",
+        });
+    }
 
     criteria
 }

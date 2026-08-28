@@ -176,6 +176,24 @@ impl AreaScreen {
         self.pods.iter().map(|pod| pod.id()).collect()
     }
 
+    /// Asks every area to repaint, so that the ones declaring a scene layer keep it.
+    ///
+    /// The price of §26.1, paid once per frame: `PaintLayerMode` is reset for every
+    /// widget at the start of every paint pass, and a widget with nothing to redraw is
+    /// not painted at all — so an idle area stops being a layer, and a host caching
+    /// layers loses exactly the area worth caching (measured in §36.1).
+    ///
+    /// What this costs is one no-op paint per area per frame: [`AreaContent::paint`]
+    /// draws nothing, and its regions keep their own cached scenes, which the paint pass
+    /// re-appends either way. What it does **not** do is ask for a frame — it is meant to
+    /// be called on frames that are happening anyway, so an idle window stays idle.
+    pub fn keep_layers(this: &mut WidgetMut<'_, Self>) {
+        for index in 0..this.widget.pods.len() {
+            let mut area = this.ctx.get_mut(&mut this.widget.pods[index]);
+            area.ctx.request_paint_only();
+        }
+    }
+
     /// Moves a splitter so that it sits under `pos`, in screen coordinates.
     ///
     /// The scripted form of a drag: what [`Widget::on_pointer_event`] does with a

@@ -16,10 +16,12 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use area_screen::{DEFAULT_AREAS, build_screen_staggered};
-use blazy_shell::window::{WindowConfig, run};
+use blazy_areas::AreaScreen;
+use blazy_shell::window::{ShellDriver, WindowConfig, run};
 use blazy_shell::{Backend, COMPILED};
 use clap::Parser;
-use masonry::core::NewWidget;
+use masonry::app::RenderRoot;
+use masonry::core::{NewWidget, WidgetId};
 use masonry::theme::default_property_set;
 use node_canvas::DEFAULT_NODES;
 
@@ -51,6 +53,34 @@ struct Args {
     /// Which rasteriser to draw with (§26.2).
     #[arg(long, value_name = "NAME")]
     backend: Option<String>,
+
+    /// Draw every frame from scratch instead of keeping idle areas' pixels (§36).
+    ///
+    /// The cache is on by default because it is what makes eight areas over one graph
+    /// affordable: an area nobody is touching costs a texture copy instead of a
+    /// rasterisation. Turning it off is how the difference is seen by eye.
+    #[arg(long)]
+    no_layer_cache: bool,
+}
+
+/// Tells the shell which subtrees are layers: every area (§36).
+///
+/// Two things at once, and deliberately so — the shell asks these widgets to repaint,
+/// without which their layers vanish (§26.1), and tells the presenter it may keep their
+/// pixels. Asking the tree every frame rather than remembering ids is what keeps this
+/// correct across a split or a join.
+struct Areas {
+    enabled: bool,
+}
+
+impl ShellDriver for Areas {
+    fn layers(&mut self, root: &mut RenderRoot) -> Vec<WidgetId> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        // The base layer is the window's own root, which is the screen.
+        root.edit_base_layer(|mut widget| widget.downcast::<AreaScreen>().widget.area_ids())
+    }
 }
 
 fn main() {
@@ -62,7 +92,14 @@ fn main() {
         })
     });
 
-    let (screen, _graph) = build_screen_staggered(args.areas.max(1), args.nodes, args.budget_widgets, args.ui_scale);
+    let layers = !args.no_layer_cache;
+    let (screen, _graph) = build_screen_staggered(
+        args.areas.max(1),
+        args.nodes,
+        args.budget_widgets,
+        args.ui_scale,
+        layers,
+    );
 
     let config = WindowConfig::default()
         .with_title(format!(
@@ -73,6 +110,9 @@ fn main() {
         .with_backend(backend);
 
     // Controls inside nodes submit actions; this experiment is about areas and has
-    // nothing to do with them.
-    run(config, NewWidget::new(screen).erased(), default_property_set(), ()).unwrap();
+    // nothing to do with them. What the driver is here for is layers (§36).
+    run(config, NewWidget::new(screen).erased(), default_property_set(), Areas {
+        enabled: layers,
+    })
+    .unwrap();
 }

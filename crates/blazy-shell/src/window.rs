@@ -126,6 +126,22 @@ pub trait ShellDriver {
     fn on_action(&mut self, action: ErasedAction, from: WidgetId) {
         let _ = (action, from);
     }
+
+    /// The subtrees that are layers of their own, asked for once per frame (§36).
+    ///
+    /// Returning ids does two things, and both are needed for either to be worth
+    /// anything: the shell asks each of those widgets to repaint, without which its
+    /// layer disappears on the first frame it is idle (§26.1), and it tells the
+    /// presenter it may keep their pixels. For a screen of areas this is
+    /// `AreaScreen::area_ids()`.
+    ///
+    /// Only ever called on frames that are happening anyway, so an application that
+    /// declares layers does not stop the window from going idle. The default declares
+    /// none, and then nothing above happens at all.
+    fn layers(&mut self, root: &mut RenderRoot) -> Vec<WidgetId> {
+        let _ = root;
+        Vec::new()
+    }
 }
 
 impl ShellDriver for () {}
@@ -383,6 +399,18 @@ impl ShellApp {
             let interval = now.duration_since(self.last_anim);
             self.last_anim = now;
             root.handle_window_event(WindowEvent::AnimFrame(interval));
+        }
+
+        // Layers, before the plan is built: a widget that wants to be one has to be
+        // painting when the paint pass reaches it (§26.1), and the presenter has to
+        // know which pixels it may keep (§36). Both from one answer, so an application
+        // cannot ask for half of the arrangement.
+        let layers = self.driver.layers(root);
+        if !layers.is_empty() {
+            for id in &layers {
+                root.edit_widget(*id, |mut widget| widget.ctx.request_paint_only());
+            }
+            presenter.cache_layers(layers);
         }
 
         let (plan, _tree_update) = root.redraw();

@@ -18,12 +18,15 @@
 use imaging_wgpu::{TextureRenderer, TextureViewTarget};
 use masonry::app::VisualLayerPlan;
 use masonry::dpi::PhysicalSize;
-use masonry::kurbo::Size;
+use masonry::imaging::Painter;
+use masonry::imaging::record::{Scene, replay_transformed};
+use masonry::kurbo::{Affine, Rect, Size};
 use masonry::peniko::Color;
 use wgpu::CurrentSurfaceTexture;
 
 use crate::backend::{Backend, BackendError};
 use crate::compose::{Composition, Hole};
+use crate::layers::{LayerCache, LayerCounters, PixelRect, scene_bounds};
 use crate::present::{PresentCounters, PresentError};
 
 /// What the intermediate frame texture has to allow.
@@ -31,12 +34,14 @@ use crate::present::{PresentCounters, PresentError};
 /// `STORAGE_BINDING` is the one that is not guessable: vello renders through a compute
 /// shader and writes the texture as storage, so without it the first frame fails
 /// validation rather than looking wrong. `TEXTURE_BINDING` is what the blitter reads
-/// it with, `RENDER_ATTACHMENT` is what a raster-based backend would need, and
-/// `COPY_SRC` is what makes the texture readable for a test or a screenshot.
+/// it with, `RENDER_ATTACHMENT` is what a raster-based backend would need, `COPY_SRC`
+/// is what makes the texture readable for a test or a screenshot, and `COPY_DST` is
+/// what lets a kept layer be copied back into the frame (§36.2).
 const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
     .union(wgpu::TextureUsages::TEXTURE_BINDING)
     .union(wgpu::TextureUsages::RENDER_ATTACHMENT)
-    .union(wgpu::TextureUsages::COPY_SRC);
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::COPY_DST);
 
 /// The format `imaging_vello` renders into. Checked against the renderer at startup.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -55,6 +60,7 @@ pub struct GpuFrames {
     background: Option<Color>,
     holes: Vec<Hole>,
     counters: PresentCounters,
+    cache: LayerCache,
 }
 
 impl GpuFrames {
@@ -96,7 +102,26 @@ impl GpuFrames {
             background: None,
             holes: Vec::new(),
             counters: PresentCounters::default(),
+            cache: LayerCache::new(),
         })
+    }
+
+    /// Registers the layers whose pixels may be kept between frames (§36).
+    ///
+    /// Empty — the default — draws every frame from scratch. A registered layer must
+    /// **own its rectangle**: nothing else may draw into it, which is true of areas
+    /// tiling a window and false of anything overlapping. The host cannot check that,
+    /// so it is asked for; see [`crate::layers`].
+    ///
+    /// The ids are the widgets that declared the layers, which for a screen of areas is
+    /// `AreaScreen::area_ids()`.
+    pub fn cache_layers(&mut self, ids: Vec<masonry::core::WidgetId>) {
+        self.cache.set_wanted(ids);
+    }
+
+    /// What the layer cache has been doing.
+    pub fn layer_counters(&self) -> LayerCounters {
+        self.cache.counters()
     }
 
     pub fn with_background(mut self, color: Color) -> Self {
@@ -193,6 +218,10 @@ impl GpuFrames {
     ) -> Result<(), PresentError> {
         self.resize(frame);
 
+        if self.cache.is_active() {
+            return self.draw_layered(plan, device_scale, checked);
+        }
+
         let composition = Composition::new(plan, device_scale);
         let composition = match self.background {
             Some(color) => composition.on_background(color, self.size.width, self.size.height),
@@ -223,6 +252,110 @@ impl GpuFrames {
                 TextureViewTarget::new(&self.view, self.size.width, self.size.height),
             )
             .map_err(|error| PresentError::Platform(format!("vello into texture: {error}")))
+    }
+
+    /// The same frame, with the layers that did not change copied instead of drawn.
+    ///
+    /// The order matters and is the whole trick: vello clears the target and draws only
+    /// what changed, and the kept rectangles are copied in **after** it, over the
+    /// background it just painted. Nothing is resampled — source and target have the
+    /// same format and the copy is pixel for pixel, so §23's sharpness claim is
+    /// untouched by construction rather than by measurement.
+    fn draw_layered(&mut self, plan: &VisualLayerPlan, device_scale: f64, checked: bool) -> Result<(), PresentError> {
+        let to_physical = Affine::scale(device_scale);
+        let mut scene = Scene::new();
+        if let Some(color) = self.background {
+            Painter::new(&mut scene)
+                .fill(
+                    Rect::new(0.0, 0.0, f64::from(self.size.width), f64::from(self.size.height)),
+                    color,
+                )
+                .draw();
+        }
+
+        self.holes.clear();
+        let mut reuse: Vec<(masonry::core::WidgetId, PixelRect)> = Vec::new();
+        let mut store: Vec<(usize, masonry::core::WidgetId, Affine, PixelRect)> = Vec::new();
+        let mut offered = 0;
+
+        for (index, layer) in plan.layers.iter().enumerate() {
+            let transform = to_physical * layer.transform;
+            match &layer.kind {
+                masonry::app::VisualLayerKind::External { bounds } => {
+                    self.holes.push(Hole {
+                        widget_id: layer.widget_id,
+                        rect: transform.transform_rect_bbox(*bounds),
+                    });
+                },
+                masonry::app::VisualLayerKind::Scene(layer_scene) => {
+                    if !self.cache.wants(layer.widget_id) {
+                        replay_transformed(layer_scene, &mut scene, transform);
+                        continue;
+                    }
+                    offered += 1;
+                    // The comparison comes first, because the rectangle is the
+                    // expensive half: it walks the layer's whole scene, and a layer
+                    // that did not change already has one (§36.3).
+                    if let Some(rect) = self.cache.reusable(layer.widget_id, layer_scene, transform) {
+                        self.cache.note_reused();
+                        reuse.push((layer.widget_id, rect));
+                        continue;
+                    }
+                    self.cache.note_drawn();
+                    replay_transformed(layer_scene, &mut scene, transform);
+                    // A layer that draws nothing has no rectangle to keep; it has
+                    // already gone into the frame, which is all it needed.
+                    if let Some(rect) = scene_bounds(layer_scene, transform, self.size) {
+                        store.push((index, layer.widget_id, transform, rect));
+                    }
+                },
+            }
+        }
+        self.cache.note_offered(offered);
+
+        if checked && let Some(overflow) = crate::tiles::over_budget(&scene, self.size) {
+            self.counters.frames_refused += 1;
+            return Err(match overflow {
+                crate::tiles::Overflow::Tiles { tiles, budget } => PresentError::SceneTooLarge { tiles, budget },
+                crate::tiles::Overflow::Blend { words, budget } => PresentError::SceneTooDeep { words, budget },
+            });
+        }
+
+        self.counters.frames += 1;
+        self.counters.holes += self.holes.len() as u64;
+
+        self.renderer
+            .render_source_into_texture(
+                &mut scene,
+                TextureViewTarget::new(&self.view, self.size.width, self.size.height),
+            )
+            .map_err(|error| PresentError::Platform(format!("vello into texture: {error}")))?;
+
+        // Textures first, because allocating one needs the cache mutably and copying
+        // out of it needs it while the encoder is alive.
+        for (index, id, transform, rect) in &store {
+            let masonry::app::VisualLayerKind::Scene(layer_scene) = &plan.layers[*index].kind else {
+                continue;
+            };
+            self.cache
+                .store(&self.device, *id, layer_scene, *transform, *rect, TARGET_FORMAT);
+        }
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("blazy layer cache"),
+        });
+        for (id, rect) in &reuse {
+            if let Some(texture) = self.cache.texture_of(*id) {
+                copy_rect(&mut encoder, texture, ORIGIN, &self.target, *rect, *rect);
+            }
+        }
+        for (_, id, _, rect) in &store {
+            if let Some(texture) = self.cache.texture_of(*id) {
+                copy_rect(&mut encoder, &self.target, *rect, texture, ORIGIN, *rect);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+        Ok(())
     }
 
     /// Copies part of the frame out of the texture, as tightly packed RGBA8.
@@ -638,6 +771,10 @@ impl crate::present::Presenter for SwapchainPresenter {
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.set_size(size);
     }
+
+    fn cache_layers(&mut self, ids: Vec<masonry::core::WidgetId>) {
+        self.gpu.cache_layers(ids);
+    }
 }
 
 /// Picks an alpha mode and a blitter that agree about premultiplication.
@@ -679,4 +816,50 @@ fn choose_blit(
     } else {
         (CompositeAlphaMode::Auto, TextureBlitter::new(device, format))
     }
+}
+
+/// The corner of a cache texture: it holds one rectangle and nothing else.
+const ORIGIN: PixelRect = PixelRect {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+};
+
+/// One rectangle from one texture into another, pixel for pixel.
+fn copy_rect(
+    encoder: &mut wgpu::CommandEncoder,
+    from: &wgpu::Texture,
+    from_at: PixelRect,
+    to: &wgpu::Texture,
+    to_at: PixelRect,
+    size: PixelRect,
+) {
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: from,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: from_at.x,
+                y: from_at.y,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: to,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: to_at.x,
+                y: to_at.y,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: size.width,
+            height: size.height,
+            depth_or_array_layers: 1,
+        },
+    );
 }

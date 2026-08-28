@@ -127,4 +127,14 @@ pub trait Presenter {
 
     /// Tells the presenter the window changed size, in physical pixels.
     fn resize(&mut self, size: PhysicalSize<u32>);
+
+    /// Names the layers whose pixels may be kept between frames (§36).
+    ///
+    /// A presenter that cannot keep pixels ignores this, and that is the honest answer
+    /// for the blit path: it rasterises into a buffer on the CPU and has no texture to
+    /// keep. The default does nothing, so a presenter written later is not obliged to
+    /// have an opinion.
+    fn cache_layers(&mut self, ids: Vec<masonry::core::WidgetId>) {
+        let _ = ids;
+    }
 }

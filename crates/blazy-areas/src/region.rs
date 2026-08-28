@@ -29,8 +29,8 @@ use std::any::TypeId;
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
-    AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef, Property, RegisterCtx,
-    UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod,
+    AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PaintLayerMode, PropertiesRef,
+    Property, RegisterCtx, UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, Point, Size};
@@ -130,6 +130,14 @@ struct Slot {
 /// two.
 pub struct AreaContent {
     slots: Vec<Slot>,
+    /// Whether this area asks to be recorded as a scene layer of its own.
+    ///
+    /// The seam per-area caching is built on (§36): a host that can tell one area's
+    /// pixels from another's can keep the ones that did not change. Off by default,
+    /// because a layer boundary is only worth its cost to a host that caches — and
+    /// because it lives exactly one paint (§26.1), so an area that wants to stay a
+    /// layer has to be asked to repaint every frame ([`AreaScreen::keep_layers`]).
+    isolated: bool,
     /// Regions whose root needs a new [`UiScale`], applied in the mutate pass.
     pending: Vec<usize>,
     layouts: u64,
@@ -157,6 +165,7 @@ impl AreaContent {
                     size: None,
                 })
                 .collect(),
+            isolated: false,
             pending: Vec::new(),
             layouts: 0,
             resizes: 0,
@@ -177,6 +186,19 @@ impl AreaContent {
     ///
     /// The queued value is pushed down by the first layout pass, so a region built
     /// this way is never briefly shown at the wrong size.
+    /// Asks to be recorded as a scene layer of its own.
+    ///
+    /// What it buys is the possibility of caching: a host that sees this area as its own
+    /// layer can keep its pixels across the frames in which it did not change (§36).
+    /// What it costs is a repaint request per frame — see [`AreaScreen::keep_layers`],
+    /// without which the layer disappears on the first frame the area is idle, which is
+    /// exactly the frame worth caching.
+    #[must_use]
+    pub fn with_isolated_layer(mut self, isolated: bool) -> Self {
+        self.isolated = isolated;
+        self
+    }
+
     pub fn with_ui_scale(mut self, index: usize, scale: f64) -> Self {
         if let Some(slot) = self.slots.get_mut(index) {
             slot.ui_scale = scale.clamp(0.1, 8.0);
@@ -308,7 +330,15 @@ impl Widget for AreaContent {
         }
     }
 
-    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+    fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {
+        // Nothing of its own to draw — an area is its regions. The one thing it does
+        // here is claim a scene layer, and it has to claim it again in every paint,
+        // because the mode is reset for every widget at the start of every paint pass
+        // (§26.1, measured in §36.1).
+        if self.isolated {
+            ctx.set_paint_layer_mode(PaintLayerMode::IsolatedScene);
+        }
+    }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
         for slot in &mut self.slots {
