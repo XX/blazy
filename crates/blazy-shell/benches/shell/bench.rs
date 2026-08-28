@@ -617,7 +617,7 @@ struct RasterRow {
 ///
 /// The answer to the task's first question, and it is better than the task hoped for:
 /// a scene can be **encoded without a device** and the encoding read out. The counting
-/// lives in `blazy_shell::encoded` (§35.1) because the canvas benchmark needs the same
+/// lives in `blazy_shell::encode` (§35.1) because the canvas benchmark needs the same
 /// number and cannot reach `imaging_vello` from where it sits; here it is one call.
 ///
 /// The CPU rasteriser has no equivalent: `imaging_vello_cpu` exposes a renderer and
@@ -625,7 +625,7 @@ struct RasterRow {
 #[cfg(feature = "vello")]
 fn encoded(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>) -> (usize, u64) {
     let composition = blazy_shell::Composition::new(plan, scale);
-    let counts = blazy_shell::encoded(&composition.scene, frame);
+    let counts = blazy_shell::encode::encoded(&composition.scene, frame);
     (counts.objects, counts.segments)
 }
 
@@ -682,7 +682,7 @@ fn tile_check_cost(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: Phys
     for _ in 0..frames {
         // What the frame path really pays, cheap answer included — not the exact walk,
         // which it reaches only for a scene that could plausibly be over budget.
-        let _ = blazy_shell::over_budget(&composed, frame);
+        let _ = blazy_shell::tiles::over_budget(&composed, frame);
     }
     start.elapsed().as_secs_f64() * 1000.0 / frames as f64
 }
@@ -1256,7 +1256,7 @@ fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> Nest
         let (w, h) = (f64::from(SIZE.0) * scale, f64::from(SIZE.1) * scale);
         PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
     };
-    let words = blazy_shell::blend_demand(&blazy_shell::Composition::new(&plans[0], scale).scene, frame_size);
+    let words = blazy_shell::tiles::blend_demand(&blazy_shell::Composition::new(&plans[0], scale).scene, frame_size);
 
     let mut row = NestRow {
         depth,

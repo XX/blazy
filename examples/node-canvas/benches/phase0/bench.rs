@@ -20,7 +20,7 @@ use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Affine, Point, Vec2};
 use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
-use node_canvas::build_canvas_with;
+use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::{GRID_STEP, GraphModel, NODE_SIZE, share};
 
@@ -305,7 +305,7 @@ fn new_harness(count: usize) -> TestHarness<NodeEditor> {
 fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
     let mut edges = node_canvas::generated_links(count);
     edges.truncate(links);
-    let (canvas, _graph) = node_canvas::build_canvas_linked(count, edges);
+    let (canvas, _graph) = CanvasSpec::new(count).with_links(edges).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -316,7 +316,7 @@ fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
 }
 
 fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEditor> {
-    let (canvas, _graph) = build_canvas_with(count, controls_on_hover);
+    let (canvas, _graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
     let editor = NodeEditor::new(canvas);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -337,7 +337,7 @@ fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEd
 /// node count, nothing else changed.
 fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
     let graph = share(GraphModel::generated_with_step(count, GRID_STEP / times.sqrt()));
-    let canvas = node_canvas::canvas_over(&graph, count, false);
+    let canvas = CanvasSpec::new(count).over(&graph);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -350,7 +350,7 @@ fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
 /// A harness over a canvas with an explicit cost ceiling.
 fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEditor> {
     let graph = share(GraphModel::generated(count));
-    let canvas = node_canvas::canvas_over(&graph, count, false).with_budget(budget);
+    let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -527,20 +527,31 @@ struct FarRow {
 fn segments_of(harness: &mut TestHarness<NodeEditor>) -> u64 {
     let (plan, _) = harness.redraw();
     let composed = blazy_shell::Composition::new(&plan, 1.0).scene;
-    blazy_shell::segments(&composed, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
+    blazy_shell::encode::segments(&composed, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
 }
 
-/// Measures one far-field configuration over a pan.
-fn far_case(
+/// One row of the far-field table: a graph, a zoom, and one decision changed.
+#[derive(Clone)]
+struct FarCase {
     what: &'static str,
     count: usize,
     zoom: f64,
     links: Vec<blazy_canvas::Link>,
     tuning: node_canvas::FarTuning,
     frames: usize,
-    paths: &mut Rasterisers,
-) -> FarRow {
-    let (canvas, _graph) = node_canvas::build_canvas_tuned(count, links, tuning);
+}
+
+/// Measures one far-field configuration over a pan.
+fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
+    let FarCase {
+        what,
+        count,
+        zoom,
+        links,
+        tuning,
+        frames,
+    } = case;
+    let (canvas, _graph) = CanvasSpec::new(count).with_links(links).with_far(tuning).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -559,7 +570,7 @@ fn far_case(
     let (plan, _) = harness.redraw();
     let frame = PhysicalSize::new(VIEWPORT.0, VIEWPORT.1);
     let composed = blazy_shell::Composition::new(&plan, 1.0).scene;
-    let encoded = blazy_shell::encoded(&composed, frame);
+    let encoded = blazy_shell::encode::encoded(&composed, frame);
 
     let (mut cpu_ms, mut gpu_ms) = (0.0, 0.0);
     if paths.timed {
@@ -597,58 +608,39 @@ fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> {
     let links_at = |min_link_px: f64| node_canvas::FarTuning { min_link_px, ..default };
 
     println!("\nfar field: what the frame is made of at zoom {zoom} ({count} nodes)");
+    let base = FarCase {
+        what: "",
+        count,
+        zoom,
+        links: links.clone(),
+        tuning: default,
+        frames,
+    };
+    let row = |what: &'static str, tuning, links: Option<Vec<blazy_canvas::Link>>| FarCase {
+        what,
+        tuning,
+        links: links.unwrap_or_else(|| base.links.clone()),
+        ..base.clone()
+    };
     let rows = vec![
         far_case(
-            "rounded nodes",
-            count,
-            zoom,
-            links.clone(),
-            node_canvas::FarTuning {
-                min_radius_px: 0.0,
-                ..default
-            },
-            frames,
+            row(
+                "rounded nodes",
+                node_canvas::FarTuning {
+                    min_radius_px: 0.0,
+                    ..default
+                },
+                None,
+            ),
             &mut paths,
         ),
-        far_case("plain nodes", count, zoom, links.clone(), default, frames, &mut paths),
-        far_case("plain, no links", count, zoom, Vec::new(), default, frames, &mut paths),
-        far_case(
-            "overscan 0.50",
-            count,
-            zoom,
-            links.clone(),
-            with(0.50),
-            frames,
-            &mut paths,
-        ),
-        far_case(
-            "overscan 0.10",
-            count,
-            zoom,
-            links.clone(),
-            with(0.10),
-            frames,
-            &mut paths,
-        ),
-        far_case(
-            "overscan 0.00",
-            count,
-            zoom,
-            links.clone(),
-            with(0.0),
-            frames,
-            &mut paths,
-        ),
-        far_case(
-            "links >= 4 px",
-            count,
-            zoom,
-            links.clone(),
-            links_at(4.0),
-            frames,
-            &mut paths,
-        ),
-        far_case("links >= 8 px", count, zoom, links, links_at(8.0), frames, &mut paths),
+        far_case(row("plain nodes", default, None), &mut paths),
+        far_case(row("plain, no links", default, Some(Vec::new())), &mut paths),
+        far_case(row("overscan 0.50", with(0.50), None), &mut paths),
+        far_case(row("overscan 0.10", with(0.10), None), &mut paths),
+        far_case(row("overscan 0.00", with(0.0), None), &mut paths),
+        far_case(row("links >= 4 px", links_at(4.0), None), &mut paths),
+        far_case(row("links >= 8 px", links_at(8.0), None), &mut paths),
     ];
     print_far(&rows);
     rows

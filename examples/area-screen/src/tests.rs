@@ -397,8 +397,8 @@ fn a_real_frame_is_far_from_both_ceilings() {
         .iter()
         .filter(|command| matches!(command, Command::PushGroup(_)))
         .count();
-    let depth = blazy_shell::nesting_depth(&composed.scene);
-    let demand = blazy_shell::demand(&composed.scene, frame);
+    let depth = blazy_shell::tiles::nesting_depth(&composed.scene);
+    let demand = blazy_shell::tiles::demand(&composed.scene, frame);
     println!(
         "eight areas over 5000 nodes: {} commands, {groups} groups, {depth} deep, \
          {} tiles of {}, {} words of {}",
@@ -433,7 +433,10 @@ fn a_real_frame_is_far_from_both_ceilings() {
 /// number equal to the first (§26.1).
 #[test]
 fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
-    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let (screen, _graph) = crate::ScreenSpec::new(8, 400)
+        .with_budget(Some(64))
+        .with_isolated_layers(true)
+        .build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
@@ -482,7 +485,10 @@ fn a_kept_layer_is_the_same_picture() {
     // keep, so a second device would only add a driver initialisation to the test.
     let mut gpu = gpu.with_background(panel);
 
-    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let (screen, _graph) = crate::ScreenSpec::new(8, 400)
+        .with_budget(Some(64))
+        .with_isolated_layers(true)
+        .build();
     let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
     let ids = harness.root_widget().area_ids();
 
@@ -553,7 +559,10 @@ fn a_changed_layer_is_drawn_again() {
     // layers it is told to keep.
     let mut gpu = gpu.with_background(panel);
 
-    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let (screen, _graph) = crate::ScreenSpec::new(8, 400)
+        .with_budget(Some(64))
+        .with_isolated_layers(true)
+        .build();
     let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
     let ids = harness.root_widget().area_ids();
     gpu.cache_layers(ids.clone());

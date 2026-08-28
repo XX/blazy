@@ -12,7 +12,7 @@ use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 use masonry::ui_events::pointer::PointerButton;
 
-use crate::build_canvas_with;
+use crate::CanvasSpec;
 use crate::editor::NodeEditor;
 use crate::model::{NODE_SIZE, SharedGraph};
 use crate::node::GraphNode;
@@ -22,7 +22,7 @@ fn harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
 }
 
 fn harness_with(count: usize, controls_on_hover: bool) -> (TestHarness<NodeEditor>, SharedGraph) {
-    let (canvas, graph) = build_canvas_with(count, controls_on_hover);
+    let (canvas, graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -614,7 +614,7 @@ fn a_look_at_the_whole_graph_does_not_stay_expensive() {
 /// A harness over a canvas with an explicit cost ceiling.
 fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEditor> {
     let graph = crate::model::share(crate::model::GraphModel::generated(count));
-    let canvas = crate::canvas_over(&graph, count, false).with_budget(budget);
+    let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),

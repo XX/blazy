@@ -31,7 +31,7 @@ use blazy_areas::{AreaContent, AreaScreen, SplitTree};
 use blazy_canvas::DetailBudget;
 use masonry::core::{NewWidget, Widget};
 use masonry::peniko::Color;
-use node_canvas::canvas_over;
+use node_canvas::CanvasSpec;
 use node_canvas::model::{GraphModel, SharedGraph, share};
 
 use crate::header::ScaledHeader;
@@ -42,41 +42,127 @@ pub const HEADER_HEIGHT: f64 = 24.0;
 /// Default area count. Roughly what a working Blender screen carries.
 pub const DEFAULT_AREAS: usize = 8;
 
-/// Builds a screen of `areas` areas, each a header region above a canvas region.
-///
-/// The graph is returned alongside so a caller can hold it: the canvases keep only
-/// a shared borrow, and the model is the source of truth that outlives every view.
-pub fn build_screen(areas: usize, nodes: usize, budget_widgets: Option<usize>) -> (AreaScreen, SharedGraph) {
-    build_screen_with(areas, nodes, budget_widgets, true)
-}
-
-/// Interface scales handed out by [`build_screen_staggered`], cycled over the areas.
+/// Interface scales a staggered screen hands out, cycled over the areas.
 pub const STAGGERED_SCALES: [f64; 4] = [1.0, 1.25, 1.5, 1.75];
 
-/// As [`build_screen`], with every area's header at a different interface scale.
+/// How the headers of a screen are scaled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum HeaderScale {
+    /// Every header at 1.0.
+    #[default]
+    Uniform,
+    /// A different scale per area, cycling [`STAGGERED_SCALES`].
+    ///
+    /// What the window opens with. A screenshot of one staggered screen says what
+    /// per-region `ui_scale` means more directly than any number does: the same header,
+    /// built from the same widget, at four sizes in one window, while the canvases below
+    /// them are untouched.
+    Staggered,
+    /// One scale for every header, whatever the area.
+    Forced(f64),
+}
+
+impl HeaderScale {
+    fn of(self, area: usize) -> f64 {
+        match self {
+            Self::Uniform => 1.0,
+            Self::Staggered => STAGGERED_SCALES[area % STAGGERED_SCALES.len()],
+            Self::Forced(scale) => scale,
+        }
+    }
+}
+
+/// How a screen of areas is put together for a window, a test or a measurement.
 ///
-/// What the window opens with. A screenshot of one staggered screen says what
-/// per-region `ui_scale` means more directly than any number does: the same header,
-/// built from the same widget, at four sizes in one window, while the canvases below
-/// them are untouched.
-pub fn build_screen_staggered(
-    areas: usize,
-    nodes: usize,
-    budget_widgets: Option<usize>,
-    forced: Option<f64>,
-    isolated: bool,
-) -> (AreaScreen, SharedGraph) {
-    let graph = share(GraphModel::generated(nodes));
-    let budget = window_budget(budget_widgets, areas);
-    let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
-        let scale = forced.unwrap_or(STAGGERED_SCALES[area % STAGGERED_SCALES.len()]);
-        let content =
-            AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), area_canvas(&graph, nodes, budget))
-                .with_ui_scale(0, scale)
-                .with_isolated_layer(isolated);
-        NewWidget::new(content).erased()
-    });
-    (screen, graph)
+/// One description with defaults rather than a constructor per combination — the same
+/// reason [`node_canvas::CanvasSpec`] exists: header or not, staggered scales or not,
+/// scene layers or not are independent axes, and a function per combination grows as
+/// their product.
+#[derive(Clone, Debug)]
+pub struct ScreenSpec {
+    /// Areas the window is tiled into.
+    pub areas: usize,
+    /// Nodes in the graph every area shows.
+    pub nodes: usize,
+    /// Widget budget for the whole window, or `None` for the default split by area.
+    pub budget_widgets: Option<usize>,
+    /// Whether each area carries a header region above its canvas.
+    ///
+    /// The headerless form is what the sweep over region counts compares against: one
+    /// region per area, so the difference between the two is the price of a region and
+    /// nothing else.
+    pub header: bool,
+    /// Whether each area asks to be its own scene layer (§36).
+    ///
+    /// Off by default, because the layer is only worth its price to a host that caches
+    /// layers, and the price — a repaint request per area per frame — is paid whether or
+    /// not anyone caches.
+    pub isolated: bool,
+    /// How the headers are scaled.
+    pub header_scale: HeaderScale,
+}
+
+impl ScreenSpec {
+    #[must_use]
+    pub fn new(areas: usize, nodes: usize) -> Self {
+        Self {
+            areas,
+            nodes,
+            budget_widgets: None,
+            header: true,
+            isolated: false,
+            header_scale: HeaderScale::Uniform,
+        }
+    }
+
+    #[must_use]
+    pub fn with_budget(mut self, widgets: Option<usize>) -> Self {
+        self.budget_widgets = widgets;
+        self
+    }
+
+    #[must_use]
+    pub fn without_header(mut self) -> Self {
+        self.header = false;
+        self
+    }
+
+    #[must_use]
+    pub fn with_isolated_layers(mut self, isolated: bool) -> Self {
+        self.isolated = isolated;
+        self
+    }
+
+    #[must_use]
+    pub fn with_header_scale(mut self, scale: HeaderScale) -> Self {
+        self.header_scale = scale;
+        self
+    }
+
+    /// Builds the screen, and hands back the graph alongside it.
+    ///
+    /// The canvases keep only a shared borrow, and the model is the source of truth that
+    /// outlives every view (§30).
+    pub fn build(self) -> (AreaScreen, SharedGraph) {
+        let graph = share(GraphModel::generated(self.nodes));
+        let budget = window_budget(self.budget_widgets, self.areas);
+        let screen = AreaScreen::new(SplitTree::balanced(self.areas), |area| {
+            let canvas = area_canvas(&graph, self.nodes, budget);
+            let content = if self.header {
+                AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)
+                    .with_ui_scale(0, self.header_scale.of(area))
+            } else {
+                AreaContent::new(vec![(blazy_areas::RegionKind::Main, 0.0, canvas)])
+            };
+            NewWidget::new(content.with_isolated_layer(self.isolated)).erased()
+        });
+        (screen, graph)
+    }
+}
+
+/// The screen the benchmarks measure: headers, uniform scale, no layers.
+pub fn build_screen(areas: usize, nodes: usize, budget_widgets: Option<usize>) -> (AreaScreen, SharedGraph) {
+    ScreenSpec::new(areas, nodes).with_budget(budget_widgets).build()
 }
 
 /// The share of the window's widget budget one area gets.
@@ -100,51 +186,10 @@ pub fn window_budget(widgets: Option<usize>, areas: usize) -> DetailBudget {
         .unwrap_or_else(|| DetailBudget::default().split(areas))
 }
 
-/// As [`build_screen`], optionally without the header region.
-///
-/// The headerless form is what the sweep over region counts compares against: one
-/// region per area, so the difference between the two is the price of a region and
-/// nothing else.
-pub fn build_screen_with(
-    areas: usize,
-    nodes: usize,
-    budget_widgets: Option<usize>,
-    with_header: bool,
-) -> (AreaScreen, SharedGraph) {
-    build_screen_layered(areas, nodes, budget_widgets, with_header, false)
-}
-
-/// As [`build_screen_with`], with every area optionally asking to be its own scene
-/// layer (§36).
-///
-/// A flag rather than the default because the layer is only worth its price to a host
-/// that caches layers, and the price — a repaint request per area per frame — is paid
-/// whether or not anyone caches.
-pub fn build_screen_layered(
-    areas: usize,
-    nodes: usize,
-    budget_widgets: Option<usize>,
-    with_header: bool,
-    isolated: bool,
-) -> (AreaScreen, SharedGraph) {
-    let graph = share(GraphModel::generated(nodes));
-    let budget = window_budget(budget_widgets, areas);
-    let screen = AreaScreen::new(SplitTree::balanced(areas), |area| {
-        let canvas = area_canvas(&graph, nodes, budget);
-        let content = if with_header {
-            AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)
-        } else {
-            AreaContent::new(vec![(blazy_areas::RegionKind::Main, 0.0, canvas)])
-        };
-        NewWidget::new(content.with_isolated_layer(isolated)).erased()
-    });
-    (screen, graph)
-}
-
 /// The canvas inside an area, as a `dyn Widget`, holding `budget` of the window's
 /// widgets.
 pub fn area_canvas(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
-    NewWidget::new(canvas_over(graph, nodes, false).with_budget(budget)).erased()
+    NewWidget::new(CanvasSpec::new(nodes).over(graph).with_budget(budget)).erased()
 }
 
 /// The header of area `area`, tinted so the areas are told apart by eye.

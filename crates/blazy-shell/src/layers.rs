@@ -223,7 +223,7 @@ fn texture_bytes(texture: &wgpu::Texture) -> u64 {
 /// The pixels a layer's scene covers, in physical coordinates.
 ///
 /// The union of every drawn shape's bounding box, transformed and clipped to the frame
-/// — the same arithmetic the `tiles` module charges tiles with, for the same reason: the
+/// — the same arithmetic [`crate::tiles`] charges tiles with, for the same reason: the
 /// plan carries scenes and no bounds, so a host that wants a rectangle has to work it
 /// out from what is drawn.
 pub fn scene_bounds(scene: &Scene, transform: Affine, frame: PhysicalSize<u32>) -> Option<PixelRect> {

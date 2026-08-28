@@ -111,7 +111,7 @@ impl GpuFrames {
     /// Empty — the default — draws every frame from scratch. A registered layer must
     /// **own its rectangle**: nothing else may draw into it, which is true of areas
     /// tiling a window and false of anything overlapping. The host cannot check that,
-    /// so it is asked for; the module doc of `layers` says why.
+    /// so it is asked for; [`crate::layers`] says why.
     ///
     /// The ids are the widgets that declared the layers, which for a screen of areas is
     /// `AreaScreen::area_ids()`.
@@ -175,9 +175,8 @@ impl GpuFrames {
     /// are `frames` and `holes` only, which is what the criteria check.
     ///
     /// Returns [`PresentError::SceneTooLarge`] or [`PresentError::SceneTooDeep`] for a
-    /// scene the rasteriser cannot take, and draws nothing — the module doc of `tiles`
-    /// says why a frame that *is* sent in that case comes back looking like the frame
-    /// before it.
+    /// scene the rasteriser cannot take, and draws nothing — [`crate::tiles`] says why
+    /// a frame that *is* sent in that case comes back looking like the frame before it.
     pub fn draw(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
         let (width, height) = Composition::physical_size(logical, device_scale);
         self.draw_sized(plan, PhysicalSize::new(width, height), device_scale)

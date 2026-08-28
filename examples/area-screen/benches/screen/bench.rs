@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use area_screen::header::ScaledHeader;
-use area_screen::{build_screen, build_screen_with};
+use area_screen::{ScreenSpec, build_screen};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
 use bench_utils::plan;
 use blazy_areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
@@ -244,7 +244,7 @@ fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 
 /// A screen of one region per area: the canvas, with no header above it.
 fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
-    let (screen, _graph) = build_screen_with(areas, nodes, None, false);
+    let (screen, _graph) = ScreenSpec::new(areas, nodes).without_header().build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
@@ -412,7 +412,7 @@ struct CacheRow {
 
 /// A screen whose areas declare scene layers, at a zoom where the frame is expensive.
 fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
-    let (screen, _graph) = area_screen::build_screen_layered(areas, nodes, None, true, true);
+    let (screen, _graph) = ScreenSpec::new(areas, nodes).with_isolated_layers(true).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
@@ -434,14 +434,26 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 /// per row would sit inside the measurement, and §32.4 found that churning the target
 /// provokes frames the GPU never draws. A row differs by what the cache is told to keep
 /// — nothing at all, for the uncached ones.
-fn cache_case(
-    gpu: &mut blazy_shell::gpu::GpuFrames,
+#[derive(Clone, Copy)]
+struct CacheCase {
     what: &'static str,
     areas: usize,
     nodes: usize,
+    /// Whether the host is told it may keep this screen's areas.
     cached: bool,
+}
+
+fn cache_case(
+    gpu: &mut blazy_shell::gpu::GpuFrames,
+    case: CacheCase,
     mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
 ) -> Option<CacheRow> {
+    let CacheCase {
+        what,
+        areas,
+        nodes,
+        cached,
+    } = case;
     let mut harness = layered_harness(areas, nodes);
     gpu.cache_layers(if cached {
         harness.root_widget().area_ids()
@@ -480,7 +492,11 @@ fn cache_case(
             // What the cache does and in the order it does it: compare first, and only
             // work out where a changed layer sits — the walk is the expensive half.
             if previous[index] != *scene {
-                let _ = blazy_shell::scene_bounds(scene, layer.transform, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1));
+                let _ = blazy_shell::layers::scene_bounds(
+                    scene,
+                    layer.transform,
+                    PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+                );
                 previous[index].clone_from(scene);
             }
         }
@@ -516,24 +532,23 @@ fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<CacheRow> {
     };
     let mut gpu = gpu.with_background(masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
     for cached in [false, true] {
-        rows.extend(cache_case(&mut gpu, "nothing changes", areas, nodes, cached, |_, _| {}));
-        rows.extend(cache_case(&mut gpu, "one area pans", areas, nodes, cached, |h, _| {
+        let case = |what| CacheCase {
+            what,
+            areas,
+            nodes,
+            cached,
+        };
+        rows.extend(cache_case(&mut gpu, case("nothing changes"), |_, _| {}));
+        rows.extend(cache_case(&mut gpu, case("one area pans"), |h, _| {
             pan_area(h, 0, PAN_STEP);
         }));
         // In the quick set too: it is the row that keeps the two criteria above from
         // passing on a sweep where nothing ever changes (§20.9).
-        rows.extend(cache_case(
-            &mut gpu,
-            "every area pans",
-            areas,
-            nodes,
-            cached,
-            move |h, _| {
-                for area in 0..areas {
-                    pan_area(h, area, PAN_STEP);
-                }
-            },
-        ));
+        rows.extend(cache_case(&mut gpu, case("every area pans"), move |h, _| {
+            for area in 0..areas {
+                pan_area(h, area, PAN_STEP);
+            }
+        }));
     }
     print_cache(&rows);
     rows
