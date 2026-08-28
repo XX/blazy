@@ -18,14 +18,12 @@
 use imaging_wgpu::{TextureRenderer, TextureViewTarget};
 use masonry::app::VisualLayerPlan;
 use masonry::dpi::PhysicalSize;
-use masonry::imaging::Painter;
-use masonry::imaging::record::{Scene, replay_transformed};
-use masonry::kurbo::{Affine, Rect, Size};
+use masonry::kurbo::{Affine, Size};
 use masonry::peniko::Color;
 use wgpu::CurrentSurfaceTexture;
 
 use crate::backend::{Backend, BackendError};
-use crate::compose::{Composition, Hole};
+use crate::compose::{Composition, Hole, LayerChoice};
 use crate::layers::{LayerCache, LayerCounters, PixelRect, scene_bounds};
 use crate::present::{PresentCounters, PresentError};
 
@@ -217,11 +215,7 @@ impl GpuFrames {
     ) -> Result<(), PresentError> {
         self.resize(frame);
 
-        if self.cache.is_active() {
-            return self.draw_layered(plan, device_scale, checked);
-        }
-
-        let composition = Composition::new(plan, device_scale);
+        let (composition, kept) = self.compose(plan, device_scale);
         let composition = match self.background {
             Some(color) => composition.on_background(color, self.size.width, self.size.height),
             None => composition,
@@ -250,89 +244,64 @@ impl GpuFrames {
                 &mut scene,
                 TextureViewTarget::new(&self.view, self.size.width, self.size.height),
             )
-            .map_err(|error| PresentError::Platform(format!("vello into texture: {error}")))
+            .map_err(|error| PresentError::Platform(format!("vello into texture: {error}")))?;
+
+        self.exchange(plan, kept);
+        Ok(())
     }
 
-    /// The same frame, with the layers that did not change copied instead of drawn.
+    /// Walks the plan, leaving out the layers whose pixels the cache still has.
     ///
-    /// The order matters and is the whole trick: vello clears the target and draws only
-    /// what changed, and the kept rectangles are copied in **after** it, over the
-    /// background it just painted. Nothing is resampled — source and target have the
-    /// same format and the copy is pixel for pixel, so §23's sharpness claim is
-    /// untouched by construction rather than by measurement.
-    fn draw_layered(&mut self, plan: &VisualLayerPlan, device_scale: f64, checked: bool) -> Result<(), PresentError> {
-        let to_physical = Affine::scale(device_scale);
-        let mut scene = Scene::new();
-        if let Some(color) = self.background {
-            Painter::new(&mut scene)
-                .fill(
-                    Rect::new(0.0, 0.0, f64::from(self.size.width), f64::from(self.size.height)),
-                    color,
-                )
-                .draw();
+    /// The decision per layer is §36.3: compare the scene first, because working out
+    /// where a layer sits walks the whole of it and a layer that did not change sits
+    /// where it sat. With no cache registered every layer is drawn and this is the
+    /// ordinary composition.
+    fn compose(&mut self, plan: &VisualLayerPlan, device_scale: f64) -> (Composition, Kept) {
+        let mut kept = Kept::default();
+        if !self.cache.is_active() {
+            return (Composition::new(plan, device_scale), kept);
         }
 
-        self.holes.clear();
-        let mut reuse: Vec<(masonry::core::WidgetId, PixelRect)> = Vec::new();
-        let mut store: Vec<(usize, masonry::core::WidgetId, Affine, PixelRect)> = Vec::new();
+        let size = self.size;
+        let cache = &mut self.cache;
         let mut offered = 0;
-
-        for (index, layer) in plan.layers.iter().enumerate() {
-            let transform = to_physical * layer.transform;
-            match &layer.kind {
-                masonry::app::VisualLayerKind::External { bounds } => {
-                    self.holes.push(Hole {
-                        widget_id: layer.widget_id,
-                        rect: transform.transform_rect_bbox(*bounds),
-                    });
-                },
-                masonry::app::VisualLayerKind::Scene(layer_scene) => {
-                    if !self.cache.wants(layer.widget_id) {
-                        replay_transformed(layer_scene, &mut scene, transform);
-                        continue;
-                    }
-                    offered += 1;
-                    // The comparison comes first, because the rectangle is the
-                    // expensive half: it walks the layer's whole scene, and a layer
-                    // that did not change already has one (§36.3).
-                    if let Some(rect) = self.cache.reusable(layer.widget_id, layer_scene, transform) {
-                        self.cache.note_reused();
-                        reuse.push((layer.widget_id, rect));
-                        continue;
-                    }
-                    self.cache.note_drawn();
-                    replay_transformed(layer_scene, &mut scene, transform);
-                    // A layer that draws nothing has no rectangle to keep; it has
-                    // already gone into the frame, which is all it needed.
-                    if let Some(rect) = scene_bounds(layer_scene, transform, self.size) {
-                        store.push((index, layer.widget_id, transform, rect));
-                    }
-                },
+        let composition = Composition::build(plan, device_scale, |index, layer, scene, transform| {
+            if !cache.wants(layer.widget_id) {
+                return LayerChoice::Draw;
             }
+            offered += 1;
+            if let Some(rect) = cache.reusable(layer.widget_id, scene, transform) {
+                cache.note_reused();
+                kept.reuse.push((layer.widget_id, rect));
+                return LayerChoice::Keep;
+            }
+            cache.note_drawn();
+            // A layer that draws nothing has no rectangle to keep; it goes into the
+            // frame like any other and that is all it needs.
+            cache.note_walk();
+            if let Some(rect) = scene_bounds(scene, transform, size) {
+                kept.store.push((index, layer.widget_id, transform, rect));
+            }
+            LayerChoice::Draw
+        });
+        cache.note_offered(offered);
+        (composition, kept)
+    }
+
+    /// Puts the kept pixels back, and takes a copy of the ones that were just drawn.
+    ///
+    /// After the rasteriser and not before: vello clears the target, so a rectangle
+    /// copied in first would be painted over. Nothing is resampled — source and target
+    /// have the same format and the copy is pixel for pixel, so §23's sharpness claim
+    /// is untouched by construction rather than by measurement.
+    fn exchange(&mut self, plan: &VisualLayerPlan, kept: Kept) {
+        if kept.reuse.is_empty() && kept.store.is_empty() {
+            return;
         }
-        self.cache.note_offered(offered);
-
-        if checked && let Some(overflow) = crate::tiles::over_budget(&scene, self.size) {
-            self.counters.frames_refused += 1;
-            return Err(match overflow {
-                crate::tiles::Overflow::Tiles { tiles, budget } => PresentError::SceneTooLarge { tiles, budget },
-                crate::tiles::Overflow::Blend { words, budget } => PresentError::SceneTooDeep { words, budget },
-            });
-        }
-
-        self.counters.frames += 1;
-        self.counters.holes += self.holes.len() as u64;
-
-        self.renderer
-            .render_source_into_texture(
-                &mut scene,
-                TextureViewTarget::new(&self.view, self.size.width, self.size.height),
-            )
-            .map_err(|error| PresentError::Platform(format!("vello into texture: {error}")))?;
 
         // Textures first, because allocating one needs the cache mutably and copying
         // out of it needs it while the encoder is alive.
-        for (index, id, transform, rect) in &store {
+        for (index, id, transform, rect) in &kept.store {
             let masonry::app::VisualLayerKind::Scene(layer_scene) = &plan.layers[*index].kind else {
                 continue;
             };
@@ -343,18 +312,17 @@ impl GpuFrames {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("blazy layer cache"),
         });
-        for (id, rect) in &reuse {
+        for (id, rect) in &kept.reuse {
             if let Some(texture) = self.cache.texture_of(*id) {
                 copy_rect(&mut encoder, texture, CORNER, &self.target, rect.origin(), *rect);
             }
         }
-        for (_, id, _, rect) in &store {
+        for (_, id, _, rect) in &kept.store {
             if let Some(texture) = self.cache.texture_of(*id) {
                 copy_rect(&mut encoder, &self.target, rect.origin(), texture, CORNER, *rect);
             }
         }
         self.queue.submit([encoder.finish()]);
-        Ok(())
     }
 
     /// Copies part of the frame out of the texture, as tightly packed RGBA8.
@@ -815,6 +783,15 @@ fn choose_blit(
     } else {
         (CompositeAlphaMode::Auto, TextureBlitter::new(device, format))
     }
+}
+
+/// What the frame owes the cache once it is drawn (§36.2).
+#[derive(Default)]
+struct Kept {
+    /// Layers whose pixels are copied in: id and where they go.
+    reuse: Vec<(masonry::core::WidgetId, PixelRect)>,
+    /// Layers that were drawn and are worth keeping: which layer, and where it landed.
+    store: Vec<(usize, masonry::core::WidgetId, Affine, PixelRect)>,
 }
 
 /// The corner of a cache texture: it holds one rectangle and nothing else.

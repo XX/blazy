@@ -24,6 +24,7 @@
 //! flattening them, which [`Composition`] does.
 
 mod backend;
+mod bounds;
 mod compose;
 #[cfg(feature = "vello")]
 pub mod encode;

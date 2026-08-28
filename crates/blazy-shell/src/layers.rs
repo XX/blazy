@@ -33,9 +33,7 @@ use std::collections::{HashMap, HashSet};
 use masonry::core::WidgetId;
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::record::{Glyph, Scene, replay};
-use masonry::imaging::{
-    BlurredRoundedRect, ClipRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef,
-};
+use masonry::imaging::{BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef};
 use masonry::kurbo::{Affine, Rect};
 
 /// What the cache did, summed over frames.
@@ -50,6 +48,13 @@ pub struct LayerCounters {
     pub reused: u64,
     /// Layers that were drawn because their scene or their place changed.
     pub drawn: u64,
+    /// Times a layer's rectangle had to be worked out by walking its scene.
+    ///
+    /// The counter behind the ordering of §36.3: comparing scenes is cheap, finding out
+    /// where a layer sits is not, and a layer that did not change sits where it sat. A
+    /// frame in which nothing changed must not raise this at all — which is a fact about
+    /// the code and not about the machine, so it is counted rather than timed.
+    pub walks: u64,
     /// Bytes of texture the cache is holding.
     pub bytes: u64,
 }
@@ -165,6 +170,10 @@ impl LayerCache {
         self.counters.drawn += 1;
     }
 
+    pub(crate) fn note_walk(&mut self) {
+        self.counters.walks += 1;
+    }
+
     pub(crate) fn texture_of(&self, id: WidgetId) -> Option<&wgpu::Texture> {
         self.entries.get(&id).map(|entry| &entry.texture)
     }
@@ -254,38 +263,31 @@ struct Bounds {
     clips: Vec<Rect>,
 }
 
+/// The union so far, widened by one box under the clips currently open.
+fn widen(union: Option<Rect>, clips: &[Rect], transform: Affine, bounds: Rect) -> Option<Rect> {
+    let mut rect = transform.transform_rect_bbox(bounds);
+    for clip in clips {
+        rect = rect.intersect(*clip);
+    }
+    if rect.is_zero_area() {
+        return union;
+    }
+    Some(match union {
+        Some(union) => union.union(rect),
+        None => rect,
+    })
+}
+
 impl Bounds {
     fn add(&mut self, transform: Affine, bounds: Rect) {
-        let mut rect = (self.transform * transform).transform_rect_bbox(bounds);
-        for clip in &self.clips {
-            rect = rect.intersect(*clip);
-        }
-        if rect.is_zero_area() {
-            return;
-        }
-        self.union = Some(match self.union {
-            Some(union) => union.union(rect),
-            None => rect,
-        });
-    }
-
-    fn add_shape(&mut self, transform: Affine, shape: &GeometryRef<'_>, outset: f64) {
-        self.add(transform, crate::tiles::shape_bounds(shape).inflate(outset, outset));
+        self.union = widen(self.union, &self.clips, self.transform * transform, bounds);
     }
 }
 
 impl PaintSink for Bounds {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
-        let (transform, shape, outset) = match clip {
-            ClipRef::Fill { transform, shape, .. } => (transform, shape, 0.0),
-            ClipRef::Stroke {
-                transform,
-                shape,
-                stroke,
-            } => (transform, shape, stroke.width / 2.0),
-        };
-        let rect = (self.transform * transform)
-            .transform_rect_bbox(crate::tiles::shape_bounds(&shape).inflate(outset, outset));
+        let (transform, bounds, _) = crate::bounds::clip(&clip);
+        let rect = (self.transform * transform).transform_rect_bbox(bounds);
         let narrowed = match self.clips.last() {
             Some(open) => rect.intersect(*open),
             None => rect,
@@ -302,24 +304,30 @@ impl PaintSink for Bounds {
     fn pop_group(&mut self) {}
 
     fn fill(&mut self, draw: FillRef<'_>) {
-        self.add_shape(draw.transform, &draw.shape, 0.0);
+        let (transform, bounds) = crate::bounds::fill(&draw);
+        self.add(transform, bounds);
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
-        self.add_shape(draw.transform, &draw.shape, draw.stroke.width / 2.0);
+        let (transform, bounds) = crate::bounds::stroke(&draw);
+        self.add(transform, bounds);
     }
 
     fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>) {
-        let em = f64::from(draw.font_size);
-        let box_of_a_glyph = Rect::new(0.0, -em, em, 0.0);
-        for glyph in glyphs {
-            let at = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)));
-            self.add(draw.transform * at, box_of_a_glyph);
-        }
+        // The clip stack is lent to the closure and handed back, rather than copied into
+        // a buffer: a glyph run is drawn every frame a layer is dirty, and an allocation
+        // there would be paid for by every text label on screen.
+        let (base, clips) = (self.transform, std::mem::take(&mut self.clips));
+        let mut union = self.union;
+        crate::bounds::for_each_glyph(&draw, glyphs, |transform, box_of_a_glyph| {
+            union = widen(union, &clips, base * transform, box_of_a_glyph);
+        });
+        self.clips = clips;
+        self.union = union;
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
-        let spread = draw.std_dev * 3.0;
-        self.add(draw.transform, draw.rect.inflate(spread, spread));
+        let (transform, bounds) = crate::bounds::blurred(&draw);
+        self.add(transform, bounds);
     }
 }

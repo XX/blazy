@@ -41,12 +41,13 @@
 //! The boundaries themselves live in the tests below, which is where they are checked
 //! rather than restated.
 
+mod blend;
+
+use blend::{Blend, Charge, TileBox};
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::record::{Command, Glyph, Scene, replay};
-use masonry::imaging::{
-    BlurredRoundedRect, ClipRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef,
-};
-use masonry::kurbo::{Affine, Rect, Shape};
+use masonry::imaging::{BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef};
+use masonry::kurbo::{Affine, Rect};
 
 /// Side of a vello tile, in device pixels.
 const TILE_PX: u32 = 16;
@@ -121,9 +122,7 @@ pub enum Overflow {
 /// proportional to the geometry, and the expensive half of this — runs only for a scene
 /// that could plausibly be over (§33.3).
 pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> {
-    let ceiling = (scene.commands().len() as u64).saturating_mul(frame_tiles(frame));
-    let deep = nesting_depth(scene) > BLEND_STACK_SPLIT;
-    if ceiling <= TILE_BUDGET && !deep {
+    if !needs_walk(scene, frame) {
         return None;
     }
 
@@ -141,6 +140,17 @@ pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> 
         });
     }
     None
+}
+
+/// Whether the cheap bounds leave the question open, so the exact walk has to run.
+///
+/// The property the guard's cost rests on, published so it can be *counted* rather than
+/// timed: a benchmark that asserts "the guard is cheap on a real frame" in milliseconds
+/// is asserting something about the machine, while this is the same claim as a
+/// deterministic counter (§20.9).
+pub fn needs_walk(scene: &Scene, frame: PhysicalSize<u32>) -> bool {
+    let ceiling = (scene.commands().len() as u64).saturating_mul(frame_tiles(frame));
+    ceiling > TILE_BUDGET || nesting_depth(scene) > BLEND_STACK_SPLIT
 }
 
 /// What a composed scene will ask vello for, at this frame size.
@@ -222,20 +232,21 @@ impl Counter {
 
     /// Charges one path, given its bounding box in scene coordinates.
     fn charge(&mut self, transform: Affine, bounds: Rect) {
-        let bounds = transform.transform_rect_bbox(bounds).intersect(self.frame);
-        if bounds.is_zero_area() {
-            return;
-        }
-        // Tiles are a fixed grid, so a box that straddles a tile boundary pays for
-        // both — which is why this is not `width / TILE` rounded up.
-        let across = (bounds.x1 / TILE).ceil() - (bounds.x0 / TILE).floor();
-        let down = (bounds.y1 / TILE).ceil() - (bounds.y0 / TILE).floor();
-        self.tiles += (across.max(1.0) * down.max(1.0)) as u64;
+        self.tiles += charge_of(self.frame, transform, bounds);
     }
+}
 
-    fn charge_shape(&mut self, transform: Affine, shape: &GeometryRef<'_>, outset: f64) {
-        self.charge(transform, shape_bounds(shape).inflate(outset, outset));
+/// The tiles one path costs: its box, clipped to the frame, over the tile grid.
+fn charge_of(frame: Rect, transform: Affine, bounds: Rect) -> u64 {
+    let bounds = transform.transform_rect_bbox(bounds).intersect(frame);
+    if bounds.is_zero_area() {
+        return 0;
     }
+    // Tiles are a fixed grid, so a box that straddles a tile boundary pays for both —
+    // which is why this is not `width / TILE` rounded up.
+    let across = (bounds.x1 / TILE).ceil() - (bounds.x0 / TILE).floor();
+    let down = (bounds.y1 / TILE).ceil() - (bounds.y0 / TILE).floor();
+    (across.max(1.0) * down.max(1.0)) as u64
 }
 
 /// The tiles of a shape, for the blend map: its box, clipped to the frame.
@@ -243,186 +254,10 @@ fn tiles_of(frame: Rect, transform: Affine, bounds: Rect) -> TileBox {
     TileBox::of(transform.transform_rect_bbox(bounds).intersect(frame))
 }
 
-pub(crate) fn shape_bounds(shape: &GeometryRef<'_>) -> Rect {
-    match shape {
-        GeometryRef::Rect(rect) => rect.bounding_box(),
-        GeometryRef::RoundedRect(rect) => rect.bounding_box(),
-        // `bounding_box` solves each curve for its extrema, which sounds like a
-        // lot in front of every frame. The cheap alternative — the box over the
-        // control points, never smaller — was tried and changed the measured cost
-        // of this walk by 2% (§33.3): the time is in walking the scene, not in the
-        // arithmetic. So the tighter box stays, because it refuses less.
-        GeometryRef::Path(path) => path.bounding_box(),
-        GeometryRef::OwnedPath(path) => path.bounding_box(),
-    }
-}
-
-/// Whether a clip's outline stays along the edges of its bounding box.
-///
-/// True for a rectangle and a rounded rectangle, which is what an area tree and a
-/// viewport clip with (§20.3), and what makes them nearly free on the blend stack. A
-/// path can wander anywhere inside its box, so it is charged for all of it — the
-/// zigzag of §34.2 is exactly that case, and it costs what a group costs.
-fn is_rectangular(shape: &GeometryRef<'_>) -> bool {
-    matches!(shape, GeometryRef::Rect(_) | GeometryRef::RoundedRect(_))
-}
-
-/// The blend stack, one entry per tile of the frame.
-///
-/// A map rather than a sum over layers, because the quantity is per tile: the same
-/// group is level 5 over one tile and level 1 over another, and only the deepest each
-/// tile ever gets is charged. `depth` follows the walk, `deepest` remembers.
-struct Blend {
-    cols: u32,
-    rows: u32,
-    depth: Vec<u16>,
-    deepest: Vec<u16>,
-    /// One entry per open layer: what it charged, and the region visible around it.
-    stack: Vec<Open>,
-    /// Tiles still reachable inside the clips currently open. A tile outside an
-    /// enclosing clip takes vello's `clip_zero` branch: nothing nested inside it is
-    /// included there, so nothing charges it.
-    visible: TileBox,
-}
-
-struct Open {
-    charged: Charge,
-    visible: TileBox,
-}
-
-/// The tiles one layer is included in.
-#[derive(Clone, Copy)]
-enum Charge {
-    /// Every tile of the box: a group, or a clip whose outline is not a rectangle.
-    Whole(TileBox),
-    /// The far column and the far row of the box: `columns + rows - 1` tiles, the count
-    /// a rectangular clip was measured to charge (§34.2, §34.3).
-    Edges(TileBox),
-}
-
-/// A half-open box in tile coordinates, already clipped to the frame.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct TileBox {
-    x0: u32,
-    y0: u32,
-    x1: u32,
-    y1: u32,
-}
-
-impl TileBox {
-    fn of(bounds: Rect) -> Self {
-        if bounds.is_zero_area() {
-            return Self {
-                x0: 0,
-                y0: 0,
-                x1: 0,
-                y1: 0,
-            };
-        }
-        Self {
-            x0: (bounds.x0 / TILE).floor().max(0.0) as u32,
-            y0: (bounds.y0 / TILE).floor().max(0.0) as u32,
-            x1: (bounds.x1 / TILE).ceil().max(0.0) as u32,
-            y1: (bounds.y1 / TILE).ceil().max(0.0) as u32,
-        }
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        let (x0, y0) = (self.x0.max(other.x0), self.y0.max(other.y0));
-        let (x1, y1) = (self.x1.min(other.x1), self.y1.min(other.y1));
-        Self {
-            x0,
-            y0,
-            x1: x1.max(x0),
-            y1: y1.max(y0),
-        }
-    }
-}
-
-impl Blend {
-    fn new(frame: &Rect) -> Self {
-        let cols = (frame.x1 / TILE).ceil().max(0.0) as u32;
-        let rows = (frame.y1 / TILE).ceil().max(0.0) as u32;
-        let cells = (cols as usize) * (rows as usize);
-        Self {
-            cols,
-            rows,
-            depth: vec![0; cells],
-            deepest: vec![0; cells],
-            stack: Vec::new(),
-            visible: TileBox {
-                x0: 0,
-                y0: 0,
-                x1: cols,
-                y1: rows,
-            },
-        }
-    }
-
-    /// Opens a layer over `box_`, charging the tiles vello would include it in.
-    fn enter(&mut self, charged: Charge, visible: TileBox) {
-        self.stack.push(Open {
-            charged,
-            visible: self.visible,
-        });
-        self.visible = visible;
-        self.step(charged, 1);
-    }
-
-    fn leave(&mut self) {
-        if let Some(open) = self.stack.pop() {
-            self.step(open.charged, -1);
-            self.visible = open.visible;
-        }
-    }
-
-    fn step(&mut self, charged: Charge, by: i32) {
-        match charged {
-            Charge::Whole(box_) => self.walk(box_, by, false),
-            Charge::Edges(box_) => self.walk(box_, by, true),
-        }
-    }
-
-    fn walk(&mut self, box_: TileBox, by: i32, edges_only: bool) {
-        for y in box_.y0..box_.y1.min(self.rows) {
-            let far_row = y + 1 == box_.y1;
-            for x in box_.x0..box_.x1.min(self.cols) {
-                if edges_only && !far_row && x + 1 != box_.x1 {
-                    continue;
-                }
-                let ix = (y as usize) * (self.cols as usize) + x as usize;
-                let depth = &mut self.depth[ix];
-                *depth = depth.saturating_add_signed(by as i16);
-                self.deepest[ix] = self.deepest[ix].max(*depth);
-            }
-        }
-    }
-
-    fn words(self) -> u64 {
-        self.deepest
-            .iter()
-            .map(|deepest| u64::from(u32::from(*deepest).saturating_sub(BLEND_STACK_SPLIT)) * SPILL_PER_TILE)
-            .sum()
-    }
-}
-
 impl PaintSink for Counter {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
         // A clip shape is a path like any other, and pays for its tiles like one.
-        let (transform, bounds, rectangular, outset) = match clip {
-            ClipRef::Fill { transform, shape, .. } => (transform, shape_bounds(&shape), is_rectangular(&shape), 0.0),
-            ClipRef::Stroke {
-                transform,
-                shape,
-                stroke,
-            } => (
-                transform,
-                shape_bounds(&shape),
-                is_rectangular(&shape),
-                stroke.width / 2.0,
-            ),
-        };
-        let bounds = bounds.inflate(outset, outset);
+        let (transform, bounds, rectangular) = crate::bounds::clip(&clip);
         self.charge(transform, bounds);
 
         let frame = self.frame;
@@ -448,16 +283,11 @@ impl PaintSink for Counter {
     fn push_group(&mut self, group: GroupRef<'_>) {
         // A group is a blend layer: `imaging_vello` pushes it with the group's own
         // clip, or against the whole surface when it has none.
-        let (transform, bounds) = match group.clip {
-            Some(ClipRef::Fill { transform, shape, .. }) => (transform, shape_bounds(&shape)),
-            Some(ClipRef::Stroke {
-                transform,
-                shape,
-                stroke,
-            }) => (
-                transform,
-                shape_bounds(&shape).inflate(stroke.width / 2.0, stroke.width / 2.0),
-            ),
+        let (transform, bounds) = match &group.clip {
+            Some(clip) => {
+                let (transform, bounds, _) = crate::bounds::clip(clip);
+                (transform, bounds)
+            },
             None => (Affine::IDENTITY, self.frame),
         };
         // The layer's clip path is a path in the scene, so it takes tiles as well.
@@ -477,30 +307,29 @@ impl PaintSink for Counter {
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
-        self.charge_shape(draw.transform, &draw.shape, 0.0);
+        let (transform, bounds) = crate::bounds::fill(&draw);
+        self.charge(transform, bounds);
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
-        // Half the width on each side, before the transform: the stroke is in the
-        // geometry's own space, which is the whole of §31.3.
-        self.charge_shape(draw.transform, &draw.shape, draw.stroke.width / 2.0);
+        let (transform, bounds) = crate::bounds::stroke(&draw);
+        self.charge(transform, bounds);
     }
 
     fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>) {
-        // A glyph is a path, and its outline fits inside its em box. Counting the
-        // glyphs costs one pass over an iterator this pass would otherwise skip.
-        let em = f64::from(draw.font_size);
-        let box_of_a_glyph = Rect::new(0.0, -em, em, 0.0);
-        for glyph in glyphs {
-            let at = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)));
-            self.charge(draw.transform * at, box_of_a_glyph);
-        }
+        // Every glyph is charged its own tiles: they are separate paths to the
+        // rasteriser, however close together they sit.
+        let frame = self.frame;
+        let mut tiles = 0;
+        crate::bounds::for_each_glyph(&draw, glyphs, |transform, box_of_a_glyph| {
+            tiles += charge_of(frame, transform, box_of_a_glyph);
+        });
+        self.tiles += tiles;
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
-        // The blur spreads the box, and vello draws it as one path.
-        let spread = draw.std_dev * 3.0;
-        self.charge(draw.transform, draw.rect.inflate(spread, spread));
+        let (transform, bounds) = crate::bounds::blurred(&draw);
+        self.charge(transform, bounds);
     }
 }
 
@@ -661,7 +490,7 @@ mod fast_path_tests {
 
 #[cfg(test)]
 mod blend_tests {
-    use masonry::imaging::{GroupRef, Painter};
+    use masonry::imaging::{GeometryRef, GroupRef, Painter};
     use masonry::kurbo::{BezPath, Point, Rect};
     use masonry::peniko::{Color, Fill};
 

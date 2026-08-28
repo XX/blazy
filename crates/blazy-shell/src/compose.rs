@@ -17,7 +17,7 @@
 //! `overlay_layers`, `replay_into` — skip them by design, which is why a host that
 //! wants a 3D viewport has to walk `layers` itself.
 
-use masonry::app::{VisualLayerKind, VisualLayerPlan};
+use masonry::app::{VisualLayer, VisualLayerKind, VisualLayerPlan};
 use masonry::core::WidgetId;
 use masonry::imaging::Painter;
 use masonry::imaging::record::{Scene, replay_transformed};
@@ -49,6 +49,15 @@ pub struct Composition {
     pub scenes: usize,
 }
 
+/// What a caller wants done with one scene layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayerChoice {
+    /// Replay it into the frame's scene, which is what an ordinary frame does.
+    Draw,
+    /// Leave it out: its pixels are coming from somewhere else (§36).
+    Keep,
+}
+
 impl Composition {
     /// Walks a plan at a device scale factor.
     ///
@@ -56,16 +65,32 @@ impl Composition {
     /// HiDPI one. It multiplies each layer's own transform, so it reaches the
     /// rasteriser as part of the final transform and never as a resample.
     pub fn new(plan: &VisualLayerPlan, device_scale: f64) -> Self {
+        Self::build(plan, device_scale, |_, _, _, _| LayerChoice::Draw)
+    }
+
+    /// The same walk, with the caller deciding which scene layers are drawn.
+    ///
+    /// One walk rather than two: the device scale and the external holes are decided
+    /// here and nowhere else, so a frame that keeps some layers (§36) cannot drift from
+    /// a frame that draws them all — which it would, since the two differ by one
+    /// `if` and are three hundred lines apart.
+    pub(crate) fn build(
+        plan: &VisualLayerPlan,
+        device_scale: f64,
+        mut choose: impl FnMut(usize, &VisualLayer, &Scene, Affine) -> LayerChoice,
+    ) -> Self {
         let to_physical = Affine::scale(device_scale);
         let mut composition = Self::default();
 
-        for layer in &plan.layers {
+        for (index, layer) in plan.layers.iter().enumerate() {
             composition.layers += 1;
             let transform = to_physical * layer.transform;
             match &layer.kind {
                 VisualLayerKind::Scene(scene) => {
-                    composition.scenes += 1;
-                    replay_transformed(scene, &mut composition.scene, transform);
+                    if choose(index, layer, scene, transform) == LayerChoice::Draw {
+                        composition.scenes += 1;
+                        replay_transformed(scene, &mut composition.scene, transform);
+                    }
                 },
                 VisualLayerKind::External { bounds } => {
                     composition.holes.push(Hole {

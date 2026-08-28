@@ -607,6 +607,9 @@ struct RasterRow {
     false_refusal: bool,
     /// What the tile check costs before the frame is sent (§33.3).
     check_ms: f64,
+    /// Whether the cheap bounds left the question open, so the guard had to walk the
+    /// scene. The counter form of "the check is free on a real frame" (§33.3).
+    walks: bool,
     /// Passes and plan assembly — the half §31 measured.
     plan_ms: f64,
     /// Turning that plan into pixels, or into a texture — the half it did not.
@@ -695,6 +698,18 @@ fn tile_check_cost(
     _frames: usize,
 ) -> f64 {
     0.0
+}
+
+/// Whether the guard would have to walk this scene's geometry (§33.3).
+#[cfg(feature = "vello")]
+fn guard_walks(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>) -> bool {
+    let composed = blazy_shell::Composition::new(plan, scale).scene;
+    blazy_shell::tiles::needs_walk(&composed, frame)
+}
+
+#[cfg(not(feature = "vello"))]
+fn guard_walks(_plan: &masonry::app::VisualLayerPlan, _scale: f64, _frame: PhysicalSize<u32>) -> bool {
+    false
 }
 
 /// A plan with nothing in it, which composes to the background and nothing else.
@@ -793,6 +808,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
     };
     let (objects, segments) = encoded(&plans[0], scale, frame_size);
     let check_ms = tile_check_cost(&plans[0], scale, frame_size, frames);
+    let walks = guard_walks(&plans[0], scale, frame_size);
     let mut rows = Vec::new();
 
     // --- The blit path: compose and rasterise on the CPU. The channel swap that
@@ -827,6 +843,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
         refused: false,
         false_refusal: false,
         check_ms,
+        walks,
         plan_ms,
         raster_ms,
     });
@@ -882,6 +899,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
                 refused: true,
                 false_refusal,
                 check_ms,
+                walks,
                 plan_ms,
                 raster_ms: 0.0,
             });
@@ -934,6 +952,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
             refused: false,
             false_refusal: false,
             check_ms,
+            walks,
             plan_ms,
             raster_ms: total.as_secs_f64() * 1000.0 / frames as f64,
         });
@@ -1794,6 +1813,30 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             measured: nest_rows.iter().filter(|row| row.false_refusal).count() as f64,
             bound: 1.0,
             unit: "scenes refused for nothing",
+        });
+
+        // What the guard's cost rests on, as a counter rather than as a stopwatch: on a
+        // frame a user interface actually draws, the cheap bounds answer and the
+        // geometry is never touched (§33.3). The batched far field is that frame — a
+        // dozen commands nested two deep — and it is the row this counts.
+        criteria.push(Criterion {
+            name: "the_budget_check_stays_out_of_the_geometry",
+            claim: "a batched far-field frame is answered without walking the scene",
+            kind: Kind::Counter,
+            measured: raster_rows.iter().filter(|row| row.groups == 1 && row.walks).count() as f64,
+            bound: 1.0,
+            unit: "frames walked for nothing",
+        });
+
+        // And its partner, from the failing side: a sweep where the walk never happens
+        // says nothing about whether the cheap bounds are doing any work.
+        criteria.push(Criterion {
+            name: "the_budget_check_is_exercised",
+            claim: "the sweep contains a scene the cheap bounds cannot answer",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!raster_rows.iter().any(|row| row.walks))),
+            bound: 1.0,
+            unit: "sweeps that never walk",
         });
 
         // Both of the above pass on a sweep that never nests deep enough to matter, so
