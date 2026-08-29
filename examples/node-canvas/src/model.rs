@@ -21,7 +21,7 @@ pub const GRID_STEP: f64 = 220.0;
 pub const GRID_COLS: usize = 80;
 
 /// One node's persistent state.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeState {
     /// Position of the top-left corner, in canvas coordinates.
     pub pos: Point,
@@ -103,6 +103,34 @@ impl GraphModel {
     /// Returns the state of a node.
     pub fn node(&self, index: usize) -> NodeState {
         self.nodes[index]
+    }
+
+    /// How many nodes the graph holds.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// A copy of every node's state.
+    ///
+    /// Here for two callers and they want opposite things from it: a test comparing
+    /// "before undo" with "after redo" needs the whole state to compare, and the
+    /// snapshot form of an undo step (§38.4) needs the whole state to hold — which is
+    /// exactly why the journal form exists.
+    pub fn snapshot(&self) -> Vec<NodeState> {
+        self.nodes.clone()
+    }
+
+    /// Puts a snapshot back.
+    ///
+    /// Nodes beyond the snapshot's length are left alone, so restoring an older,
+    /// shorter snapshot cannot silently truncate a graph that has grown.
+    pub fn restore(&mut self, nodes: &[NodeState]) {
+        let shared = self.nodes.len().min(nodes.len());
+        self.nodes[..shared].copy_from_slice(&nodes[..shared]);
     }
 
     /// Records a node's new position.

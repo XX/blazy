@@ -24,6 +24,7 @@ bench-utils = { path = "crates/bench-utils" }
 blazy = { path = "crates/blazy" }
 blazy-areas = { path = "crates/blazy-areas" }
 blazy-canvas = { path = "crates/blazy-canvas" }
+blazy-ops = { path = "crates/blazy-ops" }
 blazy-shape = { path = "crates/blazy-shape" }
 blazy-shell = { path = "crates/blazy-shell" }
 node-canvas = { path = "examples/node-canvas" }

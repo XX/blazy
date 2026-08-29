@@ -633,9 +633,12 @@ pub fn run(opts: &Options) -> Outcome {
             far.extend(crate::far::far_table(opts, count * 4, zoom));
         }
     }
+    // What a gesture costs and where the operator layer can sit (§38).
+    let gestures = crate::ops::ops_table(opts, count);
+    let undo = crate::ops::undo_table(opts);
 
     let criteria = evaluate(
-        &reports, count, &sweep, &links, &picks, zoom_picks, &zooms, &dense, wobble, &far,
+        &reports, count, &sweep, &links, &picks, zoom_picks, &zooms, &dense, wobble, &far, &gestures,
     );
     zooms.extend(dense);
     let outcome = Outcome {
@@ -647,6 +650,8 @@ pub fn run(opts: &Options) -> Outcome {
             .iter()
             .map(Report::record)
             .chain(far.iter().map(crate::far::FarRow::record))
+            .chain(gestures.iter().map(crate::ops::OpsRow::record))
+            .chain(undo.iter().map(crate::ops::UndoRow::record))
             .collect(),
         sweep,
         zoom_sweep: zooms,
@@ -1038,6 +1043,7 @@ fn evaluate(
     dense_zooms: &[ZoomRecord],
     wobble: f64,
     far: &[crate::far::FarRow],
+    gestures: &[crate::ops::OpsRow],
 ) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
@@ -1431,6 +1437,151 @@ fn evaluate(
             measured: far_records,
             bound: 0.1,
             unit: "re-recordings/frame",
+        });
+    }
+
+    // --- Operators, keymap and modality (§38).
+
+    let gesture = |name: &str, seat: &str| gestures.iter().find(|row| row.gesture == name && row.seat == seat);
+
+    if let Some(click) = gesture("click select", "tree") {
+        // Selecting is a change of state and of pixels, and of nothing else. A
+        // selection that laid out would put the graph's geometry behind every click,
+        // which is the same mistake §22 found in mixing `ui_scale` with `view` — and
+        // it is the one an operator layer makes by touching a widget instead of the
+        // model. Measured: 0.00.
+        criteria.push(Criterion {
+            name: "selecting_a_node_runs_no_layout",
+            claim: "selecting a node lays out nothing",
+            kind: Kind::Counter,
+            measured: click.content_layouts,
+            bound: 0.5,
+            unit: "layout passes/gesture",
+        });
+    }
+
+    if !gestures.is_empty() {
+        // …and the partner, from the failing side: a table where nothing ever lays out
+        // cannot say that selecting does not.
+        criteria.push(Criterion {
+            name: "the_gesture_layout_is_exercised",
+            claim: "the table contains a gesture that does lay out",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!gestures.iter().any(|row| row.content_layouts > 0.5))),
+            bound: 1.0,
+            unit: "tables where nothing lays out",
+        });
+    }
+
+    if let Some(band) = gesture("box select", "tree") {
+        // The claim modality is worth anything for: while the operator runs, the
+        // events are the operator's. It holds because the driver takes Masonry's
+        // pointer capture on the press that started it — and it holds *only* then,
+        // which is what the partner criterion below is about (§38.1).
+        criteria.push(Criterion {
+            name: "a_press_started_operator_keeps_the_events",
+            claim: "a modal operator started by a press sees every event first",
+            kind: Kind::Counter,
+            measured: band.tree_first,
+            bound: 1.0,
+            unit: "events the tree saw first/gesture",
+        });
+    }
+
+    if !gestures.is_empty() {
+        // The finding rather than a safety net: a modal operator started by a key
+        // cannot take pointer capture, because Masonry offers it during a press and
+        // nowhere else. A table without such a gesture would let the criterion above
+        // pass on a keymap that has no key-started operators at all.
+        criteria.push(Criterion {
+            name: "the_modal_leak_is_exercised",
+            claim: "the table contains a gesture the tree sees first",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!gestures.iter().any(|row| row.tree_first > 0.5))),
+            bound: 1.0,
+            unit: "tables with no leak",
+        });
+    }
+
+    if !gestures.is_empty() {
+        // Both entry points ask. A third path that did not would be invisible in
+        // every other number here, and it is exactly the kind of thing a shortcut
+        // adds later.
+        let unpolled: f64 = gestures.iter().map(|row| row.unpolled).sum();
+        criteria.push(Criterion {
+            name: "no_operator_runs_without_its_poll",
+            claim: "every operator that ran was polled first",
+            kind: Kind::Counter,
+            measured: unpolled,
+            bound: 1.0,
+            unit: "unpolled runs",
+        });
+
+        // And the poll has to be doing something: two bindings share the primary
+        // button in this keymap and the poll is what tells them apart, so a table
+        // where nothing is ever refused is a table where the poll is decoration.
+        criteria.push(Criterion {
+            name: "the_poll_is_exercised",
+            claim: "the table contains a poll that refused",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!gestures.iter().any(|row| row.refused > 0.5))),
+            bound: 1.0,
+            unit: "tables where nothing is refused",
+        });
+    }
+
+    if !gestures.is_empty() {
+        // A gesture that never ends is a hang. Counted at the end of every row, so a
+        // modal operator that forgot one of its exits is caught by whichever row
+        // takes that exit.
+        let left = gestures.iter().map(|row| row.left_running).max().unwrap_or(0);
+        criteria.push(Criterion {
+            name: "a_gesture_leaves_nothing_running",
+            claim: "no gesture leaves an operator on the modal stack",
+            kind: Kind::Counter,
+            measured: left as f64,
+            bound: 1.0,
+            unit: "operators still running",
+        });
+
+        // Half a switch is not a switch (§28.4): cancelling has to be in the table,
+        // or "nothing is left running" is a claim about the confirming path only.
+        criteria.push(Criterion {
+            name: "the_cancel_is_exercised",
+            claim: "the table contains a gesture that was cancelled",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!gestures.iter().any(|row| row.cancels > 0.5))),
+            bound: 1.0,
+            unit: "tables where nothing is cancelled",
+        });
+    }
+
+    if let Some(band) = gesture("box select", "tree") {
+        // What an operator's context costs, in the unit it is made of. The context is
+        // assembled on *hover* — the canvas publishes what it picked, and the driver
+        // reads it (§38.3) — so a gesture that has taken the pointer asks nothing more
+        // of the model. The failure this guards against is the obvious implementation:
+        // a driver that hit-tests on every event, which is what the host seat is
+        // forced into and what the leak above costs a key-started gesture (22 picks a
+        // gesture against 2).
+        criteria.push(Criterion {
+            name: "a_press_started_gesture_costs_no_extra_picks",
+            claim: "a modal operator that holds the pointer asks the model nothing more",
+            kind: Kind::Counter,
+            measured: band.picks,
+            bound: 4.0,
+            unit: "picks/gesture",
+        });
+
+        // The partner: a table where nothing ever picks per event cannot say that this
+        // gesture does not.
+        criteria.push(Criterion {
+            name: "the_per_event_pick_is_exercised",
+            claim: "the table contains a gesture that picks on every event",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!gestures.iter().any(|row| row.picks > 10.0))),
+            bound: 1.0,
+            unit: "tables with no per-event pick",
         });
     }
 

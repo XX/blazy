@@ -908,6 +908,22 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "sweeps that never evict",
         });
     }
+    if let Some(selects) = cache.iter().find(|row| row.cached && row.what == "one area selects") {
+        // Where a gesture's pixels land (§38.5). A selection is drawn by the driver
+        // inside its own area, so the frame redraws that area and copies the rest —
+        // the shape §36 gave this criterion, in the unit §36 counts in. An overlay
+        // spanning the window would put every area here instead, and would break the
+        // condition the cache cannot check: that a cached layer owns its rectangle.
+        criteria.push(Criterion {
+            name: "a_selection_repaints_one_area",
+            claim: "a selection in one area redraws that area and copies the rest",
+            kind: Kind::Counter,
+            measured: selects.drawn,
+            bound: 2.0,
+            unit: "areas drawn/frame",
+        });
+    }
+
     if !cache.is_empty() {
         // Both criteria above pass on a sweep where nothing ever changes, so the sweep
         // has to contain a frame in which everything does. Counted from the failing

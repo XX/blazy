@@ -25,6 +25,7 @@ use masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
 use masonry::theme::default_property_set;
 use masonry::ui_events::pointer::PointerButton;
 use node_canvas::build_canvas;
+use node_canvas::editor::NodeEditor;
 use node_canvas::model::SharedGraph;
 use node_canvas::node::GraphNode;
 
@@ -368,6 +369,140 @@ fn a_control_edit_in_one_area_reaches_the_others() {
     };
     assert_eq!(shows(&harness, own), !before, "the node that was clicked shows it");
     assert_eq!(shows(&harness, peer), !before, "and so does the other area's copy");
+}
+
+// --- MARK: operators inside an area (§38)
+
+/// A screen whose areas carry the operator layer, over one shared graph.
+fn ops_screen(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, SharedGraph) {
+    let (screen, graph) = crate::ScreenSpec::new(areas, nodes).with_ops(true).build();
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(1400, 900),
+    );
+    let _ = harness.redraw();
+    (harness, graph)
+}
+
+/// The editor of one area.
+fn editor_id(harness: &TestHarness<AreaScreen>, area: usize) -> WidgetId {
+    let area_id = harness.root_widget().area_ids()[area];
+    *harness
+        .get_widget_with_id(area_id)
+        .downcast::<AreaContent>()
+        .expect("every area holds a region stack")
+        .region_ids()
+        .last()
+        .expect("an area has regions")
+}
+
+fn editor_canvas_pos(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> Option<Point> {
+    let id = editor_id(harness, area);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::child_pos(&mut canvas, index))
+    })
+}
+
+/// A grab driven through the operator layer in one area moves the node everywhere.
+///
+/// The §30 rule, through the path §38 built: the operator writes the model, the
+/// driver moves its own canvas and names the other views. Two areas rather than one,
+/// because with one view "the truth is in the model" and "the truth is in the widget"
+/// are the same sentence.
+#[test]
+fn an_operator_move_in_one_area_reaches_the_others() {
+    use blazy_ops::keymap::Props;
+
+    let (mut harness, graph) = ops_screen(2, 200);
+    let live = harness.edit_widget_with_id(editor_id(&harness, 0), |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
+    });
+    assert!(!live.is_empty(), "area 0 shows something");
+    let index = live[live.len() / 2].0;
+    let before = graph.borrow().node(index).pos;
+    assert_eq!(editor_canvas_pos(&mut harness, 1, index), Some(before));
+
+    let id = editor_id(&harness, 0);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(
+            &mut editor,
+            "node.select",
+            &Props::new().with_int("index", index as i64),
+        );
+        NodeEditor::exec(
+            &mut editor,
+            "node.move",
+            &Props::new().with_float("dx", 40.0).with_float("dy", -25.0),
+        );
+    });
+    let _ = harness.redraw();
+
+    let moved = graph.borrow().node(index).pos;
+    assert_ne!(moved, before, "the operator moved the node in the model");
+    assert_eq!(
+        editor_canvas_pos(&mut harness, 0, index),
+        Some(moved),
+        "the area that ran the operator follows it"
+    );
+    assert_eq!(
+        editor_canvas_pos(&mut harness, 1, index),
+        Some(moved),
+        "and so does the other view of the same graph"
+    );
+}
+
+/// Selecting in one area is that area's business.
+///
+/// The other half of §30: the *graph* is shared and the *selection* is not, which is
+/// what makes "one gesture repaints one area" possible at all (§36, §38.5). Blender
+/// shares a selection between editors because it belongs to the scene; here it belongs
+/// to the view, and the point of the test is that the two are told apart deliberately
+/// rather than by accident.
+#[test]
+fn a_selection_stays_in_the_area_that_made_it() {
+    use blazy_ops::keymap::Props;
+
+    let (mut harness, _graph) = ops_screen(2, 200);
+    let id = editor_id(&harness, 0);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 3));
+    });
+    let _ = harness.redraw();
+
+    let selected = |harness: &TestHarness<AreaScreen>, area: usize| {
+        harness
+            .get_widget_with_id(editor_id(harness, area))
+            .downcast::<NodeEditor>()
+            .expect("an area holds an editor")
+            .selection()
+    };
+    assert_eq!(selected(&harness, 0).len(), 1, "the area that selected has a selection");
+    assert!(selected(&harness, 1).is_empty(), "the other area does not");
+}
+
+/// The pre-tree seat belongs to the layer root, and an editor inside an area is not
+/// one (§38.1).
+///
+/// This is the reason the seat cannot be the whole answer for a real application: a
+/// window of eight areas has exactly one widget that `Layer::capture_pointer_event`
+/// reaches, and it is the screen, not any of the editors in it.
+#[test]
+fn an_editor_inside_an_area_has_no_pre_tree_seat() {
+    let (mut harness, _graph) = ops_screen(2, 200);
+    harness.mouse_move(Point::new(400.0, 400.0));
+    harness.mouse_move(Point::new(420.0, 410.0));
+    let seen = harness
+        .get_widget_with_id(editor_id(&harness, 0))
+        .downcast::<NodeEditor>()
+        .expect("an area holds an editor")
+        .op_counters()
+        .seen_first;
+    assert_eq!(seen, 0, "no layer hook reaches a widget nested inside an area");
 }
 
 // --- MARK: what a real frame asks the rasteriser for (§34)

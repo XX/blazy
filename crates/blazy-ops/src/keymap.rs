@@ -1,0 +1,258 @@
+//! The keymap: data, not code.
+//!
+//! A binding is `(context, event pattern) -> (operator, properties)`, which is §11's
+//! shape and Blender's. Nothing here holds a closure or a type: an operator is named
+//! by a string and its arguments are values, so a keymap can be written to a file,
+//! edited by a user and read back. That is the whole reason the indirection exists —
+//! menus, macros and user overrides all become possible later without any of them
+//! being built now.
+//!
+//! **Contexts nest, and the innermost wins.** A [`Scope`] is the chain of contexts an
+//! event happened in, innermost first — the canvas inside an area inside the screen
+//! inside the window. Lookup walks it outwards and stops at the first binding whose
+//! operator's poll agrees, so a canvas binding shadows a window one, and a window
+//! binding still catches what no canvas claimed.
+
+use crate::event::{OpEvent, Pattern};
+
+/// One property value.
+///
+/// Three cases, because they are the three an operator has needed so far and a value
+/// type is easier to widen than to narrow. Strings are deliberately absent: the first
+/// one will want an enum, and an enum written as a string is a bug waiting for a typo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Value {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+}
+
+/// An operator's arguments, as data.
+///
+/// A short association list rather than a map: a binding carries one or two of these
+/// and is looked up on an event, so a hash would cost more than the scan it replaces.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Props(Vec<(&'static str, Value)>);
+
+impl Props {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    #[must_use]
+    pub fn with_bool(mut self, name: &'static str, value: bool) -> Self {
+        self.0.push((name, Value::Bool(value)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_int(mut self, name: &'static str, value: i64) -> Self {
+        self.0.push((name, Value::Int(value)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_float(mut self, name: &'static str, value: f64) -> Self {
+        self.0.push((name, Value::Float(value)));
+        self
+    }
+
+    /// The value of `name`, or `default` if the binding did not set it.
+    pub fn bool(&self, name: &str, default: bool) -> bool {
+        match self.get(name) {
+            Some(Value::Bool(value)) => value,
+            _ => default,
+        }
+    }
+
+    /// As [`bool`](Self::bool), for an integer property.
+    pub fn int(&self, name: &str, default: i64) -> i64 {
+        match self.get(name) {
+            Some(Value::Int(value)) => value,
+            _ => default,
+        }
+    }
+
+    /// As [`bool`](Self::bool), for a float property.
+    ///
+    /// An integer is accepted where a float is asked for, because `{"dx": 30}` is what
+    /// a hand-written keymap will say and refusing it teaches nothing.
+    pub fn float(&self, name: &str, default: f64) -> f64 {
+        match self.get(name) {
+            Some(Value::Float(value)) => value,
+            Some(Value::Int(value)) => value as f64,
+            _ => default,
+        }
+    }
+
+    /// Whether any property is set.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn get(&self, name: &str) -> Option<Value> {
+        self.0.iter().find(|(key, _)| *key == name).map(|(_, value)| *value)
+    }
+}
+
+/// One entry of a keymap.
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub pattern: Pattern,
+    /// The operator's name, as [`Operator::name`](crate::Operator::name) gives it.
+    pub op: &'static str,
+    pub props: Props,
+}
+
+impl Binding {
+    pub fn new(pattern: Pattern, op: &'static str) -> Self {
+        Self {
+            pattern,
+            op,
+            props: Props::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_props(mut self, props: Props) -> Self {
+        self.props = props;
+        self
+    }
+}
+
+/// The bindings that apply in one context.
+#[derive(Clone, Debug)]
+pub struct Section {
+    /// The context this section belongs to, e.g. `"canvas"`.
+    pub context: &'static str,
+    /// Bindings, in the order they are tried.
+    ///
+    /// Order is meaning: two bindings may share a pattern and be told apart by their
+    /// operators' polls — press-on-a-node selects, press-on-nothing starts a box —
+    /// and that is the mechanism, not a workaround for one.
+    pub bindings: Vec<Binding>,
+}
+
+/// A whole keymap.
+#[derive(Clone, Debug, Default)]
+pub struct Keymap {
+    sections: Vec<Section>,
+}
+
+/// The chain of contexts an event happened in, innermost first.
+///
+/// §11's nesting — Window → Screen → Area → Region → the active modal operator — with
+/// the modal end handled by the runtime's stack rather than by a name here. The names
+/// are the application's: this crate never invents one.
+#[derive(Clone, Copy, Debug)]
+pub struct Scope<'a>(pub &'a [&'static str]);
+
+impl Keymap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a section, or appends to the one that is already there.
+    #[must_use]
+    pub fn with(mut self, context: &'static str, bindings: Vec<Binding>) -> Self {
+        match self.sections.iter_mut().find(|section| section.context == context) {
+            Some(section) => section.bindings.extend(bindings),
+            None => self.sections.push(Section { context, bindings }),
+        }
+        self
+    }
+
+    /// The bindings matching `event`, innermost context first.
+    ///
+    /// Returns every match rather than the first, because whether a binding runs is
+    /// decided by its operator's poll and the runtime is the one holding the
+    /// operators. A keymap that answered "the binding" would have to know them.
+    pub fn matches<'a>(&'a self, scope: Scope<'_>, event: &'a OpEvent) -> impl Iterator<Item = &'a Binding> + 'a {
+        let contexts: Vec<&'static str> = scope.0.to_vec();
+        contexts.into_iter().flat_map(move |context| {
+            self.sections
+                .iter()
+                .filter(move |section| section.context == context)
+                .flat_map(|section| section.bindings.iter())
+                .filter(move |binding| binding.pattern.matches(event))
+        })
+    }
+
+    /// The bindings in a context, for a menu or a "what is bound to this" report.
+    pub fn section(&self, context: &str) -> Option<&Section> {
+        self.sections.iter().find(|section| section.context == context)
+    }
+
+    /// Total bindings, over every context.
+    pub fn len(&self) -> usize {
+        self.sections.iter().map(|section| section.bindings.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use masonry::core::keyboard::Modifiers;
+    use masonry::kurbo::Point;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use super::*;
+
+    fn press(mods: Modifiers) -> OpEvent {
+        OpEvent::Press {
+            button: PointerButton::Primary,
+            pos: Point::ORIGIN,
+            mods,
+        }
+    }
+
+    fn keymap() -> Keymap {
+        Keymap::new()
+            .with("canvas", vec![
+                Binding::new(Pattern::press(PointerButton::Primary), "node.select"),
+                Binding::new(Pattern::press(PointerButton::Primary), "node.box_select"),
+            ])
+            .with("window", vec![Binding::new(
+                Pattern::press(PointerButton::Primary),
+                "window.click",
+            )])
+    }
+
+    /// The nesting of §11, as a test: the inner context is offered first and the outer
+    /// one still gets its turn.
+    #[test]
+    fn the_innermost_context_is_tried_first() {
+        let keymap = keymap();
+        let names: Vec<_> = keymap
+            .matches(Scope(&["canvas", "window"]), &press(Modifiers::empty()))
+            .map(|binding| binding.op)
+            .collect();
+        assert_eq!(names, ["node.select", "node.box_select", "window.click"]);
+    }
+
+    /// A scope that does not contain a context does not see its bindings — which is
+    /// what makes "this key does something else in the other editor" expressible.
+    #[test]
+    fn a_context_outside_the_scope_is_not_matched() {
+        let keymap = keymap();
+        let names: Vec<_> = keymap
+            .matches(Scope(&["window"]), &press(Modifiers::empty()))
+            .map(|binding| binding.op)
+            .collect();
+        assert_eq!(names, ["window.click"]);
+    }
+
+    #[test]
+    fn properties_fall_back_to_the_default() {
+        let props = Props::new().with_bool("extend", true).with_int("count", 3);
+        assert!(props.bool("extend", false));
+        assert!(!props.bool("missing", false));
+        assert_eq!(props.int("count", 0), 3);
+        // An integer where a float was asked for: what a hand-written keymap says.
+        assert_eq!(props.float("count", 0.0), 3.0);
+        assert_eq!(props.float("dx", 1.5), 1.5);
+    }
+}

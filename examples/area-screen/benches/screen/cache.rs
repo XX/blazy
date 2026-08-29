@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 
 use area_screen::ScreenSpec;
 use blazy_areas::AreaScreen;
+use blazy_canvas::CanvasLayer;
 use masonry::core::NewWidget;
 use masonry::dpi::PhysicalSize;
 use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
+use node_canvas::editor::NodeEditor;
 
 use crate::bench::{Options, PAN_STEP, VIEWPORT, pan_area, zoom_area};
 
@@ -83,6 +85,79 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
     harness
 }
 
+/// The same screen, with the operator layer inside every area (§38.5).
+///
+/// The row it exists for asks where a gesture's pixels land. A selection outline is
+/// drawn by the driver *inside* its area, so it dirties that area's layer and no
+/// other; an overlay across the window would dirty every one of them, and worse, it
+/// would break the condition the cache cannot check — that a cached layer owns its
+/// rectangle (§36.4).
+fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+    let (screen, _graph) = ScreenSpec::new(areas, nodes)
+        .with_isolated_layers(true)
+        .with_ops(true)
+        .build();
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
+    );
+    let _ = harness.redraw();
+    for area in 0..areas {
+        zoom_editor(&mut harness, area, 0.05);
+    }
+    let _ = harness.redraw();
+    harness
+}
+
+/// The main region of an area, whatever kind of widget it is.
+fn main_region(harness: &TestHarness<AreaScreen>, area: usize) -> masonry::core::WidgetId {
+    let area_id = harness.root_widget().area_ids()[area];
+    *harness
+        .get_widget_with_id(area_id)
+        .downcast::<blazy_areas::AreaContent>()
+        .expect("every area holds a region stack")
+        .region_ids()
+        .last()
+        .expect("an area has regions")
+}
+
+/// Zooms the canvas inside an area's editor.
+fn zoom_editor(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
+    let id = main_region(harness, area);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::zoom_around(&mut canvas, masonry::kurbo::Point::new(200.0, 150.0), factor);
+        });
+    });
+}
+
+/// Where a node of an area's graph is on screen, in window coordinates.
+fn node_on_screen(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> masonry::kurbo::Point {
+    let id = main_region(harness, area);
+    let local = harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            let pos = CanvasLayer::child_pos(&mut canvas, index).unwrap_or_default();
+            let centre = pos + masonry::kurbo::Vec2::new(80.0, 48.0);
+            canvas.widget.view() * centre
+        })
+    });
+    harness.get_widget_with_id(id).ctx().window_transform() * local
+}
+
+/// Right-clicks a node in one area, the way a user selects one.
+///
+/// At this zoom no node has a widget at all: the press is answered from the model
+/// (§25.3), which is the whole reason a selection works in the far field.
+fn click_node(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) {
+    let at = node_on_screen(harness, area, index);
+    harness.mouse_move(at);
+    harness.mouse_button_press(Some(masonry::ui_events::pointer::PointerButton::Secondary));
+    harness.mouse_button_release(Some(masonry::ui_events::pointer::PointerButton::Secondary));
+}
+
 /// One gesture, on one path.
 ///
 /// The device comes from the caller and serves the whole table: a driver initialisation
@@ -98,6 +173,8 @@ struct CacheCase {
     cached: bool,
     /// Bytes of texture the cache may hold, or `None` for what the frame size gives.
     budget: Option<u64>,
+    /// Whether the areas carry the operator layer.
+    ops: bool,
 }
 
 fn cache_case(
@@ -111,8 +188,13 @@ fn cache_case(
         nodes,
         cached,
         budget,
+        ops,
     } = case;
-    let mut harness = layered_harness(areas, nodes);
+    let mut harness = if ops {
+        ops_layered_harness(areas, nodes)
+    } else {
+        layered_harness(areas, nodes)
+    };
     let budget = budget.unwrap_or_else(|| gpu.default_cache_budget());
     gpu.cache_budget(budget);
     gpu.cache_layers(if cached {
@@ -206,6 +288,7 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
             nodes,
             cached,
             budget: None,
+            ops: false,
         };
         rows.extend(cache_case(&mut gpu, case("nothing changes"), |_, _| {}));
         rows.extend(cache_case(&mut gpu, case("one area pans"), |h, _| {
@@ -218,6 +301,22 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
                 pan_area(h, area, PAN_STEP);
             }
         }));
+        // A gesture rather than a pan: where a selection's pixels land is the question
+        // §38.5 asks, and the answer is a column — one area drawn, the rest copied.
+        // Two nodes alternately, because selecting the same node twice changes nothing
+        // and a row that changes nothing would agree with any answer at all.
+        rows.extend(cache_case(
+            &mut gpu,
+            CacheCase {
+                ops: true,
+                ..case("one area selects")
+            },
+            // Two nodes near the corner the areas are zoomed about, so that both
+            // points are certainly inside area 0: at this zoom the whole graph is a
+            // few hundred pixels wide and a node further along the row lands in the
+            // area next door, where it would select something and prove nothing.
+            |h, i| click_node(h, 0, if i % 2 == 0 { 3 } else { 5 }),
+        ));
         // A ceiling two areas wide, so the cache has to drop textures to stay inside it.
         // Without this row the criterion that says it does would pass by never being
         // asked (§20.9).

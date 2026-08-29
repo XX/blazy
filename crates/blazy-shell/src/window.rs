@@ -127,6 +127,21 @@ pub trait ShellDriver {
         let _ = (action, from);
     }
 
+    /// Called once, with the tree built and before the first event.
+    ///
+    /// The window's own startup, which an application cannot do for itself: a
+    /// `RenderRoot` does not exist until the window does, and some of what an
+    /// application needs is settled on the root rather than on a widget. The keymap is
+    /// the case that made this necessary — Masonry sends a key to the focused widget
+    /// or to `RenderRoot::set_focus_fallback` and nowhere else, so a driver that wants
+    /// the keys nobody claimed has to name a widget here (§38.3).
+    ///
+    /// `root.get_layer_root(0).id()` is the application's own root widget, which saves
+    /// threading a `WidgetId` out of a tree that has not been built yet.
+    fn started(&mut self, root: &mut RenderRoot) {
+        let _ = root;
+    }
+
     /// The subtrees that are layers of their own, asked for once per frame (§36).
     ///
     /// Returning ids does two things, and both are needed for either to be worth
@@ -340,6 +355,9 @@ impl ShellApp {
                 test_font: None,
             },
         );
+
+        let mut render_root = render_root;
+        self.driver.started(&mut render_root);
 
         window.request_redraw();
         self.window = Some(window);

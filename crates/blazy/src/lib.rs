@@ -3,8 +3,8 @@
 //! This is the crate an application depends on; the others are the pieces it is made
 //! of. See `rnd/architecture.md` for the design it implements.
 //!
-//! Early, and honest about it: four subsystems exist, all measured against the
-//! criteria in §20–§26, and the rest of §16 is still to be written. What is here is
+//! Early, and honest about it: five subsystems exist, all measured against the
+//! criteria in §20–§38, and the rest of §16 is still to be written. What is here is
 //! meant to be built on rather than replaced — the shapes have been checked — but the
 //! API will move.
 //!
@@ -15,5 +15,6 @@
 
 pub use blazy_areas as areas;
 pub use blazy_canvas as canvas;
+pub use blazy_ops as ops;
 pub use blazy_shape as shape;
 pub use blazy_shell as shell;
