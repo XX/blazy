@@ -21,6 +21,7 @@ use node_canvas::DEFAULT_NODES;
 use self::bench::Options;
 
 mod bench;
+mod cache;
 
 #[derive(Parser)]
 #[command(

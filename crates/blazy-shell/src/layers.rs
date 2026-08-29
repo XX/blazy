@@ -1,20 +1,19 @@
 //! Keeping the pixels of an area that did not change.
 //!
-//! `rnd/architecture.md` §7.3 calls this level B and §32.7 gave it a price: the paint
-//! pass rebuilds the layer plan every frame and re-appends every widget's cached scene
-//! into it, so a rasteriser redraws an idle area exactly as often as a working one. On
-//! a screen of eight areas over one graph (§30) that is seven areas' worth of work
-//! thrown away every frame.
+//! The paint pass rebuilds the layer plan every frame and re-appends every widget's
+//! cached scene into it, so a rasteriser redraws an idle area exactly as often as a
+//! working one — seven areas' worth of wasted work on a screen of eight (§30, §32.7).
+//! This is the level B of §7.3: a texture per layer, and a layer that did not change is
+//! copied instead of drawn. What it saves and what it costs is §36.
 //!
-//! The mechanism is a texture per layer, and three things make it simple enough to be
-//! worth having:
+//! Three things make it simple enough to be worth having:
 //!
-//! * Masonry already hands the host a **layer per widget that asked for one** — `VisualLayer` carries the owner's
-//!   [`WidgetId`] and the layer's transform (§26.1);
-//! * a layer that did not change is recognisable without cooperation from the application: its `Scene` compares equal
-//!   to the one kept from last frame;
-//! * putting the kept pixels back needs no shader and no resampling — the frame texture and the cache texture have the
-//!   same format, so it is `copy_texture_to_texture`.
+//! * Masonry hands the host a layer per widget that asked for one, with the owner's [`WidgetId`] and the layer's
+//!   transform (§26.1);
+//! * a layer that did not change is recognisable without help from the application: its `Scene` compares equal to the
+//!   one kept from last frame;
+//! * putting the pixels back needs no shader and no resampling — frame and cache have the same format, so it is
+//!   `copy_texture_to_texture`, pixel for pixel.
 //!
 //! # What a caller has to promise
 //!
@@ -22,23 +21,19 @@
 //! Blender-style areas, which tile the window and paint opaque backgrounds, and it does
 //! not hold for a popup over an area. The host cannot check it — the plan carries no
 //! bounds, only scenes — so it is asked for rather than inferred: a caller registers the
-//! layers it knows to be disjoint through [`GpuFrames::cache_layers`](crate::gpu::GpuFrames::cache_layers).
+//! layers it knows to be disjoint through
+//! [`GpuFrames::cache_layers`](crate::gpu::GpuFrames::cache_layers).
 //!
-//! # What it costs
-//!
-//! Two things, both measured rather than assumed (§36.3): comparing the previous scene
-//! with the current one, and computing the rectangle a dirty layer occupies. Both are
-//! paid only for layers that are actually dirty, which is the case that is already
-//! paying for rasterisation.
+//! The order the decision is made in is load-bearing rather than incidental: comparing
+//! scenes is cheap, working out where a layer sits walks its whole scene, and a layer
+//! that has not changed sits where it sat (§36.3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use masonry::core::WidgetId;
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::record::{Glyph, Scene, replay};
-use masonry::imaging::{
-    BlurredRoundedRect, ClipRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef,
-};
+use masonry::imaging::{BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, StrokeRef};
 use masonry::kurbo::{Affine, Rect};
 
 /// What the cache did, summed over frames.
@@ -53,19 +48,39 @@ pub struct LayerCounters {
     pub reused: u64,
     /// Layers that were drawn because their scene or their place changed.
     pub drawn: u64,
+    /// Times a layer's rectangle had to be worked out by walking its scene.
+    ///
+    /// The counter behind the ordering of §36.3: comparing scenes is cheap, finding out
+    /// where a layer sits is not, and a layer that did not change sits where it sat. A
+    /// frame in which nothing changed must not raise this at all — which is a fact about
+    /// the code and not about the machine, so it is counted rather than timed.
+    pub walks: u64,
     /// Bytes of texture the cache is holding.
     pub bytes: u64,
+    /// Textures dropped to stay inside the ceiling.
+    ///
+    /// An eviction is not a fault — it costs the layer a redraw on the frame it comes
+    /// back — but it is the difference between a cache that is bounded and one that
+    /// grows with whatever an application registers (§37.2).
+    pub evictions: u64,
 }
 
 /// A texture and the scene it was drawn from, per layer.
 pub(crate) struct LayerCache {
-    wanted: Vec<WidgetId>,
+    wanted: HashSet<WidgetId>,
     entries: HashMap<WidgetId, Entry>,
+    /// Bytes of texture the cache may hold before it starts evicting.
+    budget: u64,
+    /// Ticks once per store or reuse, so "least recently used" is a number rather than
+    /// a guess. A frame counter would do as well; this one does not need the frame.
+    clock: u64,
     counters: LayerCounters,
 }
 
 struct Entry {
     texture: wgpu::Texture,
+    /// When this entry was last kept or refilled, by [`LayerCache::clock`].
+    used: u64,
     /// The scene this texture was drawn from. Compared, not hashed: equality is exact,
     /// and §36.3 measures what it costs.
     scene: Scene,
@@ -87,6 +102,11 @@ pub struct PixelRect {
 }
 
 impl PixelRect {
+    /// The top-left corner, which is what a texture copy takes.
+    pub fn origin(self) -> (u32, u32) {
+        (self.x, self.y)
+    }
+
     /// The pixels a bounding box covers, rounded outwards and clipped to the frame.
     fn of(bounds: Rect, frame: PhysicalSize<u32>) -> Option<Self> {
         let x0 = bounds.x0.floor().max(0.0) as u32;
@@ -105,17 +125,54 @@ impl PixelRect {
 impl LayerCache {
     pub(crate) fn new() -> Self {
         Self {
-            wanted: Vec::new(),
+            wanted: HashSet::new(),
             entries: HashMap::new(),
+            budget: u64::MAX,
+            clock: 0,
             counters: LayerCounters::default(),
         }
     }
 
     /// Registers the layers whose pixels may be kept. Empty turns the cache off.
     pub(crate) fn set_wanted(&mut self, ids: Vec<WidgetId>) {
-        self.wanted = ids;
+        self.wanted = ids.into_iter().collect();
         self.entries.retain(|id, _| self.wanted.contains(id));
-        self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
+        self.recount();
+    }
+
+    /// Sets how many bytes of texture the cache may hold.
+    ///
+    /// The natural ceiling is a few frames' worth: cached layers **tile** the window, so
+    /// their pixels add up to about one frame however many areas there are — 4.9 MiB for
+    /// eight areas of a 1400x900 window, which is that window (§37.2). A ceiling above
+    /// that covers a resize, where the old textures live until their layers are stored
+    /// again, and bounds the damage from a caller that registers overlapping layers
+    /// against the precondition.
+    pub(crate) fn set_budget(&mut self, bytes: u64) {
+        self.budget = bytes;
+        self.evict_to_fit(None);
+    }
+
+    /// Drops least-recently-used textures until the cache is inside its ceiling.
+    ///
+    /// `keep` is the entry that has just been filled, which is never worth evicting: it
+    /// is the most recently used by definition, and dropping it would mean drawing it
+    /// again next frame for nothing.
+    fn evict_to_fit(&mut self, keep: Option<WidgetId>) {
+        while self.counters.bytes > self.budget {
+            let oldest = self
+                .entries
+                .iter()
+                .filter(|(id, _)| Some(**id) != keep)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(id, _)| *id);
+            let Some(id) = oldest else {
+                return;
+            };
+            self.entries.remove(&id);
+            self.counters.evictions += 1;
+            self.recount();
+        }
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -124,6 +181,12 @@ impl LayerCache {
 
     pub(crate) fn wants(&self, id: WidgetId) -> bool {
         self.wanted.contains(&id)
+    }
+
+    /// Re-adds up what the textures cost. Called where the set of them changes, which
+    /// is the only time it can move.
+    fn recount(&mut self) {
+        self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
     }
 
     pub(crate) fn counters(&self) -> LayerCounters {
@@ -138,11 +201,15 @@ impl LayerCache {
     /// where a layer sits means walking its whole scene, and a layer that has not
     /// changed sits where it sat. Same scene and same transform is enough — the
     /// rectangle is a function of both.
-    pub(crate) fn reusable(&self, id: WidgetId, scene: &Scene, transform: Affine) -> Option<PixelRect> {
-        self.entries
-            .get(&id)
-            .filter(|entry| entry.transform == transform && entry.scene == *scene)
-            .map(|entry| entry.rect)
+    pub(crate) fn reusable(&mut self, id: WidgetId, scene: &Scene, transform: Affine) -> Option<PixelRect> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.transform == transform && entry.scene == *scene)?;
+        entry.used = clock;
+        Some(entry.rect)
     }
 
     pub(crate) fn note_offered(&mut self, count: u64) {
@@ -155,6 +222,10 @@ impl LayerCache {
 
     pub(crate) fn note_drawn(&mut self) {
         self.counters.drawn += 1;
+    }
+
+    pub(crate) fn note_walk(&mut self) {
+        self.counters.walks += 1;
     }
 
     pub(crate) fn texture_of(&self, id: WidgetId) -> Option<&wgpu::Texture> {
@@ -171,7 +242,7 @@ impl LayerCache {
         transform: Affine,
         rect: PixelRect,
         format: wgpu::TextureFormat,
-    ) -> &wgpu::Texture {
+    ) {
         let fits = self
             .entries
             .get(&id)
@@ -193,17 +264,23 @@ impl LayerCache {
             });
             self.entries.insert(id, Entry {
                 texture,
+                used: 0,
                 scene: Scene::new(),
                 transform,
                 rect,
             });
         }
+        self.clock += 1;
+        let clock = self.clock;
         let entry = self.entries.get_mut(&id).expect("just inserted or already there");
         entry.scene.clone_from(scene);
         entry.transform = transform;
         entry.rect = rect;
-        self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
-        &self.entries.get(&id).expect("just stored").texture
+        entry.used = clock;
+        if !fits {
+            self.recount();
+            self.evict_to_fit(Some(id));
+        }
     }
 }
 
@@ -239,45 +316,37 @@ struct Bounds {
     ///
     /// Tracked rather than ignored, and that took a measurement to justify: a stroke at
     /// the edge of an area inflates its bounding box by half a stroke width, so a box
-    /// that ignores the clip spills over the neighbouring area — and a rectangle copied
-    /// over a neighbour's edge is 149 pixels of the wrong picture (§36.2). The clip is
-    /// where the true edge of an area is, and it is already a whole number of pixels
-    /// because §21 rounds area rectangles.
+    /// that ignores the clip spills over the neighbouring area and the copy lands on the
+    /// wrong pixels (§36.2). The clip is where the true edge of an area is, and it is
+    /// already a whole number of pixels because §21 rounds area rectangles.
     clips: Vec<Rect>,
+}
+
+/// The union so far, widened by one box under the clips currently open.
+fn widen(union: Option<Rect>, clips: &[Rect], transform: Affine, bounds: Rect) -> Option<Rect> {
+    let mut rect = transform.transform_rect_bbox(bounds);
+    for clip in clips {
+        rect = rect.intersect(*clip);
+    }
+    if rect.is_zero_area() {
+        return union;
+    }
+    Some(match union {
+        Some(union) => union.union(rect),
+        None => rect,
+    })
 }
 
 impl Bounds {
     fn add(&mut self, transform: Affine, bounds: Rect) {
-        let mut rect = (self.transform * transform).transform_rect_bbox(bounds);
-        for clip in &self.clips {
-            rect = rect.intersect(*clip);
-        }
-        if rect.is_zero_area() {
-            return;
-        }
-        self.union = Some(match self.union {
-            Some(union) => union.union(rect),
-            None => rect,
-        });
-    }
-
-    fn add_shape(&mut self, transform: Affine, shape: &GeometryRef<'_>, outset: f64) {
-        self.add(transform, crate::tiles::shape_bounds(shape).inflate(outset, outset));
+        self.union = widen(self.union, &self.clips, self.transform * transform, bounds);
     }
 }
 
 impl PaintSink for Bounds {
     fn push_clip(&mut self, clip: ClipRef<'_>) {
-        let (transform, shape, outset) = match clip {
-            ClipRef::Fill { transform, shape, .. } => (transform, shape, 0.0),
-            ClipRef::Stroke {
-                transform,
-                shape,
-                stroke,
-            } => (transform, shape, stroke.width / 2.0),
-        };
-        let rect = (self.transform * transform)
-            .transform_rect_bbox(crate::tiles::shape_bounds(&shape).inflate(outset, outset));
+        let (transform, bounds, _) = crate::bounds::clip(&clip);
+        let rect = (self.transform * transform).transform_rect_bbox(bounds);
         let narrowed = match self.clips.last() {
             Some(open) => rect.intersect(*open),
             None => rect,
@@ -294,24 +363,30 @@ impl PaintSink for Bounds {
     fn pop_group(&mut self) {}
 
     fn fill(&mut self, draw: FillRef<'_>) {
-        self.add_shape(draw.transform, &draw.shape, 0.0);
+        let (transform, bounds) = crate::bounds::fill(&draw);
+        self.add(transform, bounds);
     }
 
     fn stroke(&mut self, draw: StrokeRef<'_>) {
-        self.add_shape(draw.transform, &draw.shape, draw.stroke.width / 2.0);
+        let (transform, bounds) = crate::bounds::stroke(&draw);
+        self.add(transform, bounds);
     }
 
     fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>) {
-        let em = f64::from(draw.font_size);
-        let box_of_a_glyph = Rect::new(0.0, -em, em, 0.0);
-        for glyph in glyphs {
-            let at = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)));
-            self.add(draw.transform * at, box_of_a_glyph);
-        }
+        // The clip stack is lent to the closure and handed back, rather than copied into
+        // a buffer: a glyph run is drawn every frame a layer is dirty, and an allocation
+        // there would be paid for by every text label on screen.
+        let (base, clips) = (self.transform, std::mem::take(&mut self.clips));
+        let mut union = self.union;
+        crate::bounds::for_each_glyph(&draw, glyphs, |transform, box_of_a_glyph| {
+            union = widen(union, &clips, base * transform, box_of_a_glyph);
+        });
+        self.clips = clips;
+        self.union = union;
     }
 
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
-        let spread = draw.std_dev * 3.0;
-        self.add(draw.transform, draw.rect.inflate(spread, spread));
+        let (transform, bounds) = crate::bounds::blurred(&draw);
+        self.add(transform, bounds);
     }
 }

@@ -135,8 +135,8 @@ pub struct AreaContent {
     /// The seam per-area caching is built on (§36): a host that can tell one area's
     /// pixels from another's can keep the ones that did not change. Off by default,
     /// because a layer boundary is only worth its cost to a host that caches — and
-    /// because it lives exactly one paint (§26.1), so an area that wants to stay a
-    /// layer has to be asked to repaint every frame ([`AreaScreen::keep_layers`]).
+    /// because it lives exactly one paint (§26.1), so an area that wants to stay a layer
+    /// has to be asked to repaint every frame, which the host does.
     isolated: bool,
     /// Regions whose root needs a new [`UiScale`], applied in the mutate pass.
     pending: Vec<usize>,
@@ -190,9 +190,11 @@ impl AreaContent {
     ///
     /// What it buys is the possibility of caching: a host that sees this area as its own
     /// layer can keep its pixels across the frames in which it did not change (§36).
-    /// What it costs is a repaint request per frame — see [`AreaScreen::keep_layers`],
-    /// without which the layer disappears on the first frame the area is idle, which is
-    /// exactly the frame worth caching.
+    /// What it costs is a repaint request per frame, which is the host's job and not the
+    /// screen's — `blazy_shell::window::ShellDriver::layers` names the layer owners once
+    /// per frame and the shell asks each of them to repaint. Without that the layer
+    /// disappears on the first frame the area is idle, which is exactly the frame worth
+    /// caching (§26.1, §36.1).
     #[must_use]
     pub fn with_isolated_layer(mut self, isolated: bool) -> Self {
         self.isolated = isolated;

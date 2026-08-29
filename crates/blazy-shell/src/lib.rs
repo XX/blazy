@@ -24,18 +24,18 @@
 //! flattening them, which [`Composition`] does.
 
 mod backend;
+mod bounds;
 mod compose;
 #[cfg(feature = "vello")]
-mod encode;
+pub mod encode;
 mod external;
 #[cfg(feature = "vello")]
 pub mod gpu;
 mod host;
 #[cfg(feature = "vello")]
-mod layers;
+pub mod layers;
 mod present;
-#[cfg(feature = "vello")]
-mod tiles;
+pub mod tiles;
 
 #[cfg(feature = "window")]
 pub mod window;
@@ -43,16 +43,15 @@ pub mod window;
 #[cfg(test)]
 mod tests;
 
+// Types and budgets at the root; the functions that compute them stay in their modules,
+// because `demand`, `segments` and `bounds` are names a library cannot own (§15.1).
 pub use crate::backend::{Backend, BackendError, COMPILED, open_any};
 pub use crate::compose::{Composition, Hole};
 #[cfg(feature = "vello")]
-pub use crate::encode::{Encoded, encoded, segments};
+pub use crate::encode::Encoded;
 pub use crate::external::ExternalContent;
 pub use crate::host::{Frame, Host, HostCounters, HostError};
 #[cfg(feature = "vello")]
-pub use crate::layers::{LayerCounters, PixelRect, scene_bounds};
+pub use crate::layers::{LayerCounters, PixelRect};
 pub use crate::present::{PresentCounters, PresentError, Presenter};
-#[cfg(feature = "vello")]
-pub use crate::tiles::{
-    BLEND_BUDGET, Demand, Overflow, TILE_BUDGET, blend_demand, demand, nesting_depth, over_budget, tile_demand,
-};
+pub use crate::tiles::{BLEND_BUDGET, Demand, Overflow, TILE_BUDGET};

@@ -15,7 +15,7 @@
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-use area_screen::{DEFAULT_AREAS, build_screen_staggered};
+use area_screen::{DEFAULT_AREAS, HeaderScale, ScreenSpec};
 use blazy_areas::AreaScreen;
 use blazy_shell::window::{ShellDriver, WindowConfig, run};
 use blazy_shell::{Backend, COMPILED};
@@ -93,13 +93,11 @@ fn main() {
     });
 
     let layers = !args.no_layer_cache;
-    let (screen, _graph) = build_screen_staggered(
-        args.areas.max(1),
-        args.nodes,
-        args.budget_widgets,
-        args.ui_scale,
-        layers,
-    );
+    let (screen, _graph) = ScreenSpec::new(args.areas.max(1), args.nodes)
+        .with_budget(args.budget_widgets)
+        .with_header_scale(args.ui_scale.map_or(HeaderScale::Staggered, HeaderScale::Forced))
+        .with_isolated_layers(layers)
+        .build();
 
     let config = WindowConfig::default()
         .with_title(format!(

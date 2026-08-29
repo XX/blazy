@@ -12,7 +12,8 @@
 
 use std::time::{Duration, Instant};
 
-use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord, ZoomRecord};
+pub(crate) use bench_utils::criteria::ScenarioRecord;
+use bench_utils::criteria::{Criterion, Kind, Outcome, SweepRecord, ZoomRecord};
 use bench_utils::plan;
 use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, DetailBudget};
 use masonry::core::NewWidget;
@@ -20,12 +21,12 @@ use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Affine, Point, Vec2};
 use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
-use node_canvas::build_canvas_with;
+use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::{GRID_STEP, GraphModel, NODE_SIZE, share};
 
 /// Viewport used for all scenarios.
-const VIEWPORT: (u32, u32) = (1100, 750);
+pub(crate) const VIEWPORT: (u32, u32) = (1100, 750);
 
 /// Frames per scenario. Enough to see a trend, short enough to stay interactive.
 const FRAMES: usize = 120;
@@ -41,7 +42,7 @@ const QUICK_FRAMES: usize = 40;
 const VIEWPORT_CENTRE: Point = Point::new(VIEWPORT.0 as f64 / 2.0, VIEWPORT.1 as f64 / 2.0);
 
 /// One pan step, in viewport pixels.
-const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
+pub(crate) const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
 
 /// How the benchmark was asked to run.
 pub struct Options {
@@ -61,13 +62,13 @@ pub struct Options {
 
 impl Options {
     /// Frames per scenario for this run.
-    fn frames(&self) -> usize {
+    pub(crate) fn frames(&self) -> usize {
         if self.quick { QUICK_FRAMES } else { FRAMES }
     }
 }
 
 /// Result of one scenario.
-struct Report {
+pub(crate) struct Report {
     name: &'static str,
     frames: usize,
     total: Duration,
@@ -86,7 +87,7 @@ struct Report {
 }
 
 impl Report {
-    fn mean_ms(&self) -> f64 {
+    pub(crate) fn mean_ms(&self) -> f64 {
         self.total.as_secs_f64() * 1000.0 / self.frames as f64
     }
 
@@ -232,7 +233,7 @@ impl Report {
 }
 
 /// Pans the canvas by one step, as a scenario body.
-fn pan_step(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
+pub(crate) fn pan_step(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::pan(&mut canvas, delta));
     });
@@ -271,7 +272,7 @@ fn per_pick(count: u64, picks: u64) -> f64 {
 /// From the canvas itself rather than from the editor's cached copy: the copy is
 /// refreshed during layout, and a pick deliberately does not run one (§25.4), so a
 /// hover scenario read that way would report having picked nothing.
-fn stats(harness: &mut TestHarness<NodeEditor>) -> CanvasStats {
+pub(crate) fn stats(harness: &mut TestHarness<NodeEditor>) -> CanvasStats {
     harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats()))
 }
 
@@ -288,7 +289,7 @@ fn pick(harness: &mut TestHarness<NodeEditor>, pos: Point) -> Option<CanvasHit> 
 }
 
 /// The canvas-space rectangle of a node.
-fn node_rect(harness: &mut TestHarness<NodeEditor>, index: usize) -> masonry::kurbo::Rect {
+pub(crate) fn node_rect(harness: &mut TestHarness<NodeEditor>, index: usize) -> masonry::kurbo::Rect {
     let pos = harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             CanvasLayer::child_pos(&mut canvas, index).unwrap_or(Point::ORIGIN)
@@ -305,7 +306,7 @@ fn new_harness(count: usize) -> TestHarness<NodeEditor> {
 fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
     let mut edges = node_canvas::generated_links(count);
     edges.truncate(links);
-    let (canvas, _graph) = node_canvas::build_canvas_linked(count, edges);
+    let (canvas, _graph) = CanvasSpec::new(count).with_links(edges).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -316,7 +317,7 @@ fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
 }
 
 fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEditor> {
-    let (canvas, _graph) = build_canvas_with(count, controls_on_hover);
+    let (canvas, _graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
     let editor = NodeEditor::new(canvas);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -337,7 +338,7 @@ fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEd
 /// node count, nothing else changed.
 fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
     let graph = share(GraphModel::generated_with_step(count, GRID_STEP / times.sqrt()));
-    let canvas = node_canvas::canvas_over(&graph, count, false);
+    let canvas = CanvasSpec::new(count).over(&graph);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -350,7 +351,7 @@ fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
 /// A harness over a canvas with an explicit cost ceiling.
 fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEditor> {
     let graph = share(GraphModel::generated(count));
-    let canvas = node_canvas::canvas_over(&graph, count, false).with_budget(budget);
+    let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::new(canvas)),
@@ -378,7 +379,7 @@ fn widgets_in_tree(harness: &mut TestHarness<NodeEditor>) -> usize {
 /// of six pixels is three hundred canvas units, and after a few points the viewport
 /// has left the graph and the rest of the sweep measures empty space. That mistake
 /// was made once, and it made the return leg look free.
-fn look_at(harness: &mut TestHarness<NodeEditor>, anchor: Point, zoom: f64) {
+pub(crate) fn look_at(harness: &mut TestHarness<NodeEditor>, anchor: Point, zoom: f64) {
     let view = Affine::translate(VIEWPORT_CENTRE - (Affine::scale(zoom) * anchor)) * Affine::scale(zoom);
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::set_view(&mut canvas, view));
@@ -387,7 +388,7 @@ fn look_at(harness: &mut TestHarness<NodeEditor>, anchor: Point, zoom: f64) {
 }
 
 /// Times `frames` iterations of `step`, each followed by a full redraw.
-fn measure(
+pub(crate) fn measure(
     name: &'static str,
     harness: &mut TestHarness<NodeEditor>,
     frames: usize,
@@ -421,239 +422,6 @@ fn measure(
         before,
         after: stats(harness),
         commands,
-    }
-}
-
-// --- MARK: the far field, in segments (§35)
-
-/// Zooms the far-field measurements are taken at.
-///
-/// Two, because they answer different questions. At 0.02 the whole graph is on screen
-/// and the recorded region is not the binding constraint — the graph is. At 0.10 the
-/// canvas is still in the far field but the graph continues past the region, which is
-/// the only situation in which the recorded margin costs anything (§35.2).
-const FAR_ZOOMS: [f64; 2] = [0.02, 0.10];
-
-/// Frames the far-field rasterisation is timed over.
-///
-/// Few, because each one is tens of milliseconds — that being the finding (§32.3).
-const FAR_RASTER_FRAMES: usize = 6;
-
-/// One far-field configuration: what it records, and what that costs.
-struct FarRow {
-    what: &'static str,
-    zoom: f64,
-    nodes: usize,
-    /// Nodes and link curves in the recording — what the scene is made of.
-    recorded_nodes: usize,
-    recorded_links: usize,
-    /// Link curves the short-link rule dropped as too small to see (§31.4).
-    hidden_links: usize,
-    /// What vello would be asked to draw (§35.1).
-    objects: usize,
-    segments: u64,
-    /// Decisions per frame: re-choosing the recorded sets is what a margin buys off.
-    far_records: f64,
-    link_reselects: f64,
-    /// Masonry's half of the frame — passes and plan assembly.
-    plan_ms: f64,
-    /// The other half, on the blit path, and on the GPU path where there is a device.
-    cpu_ms: f64,
-    gpu_ms: f64,
-}
-
-/// Path segments in the frame the canvas would hand the rasteriser.
-///
-/// Outside the clock, like every other counter here: encoding the scene is the
-/// measurement, not the frame (§35.1).
-fn segments_of(harness: &mut TestHarness<NodeEditor>) -> u64 {
-    let (plan, _) = harness.redraw();
-    let composed = blazy_shell::Composition::new(&plan, 1.0).scene;
-    blazy_shell::segments(&composed, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
-}
-
-/// Measures one far-field configuration over a pan.
-fn far_case(
-    what: &'static str,
-    count: usize,
-    zoom: f64,
-    links: Vec<blazy_canvas::Link>,
-    tuning: node_canvas::FarTuning,
-    frames: usize,
-    raster: bool,
-) -> FarRow {
-    let (canvas, _graph) = node_canvas::build_canvas_tuned(count, links, tuning);
-    let mut harness = TestHarness::create_with_size(
-        default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
-        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
-    );
-    let _ = harness.redraw();
-    let anchor = node_rect(&mut harness, count / 2).origin();
-    look_at(&mut harness, anchor, zoom);
-
-    let before = stats(&mut harness).counters;
-    let report = measure("far field", &mut harness, frames, |h, i| {
-        pan_step(h, if i < frames / 2 { PAN_STEP } else { -PAN_STEP });
-    });
-    let after = stats(&mut harness);
-
-    let (plan, _) = harness.redraw();
-    let frame = PhysicalSize::new(VIEWPORT.0, VIEWPORT.1);
-    let composed = blazy_shell::Composition::new(&plan, 1.0).scene;
-    let encoded = blazy_shell::encoded(&composed, frame);
-
-    let (mut cpu_ms, mut gpu_ms) = (0.0, 0.0);
-    if raster {
-        cpu_ms = time_raster(&plan);
-        gpu_ms = time_gpu(&plan);
-    }
-
-    FarRow {
-        what,
-        zoom,
-        nodes: count,
-        recorded_nodes: after.recorded_far,
-        recorded_links: after.recorded_links,
-        hidden_links: after.hidden_links,
-        objects: encoded.objects,
-        segments: encoded.segments,
-        far_records: (after.counters.far_records - before.far_records) as f64 / frames as f64,
-        link_reselects: (after.counters.link_reselects - before.link_reselects) as f64 / frames as f64,
-        plan_ms: report.mean_ms(),
-        cpu_ms,
-        gpu_ms,
-    }
-}
-
-/// Rasterises the plan on the blit path and returns milliseconds per frame.
-fn time_raster(plan: &masonry::app::VisualLayerPlan) -> f64 {
-    let Ok(mut host) = blazy_shell::Host::any() else {
-        return 0.0;
-    };
-    let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
-    let _ = host.render(plan, size);
-    let start = Instant::now();
-    for _ in 0..FAR_RASTER_FRAMES {
-        let _ = host.render(plan, size);
-    }
-    start.elapsed().as_secs_f64() * 1000.0 / FAR_RASTER_FRAMES as f64
-}
-
-/// The same on the GPU path, where a device opens. Zero where none does.
-fn time_gpu(plan: &masonry::app::VisualLayerPlan) -> f64 {
-    let Ok(mut gpu) = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)) else {
-        return 0.0;
-    };
-    let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
-    if gpu.draw(plan, size, 1.0).is_err() {
-        return 0.0;
-    }
-    gpu.wait();
-    let start = Instant::now();
-    for _ in 0..FAR_RASTER_FRAMES {
-        if gpu.draw(plan, size, 1.0).is_err() {
-            return 0.0;
-        }
-        gpu.wait();
-    }
-    start.elapsed().as_secs_f64() * 1000.0 / FAR_RASTER_FRAMES as f64
-}
-
-/// What a far-field frame is made of, and what each lever takes off it.
-///
-/// The table §35 is argued from. Every row is the same graph at the same zoom; what
-/// changes is one decision at a time.
-fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> {
-    let frames = opts.frames();
-    let raster = !opts.quick;
-    let links = node_canvas::generated_links(count);
-    let default = node_canvas::FarTuning::default();
-    let with = |overscan: f64| node_canvas::FarTuning { overscan, ..default };
-    let links_at = |min_link_px: f64| node_canvas::FarTuning { min_link_px, ..default };
-
-    println!("\nfar field: what the frame is made of at zoom {zoom} ({count} nodes)");
-    let rows = vec![
-        far_case(
-            "rounded nodes",
-            count,
-            zoom,
-            links.clone(),
-            node_canvas::FarTuning {
-                min_radius_px: 0.0,
-                ..default
-            },
-            frames,
-            raster,
-        ),
-        far_case("plain nodes", count, zoom, links.clone(), default, frames, raster),
-        far_case("plain, no links", count, zoom, Vec::new(), default, frames, raster),
-        far_case("overscan 0.50", count, zoom, links.clone(), with(0.50), frames, raster),
-        far_case("overscan 0.10", count, zoom, links.clone(), with(0.10), frames, raster),
-        far_case("overscan 0.00", count, zoom, links.clone(), with(0.0), frames, raster),
-        far_case(
-            "links >= 4 px",
-            count,
-            zoom,
-            links.clone(),
-            links_at(4.0),
-            frames,
-            raster,
-        ),
-        far_case("links >= 8 px", count, zoom, links, links_at(8.0), frames, raster),
-    ];
-    print_far(&rows);
-    rows
-}
-
-impl FarRow {
-    /// The plain-data form the report archives, so the levers can be diffed across
-    /// commits rather than re-argued.
-    fn record(&self) -> ScenarioRecord {
-        ScenarioRecord {
-            name: "far field",
-            frames: 0,
-            mean_ms: self.plan_ms,
-            worst_ms: self.cpu_ms,
-            materialised: 0,
-            detail: format!("{} @ {} on {} nodes", self.what, self.zoom, self.nodes),
-            child_layouts_per_frame: 0.0,
-            builds_per_frame: 0.0,
-            far_repaints_per_frame: 0.0,
-            extra: vec![
-                ("recorded_nodes", self.recorded_nodes as f64),
-                ("recorded_links", self.recorded_links as f64),
-                ("hidden_links", self.hidden_links as f64),
-                ("draw_objects", self.objects as f64),
-                ("path_segments", self.segments as f64),
-                ("far_records_per_frame", self.far_records),
-                ("link_reselects_per_frame", self.link_reselects),
-                ("cpu_raster_ms", self.cpu_ms),
-                ("gpu_raster_ms", self.gpu_ms),
-            ],
-        }
-    }
-}
-
-fn print_far(rows: &[FarRow]) {
-    println!(
-        "  {:<16} {:>8} {:>8} {:>8} {:>9} {:>10} {:>10} {:>9} {:>9} {:>9}",
-        "what", "nodes", "links", "hidden", "segments", "records/f", "resel/f", "plan ms", "cpu ms", "gpu ms"
-    );
-    for row in rows {
-        println!(
-            "  {:<16} {:>8} {:>8} {:>8} {:>9} {:>10.2} {:>10.2} {:>9.3} {:>9.2} {:>9.2}",
-            row.what,
-            row.recorded_nodes,
-            row.recorded_links,
-            row.hidden_links,
-            row.segments,
-            row.far_records,
-            row.link_reselects,
-            row.plan_ms,
-            row.cpu_ms,
-            row.gpu_ms,
-        );
     }
 }
 
@@ -859,10 +627,10 @@ pub fn run(opts: &Options) -> Outcome {
     // graph sizes for the same reason the zoom sweep uses two: a ceiling that quietly
     // follows the graph is what has to be visible.
     let mut far = Vec::new();
-    for zoom in FAR_ZOOMS {
-        far.extend(far_table(opts, count, zoom));
+    for zoom in crate::far::FAR_ZOOMS {
+        far.extend(crate::far::far_table(opts, count, zoom));
         if !opts.quick {
-            far.extend(far_table(opts, count * 4, zoom));
+            far.extend(crate::far::far_table(opts, count * 4, zoom));
         }
     }
 
@@ -878,7 +646,7 @@ pub fn run(opts: &Options) -> Outcome {
         scenarios: reports
             .iter()
             .map(Report::record)
-            .chain(far.iter().map(FarRow::record))
+            .chain(far.iter().map(crate::far::FarRow::record))
             .collect(),
         sweep,
         zoom_sweep: zooms,
@@ -942,7 +710,7 @@ fn zoom_sweep(opts: &Options, count: usize, frames: usize, density: Option<f64>)
                 level_switches_per_frame: (after.counters.level_switches - before) as f64 / frames as f64,
                 commands: report.commands,
                 hidden_links: after.hidden_links,
-                segments: segments_of(&mut harness),
+                segments: crate::far::segments_of(&mut harness),
                 mean_ms: report.mean_ms(),
                 worst_ms: report.worst_ms(),
             };
@@ -1269,7 +1037,7 @@ fn evaluate(
     zooms: &[ZoomRecord],
     dense_zooms: &[ZoomRecord],
     wobble: f64,
-    far: &[FarRow],
+    far: &[crate::far::FarRow],
 ) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();

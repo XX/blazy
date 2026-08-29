@@ -28,6 +28,7 @@ use node_canvas::DEFAULT_NODES;
 use self::bench::Options;
 
 mod bench;
+mod far;
 
 #[derive(Parser)]
 #[command(

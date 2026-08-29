@@ -397,8 +397,8 @@ fn a_real_frame_is_far_from_both_ceilings() {
         .iter()
         .filter(|command| matches!(command, Command::PushGroup(_)))
         .count();
-    let depth = blazy_shell::nesting_depth(&composed.scene);
-    let demand = blazy_shell::demand(&composed.scene, frame);
+    let depth = blazy_shell::tiles::nesting_depth(&composed.scene);
+    let demand = blazy_shell::tiles::demand(&composed.scene, frame);
     println!(
         "eight areas over 5000 nodes: {} commands, {groups} groups, {depth} deep, \
          {} tiles of {}, {} words of {}",
@@ -425,15 +425,28 @@ fn a_real_frame_is_far_from_both_ceilings() {
 
 // --- MARK: layers per area (§36)
 
+/// Asks every area to repaint, the way the shell does before a frame (§36.1).
+///
+/// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
+/// loop does it for the ids `ShellDriver::layers` returns — and a library method that
+/// exists only so a harness can imitate the host is a second way to say one thing.
+fn keep_layers(harness: &mut TestHarness<AreaScreen>) {
+    for id in harness.root_widget().area_ids() {
+        harness.edit_widget_with_id(id, |mut widget| widget.ctx.request_paint_only());
+    }
+}
 /// What a screen of areas looks like to a host that wants to cache them.
 ///
 /// Two numbers the design rests on, measured rather than assumed: how many layers the
 /// plan carries when every area declares one, and what happens on the frame after —
-/// the frame a cache exists for. `AreaScreen::keep_layers` is what keeps the second
+/// the frame a cache exists for. Asking the areas to repaint is what keeps the second
 /// number equal to the first (§26.1).
 #[test]
 fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
-    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let (screen, _graph) = crate::ScreenSpec::new(8, 400)
+        .with_budget(Some(64))
+        .with_isolated_layers(true)
+        .build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
@@ -447,7 +460,7 @@ fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
     let idle = plan.layers.len();
 
     // The same frame, with the areas asked to repaint first.
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
     let kept = plan.layers.len();
 
@@ -470,53 +483,59 @@ fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
 #[test]
 fn a_kept_layer_is_the_same_picture() {
     let size = PhysicalSize::new(1400, 900);
-    // With a background on both, because that is what a window presents (§26.4) and
-    // because a transparent pixel's colour channels are not part of the picture: without
-    // it the two paths differ in the RGB of fully transparent pixels, which is nothing.
+    // With a background, because that is what a window presents (§26.4) and because a
+    // transparent pixel's colour channels are not part of the picture: without it the
+    // two paths differ in the RGB of fully transparent pixels, which is nothing.
     let panel = Color::from_rgb8(0x14, 0x14, 0x18);
-    let Ok(plain) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
+    let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
         eprintln!("no graphics device: skipping");
         return;
     };
-    let mut plain = plain.with_background(panel);
-    let mut cached = blazy_shell::gpu::GpuFrames::offscreen(size)
-        .expect("a second device opens")
-        .with_background(panel);
+    // One device for both paths: the cache is turned on and off by what it is told to
+    // keep, so a second device would only add a driver initialisation to the test.
+    let mut gpu = gpu.with_background(panel);
 
-    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let (screen, _graph) = crate::ScreenSpec::new(8, 400)
+        .with_budget(Some(64))
+        .with_isolated_layers(true)
+        .build();
     let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
     let ids = harness.root_widget().area_ids();
-    cached.cache_layers(ids);
 
     let logical = Size::new(f64::from(size.width), f64::from(size.height));
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
 
     // The *same* plan through both paths, and twice through the caching one: the
     // second time is the frame the cache answers from. One plan rather than one frame
     // each, because two consecutive frames of a live tree are not obliged to be the
     // same picture, and this test is about the cache and not about the tree.
-    plain.draw(&plan, logical, 1.0).expect("the frame draws");
-    plain.wait();
-    let reference = plain.read_pixels();
+    //
+    // Cached first: turning the cache off drops what it kept, so the other order would
+    // have to fill it twice.
+    gpu.cache_layers(ids);
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    let kept = gpu.read_pixels();
+    let counters = gpu.layer_counters();
+
+    gpu.cache_layers(Vec::new());
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    let reference = gpu.read_pixels();
     // The rasteriser is deterministic here — the same plan twice is the same bytes —
     // so any difference below belongs to the cache and not to the GPU.
-    plain.draw(&plan, logical, 1.0).expect("the frame draws");
-    plain.wait();
-    let twice = plain.read_pixels();
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    let twice = gpu.read_pixels();
     assert_eq!(
         reference.iter().zip(twice.iter()).filter(|(a, b)| a != b).count(),
         0,
         "the rasteriser is not deterministic, so this test cannot say anything"
     );
 
-    cached.draw(&plan, logical, 1.0).expect("the frame draws");
-    cached.wait();
-    cached.draw(&plan, logical, 1.0).expect("the frame draws");
-    cached.wait();
-    let kept = cached.read_pixels();
-
-    let counters = cached.layer_counters();
     println!(
         "layer cache: offered {}, reused {}, drawn {}, {} KiB",
         counters.offered,
@@ -542,25 +561,28 @@ fn a_kept_layer_is_the_same_picture() {
 fn a_changed_layer_is_drawn_again() {
     let size = PhysicalSize::new(1400, 900);
     let panel = Color::from_rgb8(0x14, 0x14, 0x18);
-    let Ok(plain) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
+    let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
         eprintln!("no graphics device: skipping");
         return;
     };
-    let mut plain = plain.with_background(panel);
-    let mut cached = blazy_shell::gpu::GpuFrames::offscreen(size)
-        .expect("a second device opens")
-        .with_background(panel);
+    // One device, as in the test above: what turns the cache on and off is the list of
+    // layers it is told to keep.
+    let mut gpu = gpu.with_background(panel);
 
-    let (screen, _graph) = crate::build_screen_layered(8, 400, Some(64), true, true);
+    let (screen, _graph) = crate::ScreenSpec::new(8, 400)
+        .with_budget(Some(64))
+        .with_isolated_layers(true)
+        .build();
     let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
-    cached.cache_layers(harness.root_widget().area_ids());
+    let ids = harness.root_widget().area_ids();
+    gpu.cache_layers(ids.clone());
     let logical = Size::new(f64::from(size.width), f64::from(size.height));
 
     // A frame to fill the cache.
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
-    cached.draw(&plan, logical, 1.0).expect("the frame draws");
-    cached.wait();
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
 
     // Now move one area's canvas, so exactly one layer is different.
     let canvas = canvas_id(&harness, 0);
@@ -568,28 +590,31 @@ fn a_changed_layer_is_drawn_again() {
         let mut canvas = widget.downcast::<CanvasLayer>();
         CanvasLayer::pan(&mut canvas, Vec2::new(-40.0, -25.0));
     });
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
+    keep_layers(&mut harness);
     let (plan, _) = harness.redraw();
 
-    plain.draw(&plan, logical, 1.0).expect("the frame draws");
-    plain.wait();
-    let reference = plain.read_pixels();
+    // The cached frame first, while the cache still holds the frame before the pan;
+    // turning it off afterwards is what gives the reference.
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    let kept = gpu.read_pixels();
+    let counters = gpu.layer_counters();
+
+    gpu.cache_layers(Vec::new());
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    let reference = gpu.read_pixels();
     // The rasteriser is deterministic here — the same plan twice is the same bytes —
     // so any difference below belongs to the cache and not to the GPU.
-    plain.draw(&plan, logical, 1.0).expect("the frame draws");
-    plain.wait();
-    let twice = plain.read_pixels();
+    gpu.draw(&plan, logical, 1.0).expect("the frame draws");
+    gpu.wait();
+    let twice = gpu.read_pixels();
     assert_eq!(
         reference.iter().zip(twice.iter()).filter(|(a, b)| a != b).count(),
         0,
         "the rasteriser is not deterministic, so this test cannot say anything"
     );
 
-    cached.draw(&plan, logical, 1.0).expect("the frame draws");
-    cached.wait();
-    let kept = cached.read_pixels();
-
-    let counters = cached.layer_counters();
     println!(
         "after a pan in one area: reused {}, drawn {}",
         counters.reused, counters.drawn

@@ -39,33 +39,98 @@ use crate::node::GraphSource;
 /// Default graph size. The figure comes straight from the Phase 0 brief.
 pub const DEFAULT_NODES: usize = 5000;
 
-/// Builds a virtualised canvas over a generated graph.
+/// How a canvas is put together for a window, a test or a measurement.
 ///
-/// Only geometry is handed to the canvas up front. Widgets are built on demand by
-/// the closure, which reads current state from the shared model — so a node that
-/// scrolls out of view and back again comes back with the user's edits intact.
-pub fn build_canvas(count: usize) -> (CanvasLayer, SharedGraph) {
-    build_canvas_with(count, false)
+/// One description with defaults rather than a constructor per combination: every knob
+/// this example grew — controls on hover, an explicit edge set, the far-field levers of
+/// §35 — used to add another `build_canvas_*`, and the combinations multiply while the
+/// bodies stay the same three lines.
+#[derive(Clone, Debug)]
+pub struct CanvasSpec {
+    /// Nodes in the generated graph.
+    pub nodes: usize,
+    /// Edges: the generated ones unless an exact set is given (the link sweep gives one).
+    pub links: Option<Vec<Link>>,
+    /// Whether only the node under the pointer gets interactive controls.
+    ///
+    /// Off by default: at `Full` the painted stand-in does not resemble Masonry's themed
+    /// slider and checkbox closely enough, so swapping them in on hover reads as the
+    /// interface changing under the cursor. The benchmark keeps measuring both so the
+    /// price of that choice stays visible.
+    pub controls_on_hover: bool,
+    /// The far-field knobs (§35.2).
+    pub far: FarTuning,
 }
 
-/// As [`build_canvas`], with control-on-hover materialisation optionally enabled.
-///
-/// Off by default: at `Full` the painted stand-in does not resemble Masonry's themed
-/// slider and checkbox closely enough, so swapping them in on hover reads as the
-/// interface changing under the cursor. The benchmark keeps measuring both so the
-/// price of that choice stays visible.
-pub fn build_canvas_with(count: usize, controls_on_hover: bool) -> (CanvasLayer, SharedGraph) {
-    let graph = share(GraphModel::generated(count));
-    let canvas = canvas_over(&graph, count, controls_on_hover);
-    (canvas, graph)
+impl CanvasSpec {
+    #[must_use]
+    pub fn new(nodes: usize) -> Self {
+        Self {
+            nodes,
+            links: None,
+            controls_on_hover: false,
+            far: FarTuning::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
+        self.controls_on_hover = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_links(mut self, links: Vec<Link>) -> Self {
+        self.links = Some(links);
+        self
+    }
+
+    #[must_use]
+    pub fn with_far(mut self, far: FarTuning) -> Self {
+        self.far = far;
+        self
+    }
+
+    /// Builds the canvas over a graph of its own.
+    ///
+    /// Only geometry is handed to the canvas up front. Widgets are built on demand by
+    /// the source, which reads current state from the shared model — so a node that
+    /// scrolls out of view and back again comes back with the user's edits intact.
+    pub fn build(self) -> (CanvasLayer, SharedGraph) {
+        let graph = share(GraphModel::generated(self.nodes));
+        let canvas = self.over(&graph);
+        (canvas, graph)
+    }
+
+    /// Builds a canvas over a graph that already exists.
+    ///
+    /// Several views of one model is the normal arrangement — Blender shows the same
+    /// scene in several editors at once — and it is the arrangement the area
+    /// measurements need: comparing one area against sixteen only means something if
+    /// all sixteen are looking at the same graph rather than sixteen graphs of their own.
+    pub fn over(self, graph: &SharedGraph) -> CanvasLayer {
+        let nodes = self.nodes;
+        let geometry = {
+            let graph = graph.clone();
+            move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
+        };
+        let source = GraphSource::new(graph.clone()).with_far_min_radius(self.far.min_radius_px);
+        CanvasLayer::new(nodes, geometry, source)
+            .with_controls_on_hover(self.controls_on_hover)
+            .with_links(self.links.unwrap_or_else(|| generated_links(nodes)))
+            .with_far_overscan(self.far.overscan)
+            .with_link_style(blazy_canvas::LinkStyle {
+                min_screen_length: self.far.min_link_px,
+                ..blazy_canvas::LinkStyle::default()
+            })
+    }
 }
 
-/// A second canvas over a graph that already exists.
-///
-/// Several views of one model is the normal arrangement — Blender shows the same
-/// scene in several editors at once — and it is the arrangement the area
-/// measurements need: comparing one area against sixteen only means something if
-/// all sixteen are looking at the same graph rather than sixteen graphs of their own.
+/// The canvas a window opens with: a generated graph and every default.
+pub fn build_canvas(nodes: usize) -> (CanvasLayer, SharedGraph) {
+    CanvasSpec::new(nodes).build()
+}
+
 /// Edges for a generated graph: each node wired to its neighbour on the right and
 /// the one below.
 ///
@@ -85,17 +150,6 @@ pub fn generated_links(count: usize) -> Vec<Link> {
         }
     }
     links
-}
-
-/// A canvas over a fresh graph with an explicit edge set, for the link sweep.
-pub fn build_canvas_linked(count: usize, links: Vec<Link>) -> (CanvasLayer, SharedGraph) {
-    let graph = share(GraphModel::generated(count));
-    let geometry = {
-        let graph = graph.clone();
-        move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
-    };
-    let canvas = CanvasLayer::new(count, geometry, GraphSource::new(graph.clone())).with_links(links);
-    (canvas, graph)
 }
 
 /// The far-field knobs the §35 measurements sweep.
@@ -122,33 +176,4 @@ impl Default for FarTuning {
             min_link_px: blazy_canvas::LinkStyle::default().min_screen_length,
         }
     }
-}
-
-/// A canvas over a generated graph, with the far-field knobs set.
-pub fn build_canvas_tuned(count: usize, links: Vec<Link>, tuning: FarTuning) -> (CanvasLayer, SharedGraph) {
-    let graph = share(GraphModel::generated(count));
-    let geometry = {
-        let graph = graph.clone();
-        move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
-    };
-    let source = GraphSource::new(graph.clone()).with_far_min_radius(tuning.min_radius_px);
-    let canvas = CanvasLayer::new(count, geometry, source)
-        .with_links(links)
-        .with_far_overscan(tuning.overscan)
-        .with_link_style(blazy_canvas::LinkStyle {
-            min_screen_length: tuning.min_link_px,
-            ..blazy_canvas::LinkStyle::default()
-        });
-    (canvas, graph)
-}
-
-pub fn canvas_over(graph: &SharedGraph, count: usize, controls_on_hover: bool) -> CanvasLayer {
-    let geometry = {
-        let graph = graph.clone();
-        move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
-    };
-    let source = GraphSource::new(graph.clone());
-    CanvasLayer::new(count, geometry, source)
-        .with_controls_on_hover(controls_on_hover)
-        .with_links(generated_links(count))
 }

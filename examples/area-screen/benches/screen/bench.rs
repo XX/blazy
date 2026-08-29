@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use area_screen::header::ScaledHeader;
-use area_screen::{build_screen, build_screen_with};
+use area_screen::{ScreenSpec, build_screen};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
 use bench_utils::plan;
 use blazy_areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
@@ -22,7 +22,7 @@ use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 
 /// Viewport used for all scenarios. A working screen, not a demo window.
-const VIEWPORT: (u32, u32) = (1400, 900);
+pub(crate) const VIEWPORT: (u32, u32) = (1400, 900);
 
 /// Frames per scenario.
 const FRAMES: usize = 120;
@@ -31,7 +31,7 @@ const FRAMES: usize = 120;
 const QUICK_FRAMES: usize = 40;
 
 /// One pan step inside an area, in viewport pixels.
-const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
+pub(crate) const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
 
 /// Interface scales the scale scenario cycles through.
 ///
@@ -48,7 +48,7 @@ pub struct Options {
 }
 
 impl Options {
-    fn frames(&self) -> usize {
+    pub(crate) fn frames(&self) -> usize {
         if self.quick { QUICK_FRAMES } else { FRAMES }
     }
 }
@@ -244,7 +244,7 @@ fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 
 /// A screen of one region per area: the canvas, with no header above it.
 fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
-    let (screen, _graph) = build_screen_with(areas, nodes, None, false);
+    let (screen, _graph) = ScreenSpec::new(areas, nodes).without_header().build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(screen),
@@ -327,7 +327,7 @@ fn drag_step(harness: &mut TestHarness<AreaScreen>, split: NodeId, base: Point, 
 }
 
 /// Pans the canvas in area `area` by one step.
-fn pan_area(harness: &mut TestHarness<AreaScreen>, area: usize, delta: Vec2) {
+pub(crate) fn pan_area(harness: &mut TestHarness<AreaScreen>, area: usize, delta: Vec2) {
     let id = canvas_of(harness, area).ctx().widget_id();
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
@@ -336,7 +336,7 @@ fn pan_area(harness: &mut TestHarness<AreaScreen>, area: usize, delta: Vec2) {
 }
 
 /// Zooms the canvas in area `area` about its centre.
-fn zoom_area(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
+pub(crate) fn zoom_area(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
     let id = canvas_of(harness, area).ctx().widget_id();
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
@@ -386,164 +386,6 @@ fn overview_screen(opts: &Options, areas: usize, nodes: usize) -> (usize, usize,
         report.after.live,
     );
     (widgets, report.commands, report.mean_ms(), report.worst_ms())
-}
-
-// --- MARK: the layer cache (§36)
-
-/// Frames each cache scenario is timed over. Few: each one is a whole GPU frame.
-const CACHE_FRAMES: usize = 8;
-
-/// What one gesture costs a screen of areas, with and without kept layers.
-struct CacheRow {
-    what: &'static str,
-    cached: bool,
-    /// Layers the plan carried on the last frame.
-    layers: usize,
-    /// Per frame: layers copied instead of drawn, and layers drawn.
-    reused: f64,
-    drawn: f64,
-    /// What deciding costs: the rectangle of each layer plus a scene comparison.
-    decide_ms: f64,
-    /// The frame on the GPU path.
-    gpu_ms: f64,
-    /// Texture the cache is holding, in KiB.
-    kib: u64,
-}
-
-/// A screen whose areas declare scene layers, at a zoom where the frame is expensive.
-fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
-    let (screen, _graph) = area_screen::build_screen_layered(areas, nodes, None, true, true);
-    let mut harness = TestHarness::create_with_size(
-        default_property_set(),
-        NewWidget::new(screen),
-        PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
-    );
-    let _ = harness.redraw();
-    // Every canvas out at an overview zoom: the far field is what makes a frame cost
-    // tens of milliseconds (§35.5), and therefore what a kept layer saves.
-    for area in 0..areas {
-        zoom_area(&mut harness, area, 0.05);
-    }
-    let _ = harness.redraw();
-    harness
-}
-
-/// One gesture, on one path.
-fn cache_case(
-    what: &'static str,
-    areas: usize,
-    nodes: usize,
-    cached: bool,
-    mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
-) -> Option<CacheRow> {
-    let mut gpu = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
-        .ok()?
-        .with_background(masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
-    let mut harness = layered_harness(areas, nodes);
-    if cached {
-        gpu.cache_layers(harness.root_widget().area_ids());
-    }
-    let logical = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
-
-    // One frame to fill the cache, so the sweep measures the steady state rather than
-    // the first frame of it.
-    harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
-    let (plan, _) = harness.redraw();
-    gpu.draw(&plan, logical, 1.0).ok()?;
-    gpu.wait();
-
-    let before = gpu.layer_counters();
-    let mut total = Duration::ZERO;
-    let mut layers = 0;
-    let mut decide = Duration::ZERO;
-    let mut previous: Vec<masonry::imaging::record::Scene> = Vec::new();
-    for i in 0..CACHE_FRAMES {
-        step(&mut harness, i);
-        harness.edit_root_widget(|mut screen| AreaScreen::keep_layers(&mut screen));
-        let (plan, _) = harness.redraw();
-        layers = plan.layers.len();
-
-        // The cache's own decision, timed on its own rather than inferred from the
-        // difference between two paths: the rectangle a layer occupies, and whether its
-        // scene is the one from last frame.
-        let start = Instant::now();
-        previous.resize_with(plan.layers.len(), masonry::imaging::record::Scene::new);
-        for (index, layer) in plan.layers.iter().enumerate() {
-            let masonry::app::VisualLayerKind::Scene(scene) = &layer.kind else {
-                continue;
-            };
-            // What the cache does and in the order it does it: compare first, and only
-            // work out where a changed layer sits — the walk is the expensive half.
-            if previous[index] != *scene {
-                let _ = blazy_shell::scene_bounds(scene, layer.transform, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1));
-                previous[index].clone_from(scene);
-            }
-        }
-        decide += start.elapsed();
-
-        let start = Instant::now();
-        gpu.draw(&plan, logical, 1.0).ok()?;
-        gpu.wait();
-        total += start.elapsed();
-    }
-
-    let counters = gpu.layer_counters();
-    let frames = CACHE_FRAMES as f64;
-    Some(CacheRow {
-        what,
-        cached,
-        layers,
-        reused: (counters.reused - before.reused) as f64 / frames,
-        drawn: (counters.drawn - before.drawn) as f64 / frames,
-        decide_ms: decide.as_secs_f64() * 1000.0 / frames,
-        gpu_ms: total.as_secs_f64() * 1000.0 / frames,
-        kib: counters.bytes / 1024,
-    })
-}
-
-/// What keeping the pixels of idle areas is worth, and what it costs.
-fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<CacheRow> {
-    let mut rows = Vec::new();
-    println!("\nlayer cache: {areas} areas over one graph, canvases at an overview zoom");
-    for cached in [false, true] {
-        rows.extend(cache_case("nothing changes", areas, nodes, cached, |_, _| {}));
-        rows.extend(cache_case("one area pans", areas, nodes, cached, |h, _| {
-            pan_area(h, 0, PAN_STEP);
-        }));
-        // In the quick set too: it is the row that keeps the two criteria above from
-        // passing on a sweep where nothing ever changes (§20.9).
-        rows.extend(cache_case("every area pans", areas, nodes, cached, move |h, _| {
-            for area in 0..areas {
-                pan_area(h, area, PAN_STEP);
-            }
-        }));
-    }
-    print_cache(&rows);
-    rows
-}
-
-fn print_cache(rows: &[CacheRow]) {
-    if rows.is_empty() {
-        println!("  no graphics device: the layer cache is not measured here");
-        return;
-    }
-    println!(
-        "  {:<18} {:>7} {:>7} {:>8} {:>8} {:>10} {:>9} {:>8}",
-        "gesture", "cache", "layers", "reused/f", "drawn/f", "decide ms", "gpu ms", "KiB"
-    );
-    for row in rows {
-        println!(
-            "  {:<18} {:>7} {:>7} {:>8.2} {:>8.2} {:>10.3} {:>9.2} {:>8}",
-            row.what,
-            if row.cached { "on" } else { "off" },
-            row.layers,
-            row.reused,
-            row.drawn,
-            row.decide_ms,
-            row.gpu_ms,
-            row.kib,
-        );
-    }
 }
 
 /// Runs the scenarios, prints the numbers, and returns the evaluated criteria.
@@ -684,7 +526,7 @@ pub fn run(opts: &Options) -> Outcome {
     let sweep = area_sweep(opts, nodes);
     let regions = region_cost(opts, areas, nodes);
     let (overview_widgets, overview_commands, ..) = overview_screen(opts, areas, nodes);
-    let cache = cache_table(opts, areas, nodes);
+    let cache = crate::cache::cache_table(opts, areas, nodes);
 
     let outcome = Outcome {
         nodes: areas,
@@ -790,7 +632,7 @@ struct Measured<'a> {
     overview_commands: usize,
     areas: usize,
     /// What the layer cache did, row by row (§36).
-    cache: &'a [CacheRow],
+    cache: &'a [crate::cache::CacheRow],
 }
 
 fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
@@ -1007,6 +849,63 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             measured: (areas as f64 - (one.reused + one.drawn)).abs(),
             bound: 0.5,
             unit: "areas unaccounted for",
+        });
+    }
+    if let Some(idle) = cached_row("nothing changes") {
+        // Why the cache pays for itself (§36.3), as a counter: comparing scenes is
+        // cheap, finding out where a layer sits walks its whole scene, and a layer that
+        // did not change already has a rectangle. Compute the rectangle first and this
+        // is eight per frame on an idle screen.
+        criteria.push(Criterion {
+            name: "an_idle_screen_walks_no_layer",
+            claim: "a frame in which nothing changed touches no layer's geometry",
+            kind: Kind::Counter,
+            measured: idle.walks,
+            bound: 0.5,
+            unit: "layers walked/frame",
+        });
+    }
+    if !cache.is_empty() {
+        // The partner of the one above, from the failing side: a sweep where the cache
+        // never walks anything cannot say the walk is being avoided.
+        criteria.push(Criterion {
+            name: "the_layer_walk_is_exercised",
+            claim: "the sweep contains a frame in which layers are walked",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!cache.iter().any(|row| row.cached && row.walks > 0.5))),
+            bound: 1.0,
+            unit: "sweeps that never walk",
+        });
+    }
+
+    if !cache.is_empty() {
+        // §37.2: the cache is bounded. Cached layers tile the window, so what they hold
+        // adds up to about one frame however many of them there are — but a caller that
+        // registers more than that, or a window that has just resized, must not be able
+        // to grow it without limit.
+        criteria.push(Criterion {
+            name: "the_layer_cache_stays_inside_its_ceiling",
+            claim: "the cache never holds more texture than its ceiling",
+            kind: Kind::Counter,
+            measured: cache
+                .iter()
+                .filter(|row| row.cached)
+                .map(|row| row.kib.saturating_sub(row.budget_kib))
+                .max()
+                .unwrap_or(0) as f64,
+            bound: 1.0,
+            unit: "KiB over the ceiling",
+        });
+
+        // And the partner: a sweep that never fills the cache says nothing about what
+        // happens when it does.
+        criteria.push(Criterion {
+            name: "the_cache_ceiling_is_exercised",
+            claim: "the sweep contains a frame in which the cache had to evict",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!cache.iter().any(|row| row.cached && row.evictions > 0.5))),
+            bound: 1.0,
+            unit: "sweeps that never evict",
         });
     }
     if !cache.is_empty() {
