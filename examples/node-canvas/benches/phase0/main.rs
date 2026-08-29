@@ -29,6 +29,7 @@ use self::bench::Options;
 
 mod bench;
 mod far;
+mod ops;
 
 #[derive(Parser)]
 #[command(

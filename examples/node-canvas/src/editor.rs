@@ -1,27 +1,74 @@
-//! The node editor: a canvas plus a heads-up display of the Phase 0 counters.
+//! The node editor: a canvas, a heads-up display, and the operator layer's driver.
 //!
 //! The HUD exists because Phase 0 is a measurement, not a demo. Numbers that only
 //! appear in a log are numbers nobody checks while dragging a node around.
+//!
+//! ## The driver
+//!
+//! With [`NodeEditor::with_ops`] this widget is also where §38's answer lands: the
+//! seat the operator layer sits in. It is three seats at once, and it has to be,
+//! because no single one of them does the whole job:
+//!
+//! * [`Layer::capture_pointer_event`] — every pointer event, before the tree, even outside this widget's rectangle. It
+//!   cannot stop one, so it only counts them.
+//! * [`Widget::on_pointer_event`] — the ordinary bubbled route. Everything below has had its refusal first, which is
+//!   what keeps the sliders inside nodes working, and it is the only place pointer capture may be taken (Masonry allows
+//!   it during a press and nowhere else).
+//! * [`Widget::on_text_event`] — keys, once the host has made this widget the focus fallback
+//!   (`RenderRoot::set_focus_fallback`), because a keymap has to hear the keys no focused widget claimed.
+//!
+//! Everything an operator does lands in the model. What comes back out is
+//! [`EditorWorld::moved`], and carrying that into this canvas and into the *other*
+//! views of the same graph is this driver's job — §30's fan-out, moved from the
+//! canvas's own drag handler to here.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::mem;
 
 use blazy_canvas::{CanvasLayer, CanvasStats};
+use blazy_ops::keymap::{Props, Scope};
+use blazy_ops::runtime::{Dispatch, OpRuntime, Seat};
+use blazy_ops::{OpCounters, OpResult};
 use masonry::accesskit::{Node as AccessNode, Role};
+use masonry::core::keyboard::KeyState;
 use masonry::core::{
-    AccessCtx, BrushIndex, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent,
-    PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, Widget, WidgetMut, WidgetPod, render_text,
+    AccessCtx, BrushIndex, ChildrenIds, EventCtx, Layer, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent,
+    PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Widget, WidgetId, WidgetMut, WidgetPod,
+    render_text,
 };
 use masonry::imaging::Painter;
-use masonry::kurbo::{Affine, Axis, Point, Rect, Size};
+use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
 use masonry::layout::{LenReq, Length, SizeDef};
 use masonry::parley::Layout;
 use masonry::peniko::Color;
+use masonry::ui_events::pointer::{PointerScrollEvent, PointerUpdate};
 use masonry::{TextAlign, TextAlignOptions};
 
-/// Renders a canvas and overlays live statistics on top of it.
+use crate::model::SharedGraph;
+use crate::ops::{CANVAS_SCOPE, EditorWorld};
+
+/// The operator layer, when this editor drives one.
+struct Ops {
+    runtime: OpRuntime<EditorWorld>,
+    world: EditorWorld,
+}
+
+/// Renders a canvas, overlays live statistics on it, and drives the operators.
 pub struct NodeEditor {
     canvas: WidgetPod<CanvasLayer>,
+    /// The operator layer, or `None` for an editor with the canvas's own gestures.
+    ///
+    /// Optional so that every measurement written before §38 still measures what it
+    /// measured: an editor without operators is the widget it always was, down to the
+    /// counter.
+    ops: Option<Ops>,
+    /// The canvas's view transform, as of the last layout.
+    ///
+    /// Cached because the overlay is drawn in `post_paint`, and a `PaintCtx` cannot
+    /// reach into a child. It cannot go stale: the view only ever changes through a
+    /// layout (§22), and this is refreshed in every one.
+    view: Affine,
     /// Stats cached during layout, so `post_paint` draws numbers from this frame.
     stats: CanvasStats,
     /// The HUD text currently on screen.
@@ -55,12 +102,152 @@ impl NodeEditor {
     pub fn new(canvas: CanvasLayer) -> Self {
         Self {
             canvas: WidgetPod::new(canvas),
+            ops: None,
+            view: Affine::IDENTITY,
             stats: CanvasStats::default(),
             hud: String::new(),
             hud_next: String::new(),
             hud_layout: None,
         }
     }
+
+    /// The same editor, with the operator layer driving the primary button and the
+    /// keyboard.
+    ///
+    /// Takes the canvas's own primary-button gestures away
+    /// ([`CanvasLayer::with_builtin_gestures`]): the canvas is *below* this widget, so
+    /// leaving them on would mean the canvas answering a press before the keymap ever
+    /// heard of it. What the canvas keeps is the middle-button pan, the wheel zoom and
+    /// the pick on every pointer event — the last of which is what the operators' poll
+    /// reads as context.
+    pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph) -> Self {
+        Self {
+            ops: Some(Ops {
+                runtime: crate::ops::runtime(),
+                world: EditorWorld::new(graph),
+            }),
+            ..Self::new(canvas.with_builtin_gestures(false))
+        }
+    }
+
+    /// The selected nodes. Empty for an editor with no operator layer.
+    pub fn selection(&self) -> BTreeSet<usize> {
+        self.ops
+            .as_ref()
+            .map(|ops| ops.world.selection.clone())
+            .unwrap_or_default()
+    }
+
+    /// The operator counters, all zero when there is no operator layer.
+    pub fn op_counters(&self) -> OpCounters {
+        self.ops.as_ref().map(|ops| ops.runtime.counters()).unwrap_or_default()
+    }
+
+    /// How many operators are running. Zero between gestures, and a gesture that ends
+    /// with this non-zero is one that never finished.
+    pub fn modal_depth(&self) -> usize {
+        self.ops.as_ref().map_or(0, |ops| ops.runtime.modal_depth())
+    }
+
+    /// Steps in the undo history.
+    pub fn history_depth(&self) -> usize {
+        self.ops.as_ref().map_or(0, |ops| ops.runtime.history().depth())
+    }
+
+    /// Bytes the undo history is holding, by its steps' own reckoning.
+    pub fn history_bytes(&self) -> usize {
+        self.ops.as_ref().map_or(0, |ops| ops.runtime.history().bytes())
+    }
+
+    /// Runs an operator by name, from outside the tree.
+    ///
+    /// The `exec` half of §11 — a script, a test, a redo — and it goes through the
+    /// same runtime, the same poll and the same history as a key would. What it also
+    /// does is what the interactive path does after a dispatch: carry the moved nodes
+    /// into this canvas and into the other views of the graph.
+    pub fn exec(this: &mut WidgetMut<'_, Self>, name: &str, props: &Props) -> OpResult {
+        let Some(ops) = this.widget.ops.as_mut() else {
+            return OpResult::PassThrough;
+        };
+        let result = ops.runtime.exec(&mut ops.world, name, props);
+        Self::flush_mut(this);
+        result
+    }
+
+    /// Sets how undo steps are recorded, for the measurement in §38.4.
+    pub fn set_undo_mode(this: &mut WidgetMut<'_, Self>, mode: crate::ops::UndoMode) {
+        if let Some(ops) = this.widget.ops.as_mut() {
+            ops.world.undo_mode = mode;
+        }
+    }
+
+    /// Applies what the operators changed, from a `WidgetMut`.
+    ///
+    /// The twin of [`flush`](Self::flush), for the path that has no `EventCtx`. The
+    /// two differ only in how they reach the canvas, which is the whole reason both
+    /// exist rather than one.
+    fn flush_mut(this: &mut WidgetMut<'_, Self>) {
+        let Some(ops) = this.widget.ops.as_mut() else {
+            return;
+        };
+        let moved = mem::take(&mut ops.world.moved);
+        let pan = mem::replace(&mut ops.world.pan, Vec2::ZERO);
+        let dirty = mem::take(&mut ops.world.dirty);
+        let positions = positions_of(&ops.world, moved);
+        if dirty {
+            this.ctx.request_post_paint();
+        }
+        if positions.is_empty() && pan == Vec2::ZERO {
+            return;
+        }
+        {
+            let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
+            for &(index, pos) in &positions {
+                CanvasLayer::move_child(&mut canvas, index, pos);
+            }
+            if pan != Vec2::ZERO {
+                CanvasLayer::pan(&mut canvas, pan);
+            }
+        }
+        if positions.is_empty() {
+            return;
+        }
+        let peers = peers_of(
+            this.widget.ops.as_ref().expect("checked above"),
+            this.widget.canvas.id(),
+        );
+        for peer in peers {
+            let positions = positions.clone();
+            this.ctx.mutate_later(peer, move |mut widget| {
+                let mut canvas = widget.downcast::<CanvasLayer>();
+                for (index, pos) in positions {
+                    CanvasLayer::move_child(&mut canvas, index, pos);
+                }
+            });
+        }
+    }
+}
+
+/// The current position of every node in `moved`, deduplicated.
+///
+/// Deduplicated here rather than as it is filled: a drag pushes the same index on
+/// every frame, and one sort of a handful of indices per event is cheaper than a set
+/// lookup per node per frame.
+fn positions_of(world: &EditorWorld, mut moved: Vec<usize>) -> Vec<(usize, Point)> {
+    if moved.is_empty() {
+        return Vec::new();
+    }
+    moved.sort_unstable();
+    moved.dedup();
+    let graph = world.graph.borrow();
+    moved.into_iter().map(|index| (index, graph.node(index).pos)).collect()
+}
+
+/// The other canvases showing the same graph (§30).
+fn peers_of(ops: &Ops, own_canvas: WidgetId) -> Vec<WidgetId> {
+    let mut peers = Vec::new();
+    ops.world.graph.borrow().other_views(Some(own_canvas), &mut peers);
+    peers
 }
 
 /// Formats the HUD into `out`, reusing its allocation.
@@ -78,13 +265,188 @@ fn format_hud(stats: &CanvasStats, out: &mut String) {
     write!(
         out,
         "nodes {visible}/{total} materialised   zoom {zoom:.2}x   lod {detail}   built {builds}\n\
-         drag a node - left-drag empty space or middle-drag to pan - wheel to zoom",
+         left-drag a node or the view - right-click selects, right-drag boxes - G moves, B boxes, Ctrl+Z undoes",
         visible = stats.materialised,
         total = stats.total,
         zoom = stats.zoom,
         builds = stats.counters.builds,
     )
     .ok();
+}
+
+/// The pre-tree seat (§38.1).
+///
+/// Called for every pointer event before the target is even computed, and for events
+/// outside this widget's rectangle as well. It cannot stop one: the method returns
+/// nothing, its `EventCtx` is dropped, and `capture_pointer` is refused because the
+/// pass does not allow capture here. So what it does is count, and the count is the
+/// evidence for the one-line request upstream — whose own TODO already lists "return
+/// flag to suppress event from reaching children".
+impl Layer for NodeEditor {
+    fn capture_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &PointerEvent) {
+        let Some(op_event) = to_op_event(ctx, event) else {
+            return;
+        };
+        if let Some(ops) = self.ops.as_mut() {
+            ops.runtime.observe(&op_event);
+        }
+    }
+}
+
+impl NodeEditor {
+    /// Offers one event to the runtime and carries out what it changed.
+    ///
+    /// Returns whether the event was consumed. Everything the operators need to know
+    /// about the world is filled in first: where the pointer is, in canvas
+    /// coordinates, and what the canvas last found under it.
+    fn dispatch(&mut self, ctx: &mut EventCtx<'_>, event: &blazy_ops::event::OpEvent) -> bool {
+        let (view, hover) = {
+            let (canvas, _) = ctx.get_raw(&mut self.canvas);
+            (canvas.view(), canvas.stats().hovered)
+        };
+        self.view = view;
+        // Bubbled means a descendant was offered this event first. While an operator
+        // is running that is a leak, and the runtime counts it (§38.1).
+        let seat = if ctx.target() == ctx.widget_id() {
+            Seat::Tree
+        } else {
+            Seat::Bubbled
+        };
+        let is_press = matches!(event, blazy_ops::event::OpEvent::Press { .. });
+
+        let result = {
+            let ops = self.ops.as_mut().expect("checked by the caller");
+            ops.world.hover = hover;
+            if let Some(pos) = event.pos() {
+                ops.world.pointer_screen = pos;
+                ops.world.pointer = view.inverse() * pos;
+            }
+            ops.runtime.dispatch(&mut ops.world, event, Scope(&CANVAS_SCOPE), seat)
+        };
+
+        // Masonry's own modality, and the only lever that keeps an event from the
+        // tree: it may be taken during a press and at no other time (§38.1). A modal
+        // operator started from a key therefore runs without it.
+        let running = self.modal_depth() > 0;
+        let holds = ctx.pointer_capture_target_id() == Some(ctx.widget_id());
+        if running && is_press && !holds {
+            ctx.capture_pointer();
+        } else if !running && holds && !is_press {
+            ctx.release_pointer();
+        }
+
+        self.flush(ctx);
+        result != Dispatch::NoBinding
+    }
+
+    /// Applies what the operators changed to this canvas and to the graph's other
+    /// views.
+    ///
+    /// The §30 fan-out, from here rather than from the canvas's drag: the operator
+    /// wrote the model, and only the driver holds a widget context.
+    fn flush(&mut self, ctx: &mut EventCtx<'_>) {
+        let Some(ops) = self.ops.as_mut() else {
+            return;
+        };
+        let moved = mem::take(&mut ops.world.moved);
+        let pan = mem::replace(&mut ops.world.pan, Vec2::ZERO);
+        if mem::take(&mut ops.world.dirty) {
+            ctx.request_post_paint();
+        }
+        let positions = positions_of(&ops.world, moved);
+        if positions.is_empty() && pan == Vec2::ZERO {
+            return;
+        }
+        {
+            let (canvas, mut raw) = ctx.get_raw_mut(&mut self.canvas);
+            for &(index, pos) in &positions {
+                canvas.move_child_raw(index, pos, &mut raw);
+            }
+            if pan != Vec2::ZERO {
+                canvas.pan_raw(pan, &mut raw);
+            }
+        }
+        if positions.is_empty() {
+            return;
+        }
+        let peers = peers_of(self.ops.as_ref().expect("checked above"), self.canvas.id());
+        for peer in peers {
+            let positions = positions.clone();
+            ctx.mutate_later(peer, move |mut widget| {
+                let mut canvas = widget.downcast::<CanvasLayer>();
+                for (index, pos) in positions {
+                    CanvasLayer::move_child(&mut canvas, index, pos);
+                }
+            });
+        }
+    }
+
+    /// Draws the selection and the rubber band over the canvas.
+    ///
+    /// In this widget rather than in the canvas, and in canvas coordinates through the
+    /// view transform, because that is the answer §38.5 gives to "where does a modal
+    /// operator draw": inside the area that owns the pixels. An overlay across areas
+    /// would break the one condition the layer cache cannot check — that a cached
+    /// layer owns its rectangle (§36.4).
+    fn paint_overlay(&self, ctx: &PaintCtx<'_>, painter: &mut Painter<'_>) {
+        let Some(ops) = self.ops.as_ref() else {
+            return;
+        };
+        let viewport = ctx.content_box();
+        let graph = ops.world.graph.borrow();
+        for &index in &ops.world.selection {
+            if index >= graph.len() {
+                continue;
+            }
+            let rect = self
+                .view
+                .transform_rect_bbox(Rect::from_origin_size(graph.node(index).pos, crate::model::NODE_SIZE));
+            // Only what is on screen. A box select can hold thousands of nodes, and an
+            // outline off screen costs the same as one on it.
+            if rect.intersect(viewport).is_zero_area() {
+                continue;
+            }
+            painter
+                .stroke(rect, &Stroke::new(2.0), Color::from_rgb8(0xff, 0xa5, 0x2c))
+                .draw();
+        }
+        if let Some(band) = ops.world.band {
+            let rect = self.view.transform_rect_bbox(band);
+            painter.fill(rect, Color::from_rgba8(0xff, 0xa5, 0x2c, 0x20)).draw();
+            painter
+                .stroke(rect, &Stroke::new(1.0), Color::from_rgb8(0xff, 0xa5, 0x2c))
+                .draw();
+        }
+    }
+}
+
+/// Converts a Masonry pointer event into the one the keymap matches.
+///
+/// Returns `None` for the events an operator layer has no use for — enter, leave,
+/// gestures, and the scroll the canvas owns.
+fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<blazy_ops::event::OpEvent> {
+    use blazy_ops::event::OpEvent;
+    match event {
+        PointerEvent::Down(e) => Some(OpEvent::Press {
+            button: e.button?,
+            pos: ctx.local_position(e.state.position),
+            mods: e.state.modifiers,
+        }),
+        PointerEvent::Up(e) => Some(OpEvent::Release {
+            button: e.button?,
+            pos: ctx.local_position(e.state.position),
+            mods: e.state.modifiers,
+        }),
+        PointerEvent::Move(PointerUpdate { current, .. }) => Some(OpEvent::Move {
+            pos: ctx.local_position(current.position),
+            mods: current.modifiers,
+        }),
+        PointerEvent::Scroll(PointerScrollEvent { .. })
+        | PointerEvent::Enter(_)
+        | PointerEvent::Leave(_)
+        | PointerEvent::Cancel(_)
+        | PointerEvent::Gesture(_) => None,
+    }
 }
 
 impl Widget for NodeEditor {
@@ -100,6 +462,66 @@ impl Widget for NodeEditor {
         ) {
             ctx.request_post_paint();
         }
+
+        if self.ops.is_none() {
+            return;
+        }
+        // A cancel is the window telling us the gesture is over, and there is nobody
+        // else to tell the operators.
+        if let PointerEvent::Cancel(_) = event {
+            if let Some(ops) = self.ops.as_mut() {
+                ops.runtime.cancel_all(&mut ops.world);
+            }
+            self.flush(ctx);
+            return;
+        }
+        // Something below took it — a slider in a node, or the canvas panning. The
+        // capture target rather than `is_handled` alone, for the reason the canvas
+        // gives: a control may capture without marking the event handled, and
+        // dispatching over it would steal the grip.
+        if ctx.is_handled() || ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
+            return;
+        }
+        let Some(op_event) = to_op_event(ctx, event) else {
+            return;
+        };
+        if self.dispatch(ctx, &op_event) {
+            ctx.set_handled();
+        }
+    }
+
+    /// Keys, once the host has made this widget the focus fallback.
+    ///
+    /// Bubbled from whatever had focus, or targeted here directly when nothing did —
+    /// which is what a keymap needs and what `RenderRoot::set_focus_fallback` is for.
+    /// A text field keeps its keys: it is focused, it handles them, and this never
+    /// sees them (§12).
+    fn on_text_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &TextEvent) {
+        let Some(ops) = self.ops.as_mut() else {
+            return;
+        };
+        match event {
+            TextEvent::WindowFocusChange(false) => {
+                ops.runtime.cancel_all(&mut ops.world);
+                self.flush(ctx);
+            },
+            TextEvent::Keyboard(key) if !ctx.is_handled() => {
+                let op_event = blazy_ops::event::OpEvent::Key {
+                    key: key.key.clone(),
+                    mods: key.modifiers,
+                    down: key.state == KeyState::Down,
+                };
+                if self.dispatch(ctx, &op_event) {
+                    ctx.set_handled();
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Returns `Some(self)`, which is what puts this widget in the pre-tree seat.
+    fn as_layer(&mut self) -> Option<&mut dyn Layer> {
+        Some(self)
     }
 
     fn measure(
@@ -128,6 +550,7 @@ impl Widget for NodeEditor {
         // Read the canvas counters back after its layout has run.
         let (canvas, _) = ctx.get_raw(&mut self.canvas);
         let stats = canvas.stats();
+        self.view = canvas.view();
         self.stats = stats;
 
         // Format into the scratch buffer and only swap when the text really changed.
@@ -147,6 +570,9 @@ impl Widget for NodeEditor {
     }
 
     fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        // Under the HUD panel, so the numbers stay readable over a selected node.
+        self.paint_overlay(ctx, painter);
+
         let content_box = ctx.content_box();
         let panel = Rect::new(content_box.x0, content_box.y1 - 46.0, content_box.x1, content_box.y1);
         painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();

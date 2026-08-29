@@ -183,6 +183,7 @@ dependencies = [
  "bench-utils",
  "blazy-areas",
  "blazy-canvas",
+ "blazy-ops",
  "blazy-shell",
  "clap",
  "image",
@@ -288,6 +289,7 @@ version = "0.1.0"
 dependencies = [
  "blazy-areas",
  "blazy-canvas",
+ "blazy-ops",
  "blazy-shape",
  "blazy-shell",
 ]
@@ -306,6 +308,13 @@ dependencies = [
  "blazy-shape",
  "masonry",
  "strum",
+]
+
+[[package]]
+name = "blazy-ops"
+version = "0.1.0"
+dependencies = [
+ "masonry",
 ]
 
 [[package]]
@@ -1778,6 +1787,7 @@ version = "0.1.0"
 dependencies = [
  "bench-utils",
  "blazy-canvas",
+ "blazy-ops",
  "blazy-shape",
  "blazy-shell",
  "clap",

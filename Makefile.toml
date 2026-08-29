@@ -111,7 +111,7 @@ description = "Core crates must not depend on a window system."
 script_runner = "@shell"
 script = '''
 status=0
-for crate in blazy-areas blazy-canvas blazy-shape; do
+for crate in blazy-areas blazy-canvas blazy-ops blazy-shape; do
     found=$(cargo tree -e normal -p $crate 2>/dev/null | grep -Eo '^[^a-z]*(winit|wgpu|softbuffer|ui-events-winit) v[0-9.]+' | sort -u)
     if [ -n "$found" ]; then
         echo "$crate depends on a window system:"
@@ -120,7 +120,7 @@ for crate in blazy-areas blazy-canvas blazy-shape; do
     fi
 done
 if [ $status -eq 0 ]; then
-    echo "dependency rule holds: blazy-areas, blazy-canvas and blazy-shape know nothing about windows"
+    echo "dependency rule holds: blazy-areas, blazy-canvas, blazy-ops and blazy-shape know nothing about windows"
 fi
 exit $status
 '''

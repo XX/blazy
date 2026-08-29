@@ -31,6 +31,7 @@ workspace = true
 [dependencies]
 blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
+blazy-ops = { workspace = true }
 clap = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
 # With the GPU frame path: on any window worth the name it is the faster one, and

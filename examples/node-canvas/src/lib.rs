@@ -27,7 +27,10 @@
 pub mod editor;
 pub mod model;
 pub mod node;
+pub mod ops;
 
+#[cfg(test)]
+mod ops_tests;
 #[cfg(test)]
 mod tests;
 

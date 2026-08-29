@@ -13,9 +13,10 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use blazy_canvas::{DEFAULT_WIDGET_BUDGET, DetailBudget};
-use blazy_shell::window::{WindowConfig, run};
+use blazy_shell::window::{ShellDriver, WindowConfig, run};
 use blazy_shell::{Backend, COMPILED};
 use clap::Parser;
+use masonry::app::RenderRoot;
 use masonry::core::NewWidget;
 use masonry::theme::default_property_set;
 use node_canvas::editor::NodeEditor;
@@ -53,12 +54,16 @@ fn main() {
         })
     });
 
-    let (canvas, _graph) = build_canvas(args.nodes);
+    let (canvas, graph) = build_canvas(args.nodes);
     let canvas = canvas.with_budget(DetailBudget {
         widgets: args.budget_widgets,
         ..Default::default()
     });
-    let editor = NodeEditor::new(canvas);
+    // With the operator layer: click selects, left-drag on empty canvas boxes,
+    // `G` grabs, `B` boxes, Escape cancels, Ctrl+Z undoes (§38). The canvas's own
+    // primary-button gestures step aside for the keymap; the middle button still pans
+    // and the wheel still zooms.
+    let editor = NodeEditor::with_ops(canvas, &graph);
 
     let config = WindowConfig::default()
         .with_title(format!("blazy - Phase 0 node canvas ({} nodes)", args.nodes))
@@ -66,6 +71,24 @@ fn main() {
         .with_backend(backend);
 
     // Sliders and checkboxes inside nodes submit actions. This experiment does not
-    // need to act on them — that they arrive at all is claim 3 holding.
-    run(config, NewWidget::new(editor).erased(), default_property_set(), ()).unwrap();
+    // need to act on them — that they arrive at all is claim 3 holding. What the
+    // driver is here for is the other half of the keymap: the keys no focused widget
+    // claimed have to reach the editor, and only the host can say so.
+    run(
+        config,
+        NewWidget::new(editor).erased(),
+        default_property_set(),
+        KeymapFocus,
+    )
+    .unwrap();
+}
+
+/// Makes the application's root widget the focus fallback, so the keymap hears keys.
+struct KeymapFocus;
+
+impl ShellDriver for KeymapFocus {
+    fn started(&mut self, root: &mut RenderRoot) {
+        let id = root.get_layer_root(0).id();
+        root.set_focus_fallback(Some(id));
+    }
 }

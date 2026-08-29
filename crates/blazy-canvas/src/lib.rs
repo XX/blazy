@@ -950,6 +950,13 @@ pub struct CanvasContent {
 // as expected".
 impl AllowRawMut for CanvasContent {}
 
+/// So a parent driving gestures from above can reach the canvas inside its own event.
+///
+/// The alternative is `mutate_later`, which defers to the mutate pass and boxes a
+/// closure per node per event; a driver moving a selection is the case that makes the
+/// difference (§38.3).
+impl AllowRawMut for CanvasLayer {}
+
 impl CanvasContent {
     fn new(slots: Vec<Slot>, source: Box<dyn NodeSource>) -> Self {
         let index = SpatialIndex::build(slots.iter().map(|s| Rect::from_origin_size(s.pos, s.size)));
@@ -1585,6 +1592,8 @@ pub struct CanvasLayer {
     drag: Drag,
     /// Whether only the node under the pointer gets interactive controls.
     controls_on_hover: bool,
+    /// Whether the canvas acts on the primary button itself.
+    builtin_gestures: bool,
     /// Where the detail levels switch over for readability.
     thresholds: DetailThresholds,
     /// What the tree may cost, in widgets.
@@ -1632,6 +1641,7 @@ impl CanvasLayer {
             }),
             drag: Drag::None,
             controls_on_hover: false,
+            builtin_gestures: true,
             thresholds: DetailThresholds::default(),
             budget: DetailBudget::default(),
             attached: false,
@@ -1693,6 +1703,24 @@ impl CanvasLayer {
 
     pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
         self.controls_on_hover = enabled;
+        self
+    }
+
+    /// Whether the canvas acts on the primary button itself. On by default.
+    ///
+    /// The seam an operator layer needs (§11, §38). The canvas's own primary-button
+    /// gestures — drag the node under the pointer, pan when there is none — are a
+    /// default, not the mechanism: an application whose keymap binds that button
+    /// cannot have the canvas answering it first, because the canvas sits *below* the
+    /// application's driver and Masonry routes to the deepest widget before it
+    /// bubbles.
+    ///
+    /// Turning them off leaves the rest alone: the middle button still pans, the wheel
+    /// still zooms, and the pointer still picks on every press and move — the pick is
+    /// what an operator's context is made of, and it is measured not to cost a layout
+    /// (§25.4).
+    pub fn with_builtin_gestures(mut self, enabled: bool) -> Self {
+        self.builtin_gestures = enabled;
         self
     }
 
@@ -1809,6 +1837,39 @@ impl CanvasLayer {
     pub fn move_child(this: &mut WidgetMut<'_, Self>, index: usize, pos: Point) {
         let mut content = this.ctx.get_mut(&mut this.widget.content);
         content.widget.store_child_pos(index, pos).apply(&mut content.ctx);
+    }
+
+    /// Moves a child from the parent's raw context, without telling the model.
+    ///
+    /// The seam an operator layer moves nodes through (§38.3). By then the operator
+    /// has already written the position to the model — that is where the truth lives
+    /// (§30) — and what is left is this view's own copy of the geometry. Three ways
+    /// in, and the difference is who has already been told:
+    ///
+    /// * [`move_child`](Self::move_child) — a `WidgetMut`, from outside any pass;
+    /// * this one — the parent widget, holding an `EventCtx`, in the same event;
+    /// * the canvas's own drag, which also calls [`NodeSource::moved`] because there the canvas is the one that heard
+    ///   the user.
+    ///
+    /// Nothing is broadcast to the other views of the same model: the caller wrote the
+    /// model and knows who else is looking at it.
+    pub fn move_child_raw(&mut self, index: usize, pos: Point, ctx: &mut RawCtx<'_>) {
+        let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
+        content.store_child_pos(index, pos).apply(&mut raw);
+    }
+
+    /// Pans the view from the parent's raw context.
+    ///
+    /// The view twin of [`move_child_raw`](Self::move_child_raw), and it exists for the
+    /// same caller: an operator layer that has taken the primary button owns panning
+    /// too, and the driver holding an `EventCtx` is the one that has to carry it in.
+    /// Only the canvas is dirtied — child positions are in canvas coordinates, so a
+    /// view change moves nobody (§22).
+    pub fn pan_raw(&mut self, delta: Vec2, ctx: &mut RawCtx<'_>) {
+        let view = Affine::translate(delta) * self.view;
+        if self.store_view(view) {
+            ctx.request_layout();
+        }
     }
 
     /// Reaches node `index`'s widget, if it currently has one.
@@ -1967,12 +2028,13 @@ impl CanvasLayer {
     /// layout. Keeping the two apart is the same distinction the link layer makes
     /// between repainting a curve and re-choosing the set (§24.3): a highlight must
     /// not drag a relayout of the graph behind it.
-    fn hover(&mut self, pos: Point, ctx: &mut EventCtx<'_>) {
+    fn hover(&mut self, pos: Point, ctx: &mut EventCtx<'_>) -> Option<CanvasHit> {
         let hit = self.hit_at(pos, ctx);
         self.set_hovered(hit, ctx);
         if self.controls_on_hover {
             self.set_active(hit.and_then(CanvasHit::node), ctx);
         }
+        hit
     }
 
     /// Stores what the pointer is over, repainting if the highlight changed.
@@ -2007,21 +2069,29 @@ impl Widget for CanvasLayer {
                 }
                 let pos = ctx.local_position(e.state.position);
                 let canvas_pos = self.view.inverse() * pos;
+                // A press picks whatever a move would have picked, whether or not the
+                // canvas is going to act on it. The record is what an operator layer
+                // above reads as its context (§38.3): a driver holding an `EventCtx`
+                // cannot hit-test a child, and this costs the pick the drag decision
+                // needed anyway.
+                let hit = self.hover(pos, ctx);
                 self.drag = match e.button {
                     // Left button drags a node if there is one under the pointer,
-                    // and pans otherwise.
-                    Some(PointerButton::Primary) => match self.hit_at(pos, ctx) {
+                    // and pans otherwise — unless the application has taken the
+                    // primary button for its keymap.
+                    Some(PointerButton::Primary) if self.builtin_gestures => match hit {
                         Some(CanvasHit::Node { index, pos: child_pos }) => Drag::Node {
                             index,
                             grab: canvas_pos - child_pos,
                         },
-                        // A link is pickable but not yet draggable: selection and
-                        // rewiring are operators, and operators are `blazy-ops`
-                        // (§11). Until then a press on a curve pans, as it did
-                        // before curves could be picked at all.
+                        // A link is pickable but not draggable by the canvas:
+                        // selection and rewiring are operators (§11). A press on a
+                        // curve pans, as it did before curves could be picked at all.
                         Some(CanvasHit::Link { .. }) | None => Drag::Pan { last: pos },
                     },
-                    // Middle button always pans, as in Blender.
+                    // Middle button always pans, as in Blender. Not a gesture an
+                    // operator layer competes for, so it is not switched off with the
+                    // others.
                     Some(PointerButton::Auxiliary) => Drag::Pan { last: pos },
                     _ => Drag::None,
                 };
@@ -2033,7 +2103,9 @@ impl Widget for CanvasLayer {
             PointerEvent::Move(PointerUpdate { current, .. }) => {
                 let pos = ctx.local_position(current.position);
                 match self.drag {
-                    Drag::None => self.hover(pos, ctx),
+                    Drag::None => {
+                        self.hover(pos, ctx);
+                    },
                     Drag::Pan { last } => {
                         self.drag = Drag::Pan { last: pos };
                         let view = Affine::translate(pos - last) * self.view;

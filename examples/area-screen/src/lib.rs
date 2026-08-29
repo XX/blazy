@@ -32,6 +32,7 @@ use blazy_canvas::DetailBudget;
 use masonry::core::{NewWidget, Widget};
 use masonry::peniko::Color;
 use node_canvas::CanvasSpec;
+use node_canvas::editor::NodeEditor;
 use node_canvas::model::{GraphModel, SharedGraph, share};
 
 use crate::header::ScaledHeader;
@@ -100,6 +101,13 @@ pub struct ScreenSpec {
     pub isolated: bool,
     /// How the headers are scaled.
     pub header_scale: HeaderScale,
+    /// Whether each area's canvas is wrapped in the operator layer's driver (§38).
+    ///
+    /// Off by default, and that is not only about keeping the older measurements
+    /// still: with operators an area holds a `NodeEditor`, and what that changes about
+    /// a frame — one more widget, an overlay in `post_paint` — has to be visible as a
+    /// row of its own rather than folded into every number in the file.
+    pub ops: bool,
 }
 
 impl ScreenSpec {
@@ -112,7 +120,15 @@ impl ScreenSpec {
             header: true,
             isolated: false,
             header_scale: HeaderScale::Uniform,
+            ops: false,
         }
+    }
+
+    /// Wraps every area's canvas in the operator layer's driver.
+    #[must_use]
+    pub fn with_ops(mut self, ops: bool) -> Self {
+        self.ops = ops;
+        self
     }
 
     #[must_use]
@@ -147,7 +163,11 @@ impl ScreenSpec {
         let graph = share(GraphModel::generated(self.nodes));
         let budget = window_budget(self.budget_widgets, self.areas);
         let screen = AreaScreen::new(SplitTree::balanced(self.areas), |area| {
-            let canvas = area_canvas(&graph, self.nodes, budget);
+            let canvas = if self.ops {
+                area_editor(&graph, self.nodes, budget)
+            } else {
+                area_canvas(&graph, self.nodes, budget)
+            };
             let content = if self.header {
                 AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)
                     .with_ui_scale(0, self.header_scale.of(area))
@@ -190,6 +210,17 @@ pub fn window_budget(widgets: Option<usize>, areas: usize) -> DetailBudget {
 /// widgets.
 pub fn area_canvas(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
     NewWidget::new(CanvasSpec::new(nodes).over(graph).with_budget(budget)).erased()
+}
+
+/// The same canvas with the operator layer's driver around it (§38).
+///
+/// The driver is a widget of the area rather than of the window, which is the shape
+/// §11's nesting asks for — and it is also the only shape available: Masonry's pre-tree
+/// hook belongs to a *layer root*, so in a window of eight areas exactly one widget can
+/// have it, and it is not any of the editors (§38.1).
+pub fn area_editor(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
+    let canvas = CanvasSpec::new(nodes).over(graph).with_budget(budget);
+    NewWidget::new(NodeEditor::with_ops(canvas, graph)).erased()
 }
 
 /// The header of area `area`, tinted so the areas are told apart by eye.

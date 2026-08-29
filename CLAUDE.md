@@ -73,6 +73,7 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy` | Facade — the crate an application depends on. Re-exports the rest. |
 | `crates/blazy-canvas` | Virtualised, zoomable canvas: nodes, links, spatial index. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
+| `crates/blazy-ops` | Operators, keymap as data, modal stack, undo journal. |
 | `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
 | `crates/blazy-shell` | The host: window, event loop, composition, choice of rasteriser. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
@@ -293,6 +294,39 @@ window from ever idling. And a cached layer **owns its rectangle** — nothing e
 draw into it — which the host cannot check and therefore asks for. The cache is bounded:
 the layers tile the window, so all of them together are about one frame of pixels, and the
 default ceiling is two frames with eviction by least recent use (§37.2).
+
+**There is no one place to intercept an event, and the layer is not a widget (§38).**
+Masonry calls `Layer::capture_pointer_event` on every *layer root* before it even works
+out the target — a genuine pre-tree hook, and it cannot stop the event: no return flag,
+its `EventCtx` is discarded, `capture_pointer` is refused there. The only lever that
+keeps an event from the tree is pointer capture, and Masonry offers it during a press
+and nowhere else. So a modal operator started by a press is airtight and one started by
+a key (`G`, `B`) leaks every event to the tree — counted, at 21 events and 20 needless
+picks a gesture, not argued. `blazy-ops` therefore keeps its state in a plain
+`OpRuntime<W>` and a driver feeds it, saying through `Seat` where the event came from;
+the host seat in front of `RenderRoot` can withhold anything but must pay
+`edit_widget` (a whole rewrite battery) to learn what is under the pointer.
+
+The corollary shapes the keymap: because capture is only granted on the press, an
+operator that may have to hold the pointer must start there — before anyone knows
+whether the gesture will become a drag. So Blender's `CLICK` / `CLICK_DRAG` event
+values cannot be keymap data here; what the gesture turned out to be is decided by the
+operator holding it, steered by properties on the binding (§38.3).
+
+**An operator never touches a widget (§38.3).** It changes the model and lists what
+moved — or, for a view operator like `view.pan`, how far the view should move; the
+driver carries that into its own canvas and into the graph's other views.
+That is what makes `exec` worth having — the same operators run in a test with no tree,
+so "the key and the script do the same thing" is checked by comparing model state. The
+context an operator polls against is assembled *on hover*: the canvas picks on every
+pointer event, including the press, and publishes the answer, because a driver holding
+an `EventCtx` cannot hit-test a child.
+
+**Undo is a journal, and the number decided it (§38.4).** A snapshot step costs the
+graph — 1.92 MB and 0.29 ms on 20 000 nodes — where a journal step costs what was
+touched: 40 bytes for a one-node drag. The graph is shared and the selection is not,
+deliberately: a selection in the model would repaint every area showing that graph,
+and one drawn inside its own area repaints one of eight (12.99 ms against 50.57).
 
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The

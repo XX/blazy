@@ -22,5 +22,6 @@ vello = ["blazy-shell/vello"]
 [dependencies]
 blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
+blazy-ops = { workspace = true }
 blazy-shape = { workspace = true }
 blazy-shell = { workspace = true }
