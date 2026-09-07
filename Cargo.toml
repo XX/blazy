@@ -28,7 +28,7 @@ blazy-ops = { path = "crates/blazy-ops" }
 blazy-shape = { path = "crates/blazy-shape" }
 blazy-shell = { path = "crates/blazy-shell" }
 node-canvas = { path = "examples/node-canvas" }
-masonry = { git = "https://github.com/linebender/xilem.git", rev = "ce7b04d2ba2d9d7a8c364f2ab109e2083121e144", default-features = false }
+masonry = { git = "https://github.com/XX/xilem.git", rev = "fc0391fc6312c37fc5d503a9bc7813a2132d01b6", default-features = false }
 winit = "0.30"
 softbuffer = "0.4"
 tracing = "0.1"

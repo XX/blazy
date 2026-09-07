@@ -27,22 +27,23 @@ use std::fmt::Write as _;
 use std::mem;
 
 use blazy_canvas::{CanvasLayer, CanvasStats};
+use blazy_ops::event::{Device, Sample};
 use blazy_ops::keymap::{Props, Scope};
-use blazy_ops::runtime::{Dispatch, OpRuntime, Seat};
+use blazy_ops::runtime::{OpRuntime, Seat};
 use blazy_ops::{OpCounters, OpResult};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::keyboard::KeyState;
 use masonry::core::{
-    AccessCtx, BrushIndex, ChildrenIds, EventCtx, Layer, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent,
-    PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Widget, WidgetId, WidgetMut, WidgetPod,
-    render_text,
+    AccessCtx, BrushIndex, ChildrenIds, EventCtx, Handled, Layer, LayoutCtx, MeasureCtx, NoAction, PaintCtx,
+    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Widget, WidgetId, WidgetMut,
+    WidgetPod, render_text,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
 use masonry::layout::{LenReq, Length, SizeDef};
 use masonry::parley::Layout;
 use masonry::peniko::Color;
-use masonry::ui_events::pointer::{PointerScrollEvent, PointerUpdate};
+use masonry::ui_events::pointer::{PointerScrollEvent, PointerType, PointerUpdate};
 use masonry::{TextAlign, TextAlignOptions};
 
 use crate::model::SharedGraph;
@@ -147,6 +148,22 @@ impl NodeEditor {
     /// with this non-zero is one that never finished.
     pub fn modal_depth(&self) -> usize {
         self.ops.as_ref().map_or(0, |ops| ops.runtime.modal_depth())
+    }
+
+    /// The status line as it was last painted.
+    ///
+    /// For a test that wants to check what the window says rather than what the counters
+    /// hold — the two can disagree, and when they do it is the line that is wrong.
+    pub fn hud(&self) -> &str {
+        &self.hud
+    }
+
+    /// Whether a press is being held while the runtime waits to see what it becomes.
+    ///
+    /// Between "nothing running" and "a modal operator running" there is now a third
+    /// state, and a gesture that ends in it is one that never resolved (§39.3).
+    pub fn is_holding(&self) -> bool {
+        self.ops.as_ref().is_some_and(|ops| ops.runtime.is_holding())
     }
 
     /// Steps in the undo history.
@@ -256,7 +273,14 @@ fn peers_of(ops: &Ops, own_canvas: WidgetId) -> Vec<WidgetId> {
 /// materialised, the zoom, the detail level, and how many widgets have been built.
 /// The cumulative pass counters live in [`CanvasStats`] for the benchmark; putting
 /// them on screen would change the text every frame and defeat the cache.
-fn format_hud(stats: &CanvasStats, out: &mut String) {
+/// The status line, and the second half of it is a measurement rather than a caption.
+///
+/// A gesture is decided from the events themselves — the travel since the press and the
+/// platform's own timestamps (§39.2) — so the only way to know that the platform really
+/// gives us what the mechanism assumes is to watch the counters move in a real window.
+/// A double click that never registers because `PointerState::time` arrives as zero on
+/// some backend is invisible to every test we have, and obvious here.
+fn format_hud(stats: &CanvasStats, ops: &OpCounters, out: &mut String) {
     let detail = match stats.detail {
         Some(detail) => detail.as_str(),
         None => "-",
@@ -265,11 +289,16 @@ fn format_hud(stats: &CanvasStats, out: &mut String) {
     write!(
         out,
         "nodes {visible}/{total} materialised   zoom {zoom:.2}x   lod {detail}   built {builds}\n\
+         clicks {clicks} (double {doubles})   drags {drags}   held from the tree {withheld}\n\
          left-drag a node or the view - right-click selects, right-drag boxes - G moves, B boxes, Ctrl+Z undoes",
         visible = stats.materialised,
         total = stats.total,
         zoom = stats.zoom,
         builds = stats.counters.builds,
+        clicks = ops.clicks,
+        doubles = ops.double_clicks,
+        drags = ops.drags,
+        withheld = ops.withheld,
     )
     .ok();
 }
@@ -283,12 +312,36 @@ fn format_hud(stats: &CanvasStats, out: &mut String) {
 /// evidence for the one-line request upstream — whose own TODO already lists "return
 /// flag to suppress event from reaching children".
 impl Layer for NodeEditor {
-    fn capture_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &PointerEvent) {
-        let Some(op_event) = to_op_event(ctx, event) else {
-            return;
+    fn capture_pointer_event(
+        &mut self,
+        ctx: &mut EventCtx<'_>,
+        _props: &mut PropertiesMut<'_>,
+        event: &PointerEvent,
+    ) -> Handled {
+        let Some((op_event, sample)) = to_op_event(ctx, event) else {
+            return Handled::No;
         };
-        if let Some(ops) = self.ops.as_mut() {
-            ops.runtime.observe(&op_event);
+        if self.ops.is_none() {
+            return Handled::No;
+        }
+        // Somebody below holds the pointer, so the event is going to the tree whatever
+        // this seat says — the fork lets capture outrank a layer, exactly so that a
+        // widget in the middle of a gesture is told how it ends. Dispatching here as
+        // well would deliver every event twice.
+        if ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
+            if let Some(ops) = self.ops.as_mut() {
+                ops.runtime.observe(&op_event);
+            }
+            return Handled::No;
+        }
+        // Everything else is the runtime's call. It acts from this seat only when it
+        // already owns the gesture — a running modal operator, or a press it is holding
+        // to see whether it becomes a click or a drag — and otherwise counts and lets
+        // the tree have its right of first refusal (§20 claim 3, §39.3).
+        if self.dispatch(ctx, &op_event, sample, Seat::Layer) {
+            Handled::Yes
+        } else {
+            Handled::No
         }
     }
 }
@@ -299,44 +352,57 @@ impl NodeEditor {
     /// Returns whether the event was consumed. Everything the operators need to know
     /// about the world is filled in first: where the pointer is, in canvas
     /// coordinates, and what the canvas last found under it.
-    fn dispatch(&mut self, ctx: &mut EventCtx<'_>, event: &blazy_ops::event::OpEvent) -> bool {
+    fn dispatch(
+        &mut self,
+        ctx: &mut EventCtx<'_>,
+        event: &blazy_ops::event::OpEvent,
+        sample: Sample,
+        seat: Seat,
+    ) -> bool {
         let (view, hover) = {
             let (canvas, _) = ctx.get_raw(&mut self.canvas);
             (canvas.view(), canvas.stats().hovered)
         };
         self.view = view;
-        // Bubbled means a descendant was offered this event first. While an operator
-        // is running that is a leak, and the runtime counts it (§38.1).
-        let seat = if ctx.target() == ctx.widget_id() {
-            Seat::Tree
-        } else {
-            Seat::Bubbled
-        };
         let is_press = matches!(event, blazy_ops::event::OpEvent::Press { .. });
+
+        // Into canvas coordinates before the runtime sees it, because that is the space
+        // this application's operators think in — and the space a `Drag` has to carry its
+        // anchor in, or the first event of every drag moves the node by the pan (§39.7).
+        // The other space travels in the sample, which is what a view operator uses.
+        let event = match event.pos() {
+            Some(pos) => event.clone().with_pos(view.inverse() * pos),
+            None => event.clone(),
+        };
 
         let result = {
             let ops = self.ops.as_mut().expect("checked by the caller");
             ops.world.hover = hover;
             if let Some(pos) = event.pos() {
-                ops.world.pointer_screen = pos;
-                ops.world.pointer = view.inverse() * pos;
+                ops.world.pointer = pos;
+                ops.world.pointer_screen = sample.screen;
             }
-            ops.runtime.dispatch(&mut ops.world, event, Scope(&CANVAS_SCOPE), seat)
+            ops.runtime
+                .feed(&mut ops.world, &event, sample, Scope(&CANVAS_SCOPE), seat)
         };
 
-        // Masonry's own modality, and the only lever that keeps an event from the
-        // tree: it may be taken during a press and at no other time (§38.1). A modal
-        // operator started from a key therefore runs without it.
-        let running = self.modal_depth() > 0;
-        let holds = ctx.pointer_capture_target_id() == Some(ctx.widget_id());
-        if running && is_press && !holds {
-            ctx.capture_pointer();
-        } else if !running && holds && !is_press {
-            ctx.release_pointer();
+        // Masonry's own modality. It may be taken during a press and at no other time,
+        // and only where the event is addressed to this widget — the pre-tree seat is
+        // given a context that refuses it (§38.1). Kept even though the layer seat can
+        // now withhold events on its own: capture is what stops the *tree* from acting
+        // on a gesture this driver already owns.
+        if seat != Seat::Layer {
+            let running = self.modal_depth() > 0;
+            let holds = ctx.pointer_capture_target_id() == Some(ctx.widget_id());
+            if running && is_press && !holds {
+                ctx.capture_pointer();
+            } else if !running && holds && !is_press {
+                ctx.release_pointer();
+            }
         }
 
         self.flush(ctx);
-        result != Dispatch::NoBinding
+        result.is_consumed()
     }
 
     /// Applies what the operators changed to this canvas and to the graph's other
@@ -424,29 +490,60 @@ impl NodeEditor {
 ///
 /// Returns `None` for the events an operator layer has no use for — enter, leave,
 /// gestures, and the scroll the canvas owns.
-fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<blazy_ops::event::OpEvent> {
+fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(blazy_ops::event::OpEvent, Sample)> {
     use blazy_ops::event::OpEvent;
-    match event {
-        PointerEvent::Down(e) => Some(OpEvent::Press {
-            button: e.button?,
-            pos: ctx.local_position(e.state.position),
-            mods: e.state.modifiers,
-        }),
-        PointerEvent::Up(e) => Some(OpEvent::Release {
-            button: e.button?,
-            pos: ctx.local_position(e.state.position),
-            mods: e.state.modifiers,
-        }),
-        PointerEvent::Move(PointerUpdate { current, .. }) => Some(OpEvent::Move {
-            pos: ctx.local_position(current.position),
-            mods: current.modifiers,
-        }),
+    let (op_event, state, info) = match event {
+        PointerEvent::Down(e) => (
+            OpEvent::Press {
+                button: e.button?,
+                pos: ctx.local_position(e.state.position),
+                mods: e.state.modifiers,
+            },
+            &e.state,
+            &e.pointer,
+        ),
+        PointerEvent::Up(e) => (
+            OpEvent::Release {
+                button: e.button?,
+                pos: ctx.local_position(e.state.position),
+                mods: e.state.modifiers,
+            },
+            &e.state,
+            &e.pointer,
+        ),
+        PointerEvent::Move(PointerUpdate { current, pointer, .. }) => (
+            OpEvent::Move {
+                pos: ctx.local_position(current.position),
+                mods: current.modifiers,
+            },
+            current,
+            pointer,
+        ),
         PointerEvent::Scroll(PointerScrollEvent { .. })
         | PointerEvent::Enter(_)
         | PointerEvent::Leave(_)
         | PointerEvent::Cancel(_)
-        | PointerEvent::Gesture(_) => None,
-    }
+        | PointerEvent::Gesture(_) => return None,
+    };
+    // The threshold is measured in screen pixels and the timestamp comes from the
+    // platform, so a drag means the same distance at every zoom and a double click can
+    // be produced by a test without a clock (§39.2).
+    //
+    // `screen` is this widget's own logical space — the space `EditorWorld::pointer_screen`
+    // is in — and not the physical position the event arrived with. Two spaces are one
+    // too many already; a third, differing by the display's scale factor, is how the
+    // view came to jump by half a click on a HiDPI screen.
+    let sample = Sample {
+        time_ns: state.time,
+        device: match info.pointer_type {
+            PointerType::Mouse => Device::Mouse,
+            PointerType::Pen => Device::Pen,
+            PointerType::Touch => Device::Touch,
+            _ => Device::Other,
+        },
+        screen: ctx.local_position(state.position),
+    };
+    Some((op_event, sample))
 }
 
 impl Widget for NodeEditor {
@@ -482,10 +579,17 @@ impl Widget for NodeEditor {
         if ctx.is_handled() || ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
             return;
         }
-        let Some(op_event) = to_op_event(ctx, event) else {
+        let Some((op_event, sample)) = to_op_event(ctx, event) else {
             return;
         };
-        if self.dispatch(ctx, &op_event) {
+        // Bubbled means a descendant was offered this event first. While an operator is
+        // running that is a leak, and the runtime counts it (§38.1).
+        let seat = if ctx.target() == ctx.widget_id() {
+            Seat::Tree
+        } else {
+            Seat::Bubbled
+        };
+        if self.dispatch(ctx, &op_event, sample, seat) {
             ctx.set_handled();
         }
     }
@@ -511,7 +615,14 @@ impl Widget for NodeEditor {
                     mods: key.modifiers,
                     down: key.state == KeyState::Down,
                 };
-                if self.dispatch(ctx, &op_event) {
+                let seat = if ctx.target() == ctx.widget_id() {
+                    Seat::Tree
+                } else {
+                    Seat::Bubbled
+                };
+                // A key has no position and no device: the sample is what a resolver
+                // would measure a gesture on, and there is no gesture here.
+                if self.dispatch(ctx, &op_event, Sample::default(), seat) {
                     ctx.set_handled();
                 }
             },
@@ -552,15 +663,6 @@ impl Widget for NodeEditor {
         let stats = canvas.stats();
         self.view = canvas.view();
         self.stats = stats;
-
-        // Format into the scratch buffer and only swap when the text really changed.
-        // Formatting is cheap; shaping is not, so the point is to keep `hud_layout`
-        // valid for as long as possible.
-        format_hud(&stats, &mut self.hud_next);
-        if self.hud_next != self.hud {
-            mem::swap(&mut self.hud, &mut self.hud_next);
-            self.hud_layout = None;
-        }
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
@@ -574,8 +676,17 @@ impl Widget for NodeEditor {
         self.paint_overlay(ctx, painter);
 
         let content_box = ctx.content_box();
-        let panel = Rect::new(content_box.x0, content_box.y1 - 46.0, content_box.x1, content_box.y1);
-        painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();
+
+        // Formatted here rather than in `layout`, because half of what it says changes
+        // without the layout changing: a click moves the counters and relayouts nothing.
+        // Formatting into a scratch buffer and swapping only on a real difference is what
+        // keeps the shaped text — which is the expensive half — valid between frames.
+        let counters = self.op_counters();
+        format_hud(&self.stats, &counters, &mut self.hud_next);
+        if self.hud_next != self.hud {
+            mem::swap(&mut self.hud, &mut self.hud_next);
+            self.hud_layout = None;
+        }
 
         if self.hud_layout.is_none() {
             let text = &self.hud;
@@ -590,6 +701,13 @@ impl Widget for NodeEditor {
         let Some(layout) = self.hud_layout.as_ref() else {
             return;
         };
+
+        // The panel is as tall as the text, rather than as tall as the text used to be:
+        // a line added to the status line should not disappear under the edge of a
+        // rectangle whose height someone typed in once.
+        let height = f64::from(layout.height()) + 16.0;
+        let panel = Rect::new(content_box.x0, content_box.y1 - height, content_box.x1, content_box.y1);
+        painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();
 
         render_text(
             painter,

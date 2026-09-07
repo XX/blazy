@@ -13,6 +13,7 @@
 use std::time::Instant;
 
 use blazy_canvas::CanvasLayer;
+use blazy_ops::event::{Device, Sample};
 use blazy_ops::keymap::{Props, Scope};
 use blazy_ops::runtime::Seat;
 use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
@@ -58,6 +59,11 @@ pub(crate) struct OpsRow {
     pub(crate) modal_events: f64,
     /// Events that reached the widget tree first while an operator was running.
     pub(crate) tree_first: f64,
+    /// Events a pre-tree seat kept from the widget tree, per gesture.
+    ///
+    /// The mirror of [`tree_first`](Self::tree_first), and the column §39 added: what
+    /// used to leak is now withheld, and the two numbers add up to the same gesture.
+    pub(crate) withheld: f64,
     /// Nodes laid out, per gesture. The comparison with the canvas's own drag.
     pub(crate) child_layouts: f64,
     /// Layout passes over the canvas content, per gesture.
@@ -210,6 +216,7 @@ fn row(
         events,
         modal_events: per(ops.modal_events - start.ops.modal_events),
         tree_first: per(ops.tree_first - start.ops.tree_first),
+        withheld: per(ops.withheld - start.ops.withheld),
         child_layouts: per(stats.counters.child_layouts - start.child_layouts),
         content_layouts: per(stats.counters.content_layouts - start.content_layouts),
         picks: per(stats.counters.hit_queries - start.picks),
@@ -428,7 +435,13 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
             mods: Modifiers::empty(),
             down: true,
         };
-        runtime.dispatch(&mut world, &key_event, Scope(&CANVAS_SCOPE), Seat::Host);
+        runtime.feed(
+            &mut world,
+            &key_event,
+            Sample::default(),
+            Scope(&CANVAS_SCOPE),
+            Seat::Host,
+        );
         apply(&mut harness, &mut world, &mut probes);
 
         for step in 1..=MOVES {
@@ -441,9 +454,19 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
                 pos,
                 mods: Modifiers::empty(),
             };
-            let dispatch = runtime.dispatch(&mut world, &moved, Scope(&CANVAS_SCOPE), Seat::Host);
+            let fed = runtime.feed(
+                &mut world,
+                &moved,
+                Sample {
+                    time_ns: step as u64 * 8_000_000,
+                    device: Device::Mouse,
+                    screen: pos,
+                },
+                Scope(&CANVAS_SCOPE),
+                Seat::Host,
+            );
             apply(&mut harness, &mut world, &mut probes);
-            if !dispatch.is_consumed() {
+            if !fed.is_consumed() {
                 harness.mouse_move(pos);
             }
             let _ = harness.redraw();
@@ -454,7 +477,17 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
             pos: at,
             mods: Modifiers::empty(),
         };
-        runtime.dispatch(&mut world, &confirm, Scope(&CANVAS_SCOPE), Seat::Host);
+        runtime.feed(
+            &mut world,
+            &confirm,
+            Sample {
+                time_ns: 200_000_000,
+                device: Device::Mouse,
+                screen: at,
+            },
+            Scope(&CANVAS_SCOPE),
+            Seat::Host,
+        );
         apply(&mut harness, &mut world, &mut probes);
         let _ = harness.redraw();
     }
@@ -471,6 +504,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
         // Nothing reached the tree first, because nothing reached the tree at all:
         // the host seat forwards only what no operator wanted.
         tree_first: per(counters.tree_first),
+        withheld: per(counters.withheld),
         child_layouts: (stats.counters.child_layouts - start.child_layouts) as f64 / repeats as f64,
         content_layouts: (stats.counters.content_layouts - start.content_layouts) as f64 / repeats as f64,
         picks: (stats.counters.hit_queries - start.picks) as f64 / repeats as f64,
@@ -631,6 +665,7 @@ impl OpsRow {
                 ("content_layouts_per_gesture", self.content_layouts),
                 ("modal_events_per_gesture", self.modal_events),
                 ("tree_first_per_gesture", self.tree_first),
+                ("withheld_per_gesture", self.withheld),
                 ("picks_per_gesture", self.picks),
                 ("probes_per_gesture", self.probes),
                 ("refused_per_gesture", self.refused),
@@ -665,17 +700,28 @@ impl UndoRow {
 
 fn print_ops(rows: &[OpsRow]) {
     println!(
-        "  {:<17} {:<7} {:>7} {:>8} {:>10} {:>9} {:>7} {:>8} {:>8} {:>9}",
-        "gesture", "seat", "events", "modal/g", "tree-1st/g", "layouts/g", "picks/g", "probes/g", "refused", "ms/g"
+        "  {:<17} {:<7} {:>7} {:>8} {:>10} {:>7} {:>9} {:>7} {:>8} {:>8} {:>9}",
+        "gesture",
+        "seat",
+        "events",
+        "modal/g",
+        "tree-1st/g",
+        "held/g",
+        "layouts/g",
+        "picks/g",
+        "probes/g",
+        "refused",
+        "ms/g"
     );
     for row in rows {
         println!(
-            "  {:<17} {:<7} {:>7} {:>8.1} {:>10.1} {:>9.2} {:>7.1} {:>8.1} {:>8.1} {:>9.3}",
+            "  {:<17} {:<7} {:>7} {:>8.1} {:>10.1} {:>7.1} {:>9.2} {:>7.1} {:>8.1} {:>8.1} {:>9.3}",
             row.gesture,
             row.seat,
             row.events,
             row.modal_events,
             row.tree_first,
+            row.withheld,
             row.content_layouts,
             row.picks,
             row.probes,

@@ -257,7 +257,9 @@ mod tests {
         let red = |image: &RgbaImage| {
             image
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| pixel[0] > 0x80 && pixel[1] < 0x40)
                 .count()
         };

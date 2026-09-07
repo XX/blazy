@@ -13,6 +13,50 @@ use masonry::core::keyboard::{Key, Modifiers};
 use masonry::kurbo::Point;
 use masonry::ui_events::pointer::PointerButton;
 
+/// What kind of pointer produced an event.
+///
+/// Here because the drag threshold is not one number: a mouse and a finger differ by an
+/// order of magnitude in how far they travel before the user meant to travel (§39.2).
+/// Masonry carries this on every pointer event, so a driver has it for free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Device {
+    #[default]
+    Mouse,
+    Pen,
+    Touch,
+    Other,
+}
+
+/// What a driver knows about an event that the event itself does not say.
+///
+/// Two fields, and both are needed to tell a click from a drag without a clock:
+///
+/// * `time_ns` comes from `PointerState::time` — the platform's own timestamp, so a double click is decided from the
+///   events and a test can produce one by hand.
+/// * `screen` is where the pointer was **in screen pixels**. The position inside an [`OpEvent`] is in whatever space
+///   the driver thinks in — canvas units in the example, which span a factor of 400 across the zoom range — so a
+///   threshold measured on it would mean something different at every zoom (§25.2 learned this once already).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sample {
+    pub time_ns: u64,
+    pub device: Device,
+    pub screen: Point,
+}
+
+impl Sample {
+    /// A sample with no timestamp, for a driver or a test that has none.
+    ///
+    /// Zero time means every click is a first click: two of them cannot be closer than
+    /// the double-click window because they are not closer at all.
+    pub fn at(screen: Point) -> Self {
+        Self {
+            time_ns: 0,
+            device: Device::Mouse,
+            screen,
+        }
+    }
+}
+
 /// A pointer or key event, in the form the keymap matches and an operator receives.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpEvent {
@@ -33,14 +77,85 @@ pub enum OpEvent {
     Move { pos: Point, mods: Modifiers },
     /// A key went down or came up.
     Key { key: Key, mods: Modifiers, down: bool },
+    /// A press that turned out to be a click: the button went down and came up again
+    /// without travelling past the drag threshold.
+    ///
+    /// Synthesised by [`OpRuntime`](crate::runtime::OpRuntime), never by a driver, and
+    /// `pos` is **the press's** position rather than the release's — an operator started
+    /// by a gesture wants where the gesture began.
+    Click {
+        button: PointerButton,
+        pos: Point,
+        /// The same point in screen pixels, for an operator that works in that space.
+        ///
+        /// Both are here because a gesture has one beginning and two audiences: an
+        /// operator that moves a node thinks in the driver's space, one that moves the
+        /// view thinks in pixels, and neither should have to ask the other's question.
+        screen: Point,
+        mods: Modifiers,
+        /// 1 for a single click, 2 for the second click of a double, and so on.
+        count: u8,
+    },
+    /// A press that turned out to be a drag: the pointer travelled past the threshold
+    /// while the button was down. `pos` is the press's position, which is the anchor a
+    /// transform operator needs.
+    Drag {
+        button: PointerButton,
+        pos: Point,
+        /// The press's position in screen pixels. See [`Click::screen`](Self::Click).
+        screen: Point,
+        mods: Modifiers,
+    },
 }
 
 impl OpEvent {
     /// Where the pointer was, for the events that have a position.
     pub fn pos(&self) -> Option<Point> {
         match self {
-            Self::Press { pos, .. } | Self::Release { pos, .. } | Self::Move { pos, .. } => Some(*pos),
+            Self::Press { pos, .. }
+            | Self::Release { pos, .. }
+            | Self::Move { pos, .. }
+            | Self::Click { pos, .. }
+            | Self::Drag { pos, .. } => Some(*pos),
             Self::Key { .. } => None,
+        }
+    }
+
+    /// The same event at another position.
+    ///
+    /// For a driver that has to convert: the positions in an [`OpEvent`] are in one
+    /// space — whichever one the operators think in — and what arrives from the toolkit
+    /// is in another. Converting once, here, is what keeps an operator from having to
+    /// know which is which; the space that is *not* this one travels in
+    /// [`Sample::screen`]. An event with no position is returned unchanged.
+    #[must_use]
+    pub fn with_pos(self, at: Point) -> Self {
+        match self {
+            Self::Press { button, mods, .. } => Self::Press { button, pos: at, mods },
+            Self::Release { button, mods, .. } => Self::Release { button, pos: at, mods },
+            Self::Move { mods, .. } => Self::Move { pos: at, mods },
+            Self::Click {
+                button,
+                screen,
+                mods,
+                count,
+                ..
+            } => Self::Click {
+                button,
+                pos: at,
+                screen,
+                mods,
+                count,
+            },
+            Self::Drag {
+                button, screen, mods, ..
+            } => Self::Drag {
+                button,
+                pos: at,
+                screen,
+                mods,
+            },
+            Self::Key { .. } => self,
         }
     }
 
@@ -50,7 +165,9 @@ impl OpEvent {
             Self::Press { mods, .. }
             | Self::Release { mods, .. }
             | Self::Move { mods, .. }
-            | Self::Key { mods, .. } => *mods,
+            | Self::Key { mods, .. }
+            | Self::Click { mods, .. }
+            | Self::Drag { mods, .. } => *mods,
         }
     }
 }
@@ -67,6 +184,19 @@ pub enum Trigger {
     /// A key coming up. Rare, and here because a keymap that cannot express it makes
     /// "held to pan" impossible to write as data.
     KeyUp(Key),
+    /// A press and release of `button` that never became a drag.
+    ///
+    /// The trigger a keymap wants for "click on nothing deselects", and the reason this
+    /// enum grew: with only [`Press`](Self::Press) that sentence had to be a property on
+    /// somebody else's binding (§39.1).
+    Click(PointerButton),
+    /// A press of `button` that travelled past the drag threshold.
+    Drag(PointerButton),
+    /// The second click of a double click, within the keymap's window.
+    ///
+    /// A separate trigger rather than a count property, because a binding on it must be
+    /// able to sit *before* the single-click one and win.
+    DoubleClick(PointerButton),
 }
 
 /// One event pattern: what happened, and which modifiers were held while it did.
@@ -106,6 +236,21 @@ impl Pattern {
         Self::new(Trigger::Release(button))
     }
 
+    /// A click of `button`: pressed and released without a drag.
+    pub fn click(button: PointerButton) -> Self {
+        Self::new(Trigger::Click(button))
+    }
+
+    /// A drag of `button`.
+    pub fn drag(button: PointerButton) -> Self {
+        Self::new(Trigger::Drag(button))
+    }
+
+    /// A double click of `button`.
+    pub fn double_click(button: PointerButton) -> Self {
+        Self::new(Trigger::DoubleClick(button))
+    }
+
     /// A character key going down, e.g. `Pattern::key("g")`.
     pub fn key(name: &str) -> Self {
         Self::new(Trigger::Key(Key::Character(name.into())))
@@ -114,6 +259,19 @@ impl Pattern {
     /// A named key going down, e.g. `Pattern::named(NamedKey::Escape)`.
     pub fn named(key: masonry::core::keyboard::NamedKey) -> Self {
         Self::new(Trigger::Key(Key::Named(key)))
+    }
+
+    /// Whether this pattern is waiting for a gesture on `button` rather than for a raw
+    /// press or release.
+    ///
+    /// What the runtime asks to decide whether a press is worth holding: if no binding
+    /// wants a click or a drag on this button, there is nothing to wait for and the
+    /// press is over the moment it happened.
+    pub fn wants_gesture(&self, button: PointerButton) -> bool {
+        matches!(
+            self.trigger,
+            Trigger::Click(want) | Trigger::Drag(want) | Trigger::DoubleClick(want) if want == button
+        )
     }
 
     /// Whether `event` is this pattern.
@@ -128,6 +286,12 @@ impl Pattern {
             (Trigger::Release(want), OpEvent::Release { button, .. }) => want == button,
             (Trigger::Key(want), OpEvent::Key { key, down: true, .. }) => want == key,
             (Trigger::KeyUp(want), OpEvent::Key { key, down: false, .. }) => want == key,
+            // A double click is also a click, and the keymap's order decides which
+            // binding gets it: a `DoubleClick` binding placed first wins, and one that
+            // is not there leaves the second click behaving like any other.
+            (Trigger::Click(want), OpEvent::Click { button, .. }) => want == button,
+            (Trigger::DoubleClick(want), OpEvent::Click { button, count, .. }) => want == button && *count >= 2,
+            (Trigger::Drag(want), OpEvent::Drag { button, .. }) => want == button,
             _ => false,
         }
     }

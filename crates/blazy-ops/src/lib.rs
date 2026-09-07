@@ -153,6 +153,26 @@ pub struct OpCounters {
     pub tree_first: u64,
     /// Events the pre-tree seat saw, whether or not it was allowed to act on them.
     pub seen_first: u64,
+    /// Events a pre-tree seat kept from the widget tree.
+    ///
+    /// The mirror of [`tree_first`](Self::tree_first), and the number §39 is written on:
+    /// with the flag this fork adds to `Layer::capture_pointer_event`, a gesture the
+    /// runtime owns costs the tree nothing at all.
+    pub withheld: u64,
+    /// Presses held while the runtime waited to see what they became.
+    pub holds: u64,
+    /// Held presses that resolved into neither a click nor a drag, and were dropped.
+    ///
+    /// Not an error: another button, a key or a cancel arrived first. It is counted
+    /// because a hold that is abandoned often means a keymap asking to hold presses
+    /// nothing is waiting for.
+    pub holds_abandoned: u64,
+    /// Presses that turned out to be clicks.
+    pub clicks: u64,
+    /// Clicks that were the second of a double click.
+    pub double_clicks: u64,
+    /// Presses that turned out to be drags.
+    pub drags: u64,
     /// Keymap lookups.
     pub lookups: u64,
     /// Keymap lookups that found at least one binding.

@@ -486,7 +486,7 @@ fn presentation_table(opts: &Options) -> Vec<PresentRow> {
 
                 let mut buffer = vec![0_u32; (frame.image.width * frame.image.height) as usize];
                 let start = Instant::now();
-                for (out, pixel) in buffer.iter_mut().zip(frame.image.data.chunks_exact(4)) {
+                for (out, pixel) in buffer.iter_mut().zip(frame.image.data.as_chunks::<4>().0) {
                     *out = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
                 }
                 show += start.elapsed();
@@ -641,7 +641,9 @@ fn encoded(_plan: &masonry::app::VisualLayerPlan, _scale: f64, _frame: PhysicalS
 fn ink(pixels: &[u8], panel: Color) -> f64 {
     let base = panel.to_rgba8();
     let count = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[0] != base.r || pixel[1] != base.g || pixel[2] != base.b)
         .count();
     count as f64 / (pixels.len() / 4) as f64
@@ -664,10 +666,13 @@ fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
     if a.len() != b.len() {
         return 1.0;
     }
-    let luma = |pixel: &[u8]| 0.299 * f64::from(pixel[0]) + 0.587 * f64::from(pixel[1]) + 0.114 * f64::from(pixel[2]);
+    let luma =
+        |pixel: &[u8; 4]| 0.299 * f64::from(pixel[0]) + 0.587 * f64::from(pixel[1]) + 0.114 * f64::from(pixel[2]);
     let total: f64 = a
-        .chunks_exact(4)
-        .zip(b.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
         .map(|(p, q)| (luma(p) - luma(q)).abs())
         .sum();
     total / (a.len() / 4) as f64 / 255.0
@@ -1506,7 +1511,14 @@ pub fn run(opts: &Options) -> Outcome {
             .with_background(Color::from_rgb8(0x14, 0x14, 0x18));
         let (plan, _tree) = harness.redraw();
         let frame = host.render(&plan, logical_size()).expect("the host renders");
-        let count = frame.image.data.chunks_exact(4).filter(|pixel| pixel[3] != 255).count();
+        let count = frame
+            .image
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[3] != 255)
+            .count();
         println!("\nframe as presented: {count} pixels not fully opaque");
         count
     };

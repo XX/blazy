@@ -13,7 +13,7 @@
 //! operator's poll agrees, so a canvas binding shadows a window one, and a window
 //! binding still catches what no canvas claimed.
 
-use crate::event::{OpEvent, Pattern};
+use crate::event::{Device, OpEvent, Pattern};
 
 /// One property value.
 ///
@@ -133,10 +133,63 @@ pub struct Section {
     pub bindings: Vec<Binding>,
 }
 
+/// How far and how fast a gesture has to be to count as one.
+///
+/// **On the keymap rather than on a binding**, and that is not filing convenience: two
+/// bindings on the same button that disagreed about what a click is would resolve the
+/// same gesture two ways, and which one the user got would depend on binding order.
+/// Blender puts these in preferences for the same reason, and computes the answer in the
+/// window manager before the keymap ever sees the event (§39.2).
+///
+/// The distances are in **screen pixels**, taken from [`Sample::screen`](crate::event::Sample);
+/// a threshold measured in the driver's own units would mean something different at
+/// every zoom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Thresholds {
+    /// Travel past which a mouse press is a drag. Blender's default is 3 px.
+    pub drag_mouse: f64,
+    /// The same for a pen or stylus, which shakes more. Blender's tablet default is 10 px.
+    pub drag_pen: f64,
+    /// The same for a finger, which shakes more again and covers more of the screen.
+    pub drag_touch: f64,
+    /// How long after a click a second one still counts as a double click.
+    ///
+    /// Counted here rather than taken from the platform's own `PointerState::count`:
+    /// `ui-events-winit` fills that in, other backends may not, and a double click that
+    /// works on one backend is worse than none (§39.2).
+    pub double_click_ms: u64,
+    /// How far apart two clicks may be and still be a double click.
+    pub double_click_slop: f64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            drag_mouse: 3.0,
+            drag_pen: 10.0,
+            drag_touch: 15.0,
+            double_click_ms: 250,
+            double_click_slop: 6.0,
+        }
+    }
+}
+
+impl Thresholds {
+    /// The drag threshold for the device that produced the press.
+    pub fn drag_for(&self, device: Device) -> f64 {
+        match device {
+            Device::Mouse | Device::Other => self.drag_mouse,
+            Device::Pen => self.drag_pen,
+            Device::Touch => self.drag_touch,
+        }
+    }
+}
+
 /// A whole keymap.
 #[derive(Clone, Debug, Default)]
 pub struct Keymap {
     sections: Vec<Section>,
+    thresholds: Thresholds,
 }
 
 /// The chain of contexts an event happened in, innermost first.
@@ -150,6 +203,18 @@ pub struct Scope<'a>(pub &'a [&'static str]);
 impl Keymap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The thresholds a gesture is measured against.
+    pub fn thresholds(&self) -> Thresholds {
+        self.thresholds
+    }
+
+    /// Replaces them. What a preferences panel, or a test with a fat finger, does.
+    #[must_use]
+    pub fn with_thresholds(mut self, thresholds: Thresholds) -> Self {
+        self.thresholds = thresholds;
+        self
     }
 
     /// Adds a section, or appends to the one that is already there.
@@ -175,6 +240,21 @@ impl Keymap {
                 .filter(move |section| section.context == context)
                 .flat_map(|section| section.bindings.iter())
                 .filter(move |binding| binding.pattern.matches(event))
+        })
+    }
+
+    /// Every binding in scope, innermost context first, whatever the event.
+    ///
+    /// [`matches`](Self::matches) answers "what fires on this event"; this answers "what
+    /// could fire on this button at all", which is what the runtime needs *before* it
+    /// knows whether a press will become a click or a drag.
+    pub fn sections_for<'a>(&'a self, scope: Scope<'_>) -> impl Iterator<Item = &'a Binding> + 'a {
+        let contexts: Vec<&'static str> = scope.0.to_vec();
+        contexts.into_iter().flat_map(move |context| {
+            self.sections
+                .iter()
+                .filter(move |section| section.context == context)
+                .flat_map(|section| section.bindings.iter())
         })
     }
 

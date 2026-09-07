@@ -14,7 +14,7 @@ use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, Nam
 use masonry::core::{NewWidget, TextEvent};
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Point, Vec2};
-use masonry::testing::TestHarness;
+use masonry::testing::{TestHarness, TestHarnessParams};
 use masonry::theme::default_property_set;
 use masonry::ui_events::pointer::PointerButton;
 
@@ -132,8 +132,16 @@ fn a_left_drag_moves_the_node_under_the_pointer() {
     let at = node_grab(&mut harness, index);
     harness.mouse_move(at);
     harness.mouse_button_press(Some(PointerButton::Primary));
-    assert_eq!(harness.root_widget().modal_depth(), 1, "the press started the move");
+    // The press starts nothing now: it is held until the gesture says what it is
+    // (§39.3). Under §38 this assertion read `modal_depth() == 1`.
+    assert_eq!(
+        harness.root_widget().modal_depth(),
+        0,
+        "a press on its own is not a drag"
+    );
+    assert!(harness.root_widget().is_holding(), "it is being held");
     harness.mouse_move(at + Vec2::new(35.0, 20.0));
+    assert_eq!(harness.root_widget().modal_depth(), 1, "the move made it a drag");
     harness.mouse_button_release(Some(PointerButton::Primary));
     let _ = harness.redraw();
 
@@ -142,6 +150,154 @@ fn a_left_drag_moves_the_node_under_the_pointer() {
     assert_eq!(selection(&harness), BTreeSet::from([index]), "and it is selected");
     // Nothing reached the tree first: a press-started operator holds the capture.
     assert_eq!(harness.root_widget().op_counters().tree_first, 0);
+}
+
+/// Where a node sits **on screen**, which is not where it sits on the canvas once the
+/// view has moved. [`node_grab`] answers the canvas question; a test that drives the
+/// pointer needs this one.
+fn node_grab_screen(harness: &mut TestHarness<NodeEditor>, index: usize) -> Point {
+    let canvas_pos = node_grab(harness, index);
+    let view =
+        harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.view()));
+    view * canvas_pos
+}
+
+/// The same drag, on a view that is not the identity.
+///
+/// The regression that made this a test: a gesture's anchor and the pointer it is
+/// compared against have to be in the same space, and there are two spaces here —
+/// canvas and window. With the view at the identity they coincide, so a test that only
+/// ever drags an unpanned canvas cannot tell them apart, and the node jumps by the pan
+/// on the first event of every drag in the real window.
+#[test]
+fn a_drag_is_anchored_where_the_press_was_on_a_panned_view() {
+    let (mut harness, graph) = ops_harness(500);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::pan(&mut canvas, Vec2::new(120.0, -80.0));
+        });
+    });
+    let _ = harness.redraw();
+
+    let index = visible_node(&mut harness);
+    let before = graph.borrow().node(index).pos;
+    let at = node_grab_screen(&mut harness, index);
+    harness.mouse_move(at);
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    harness.mouse_move(at + Vec2::new(35.0, 20.0));
+    harness.mouse_button_release(Some(PointerButton::Primary));
+    let _ = harness.redraw();
+
+    assert_eq!(
+        graph.borrow().node(index).pos,
+        before + Vec2::new(35.0, 20.0),
+        "the node follows the pointer, and does not jump by the pan first"
+    );
+}
+
+/// The rubber band, on the same panned view: it begins at the press.
+#[test]
+fn a_band_starts_where_the_press_was_on_a_panned_view() {
+    let (mut harness, graph) = ops_harness(500);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::pan(&mut canvas, Vec2::new(120.0, -80.0));
+        });
+    });
+    let _ = harness.redraw();
+
+    // A band drawn tightly around one node takes that node and nothing else. Drawn from
+    // an anchor that is off by the pan, it takes whatever happens to be over there.
+    let index = visible_node(&mut harness);
+    let at = node_grab_screen(&mut harness, index);
+    let from = at + Vec2::new(-30.0, -20.0);
+    harness.mouse_move(from);
+    harness.mouse_button_press(Some(PointerButton::Secondary));
+    harness.mouse_move(at + Vec2::new(30.0, 30.0));
+    harness.mouse_button_release(Some(PointerButton::Secondary));
+    let _ = harness.redraw();
+
+    let _ = graph;
+    // Exactly that node: a band anchored a pan away from the press is not empty, it is
+    // *huge* — it stretches from wherever the anchor landed to the pointer and sweeps up
+    // everything in between, which is why "did it select the node" is not the question.
+    assert_eq!(
+        selection(&harness),
+        BTreeSet::from([index]),
+        "a tight band takes one node"
+    );
+}
+
+/// Panning on a HiDPI display moves the view by what the pointer did, and not by more.
+///
+/// The other half of the same regression: a gesture's anchor came from the event's
+/// *physical* position while the operator compared it against a logical one, so the
+/// first event of a pan jumped by roughly the click position times the scale factor
+/// minus one. At scale 1 the two spaces coincide and nothing is visible, which is why
+/// this test sets one.
+#[test]
+fn a_pan_on_a_scaled_display_moves_by_what_the_pointer_did() {
+    let (canvas, graph) = CanvasSpec::new(500).build();
+    let mut harness = TestHarness::create_with(
+        default_property_set(),
+        NewWidget::new(NodeEditor::with_ops(canvas, &graph)),
+        {
+            let mut params = TestHarnessParams::default();
+            params.window_size = PhysicalSize::new(1100, 750);
+            params.scale_factor = 2.0;
+            params
+        },
+    );
+    let _ = harness.redraw();
+    let root = harness.root_id();
+    harness.set_focus_fallback(Some(root));
+
+    // The harness takes *physical* positions, and at scale 2 they are twice the logical
+    // ones the canvas answers hit tests in — so the gesture is driven in physical
+    // coordinates and expected to move the view by half of what it travelled.
+    let from = empty_spot(&mut harness);
+    let physical = |p: Point| Point::new(p.x * 2.0, p.y * 2.0);
+    harness.mouse_move(physical(from));
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    harness.mouse_move(physical(from) + Vec2::new(80.0, 60.0));
+    harness.mouse_button_release(Some(PointerButton::Primary));
+    let _ = harness.redraw();
+
+    let view =
+        harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.view()));
+    assert_eq!(
+        view.translation(),
+        Vec2::new(40.0, 30.0),
+        "the view moved by the pointer's travel, not by the scale factor"
+    );
+}
+
+/// The status line reports what the runtime decided, and a double click is in it.
+///
+/// The one path from a real pointer to `count >= 2` that a test can walk: the harness
+/// fills `PointerState::time` the way a backend does, the runtime resolves, and the HUD
+/// prints. What no test can check is whether *this platform's* timestamps are usable —
+/// that is what the line is in the window for (§39.2).
+#[test]
+fn the_status_line_reports_a_double_click() {
+    let (mut harness, _graph) = ops_harness(500);
+    let empty = empty_spot(&mut harness);
+
+    harness.mouse_move(empty);
+    for _ in 0..2 {
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_button_release(Some(PointerButton::Primary));
+    }
+    let _ = harness.redraw();
+
+    let counters = harness.root_widget().op_counters();
+    assert_eq!(counters.clicks, 2, "two clicks");
+    assert_eq!(counters.double_clicks, 1, "the second one was a double");
+    assert!(
+        harness.root_widget().hud().contains("clicks 2 (double 1)"),
+        "the status line says so, got {:?}",
+        harness.root_widget().hud()
+    );
 }
 
 /// A left click on empty canvas means "nothing selected".
@@ -244,10 +400,14 @@ fn poll_decides_which_of_two_bindings_runs() {
     );
 
     let empty = empty_spot(&mut harness);
+    let before = harness.root_widget().op_counters().refused;
     harness.mouse_move(empty);
     harness.mouse_button_press(Some(PointerButton::Secondary));
-    let counters = harness.root_widget().op_counters();
-    assert_eq!(counters.refused, 1, "over empty canvas the select operator refused");
+    harness.mouse_move(empty + Vec2::new(20.0, 10.0));
+    assert!(
+        harness.root_widget().op_counters().refused > before,
+        "over empty canvas the select operator refused"
+    );
     assert_eq!(harness.root_widget().modal_depth(), 1, "and the box select started");
     harness.mouse_button_release(Some(PointerButton::Secondary));
     let _ = harness.redraw();
@@ -256,9 +416,9 @@ fn poll_decides_which_of_two_bindings_runs() {
     let before = harness.root_widget().op_counters().refused;
     harness.mouse_move(empty);
     harness.mouse_button_press(Some(PointerButton::Primary));
-    assert_eq!(
-        harness.root_widget().op_counters().refused,
-        before + 1,
+    harness.mouse_move(empty + Vec2::new(20.0, 10.0));
+    assert!(
+        harness.root_widget().op_counters().refused > before,
         "over empty canvas the move operator refused"
     );
     assert_eq!(harness.root_widget().modal_depth(), 1, "and the pan started");
@@ -430,7 +590,7 @@ fn escape_cancels_a_grab_and_leaves_nothing_running() {
 /// One started from a *key* cannot take capture — Masonry offers it during a press and
 /// at no other time — so every event of that gesture reaches the tree first.
 #[test]
-fn capture_is_what_keeps_the_events_and_a_key_cannot_take_it() {
+fn a_gesture_the_runtime_owns_costs_the_tree_nothing() {
     let (mut harness, _graph) = ops_harness(500);
     let start = empty_spot(&mut harness);
     harness.mouse_move(start);
@@ -454,10 +614,17 @@ fn capture_is_what_keeps_the_events_and_a_key_cannot_take_it() {
     }
     harness.mouse_button_press(Some(PointerButton::Primary));
     let keyed = harness.root_widget().op_counters();
+    // Under §38 this assertion read `tree_first >= 4`: a key-started operator could not
+    // take pointer capture, so every move of it reached the tree first. The layer seat
+    // can withhold now, and the two starts cost the same (§39.4).
+    assert_eq!(
+        keyed.tree_first, 0,
+        "a key-started operator leaks nothing now that its seat can withhold"
+    );
     assert!(
-        keyed.tree_first >= 4,
-        "a key-started operator has no capture, so every move reaches the tree first: {}",
-        keyed.tree_first
+        keyed.withheld >= 4,
+        "and what it does not leak, it withheld: {}",
+        keyed.withheld
     );
 }
 
@@ -469,13 +636,22 @@ fn capture_is_what_keeps_the_events_and_a_key_cannot_take_it() {
 #[test]
 fn the_pre_tree_seat_sees_every_pointer_event() {
     let (mut harness, _graph) = ops_harness(500);
-    let before = harness.root_widget().op_counters().seen_first;
+    let before = harness.root_widget().op_counters();
     harness.mouse_move(Point::new(200.0, 200.0));
     harness.mouse_move(Point::new(240.0, 210.0));
     harness.mouse_button_press(Some(PointerButton::Primary));
     harness.mouse_button_release(Some(PointerButton::Primary));
-    let seen = harness.root_widget().op_counters().seen_first - before;
+    let after = harness.root_widget().op_counters();
+    let seen = after.seen_first - before.seen_first;
     assert!(seen >= 4, "the layer hook saw the whole gesture, got {seen}");
+    // And a click — a press and a release with nothing in between — is withheld from
+    // nobody. That is the property that makes holding a press safe (§39.3): what the
+    // runtime keeps back is the *moves* in the middle of a gesture, never the press or
+    // the release, so a press held in error costs the tree a hover and not a click.
+    assert_eq!(
+        after.withheld, before.withheld,
+        "a click takes nothing away from the tree"
+    );
 }
 
 /// A grab with nothing selected must not start. The poll is the mechanism, and a

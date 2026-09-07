@@ -45,7 +45,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, VisualLayerPlan, WindowSizePolicy};
-use masonry::core::{DefaultProperties, ErasedAction, NewWidget, TextEvent, Widget, WidgetId, WindowEvent};
+use masonry::core::{
+    DefaultProperties, ErasedAction, Handled, NewWidget, PointerEvent, TextEvent, Widget, WidgetId, WindowEvent,
+};
 use masonry::dpi::{LogicalSize, PhysicalSize};
 use masonry::imaging::RgbaImage;
 use masonry::peniko::Color;
@@ -157,6 +159,52 @@ pub trait ShellDriver {
         let _ = root;
         Vec::new()
     }
+
+    /// The seat in front of the widget tree: every pointer event, before `RenderRoot`
+    /// is called, with the power to keep it.
+    ///
+    /// Returning [`Handled::Yes`] means the tree never sees the event at all — not the
+    /// widget under the pointer, not its ancestors, not a layer root's own hook. This is
+    /// the seat §38.2 priced and §39.5 moved out of a benchmark and into the library.
+    ///
+    /// What it buys and what it costs, both measured (§38.2): it is the only seat that
+    /// can withhold *anything*, including events no widget would have handled, and it is
+    /// the only one that does not know what is under the pointer. Asking costs
+    /// `RenderRoot::edit_widget` and the rewrite battery that follows it, at 41.2 probes
+    /// per gesture — which is why an application with a layer root of its own should
+    /// prefer that seat and keep this one for what only it can do.
+    fn pointer_event(&mut self, root: &mut RenderRoot, event: &PointerEvent) -> Handled {
+        let _ = (root, event);
+        Handled::No
+    }
+
+    /// The same seat, for keys.
+    ///
+    /// Keys never reach a widget that has not been made the focus fallback, so this is
+    /// also the seat that can hear a key when the tree would have dropped it (§38.3).
+    fn text_event(&mut self, root: &mut RenderRoot, event: &TextEvent) -> Handled {
+        let _ = (root, event);
+        Handled::No
+    }
+}
+
+/// Offers one pointer event to the host seat, and then to the tree unless it was taken.
+///
+/// The whole of the host seat, and it is a free function so that an embedder running its
+/// own loop — or a test with no window at all — gets exactly what the shell's loop gets.
+pub fn deliver_pointer(driver: &mut dyn ShellDriver, root: &mut RenderRoot, event: PointerEvent) -> Handled {
+    if driver.pointer_event(root, &event).is_handled() {
+        return Handled::Yes;
+    }
+    root.handle_pointer_event(event)
+}
+
+/// As [`deliver_pointer`], for keys.
+pub fn deliver_text(driver: &mut dyn ShellDriver, root: &mut RenderRoot, event: TextEvent) -> Handled {
+    if driver.text_event(root, &event).is_handled() {
+        return Handled::Yes;
+    }
+    root.handle_text_event(event)
 }
 
 impl ShellDriver for () {}
@@ -520,7 +568,7 @@ fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &Rgb
     surface.resize(width, height).map_err(platform)?;
 
     let mut buffer = surface.buffer_mut().map_err(platform)?;
-    for (out, pixel) in buffer.iter_mut().zip(image.data.chunks_exact(4)) {
+    for (out, pixel) in buffer.iter_mut().zip(image.data.as_chunks::<4>().0) {
         *out = (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
     }
     buffer.present().map_err(platform)
@@ -546,10 +594,10 @@ impl ApplicationHandler for ShellApp {
         if let Some(translation) = self.reducer.reduce(scale_factor, &event) {
             match translation {
                 WindowEventTranslation::Keyboard(key) => {
-                    root.handle_text_event(TextEvent::Keyboard(key));
+                    deliver_text(self.driver.as_mut(), root, TextEvent::Keyboard(key));
                 },
                 WindowEventTranslation::Pointer(pointer) => {
-                    root.handle_pointer_event(pointer);
+                    deliver_pointer(self.driver.as_mut(), root, pointer);
                 },
             }
         }
@@ -570,7 +618,7 @@ impl ApplicationHandler for ShellApp {
                 root.handle_window_event(WindowEvent::Rescale(scale_factor));
             },
             WinitWindowEvent::Focused(focused) => {
-                root.handle_text_event(TextEvent::WindowFocusChange(focused));
+                deliver_text(self.driver.as_mut(), root, TextEvent::WindowFocusChange(focused));
             },
             WinitWindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw() {

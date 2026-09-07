@@ -271,19 +271,27 @@ impl Operator<EditorWorld> for SelectOp {
         "node.select"
     }
 
-    /// Only over a node — or over one named by a property.
+    /// Only over a node — or over one named by a property, or asked to clear.
     ///
-    /// The other binding on the same button, the box select, is what a press on empty
-    /// canvas reaches, and it reaches it *because* this refuses. The second half of
-    /// the condition is what keeps the scripted path honest: a poll that asked about
-    /// the pointer alone would refuse every call that does not come from one, and
-    /// "the key and the script do the same thing" would be true only of the key.
+    /// The other binding on the same button, the box select, is what a drag on empty
+    /// canvas reaches, and it reaches it *because* this refuses. The `index` half keeps
+    /// the scripted path honest: a poll that asked about the pointer alone would refuse
+    /// every call that does not come from one, and "the key and the script do the same
+    /// thing" would be true only of the key. The `deselect_all` half is Blender's
+    /// property of the same name — a click on nothing means "nothing selected", and it
+    /// is the operator's business what a click means, not the keymap's (§39.1).
     fn poll(&self, cx: &OpCtx<'_, EditorWorld>) -> bool {
-        cx.world().hovered_node().is_some() || cx.props().int("index", -1) >= 0
+        cx.world().hovered_node().is_some()
+            || cx.props().int("index", -1) >= 0
+            || cx.props().bool("deselect_all", false)
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld>) -> OpResult {
         let Some(index) = cx.world().hovered_node() else {
+            if cx.props().bool("deselect_all", false) {
+                set_selection(cx, BTreeSet::new());
+                return OpResult::Finished;
+            }
             return OpResult::PassThrough;
         };
         select(cx, index)
@@ -360,9 +368,12 @@ impl Operator<EditorWorld> for BoxSelectOp {
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld>) -> OpResult {
-        self.anchor = cx.world().pointer;
+        self.anchor = match cx.event() {
+            Some(OpEvent::Drag { pos, .. }) => *pos,
+            _ => cx.world().pointer,
+        };
         self.button = match cx.event() {
-            Some(OpEvent::Press { button, .. }) => Some(*button),
+            Some(OpEvent::Drag { button, .. } | OpEvent::Press { button, .. }) => Some(*button),
             _ => None,
         };
         self.tracking = self.button.is_some();
@@ -461,25 +472,25 @@ impl Operator<EditorWorld> for MoveOp {
         "node.move"
     }
 
-    /// Something to move, and the binding decides what counts.
+    /// Something to move, and **the event says what** — no property required.
     ///
-    /// The poll a criterion is written on, and it is what tells the two bindings on the
-    /// primary button apart: over a node this takes the press, over empty canvas it
-    /// refuses and the pan gets its turn. That is what `under_pointer` is for — without
-    /// it a press on empty canvas would start moving the *selection* the moment there
-    /// was one, and the view would stop panning as soon as the user selected anything.
-    /// `G` carries no such property, because a grab from the keyboard is precisely the
-    /// one that moves what is selected wherever the pointer happens to be — and with
-    /// nothing selected it must refuse rather than start and find itself idle.
+    /// This is what `under_pointer` used to buy, and why it is gone (§39.1). A pointer
+    /// gesture names its target by pointing at it: a drag that started on empty canvas
+    /// is not a request to move the selection, or the view would stop panning the moment
+    /// the user selected anything. A grab from `G`, or from a script, has no pointer to
+    /// mean anything by, and moves what is selected. The keymap says neither; the shape
+    /// of the event does.
     fn poll(&self, cx: &OpCtx<'_, EditorWorld>) -> bool {
-        if cx.props().bool("under_pointer", false) {
-            return cx.world().hovered_node().is_some();
+        match cx.event() {
+            Some(OpEvent::Drag { .. } | OpEvent::Click { .. } | OpEvent::Press { .. }) => {
+                cx.world().hovered_node().is_some()
+            },
+            _ => cx.world().hovered_node().is_some() || !cx.world().selection.is_empty(),
         }
-        cx.world().hovered_node().is_some() || !cx.world().selection.is_empty()
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld>) -> OpResult {
-        self.from_press = matches!(cx.event(), Some(OpEvent::Press { .. }));
+        self.from_press = matches!(cx.event(), Some(OpEvent::Drag { .. } | OpEvent::Press { .. }));
         // Dragging an unselected node takes it, as every editor does: the alternative
         // is a drag that silently moves something else.
         if let Some(index) = cx.world().hovered_node()
@@ -488,7 +499,10 @@ impl Operator<EditorWorld> for MoveOp {
         {
             select(cx, index);
         }
-        self.anchor = cx.world().pointer;
+        self.anchor = match cx.event() {
+            Some(OpEvent::Drag { pos, .. }) => *pos,
+            _ => cx.world().pointer,
+        };
         self.grab(cx);
         OpResult::Running
     }
@@ -608,13 +622,6 @@ impl MoveOp {
     }
 }
 
-/// How far the pointer may travel and still count as a click, in screen pixels.
-///
-/// Three, which is what every editor uses and what a hand does on a mouse: a press and
-/// release at "the same place" is a couple of pixels apart, and a threshold of zero
-/// would turn half the clicks into one-pixel drags.
-const CLICK_SLOP: f64 = 3.0;
-
 /// Moves the view with the pointer.
 ///
 /// An operator that changes no model state at all, which is why it is here: the view is
@@ -623,14 +630,14 @@ const CLICK_SLOP: f64 = 3.0;
 /// as it carries a moved node. In screen units, because the view moves under the
 /// pointer while this runs.
 ///
-/// **It also decides that a press which never moved was a click**, and with
-/// `click_deselects` clears the selection. That belongs here and not in the keymap, and
-/// the reason is §38.1: pointer capture is granted during the press and at no other
-/// time, so an operator that may need to hold the pointer has to start on the press —
-/// before anyone can know whether the gesture will turn out to be a drag. Whoever holds
-/// the gesture is therefore the only one who can say, at the end, what it was.
-/// [`MoveOp`] does the same thing from the other side: a press on a node that never
-/// moved leaves the node selected and nothing in the history.
+/// **It used to decide what a click was, and no longer does** (§39.1). Under §38 pointer
+/// capture was granted during the press and at no other time, so an operator that might
+/// have to hold the pointer had to start on the press — before anyone could know what
+/// the gesture would become — and whoever held it was the only one who could say
+/// afterwards what it had been. That is why this operator carried `click_deselects`.
+/// With the layer seat able to withhold events, the runtime resolves the gesture before
+/// any operator starts, and a click on empty canvas is its own binding on
+/// `node.select`.
 #[derive(Default)]
 pub struct PanOp {
     anchor: Point,
@@ -643,7 +650,13 @@ impl Operator<EditorWorld> for PanOp {
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld>) -> OpResult {
-        self.anchor = cx.world().pointer_screen;
+        // Where the *press* was, not where the pointer is now: a drag is recognised a
+        // few pixels after it started, and those pixels are part of the movement. This
+        // is what `OpEvent::Drag` carries the gesture's origin for (§39.3).
+        self.anchor = match cx.event() {
+            Some(OpEvent::Drag { screen, .. }) => *screen,
+            _ => cx.world().pointer_screen,
+        };
         self.total = Vec2::ZERO;
         OpResult::Running
     }
@@ -669,14 +682,7 @@ impl Operator<EditorWorld> for PanOp {
             Some(OpEvent::Release {
                 button: PointerButton::Primary,
                 ..
-            }) => {
-                // A press that went nowhere was a click on empty canvas, and a click on
-                // empty canvas means "nothing".
-                if cx.props().bool("click_deselects", false) && self.total.hypot() < CLICK_SLOP {
-                    set_selection(cx, BTreeSet::new());
-                }
-                OpResult::Finished
-            },
+            }) => OpResult::Finished,
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
@@ -738,43 +744,45 @@ impl Operator<EditorWorld> for RedoOp {
 
 /// The keymap the example opens with — Blender's classic one, as data.
 ///
-/// The left button drags: the node under the pointer if there is one, the view if
-/// there is not — and a left press on empty canvas that never moved clears the
-/// selection, which is the `click_deselects` property on that binding. The right button
-/// selects: the node under the pointer if there is one, a rubber band if there is not. None of that is written as a
-/// branch — **each button carries two bindings and their operators' polls tell them apart**, which is the
-/// mechanism §11 describes and the whole reason `poll` exists.
+/// **Click and drag are triggers now** (§39.1), and the two sentences that used to be
+/// properties on somebody else's binding are two rows a user could move to another
+/// button: "drag on empty canvas pans the view" and "click on empty canvas deselects".
+/// Each button still carries several bindings whose operators' polls tell them apart —
+/// dragging moves the node under the pointer if there is one and the view if there is
+/// not — which is the mechanism §11 describes and the whole reason `poll` exists.
 ///
 /// `G` and `B` start the same two operators from the keyboard. They are kept because
-/// they are Blender's, and because a modal operator started by a key cannot take
-/// pointer capture: the difference between the two kinds of start is the finding of
-/// §38.1, and an example with only one kind would hide it.
+/// they are Blender's, and because a modal operator started by a key cannot take pointer
+/// capture: the difference between the two kinds of start is the finding of §38.1, and
+/// an example with only one kind would hide it. What §39 changed is that it no longer
+/// *costs* anything — the layer seat withholds the events either way.
 pub fn default_keymap() -> Keymap {
     Keymap::new()
         .with(CANVAS_CONTEXT, vec![
-            // Left: drag the node under the pointer, or drag the view.
-            Binding::new(Pattern::press(PointerButton::Primary), "node.move")
-                .with_props(Props::new().with_bool("under_pointer", true)),
-            Binding::new(Pattern::press(PointerButton::Primary), "view.pan")
-                .with_props(Props::new().with_bool("click_deselects", true)),
+            // Left drag: the node under the pointer, or the view. Two rows, and the
+            // polls tell them apart.
+            Binding::new(Pattern::drag(PointerButton::Primary), "node.move"),
+            Binding::new(Pattern::drag(PointerButton::Primary), "view.pan"),
+            // Left click: the node under the pointer, or nothing at all — the sentence
+            // that used to live inside `view.pan` as `click_deselects`.
+            Binding::new(Pattern::click(PointerButton::Primary), "node.select")
+                .with_props(Props::new().with_bool("deselect_all", true)),
             // Shift-left: add to the selection, by node or by band.
             Binding::new(
-                Pattern::press(PointerButton::Primary).with_mods(Modifiers::SHIFT),
+                Pattern::click(PointerButton::Primary).with_mods(Modifiers::SHIFT),
                 "node.select",
             )
             .with_props(Props::new().with_bool("extend", true)),
             Binding::new(
-                Pattern::press(PointerButton::Primary).with_mods(Modifiers::SHIFT),
+                Pattern::drag(PointerButton::Primary).with_mods(Modifiers::SHIFT),
                 "node.box_select",
             )
             .with_props(Props::new().with_bool("extend", true)),
-            // Right: select the node under the pointer, or drag a band. A band that
-            // ends where it began selects nothing, which is how a click on empty
-            // canvas clears the selection without an operator of its own.
-            Binding::new(Pattern::press(PointerButton::Secondary), "node.select"),
-            Binding::new(Pattern::press(PointerButton::Secondary), "node.box_select"),
+            // Right: click selects the node under the pointer, drag pulls a rubber band.
+            Binding::new(Pattern::click(PointerButton::Secondary), "node.select"),
+            Binding::new(Pattern::drag(PointerButton::Secondary), "node.box_select"),
             Binding::new(
-                Pattern::press(PointerButton::Secondary).with_mods(Modifiers::SHIFT),
+                Pattern::click(PointerButton::Secondary).with_mods(Modifiers::SHIFT),
                 "node.select",
             )
             .with_props(Props::new().with_bool("extend", true)),

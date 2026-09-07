@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
-    AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PaintLayerMode, PropertiesRef,
-    RegisterCtx, Widget, WindowEvent,
+    AccessCtx, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PaintLayerMode,
+    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, Widget, WindowEvent,
 };
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::Painter;
@@ -27,6 +27,49 @@ struct Counting {
     layouts: Rc<Cell<u64>>,
     /// Whether to declare an external layer when painting.
     external: bool,
+}
+
+/// A widget that counts the pointer events that reach it.
+struct Probe {
+    seen: Rc<Cell<u64>>,
+}
+
+impl Widget for Probe {
+    type Action = NoAction;
+
+    fn on_pointer_event(&mut self, _ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, _event: &PointerEvent) {
+        self.seen.set(self.seen.get() + 1);
+    }
+
+    fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
+
+    fn measure(
+        &mut self,
+        _ctx: &mut MeasureCtx<'_>,
+        _props: &PropertiesRef<'_>,
+        _axis: Axis,
+        len_req: LenReq,
+        _cross_length: Option<Length>,
+    ) -> Length {
+        match len_req {
+            LenReq::MinContent | LenReq::MaxContent => Length::px(100.0),
+            LenReq::FitContent(space) => space,
+        }
+    }
+
+    fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
+
+    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::new()
+    }
+
+    fn accessibility_role(&self) -> Role {
+        Role::GenericContainer
+    }
+
+    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
 }
 
 /// A widget that declares itself an isolated scene layer whenever it paints.
@@ -235,7 +278,13 @@ fn a_window_frame_is_opaque() {
 
 /// Pixels that are not fully opaque.
 fn transparent_pixels(image: &masonry::imaging::RgbaImage) -> usize {
-    image.data.chunks_exact(4).filter(|pixel| pixel[3] != 255).count()
+    image
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] != 255)
+        .count()
 }
 
 /// A widget that paints a shape in the middle and leaves the rest of the window bare.
@@ -375,7 +424,7 @@ fn a_frame_read_back_is_the_frame_that_was_drawn() {
     let pixels = frames.read_pixels();
     assert_eq!(pixels.len(), 200 * 120 * 4, "tightly packed, padding dropped");
     assert!(
-        pixels.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0),
         "the frame came back empty"
     );
     assert_eq!(frames.counters().readbacks, 1, "a readback went uncounted");
@@ -441,4 +490,103 @@ fn an_isolated_layer_lasts_one_paint() {
     assert_eq!(painted, 1, "the frame it painted in has its layer");
     assert_eq!(clean, 1, "a plan always has at least the root layer");
     assert_eq!(paints.get(), before, "the clean frame did not paint it");
+}
+
+/// The host seat: what a driver in front of `RenderRoot` can do (§39.5).
+mod host_seat {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use masonry::app::{RenderRoot, RenderRootOptions, WindowSizePolicy};
+    use masonry::core::{Handled, NewWidget, PointerEvent, PointerInfo, PointerType, PointerUpdate};
+    use masonry::dpi::{PhysicalPosition, PhysicalSize};
+    use masonry::theme::default_property_set;
+    use masonry::ui_events::pointer::PointerState;
+
+    use super::Probe;
+    use crate::window::{ShellDriver, deliver_pointer};
+
+    /// A driver that takes everything, or nothing.
+    struct Seat {
+        withhold: bool,
+        seen: Rc<Cell<u64>>,
+    }
+
+    impl ShellDriver for Seat {
+        fn pointer_event(&mut self, _root: &mut RenderRoot, _event: &PointerEvent) -> Handled {
+            self.seen.set(self.seen.get() + 1);
+            if self.withhold { Handled::Yes } else { Handled::No }
+        }
+    }
+
+    fn root(seen: &Rc<Cell<u64>>) -> RenderRoot {
+        RenderRoot::new(
+            NewWidget::new(Probe { seen: seen.clone() }),
+            |_signal| {},
+            RenderRootOptions {
+                default_properties: Arc::new(default_property_set()),
+                use_system_fonts: false,
+                size_policy: WindowSizePolicy::User,
+                size: PhysicalSize::new(200, 100),
+                scale_factor: 1.0,
+                test_font: None,
+            },
+        )
+    }
+
+    fn moved(x: f64, y: f64) -> PointerEvent {
+        PointerEvent::Move(PointerUpdate {
+            pointer: PointerInfo {
+                pointer_id: None,
+                persistent_device_id: None,
+                pointer_type: PointerType::Mouse,
+            },
+            current: PointerState {
+                position: PhysicalPosition::new(x, y),
+                ..Default::default()
+            },
+            coalesced: vec![],
+            predicted: vec![],
+        })
+    }
+
+    /// The one thing this seat can do that no other can: the tree does not see it.
+    #[test]
+    fn a_withheld_event_never_reaches_the_tree() {
+        let widget_seen = Rc::new(Cell::new(0));
+        let seat_seen = Rc::new(Cell::new(0));
+        let mut root = root(&widget_seen);
+        let mut driver = Seat {
+            withhold: true,
+            seen: seat_seen.clone(),
+        };
+
+        for step in 0..5 {
+            let handled = deliver_pointer(&mut driver, &mut root, moved(10.0 + f64::from(step), 10.0));
+            assert!(handled.is_handled(), "the seat took it");
+        }
+
+        assert_eq!(seat_seen.get(), 5, "the seat saw every event");
+        assert_eq!(widget_seen.get(), 0, "and the tree saw none of them");
+    }
+
+    /// And the other half of the switch: a seat that takes nothing changes nothing.
+    #[test]
+    fn what_the_seat_passes_reaches_the_tree() {
+        let widget_seen = Rc::new(Cell::new(0));
+        let seat_seen = Rc::new(Cell::new(0));
+        let mut root = root(&widget_seen);
+        let mut driver = Seat {
+            withhold: false,
+            seen: seat_seen.clone(),
+        };
+
+        for step in 0..5 {
+            deliver_pointer(&mut driver, &mut root, moved(10.0 + f64::from(step), 10.0));
+        }
+
+        assert_eq!(seat_seen.get(), 5);
+        assert!(widget_seen.get() > 0, "the tree got what the seat did not take");
+    }
 }

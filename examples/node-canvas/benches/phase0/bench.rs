@@ -1488,18 +1488,51 @@ fn evaluate(
         });
     }
 
-    if !gestures.is_empty() {
-        // The finding rather than a safety net: a modal operator started by a key
-        // cannot take pointer capture, because Masonry offers it during a press and
-        // nowhere else. A table without such a gesture would let the criterion above
-        // pass on a keymap that has no key-started operators at all.
+    if let Some(grab) = gesture("grab (key G)", "tree") {
+        // The other half of the pair, and the finding §39 replaced. Under §38 this
+        // gesture leaked 21 events a gesture: a modal operator started by a key cannot
+        // take pointer capture, and nothing else could keep an event from the tree. The
+        // layer seat can withhold now, so a key-started gesture costs what a
+        // press-started one costs — and the counter that used to be 21 is the bound.
         criteria.push(Criterion {
-            name: "the_modal_leak_is_exercised",
-            claim: "the table contains a gesture the tree sees first",
+            name: "a_key_started_operator_keeps_the_events_too",
+            claim: "a modal operator started by a key sees every event first",
             kind: Kind::Counter,
-            measured: f64::from(u8::from(!gestures.iter().any(|row| row.tree_first > 0.5))),
+            measured: grab.tree_first,
             bound: 1.0,
-            unit: "tables with no leak",
+            unit: "events the tree saw first/gesture",
+        });
+    }
+
+    if !gestures.is_empty() {
+        // And the vacuity guard, which had to be restated rather than deleted: the
+        // criterion above is about a leak that no longer happens, so what has to be
+        // exercised is the mechanism that closed it. A table where nothing is ever
+        // withheld would let it pass on a driver that stopped withholding at all.
+        criteria.push(Criterion {
+            name: "the_withholding_is_exercised",
+            claim: "the table contains a gesture that keeps events from the tree",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(!gestures.iter().any(|row| row.withheld > 0.5))),
+            bound: 1.0,
+            unit: "tables where nothing is withheld",
+        });
+
+        // A click is the case where withholding would be a theft rather than a saving:
+        // the press and the release belong to the tree, and only the moves in between
+        // are the runtime's (§39.3). Zero, from the failing side.
+        let click_withholds = gestures
+            .iter()
+            .filter(|row| row.gesture == "click select")
+            .map(|row| row.withheld)
+            .fold(0.0, f64::max);
+        criteria.push(Criterion {
+            name: "a_click_takes_nothing_from_the_tree",
+            claim: "a click withholds no event",
+            kind: Kind::Counter,
+            measured: click_withholds,
+            bound: 0.5,
+            unit: "events withheld/click",
         });
     }
 
