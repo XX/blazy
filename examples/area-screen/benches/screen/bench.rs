@@ -527,6 +527,7 @@ pub fn run(opts: &Options) -> Outcome {
     let regions = region_cost(opts, areas, nodes);
     let (overview_widgets, overview_commands, ..) = overview_screen(opts, areas, nodes);
     let cache = crate::cache::cache_table(opts, areas, nodes);
+    let operations = crate::ops::ops_table(opts, areas, nodes);
 
     let outcome = Outcome {
         nodes: areas,
@@ -541,6 +542,7 @@ pub fn run(opts: &Options) -> Outcome {
             overview_commands,
             areas,
             cache: &cache,
+            operations: &operations,
         }),
         scenarios: reports.iter().map(Report::record).collect(),
         sweep,
@@ -633,6 +635,8 @@ struct Measured<'a> {
     areas: usize,
     /// What the layer cache did, row by row (§36).
     cache: &'a [crate::cache::CacheRow],
+    /// What each operation on the areas cost (§41.2).
+    operations: &'a [crate::ops::OpsRow],
 }
 
 fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
@@ -645,6 +649,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         overview_commands,
         areas,
         cache,
+        operations,
     } = *measured;
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
@@ -936,6 +941,108 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             measured: f64::from(u8::from(!redrew_everything)),
             bound: 1.0,
             unit: "sweeps that never redraw",
+        });
+    }
+
+    let op = |what: &str| operations.iter().find(|row| row.what == what);
+
+    if let Some(join) = op("join") {
+        // The counter the splitter drag is judged on, asked of a join: the parent split
+        // disappears and the survivor takes the rectangle the pair shared, so exactly one
+        // area changes size however many the screen holds.
+        criteria.push(Criterion {
+            name: "join_resizes_only_the_survivor",
+            claim: "joining two areas resizes one",
+            kind: Kind::Counter,
+            measured: join.resizes as f64,
+            bound: 2.0,
+            unit: "area resizes",
+        });
+    }
+
+    if !operations.is_empty() {
+        // The requirement of §41.2, and not an optimisation: an area that survived an
+        // operation has to come out of it as the same widget, because its view, its
+        // selection and its materialised nodes live nowhere else (§30). Split is the one
+        // operation that may build, and it is excluded here and guarded below.
+        let rebuilt: u64 = operations
+            .iter()
+            .filter(|row| row.what != "split")
+            .map(|row| row.builds)
+            .sum();
+        criteria.push(Criterion {
+            name: "no_operation_rebuilds_a_surviving_area",
+            claim: "join, swap, maximize, restore and a workspace load build nothing",
+            kind: Kind::Counter,
+            measured: rebuilt as f64,
+            bound: 1.0,
+            unit: "area widgets built",
+        });
+
+        // Vacuity: a screen where nothing is ever built passes the criterion above by
+        // doing nothing at all.
+        criteria.push(Criterion {
+            name: "the_table_contains_an_operation_that_builds",
+            claim: "splitting an area builds a widget for it",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(op("split").is_none_or(|row| row.builds == 0))),
+            bound: 1.0,
+            unit: "tables where a split built nothing",
+        });
+    }
+
+    if let Some(restore) = op("maximize and restore") {
+        // A return has to be exact, not approximate (§28.4 on sweeps that only go one
+        // way): the screen comes back to the rectangles it left, or the flag is not a
+        // flag but a rebuild.
+        criteria.push(Criterion {
+            name: "maximize_and_restore_return_the_same_screen",
+            claim: "restoring gives back the rectangles maximizing hid",
+            kind: Kind::Counter,
+            measured: restore.mismatched as f64,
+            bound: 1.0,
+            unit: "areas back at the wrong size",
+        });
+
+        // Vacuity: restoring from a maximize that changed nothing proves nothing.
+        criteria.push(Criterion {
+            name: "the_table_contains_a_maximize_that_changed_the_screen",
+            claim: "maximizing an area resizes it",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(op("maximize").is_none_or(|row| row.resizes == 0))),
+            bound: 1.0,
+            unit: "tables where maximizing changed nothing",
+        });
+    }
+
+    if let Some(trip) = op("workspace round trip") {
+        // Tree → file → tree, over a screen that moved on in between (see `ops.rs`): the
+        // areas have to arrive at the rectangles the file was written from, which means
+        // the same ids as well as the same geometry — the widgets are keyed by the ids.
+        criteria.push(Criterion {
+            name: "a_workspace_round_trip_puts_every_area_back",
+            claim: "a workspace read back puts every area where it was written",
+            kind: Kind::Counter,
+            measured: trip.mismatched as f64,
+            bound: 1.0,
+            unit: "areas in the wrong place",
+        });
+    }
+
+    // The set of layers is the set of areas, so an operation that changes the areas
+    // changes what the cache is holding. That it stays inside its ceiling while doing so
+    // is *not* a criterion of its own: `the_layer_cache_stays_inside_its_ceiling` takes
+    // the worst of every cached row, and the "join, small ceiling" row exists to put a
+    // changing area set among them — a second criterion over the same rows would only
+    // look like more evidence. What is new is the other half.
+    if let Some(joined) = cache.iter().find(|row| row.what == "join" && row.cached) {
+        criteria.push(Criterion {
+            name: "a_join_does_not_stop_the_layer_cache_reusing",
+            claim: "the areas a join did not touch keep their pixels",
+            kind: Kind::Counter,
+            measured: joined.layers as f64 - joined.reused,
+            bound: 3.0,
+            unit: "layers drawn rather than kept/frame",
         });
     }
 

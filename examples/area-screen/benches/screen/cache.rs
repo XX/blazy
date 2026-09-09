@@ -219,6 +219,12 @@ fn cache_case(
     let mut previous: Vec<masonry::imaging::record::Scene> = Vec::new();
     for i in 0..CACHE_FRAMES {
         step(&mut harness, i);
+        // Asked again every frame, exactly as `ShellDriver::layers` is: the set of areas
+        // is not fixed once an operation can change it, and re-registering the same set
+        // is what the shell does anyway.
+        if cached {
+            gpu.cache_layers(harness.root_widget().area_ids());
+        }
         keep_layers(&mut harness);
         let (plan, _) = harness.redraw();
         layers = plan.layers.len();
@@ -316,6 +322,35 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
             // few hundred pixels wide and a node further along the row lands in the
             // area next door, where it would select something and prove nothing.
             |h, i| click_node(h, 0, if i % 2 == 0 { 3 } else { 5 }),
+        ));
+        // The set of layers *is* the set of areas, so an operation that changes the areas
+        // changes what the cache holds — §41.2 asks whether it survives that. The join
+        // happens once, part way through, so the row measures the frames on both sides of
+        // it rather than the frame it happened in.
+        let join = |h: &mut TestHarness<AreaScreen>, i: usize| {
+            if i != CACHE_FRAMES / 2 {
+                return;
+            }
+            let sibling = h.root_widget().tree().joinable(0);
+            h.edit_root_widget(|mut screen| {
+                if let Some(sibling) = sibling {
+                    assert!(AreaScreen::join(&mut screen, 0, sibling));
+                }
+            });
+        };
+        rows.extend(cache_case(&mut gpu, case("join"), join));
+        // The same join with the cache already evicting, which is the case the ceiling
+        // criterion is about: a set of layers that changes *while* the cache is at its
+        // limit. Under the default ceiling nothing is ever dropped, so that row would
+        // agree with a cache that had forgotten how to count.
+        rows.extend(cache_case(
+            &mut gpu,
+            CacheCase {
+                what: "join, small ceiling",
+                budget: Some(u64::from(VIEWPORT.0) * u64::from(VIEWPORT.1) * 4 / 4),
+                ..case("")
+            },
+            join,
         ));
         // A ceiling two areas wide, so the cache has to drop textures to stay inside it.
         // Without this row the criterion that says it does would pass by never being

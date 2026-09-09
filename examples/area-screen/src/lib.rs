@@ -162,11 +162,14 @@ impl ScreenSpec {
     pub fn build(self) -> (AreaScreen, SharedGraph) {
         let graph = share(GraphModel::generated(self.nodes));
         let budget = window_budget(self.budget_widgets, self.areas);
-        let screen = AreaScreen::new(SplitTree::balanced(self.areas), |area| {
+        // The builder outlives this call: the screen keeps it so a split can ask for the
+        // widget of an area that does not exist yet.
+        let building = graph.clone();
+        let screen = AreaScreen::new(SplitTree::balanced(self.areas), move |area| {
             let canvas = if self.ops {
-                area_editor(&graph, self.nodes, budget)
+                area_editor(&building, self.nodes, budget)
             } else {
-                area_canvas(&graph, self.nodes, budget)
+                area_canvas(&building, self.nodes, budget)
             };
             let content = if self.header {
                 AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)

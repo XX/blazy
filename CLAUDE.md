@@ -194,10 +194,27 @@ decision about *which widgets to build*, not about how to draw them (§20.7).
 
 **Areas do not add up (§21).** `SplitTree` is pure geometry and knows nothing of
 widgets; `AreaScreen` places one child per area at the rect the tree computed. Keep
-that seam: the tree is what will later be serialised into a workspace file.
-Rectangles are **rounded to whole pixels**, and that is load-bearing rather than
-cosmetic — a fractional boundary makes every area count as resized on every frame of a
-drag.
+that seam: the tree is what a `Workspace` serialises, and what fills each area lives
+beside it rather than in it (§41.5). Rectangles are **rounded to whole pixels**, and
+that is load-bearing rather than cosmetic — a fractional boundary makes every area
+count as resized on every frame of a drag.
+
+**An `AreaId` is the identity, and no operation renumbers one (§41.2).** Split, join,
+swap, maximize/restore and a workspace load all obey one rule: an area that survives
+keeps its widget, because a view, a selection and materialised nodes live nowhere else
+(§30). That is what the tree's free lists and `AreaScreen`'s tombstoned `pods` are for,
+and the `builds` counter is what holds it — zero for everything but a split. Two
+consequences: **swap exchanges the leaves, not the widgets** (moving the id moves
+everything keyed by it, at no cost at all), and **maximize is a flag plus `set_stashed`,
+not a saved tree** — the tree underneath is untouched, so restoring returns the same
+rectangles bit for bit rather than rebuilt ones.
+
+**Join can only merge siblings, and §41.1 says what that costs.** Blender merges any two
+areas with a coincident border; a binary tree can only replace a split with one of its
+two children. Measured: 4 of 10 bordering pairs on eight areas, 8 of 24 on sixteen. It
+is the price §8 named in advance, not a defect to patch — and an area whose sibling is a
+split rather than a leaf has no partner at all. Do not "fix" it locally; replacing the
+tree with a vertex-and-edge graph is its own work with its own numbers.
 
 **Several canvases over one model is the normal case, and the model has to carry
 every field of a node's state (§30).** Node geometry included: a canvas keeps its own

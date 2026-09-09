@@ -189,6 +189,7 @@ dependencies = [
  "image",
  "masonry",
  "node-canvas",
+ "tracing",
 ]
 
 [[package]]

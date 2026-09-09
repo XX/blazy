@@ -35,14 +35,29 @@
 //! tree computed. §8 asks for exactly this seam, so the tree can later be
 //! serialised, or replaced by a vertex-and-edge graph, without touching the widget.
 //! [`AreaContent`] fills one area with regions, each carrying its own [`UiScale`].
+//! [`Workspace`] is where the tree meets what fills each of its areas, because the
+//! tree deliberately does not know (§41.5).
+//!
+//! # Operations, and the one that does not fit
+//!
+//! [`AreaScreen`] splits, joins, swaps, maximizes and restores, and a [`Workspace`]
+//! writes the result to a file and reads it back (§41). All of them go through the seam
+//! above, and all of them obey one rule that is a requirement rather than an
+//! optimisation: **an area that survives an operation keeps its widget**. An
+//! [`AreaId`] is the identity, nothing renumbers one, and what an area's widget holds —
+//! a view, a selection, materialised nodes — lives nowhere else (§30).
+//!
+//! **Join is where the binary tree stops being enough, and by how much is measured.**
+//! Blender merges any two areas whose border coincides; a tree can only merge
+//! *siblings*. On eight areas, ten pairs share a whole border and four of them are
+//! siblings; on sixteen, eight of twenty-four (§41.1). That is not a defect to fix
+//! here — it is the price §8 named in advance, and the vertex-and-edge graph it
+//! recommends instead is its own work with its own numbers.
 //!
 //! # What is missing
 //!
-//! Not the finished subsystem yet. There is no join, no maximize/restore, no swap, no
-//! detach into a second OS window, and no regions beyond a header and a main view —
-//! no toolbar, no sidebar, no footer. All of those are operations on a split tree that
-//! already exists and is covered by tests; the five claims above have been measured
-//! and held (§21, §22), so they are work rather than risk.
+//! Not the finished subsystem yet. There is no detach into a second OS window, and no
+//! regions beyond a header and a main view — no toolbar, no sidebar, no footer.
 //!
 //! One limit is not a matter of features and will not go away by writing more of
 //! them: **Masonry's own widgets do not honour [`UiScale`]**. Nothing in
@@ -55,6 +70,7 @@
 
 mod region;
 mod tree;
+mod workspace;
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
@@ -62,13 +78,14 @@ use masonry::core::{
     PropertiesMut, PropertiesRef, RegisterCtx, Widget, WidgetId, WidgetMut, WidgetPod,
 };
 use masonry::imaging::Painter;
-use masonry::kurbo::{Point, Rect, Size};
+use masonry::kurbo::{Axis, Point, Rect, Size};
 use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
 use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerButton, PointerUpdate};
 
 pub use crate::region::{AreaContent, RegionCounters, RegionKind, UiScale};
 pub use crate::tree::{AreaId, Bar, NodeId, SplitTree, ratio_at};
+pub use crate::workspace::{Workspace, WorkspaceError};
 
 /// Thickness of a splitter, in logical pixels.
 const BAR_THICKNESS: f64 = 4.0;
@@ -94,6 +111,14 @@ pub struct ScreenStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScreenCounters {
+    /// Area widgets built, one per area that appeared.
+    ///
+    /// The counter the area operations are judged on (§41.2). A join, a swap and a
+    /// maximize must leave it flat: the widget of a surviving area holds a view, a
+    /// selection and materialised nodes, and rebuilding it throws all of that away —
+    /// which §30 already priced. Only a split, and the first build of the screen, may
+    /// raise it.
+    pub builds: u64,
     /// Layout passes run on the screen itself.
     pub layouts: u64,
     /// Areas handed a border-box size different from their last one, summed over
@@ -120,8 +145,18 @@ pub struct ScreenCounters {
 /// rectangles we computed, so Masonry does not recompute the split layout".
 pub struct AreaScreen {
     tree: SplitTree,
-    /// One child per area, indexed by [`AreaId`].
-    pods: Vec<WidgetPod<dyn Widget>>,
+    /// Builds the widget for an area that appears.
+    ///
+    /// Kept rather than consumed by the constructor, and that is what an operation which
+    /// *adds* an area runs into first: a split needs a child for the id the tree just
+    /// handed out, and there is nobody else to ask.
+    build: Box<dyn FnMut(AreaId) -> NewWidget<dyn Widget>>,
+    /// One child per area, indexed by [`AreaId`]; `None` where an area was joined away.
+    ///
+    /// A tombstone rather than a compacted list, for the same reason the tree keeps free
+    /// slots: the id is the caller's index, so removing an entry would move everyone
+    /// after it. The hole is filled again when the id is handed out again.
+    pods: Vec<Option<WidgetPod<dyn Widget>>>,
     /// The border-box size each area was last given, for counting real resizes.
     sizes: Vec<Option<Size>>,
     /// Where each area goes, recomputed every layout. Reused, so a resize allocates
@@ -131,7 +166,15 @@ pub struct AreaScreen {
     bars: Vec<Bar>,
     /// The splitter currently being dragged, if any.
     drag: Option<NodeId>,
+    /// The area the pointer is over, as of the last pointer event.
+    ///
+    /// Published because a driver above the screen cannot work it out for itself: it
+    /// holds no widget context, so it cannot turn a window position into a local one —
+    /// the same reason the canvas publishes what it picked (§38.3). An operation on
+    /// "the area under the pointer" needs this and nothing else.
+    hovered: Option<AreaId>,
     layouts: u64,
+    builds: u64,
     area_resizes: u64,
     area_layouts: u64,
 }
@@ -141,16 +184,28 @@ impl AreaScreen {
     ///
     /// Every area is materialised up front, unlike the canvas's nodes: an area is
     /// on screen by definition, and there are tens of them rather than thousands.
-    pub fn new(tree: SplitTree, mut build: impl FnMut(AreaId) -> NewWidget<dyn Widget>) -> Self {
+    pub fn new(tree: SplitTree, mut build: impl FnMut(AreaId) -> NewWidget<dyn Widget> + 'static) -> Self {
+        // By area id rather than by count: a tree loaded from a workspace, or one that
+        // has been joined, holds ids that are not dense.
+        let slots = tree.areas().map(|area| area + 1).max().unwrap_or(0);
+        let mut pods: Vec<Option<WidgetPod<dyn Widget>>> = (0..slots).map(|_| None).collect();
+        let mut builds = 0;
+        for area in tree.areas() {
+            pods[area] = Some(build(area).to_pod());
+            builds += 1;
+        }
         let count = tree.area_count();
         Self {
             tree,
-            pods: (0..count).map(|area| build(area).to_pod()).collect(),
-            sizes: vec![None; count],
+            build: Box::new(build),
+            pods,
+            sizes: vec![None; slots],
             rects: Vec::with_capacity(count),
             bars: Vec::with_capacity(count.saturating_sub(1)),
             drag: None,
+            hovered: None,
             layouts: 0,
+            builds,
             area_resizes: 0,
             area_layouts: 0,
         }
@@ -161,6 +216,7 @@ impl AreaScreen {
         ScreenStats {
             areas: self.tree.area_count(),
             counters: ScreenCounters {
+                builds: self.builds,
                 layouts: self.layouts,
                 area_resizes: self.area_resizes,
                 area_layouts: self.area_layouts,
@@ -173,12 +229,26 @@ impl AreaScreen {
         &self.bars
     }
 
-    /// The widget id of each area, in area order.
+    /// The split tree the screen is placing areas from.
+    ///
+    /// Read-only on purpose: every change goes through an operation on the screen, so
+    /// the widgets can follow it. This is what an application serialises (see
+    /// [`Workspace`](crate::Workspace)).
+    pub fn tree(&self) -> &SplitTree {
+        &self.tree
+    }
+
+    /// The widget id of each area, by area id, skipping the ids that hold no area.
     ///
     /// The way a test or a benchmark reaches inside an area to read its own
     /// counters; the screen deliberately knows nothing about what an area contains.
     pub fn area_ids(&self) -> Vec<WidgetId> {
-        self.pods.iter().map(|pod| pod.id()).collect()
+        self.pods.iter().flatten().map(|pod| pod.id()).collect()
+    }
+
+    /// The widget id of one area, if it has one.
+    pub fn area_widget(&self, area: AreaId) -> Option<WidgetId> {
+        self.pods.get(area).and_then(|pod| pod.as_ref()).map(|pod| pod.id())
     }
 
     /// Moves a splitter so that it sits under `pos`, in screen coordinates.
@@ -202,6 +272,143 @@ impl AreaScreen {
             return false;
         };
         self.tree.set_ratio(split, ratio_at(&bar, pos, BAR_THICKNESS))
+    }
+
+    // --- MARK: OPERATIONS
+
+    /// Splits `area` in two, building a widget for the area that appears.
+    ///
+    /// Returns the new area's id, or `None` if `area` is not on the screen. The existing
+    /// area keeps its id, its rectangle's first `ratio` and — the point — its widget:
+    /// nothing about it is rebuilt.
+    ///
+    /// This is the operation the builder is kept for. Everything else here only ever
+    /// moves or hides areas that already exist.
+    pub fn split(this: &mut WidgetMut<'_, Self>, area: AreaId, axis: Axis, ratio: f64) -> Option<AreaId> {
+        let fresh = this.widget.tree.split(area, axis, ratio)?;
+        let widget = (this.widget.build)(fresh);
+        if fresh >= this.widget.pods.len() {
+            this.widget.pods.resize_with(fresh + 1, || None);
+            this.widget.sizes.resize(fresh + 1, None);
+        }
+        this.widget.pods[fresh] = Some(widget.to_pod());
+        // A reused id may carry the size its previous occupant was given, and a stale
+        // one would swallow the first resize of the new area.
+        this.widget.sizes[fresh] = None;
+        this.widget.builds += 1;
+        this.ctx.children_changed();
+        this.ctx.request_layout();
+        Some(fresh)
+    }
+
+    /// Merges two sibling areas, keeping `keep` and taking `dropped` off the screen.
+    ///
+    /// Returns whether anything happened; see [`SplitTree::join`] for when it does not.
+    /// The survivor's widget is **not** rebuilt — it is the same widget, given a bigger
+    /// rectangle — so its view, its selection and everything else it holds come through
+    /// the operation untouched.
+    pub fn join(this: &mut WidgetMut<'_, Self>, keep: AreaId, dropped: AreaId) -> bool {
+        if !this.widget.tree.join(keep, dropped) {
+            return false;
+        }
+        if let Some(pod) = this.widget.pods.get_mut(dropped).and_then(Option::take) {
+            this.ctx.remove_child(pod);
+        }
+        this.widget.sizes[dropped] = None;
+        this.ctx.children_changed();
+        this.ctx.request_layout();
+        true
+    }
+
+    /// Exchanges the places of two areas. Returns whether anything happened.
+    ///
+    /// Neither widget is touched: the tree moves the ids, and the ids are what the
+    /// widgets are keyed by, so both editors arrive at the other rectangle whole.
+    pub fn swap(this: &mut WidgetMut<'_, Self>, a: AreaId, b: AreaId) -> bool {
+        if !this.widget.tree.swap(a, b) {
+            return false;
+        }
+        this.ctx.request_layout();
+        true
+    }
+
+    /// Shows one area alone. Returns whether anything happened.
+    ///
+    /// The others are stashed rather than removed, so they keep everything they hold and
+    /// cost nothing while they are hidden; [`restore`](Self::restore) brings them back at
+    /// the rectangles they had.
+    pub fn maximize(this: &mut WidgetMut<'_, Self>, area: AreaId) -> bool {
+        if !this.widget.tree.maximize(area) {
+            return false;
+        }
+        this.ctx.request_layout();
+        true
+    }
+
+    /// Shows the whole screen again. Returns whether anything happened.
+    pub fn restore(this: &mut WidgetMut<'_, Self>) -> bool {
+        if !this.widget.tree.restore() {
+            return false;
+        }
+        this.ctx.request_layout();
+        true
+    }
+
+    /// Replaces the tree, keeping every widget whose area is in both.
+    ///
+    /// What loading a workspace does. An area that is in the new tree and was in the old
+    /// one keeps its widget — the id is the identity, and §30 already said what a rebuilt
+    /// view costs — so a load that changes one splitter builds nothing at all.
+    pub fn set_tree(this: &mut WidgetMut<'_, Self>, tree: SplitTree) {
+        let slots = tree
+            .areas()
+            .map(|area| area + 1)
+            .max()
+            .unwrap_or(0)
+            .max(this.widget.pods.len());
+        this.widget.pods.resize_with(slots, || None);
+        this.widget.sizes.resize(slots, None);
+
+        for area in 0..slots {
+            match (tree.holds(area), this.widget.pods[area].is_some()) {
+                (false, true) => {
+                    if let Some(pod) = this.widget.pods[area].take() {
+                        this.ctx.remove_child(pod);
+                    }
+                    this.widget.sizes[area] = None;
+                },
+                (true, false) => {
+                    let widget = (this.widget.build)(area);
+                    this.widget.pods[area] = Some(widget.to_pod());
+                    this.widget.sizes[area] = None;
+                    this.widget.builds += 1;
+                },
+                _ => {},
+            }
+        }
+
+        this.widget.tree = tree;
+        this.ctx.children_changed();
+        this.ctx.request_layout();
+    }
+
+    /// The area under a screen-space point, if the point is on one rather than on a
+    /// splitter.
+    ///
+    /// Empty until the first layout pass has run, like [`bars`](Self::bars).
+    pub fn area_at(&self, pos: Point) -> Option<AreaId> {
+        self.rects
+            .iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(area, _)| *area)
+    }
+
+    /// The area the pointer is over, as of the last pointer event it saw.
+    ///
+    /// `None` before the pointer has moved over the screen, and while it is over a
+    /// splitter rather than an area.
+    pub fn hovered_area(&self) -> Option<AreaId> {
+        self.hovered
     }
 
     /// The splitter under `pos`, if the pointer is close enough to grab one.
@@ -233,10 +440,14 @@ impl Widget for AreaScreen {
                 }
             },
             PointerEvent::Move(PointerUpdate { current, .. }) => {
+                let pos = ctx.local_position(current.position);
+                // Recorded whether or not this widget acts on the event, and whether or
+                // not something below already handled it: knowing where the pointer is
+                // is not acting on it.
+                self.hovered = self.area_at(pos);
                 let Some(split) = self.drag else {
                     return;
                 };
-                let pos = ctx.local_position(current.position);
                 if self.move_bar(split, pos) {
                     ctx.request_layout();
                 }
@@ -246,6 +457,7 @@ impl Widget for AreaScreen {
                 ctx.release_pointer();
                 ctx.set_handled();
             },
+            PointerEvent::Leave(_) => self.hovered = None,
             _ => {},
         }
     }
@@ -285,6 +497,16 @@ impl Widget for AreaScreen {
             &mut self.bars,
         );
 
+        // An area the tree did not place is hidden rather than absent — that is what
+        // maximize is (§41.3). A stashed child is not laid out, not painted and not hit
+        // tested, and Masonry excuses it from the "every child was laid out" check, so
+        // this is the whole of hiding one.
+        for (area, pod) in self.pods.iter_mut().enumerate() {
+            let Some(pod) = pod else { continue };
+            let placed = self.rects.iter().any(|(id, _)| *id == area);
+            ctx.set_stashed(pod, !placed);
+        }
+
         for i in 0..self.rects.len() {
             let (area, rect) = self.rects[i];
             let area_size = rect.size();
@@ -292,7 +514,9 @@ impl Widget for AreaScreen {
                 self.sizes[area] = Some(area_size);
                 self.area_resizes += 1;
             }
-            let pod = &mut self.pods[area];
+            let Some(pod) = self.pods[area].as_mut() else {
+                continue;
+            };
             if ctx.child_needs_layout(pod) {
                 self.area_layouts += 1;
             }
@@ -311,13 +535,13 @@ impl Widget for AreaScreen {
     }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
-        for pod in &mut self.pods {
+        for pod in self.pods.iter_mut().flatten() {
             ctx.register_child(pod);
         }
     }
 
     fn children_ids(&self) -> ChildrenIds {
-        self.pods.iter().map(|pod| pod.id()).collect()
+        self.pods.iter().flatten().map(|pod| pod.id()).collect()
     }
 
     fn accessibility_role(&self) -> Role {
@@ -456,6 +680,204 @@ mod tests {
 
         let moved = harness.root_widget().bars()[0].rect.center().x;
         assert!((moved - target.x).abs() <= 1.0, "bar landed at {moved}");
+    }
+
+    /// The requirement, not the optimisation: an operation must not rebuild the widget
+    /// of an area that survived it.
+    ///
+    /// Checked by widget id, because a rebuilt widget is a *new* widget however alike it
+    /// looks — and what would be lost with the old one is the view, the selection and the
+    /// materialised nodes §30 put in the model's way.
+    #[test]
+    fn no_operation_rebuilds_a_surviving_area() {
+        let mut harness = harness(8);
+        let before: Vec<Option<WidgetId>> = (0..8).map(|a| harness.root_widget().area_widget(a)).collect();
+        let builds = harness.root_widget().stats().counters.builds;
+
+        harness.edit_root_widget(|mut screen| {
+            assert!(AreaScreen::join(&mut screen, 0, 1));
+            assert!(AreaScreen::swap(&mut screen, 2, 3));
+            assert!(AreaScreen::maximize(&mut screen, 4));
+            assert!(AreaScreen::restore(&mut screen));
+        });
+        let _ = harness.redraw();
+
+        assert_eq!(
+            harness.root_widget().stats().counters.builds,
+            builds,
+            "nothing was built"
+        );
+        for area in [0, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(
+                harness.root_widget().area_widget(area),
+                before[area],
+                "area {area} kept the widget it had"
+            );
+        }
+        assert_eq!(harness.root_widget().area_widget(1), None, "the joined area is gone");
+    }
+
+    /// A join must move only what changed rectangle.
+    #[test]
+    fn joining_resizes_only_the_survivor() {
+        let mut harness = harness(8);
+        let resizes = harness.root_widget().stats().counters.area_resizes;
+
+        harness.edit_root_widget(|mut screen| assert!(AreaScreen::join(&mut screen, 0, 1)));
+        let _ = harness.redraw();
+
+        assert_eq!(
+            harness.root_widget().stats().counters.area_resizes - resizes,
+            1,
+            "area 0 took the pair's rectangle and nobody else moved"
+        );
+        assert_eq!(harness.root_widget().area_ids().len(), 7);
+    }
+
+    /// A split is the one operation that builds, and it builds exactly one child.
+    #[test]
+    fn splitting_builds_one_child_and_leaves_the_rest() {
+        let mut harness = harness(4);
+        let before = harness.root_widget().area_widget(0);
+        let builds = harness.root_widget().stats().counters.builds;
+
+        let fresh = harness
+            .edit_root_widget(|mut screen| AreaScreen::split(&mut screen, 0, Axis::Vertical, 0.5))
+            .expect("area 0 exists");
+        let _ = harness.redraw();
+
+        assert_eq!(harness.root_widget().stats().counters.builds - builds, 1);
+        assert_eq!(harness.root_widget().area_widget(0), before, "area 0 was not rebuilt");
+        assert!(harness.root_widget().area_widget(fresh).is_some());
+        assert_eq!(harness.root_widget().area_ids().len(), 5);
+    }
+
+    /// Maximize hides the rest of the screen rather than removing it, and restore gives
+    /// back exactly the sizes that were there.
+    #[test]
+    fn maximize_hides_the_others_and_restore_gives_the_sizes_back() {
+        let mut harness = harness(8);
+        let ids = harness.root_widget().area_ids();
+        let sizes = |h: &TestHarness<AreaScreen>| -> Vec<Size> {
+            ids.iter()
+                .map(|id| h.get_widget_with_id(*id).ctx().border_box().size())
+                .collect()
+        };
+        let before = sizes(&harness);
+
+        harness.edit_root_widget(|mut screen| assert!(AreaScreen::maximize(&mut screen, 3)));
+        let _ = harness.redraw();
+        assert_eq!(
+            harness.root_widget().area_ids().len(),
+            8,
+            "the hidden areas are still children"
+        );
+        let maximized = harness.get_widget_with_id(ids[3]).ctx().border_box().size();
+        assert_eq!(maximized, Size::new(f64::from(SCREEN.0), f64::from(SCREEN.1)));
+
+        harness.edit_root_widget(|mut screen| assert!(AreaScreen::restore(&mut screen)));
+        let _ = harness.redraw();
+        assert_eq!(sizes(&harness), before, "bit for bit, not approximately");
+    }
+
+    /// Swapping two areas exchanges their rectangles and touches nothing else.
+    #[test]
+    fn swapping_exchanges_two_rectangles() {
+        let mut harness = harness(4);
+        let ids = harness.root_widget().area_ids();
+        let size_of = |h: &TestHarness<AreaScreen>, at: usize| h.get_widget_with_id(ids[at]).ctx().border_box().size();
+        let boxes: Vec<Size> = (0..4).map(|a| size_of(&harness, a)).collect();
+
+        harness.edit_root_widget(|mut screen| assert!(AreaScreen::swap(&mut screen, 0, 3)));
+        let _ = harness.redraw();
+
+        assert_eq!(size_of(&harness, 0), boxes[3], "area 0's widget went to 3's rectangle");
+        assert_eq!(size_of(&harness, 3), boxes[0]);
+        assert_eq!(size_of(&harness, 1), boxes[1], "the others stayed put");
+    }
+
+    /// Loading a workspace builds only what was not already there.
+    ///
+    /// The whole reason an id is the identity: a layout that comes back from a file is
+    /// the same areas in different rectangles, and rebuilding them would throw away
+    /// everything they hold to achieve exactly that.
+    #[test]
+    fn loading_a_tree_keeps_the_areas_both_trees_hold() {
+        let mut harness = harness(4);
+        let before: Vec<Option<WidgetId>> = (0..4).map(|a| harness.root_widget().area_widget(a)).collect();
+        let builds = harness.root_widget().stats().counters.builds;
+
+        // The same four areas, tiled differently: nothing to build, nothing to drop.
+        let same = SplitTree::balanced(4);
+        harness.edit_root_widget(|mut screen| AreaScreen::set_tree(&mut screen, same));
+        let _ = harness.redraw();
+        assert_eq!(
+            harness.root_widget().stats().counters.builds,
+            builds,
+            "nothing was built"
+        );
+        for (area, was) in before.iter().enumerate() {
+            assert_eq!(harness.root_widget().area_widget(area), *was);
+        }
+
+        // A smaller screen: the areas that went are dropped, the rest are not rebuilt.
+        harness.edit_root_widget(|mut screen| AreaScreen::set_tree(&mut screen, SplitTree::balanced(2)));
+        let _ = harness.redraw();
+        assert_eq!(harness.root_widget().stats().counters.builds, builds);
+        assert_eq!(harness.root_widget().area_ids().len(), 2);
+        assert_eq!(harness.root_widget().area_widget(0), before[0]);
+        assert_eq!(harness.root_widget().area_widget(3), None);
+
+        // And back up: only the areas that were not there are built.
+        harness.edit_root_widget(|mut screen| AreaScreen::set_tree(&mut screen, SplitTree::balanced(4)));
+        let _ = harness.redraw();
+        assert_eq!(
+            harness.root_widget().stats().counters.builds - builds,
+            2,
+            "areas 2 and 3 came back, and only those"
+        );
+    }
+
+    /// A workspace that has been through a file puts every widget back in its own area.
+    #[test]
+    fn a_workspace_round_trip_puts_every_area_back() {
+        let mut harness = harness(8);
+        harness.edit_root_widget(|mut screen| {
+            assert!(AreaScreen::join(&mut screen, 0, 1));
+            assert!(AreaScreen::swap(&mut screen, 2, 5));
+        });
+        let _ = harness.redraw();
+
+        let ids = harness.root_widget().area_ids();
+        let sizes = |h: &TestHarness<AreaScreen>| -> Vec<Size> {
+            ids.iter()
+                .map(|id| h.get_widget_with_id(*id).ctx().border_box().size())
+                .collect()
+        };
+        let before = sizes(&harness);
+        let builds = harness.root_widget().stats().counters.builds;
+
+        let text = crate::Workspace::new(harness.root_widget().tree().clone()).write();
+        let read = crate::Workspace::parse(&text).expect("what we wrote reads back");
+        harness.edit_root_widget(|mut screen| AreaScreen::set_tree(&mut screen, read.tree().clone()));
+        let _ = harness.redraw();
+
+        assert_eq!(sizes(&harness), before, "every area is where it was");
+        assert_eq!(harness.root_widget().area_ids(), ids, "and it is the same widget");
+        assert_eq!(harness.root_widget().stats().counters.builds, builds);
+    }
+
+    /// The screen has to know where the pointer is, because the driver above it cannot.
+    #[test]
+    fn the_screen_records_the_area_under_the_pointer() {
+        let mut harness = harness(4);
+        assert_eq!(harness.root_widget().hovered_area(), None, "before the pointer moved");
+
+        for area in 0..4 {
+            let rect = expected(4)[area].1;
+            harness.mouse_move(rect.center());
+            assert_eq!(harness.root_widget().hovered_area(), Some(area));
+        }
     }
 
     /// A screen of one area still tiles, and has no splitter to grab.

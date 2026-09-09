@@ -10,9 +10,18 @@
 use masonry::kurbo::{Axis, Point, Rect};
 
 /// Index of a node in the tree.
+///
+/// Not stable across operations and not written to a workspace file: a [`Bar`] carries
+/// one so a drag can name the split it is moving, and it is re-read from the layout that
+/// produced it. [`AreaId`] is the identifier that keeps its meaning.
 pub type NodeId = usize;
 
 /// Index of an area. Stable for the life of the tree.
+///
+/// Nothing renumbers one: a join frees the id of the area that went, a later split hands
+/// that id out again, and every area that stayed keeps the id it had. That is what lets a
+/// caller key its own state by [`AreaId`] — `AreaScreen` keys the widgets by it, and a
+/// workspace file names areas by it.
 pub type AreaId = usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +34,12 @@ enum Node {
         b: NodeId,
     },
     Area(AreaId),
+    /// A slot whose node has left the tree.
+    ///
+    /// Kept rather than removed because every other node names its children by index:
+    /// compacting `nodes` would move ids that are still referenced, and a tree of tens
+    /// of nodes has nothing to gain from it.
+    Free,
 }
 
 /// One splitter, as laid out.
@@ -55,7 +70,24 @@ pub struct Bar {
 pub struct SplitTree {
     nodes: Vec<Node>,
     root: NodeId,
+    /// Areas currently in the tree.
     areas: usize,
+    /// Node slots a join emptied, for the next split to fill.
+    free_nodes: Vec<NodeId>,
+    /// Area ids a join freed, for the next split to hand out again.
+    ///
+    /// Reused rather than retired, because an id is an index into the caller's own
+    /// arrays: retiring them means those arrays grow with the number of joins a session
+    /// has seen rather than with the number of areas it holds.
+    free_areas: Vec<AreaId>,
+    /// The next never-used area id.
+    next_area: AreaId,
+    /// The area shown alone, if the screen is maximized.
+    ///
+    /// A flag on the tree rather than a saved copy of it (§41.3): the tree underneath is
+    /// untouched, so restoring gives back exactly the rectangles that were there — a
+    /// property a test can check bit for bit, which a rebuilt tree could only approximate.
+    maximized: Option<AreaId>,
 }
 
 impl SplitTree {
@@ -65,6 +97,10 @@ impl SplitTree {
             nodes: vec![Node::Area(0)],
             root: 0,
             areas: 1,
+            free_nodes: Vec::new(),
+            free_areas: Vec::new(),
+            next_area: 1,
+            maximized: None,
         }
     }
 
@@ -85,6 +121,10 @@ impl SplitTree {
             nodes: Vec::new(),
             root: 0,
             areas,
+            free_nodes: Vec::new(),
+            free_areas: Vec::new(),
+            next_area: areas,
+            maximized: None,
         };
         let mut next = 0;
         tree.root = tree.build_balanced(areas, 0, &mut next);
@@ -120,23 +160,40 @@ impl SplitTree {
         self.areas
     }
 
+    /// The areas the tree holds, in tree order rather than by id.
+    ///
+    /// Ids are not dense once anything has been joined, so this is the only honest way
+    /// to ask what is on the screen.
+    pub fn areas(&self) -> impl Iterator<Item = AreaId> + '_ {
+        self.nodes.iter().filter_map(|node| match node {
+            Node::Area(area) => Some(*area),
+            _ => None,
+        })
+    }
+
+    /// Whether `area` is in the tree.
+    pub fn holds(&self, area: AreaId) -> bool {
+        self.node_of(area).is_some()
+    }
+
     /// Splits `area` in two, returning the id of the area that appears.
     ///
     /// The existing area keeps its id and the first `ratio` of the space, which is
     /// what makes a split non-destructive: whatever widget the caller has already
     /// built for `area` stays valid and stays where it was.
+    ///
+    /// The new id is one a join freed, if there is one, and a fresh one otherwise.
     pub fn split(&mut self, area: AreaId, axis: Axis, ratio: f64) -> Option<AreaId> {
-        let node = self
-            .nodes
-            .iter()
-            .position(|n| matches!(n, Node::Area(id) if *id == area))?;
-        let fresh = self.areas;
+        let node = self.node_of(area)?;
+        let fresh = self.free_areas.pop().unwrap_or_else(|| {
+            let id = self.next_area;
+            self.next_area += 1;
+            id
+        });
         self.areas += 1;
 
-        self.nodes.push(Node::Area(area));
-        let a = self.nodes.len() - 1;
-        self.nodes.push(Node::Area(fresh));
-        let b = self.nodes.len() - 1;
+        let a = self.alloc_node(Node::Area(area));
+        let b = self.alloc_node(Node::Area(fresh));
 
         self.nodes[node] = Node::Split {
             axis,
@@ -147,11 +204,238 @@ impl SplitTree {
         Some(fresh)
     }
 
+    /// The area `area` could be joined with, if any.
+    ///
+    /// **Its sibling, and only its sibling** — that is the whole of what a binary tree
+    /// can express, and §41.1 measures what it costs: on a screen of eight areas, eleven
+    /// pairs share a full border and four of them are siblings. An area whose sibling is
+    /// a split rather than a leaf has no partner at all.
+    pub fn joinable(&self, area: AreaId) -> Option<AreaId> {
+        let node = self.node_of(area)?;
+        let parent = self.parent_of(node)?;
+        let Node::Split { a, b, .. } = self.nodes[parent] else {
+            return None;
+        };
+        let sibling = if a == node { b } else { a };
+        match self.nodes[sibling] {
+            Node::Area(other) => Some(other),
+            _ => None,
+        }
+    }
+
+    /// Whether [`join`](Self::join) would do anything for this pair.
+    pub fn can_join(&self, keep: AreaId, dropped: AreaId) -> bool {
+        keep != dropped && self.joinable(keep) == Some(dropped)
+    }
+
+    /// Merges two areas into one, keeping `keep` and freeing `dropped`.
+    ///
+    /// Returns whether anything happened. The two have to be **siblings**: the parent
+    /// split disappears and `keep` takes the whole rectangle the two of them shared.
+    /// `keep` keeps its id, and therefore its widget and everything that widget holds —
+    /// which is the requirement, not the optimisation (§30 already priced losing a
+    /// view's state).
+    ///
+    /// Blender joins any two areas with a coincident border; this joins the pairs that
+    /// happen to be siblings, which is a subset. §41.1 says which pairs are missing and
+    /// on what screens.
+    pub fn join(&mut self, keep: AreaId, dropped: AreaId) -> bool {
+        if !self.can_join(keep, dropped) {
+            return false;
+        }
+        let (Some(keep_node), Some(dropped_node)) = (self.node_of(keep), self.node_of(dropped)) else {
+            return false;
+        };
+        let Some(parent) = self.parent_of(keep_node) else {
+            return false;
+        };
+
+        self.nodes[parent] = Node::Area(keep);
+        self.free_node(keep_node);
+        self.free_node(dropped_node);
+        self.free_areas.push(dropped);
+        self.areas -= 1;
+        // An area that is gone cannot be the one shown alone.
+        if self.maximized == Some(dropped) {
+            self.maximized = None;
+        }
+        true
+    }
+
+    /// Exchanges the places of two areas. Returns whether anything happened.
+    ///
+    /// The **leaves** are exchanged, not the widgets: an area is its id, so moving the id
+    /// moves everything keyed by it — the editor, its view, its selection, its
+    /// materialised nodes. Nothing is rebuilt and nothing is told, which is why this is
+    /// the version that feels like swapping two editors rather than two rectangles
+    /// (§41.4).
+    pub fn swap(&mut self, a: AreaId, b: AreaId) -> bool {
+        if a == b {
+            return false;
+        }
+        let (Some(node_a), Some(node_b)) = (self.node_of(a), self.node_of(b)) else {
+            return false;
+        };
+        self.nodes[node_a] = Node::Area(b);
+        self.nodes[node_b] = Node::Area(a);
+        true
+    }
+
+    /// Shows one area alone, hiding the rest. Returns whether anything happened.
+    ///
+    /// The tree underneath is left exactly as it was, so [`restore`](Self::restore) gives
+    /// back the same rectangles rather than rebuilt ones. Splitting or joining while
+    /// maximized is allowed and lands in that hidden tree; it becomes visible on restore.
+    pub fn maximize(&mut self, area: AreaId) -> bool {
+        if self.maximized == Some(area) || !self.holds(area) {
+            return false;
+        }
+        self.maximized = Some(area);
+        true
+    }
+
+    /// Shows the whole screen again. Returns whether anything happened.
+    pub fn restore(&mut self) -> bool {
+        self.maximized.take().is_some()
+    }
+
+    /// The area shown alone, if the screen is maximized.
+    pub fn maximized(&self) -> Option<AreaId> {
+        self.maximized
+    }
+
+    /// The node holding `area`.
+    fn node_of(&self, area: AreaId) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .position(|n| matches!(n, Node::Area(id) if *id == area))
+    }
+
+    /// The node whose child `node` is.
+    ///
+    /// A search rather than a stored parent pointer: a screen holds tens of nodes, and a
+    /// pointer is one more invariant for every operation to keep.
+    fn parent_of(&self, node: NodeId) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .position(|n| matches!(n, Node::Split { a, b, .. } if *a == node || *b == node))
+    }
+
+    /// Writes the tree as a prefix expression: `split h 0.5 area 0 area 1`.
+    ///
+    /// Node ids are not written. They are indices into an array with free slots in it,
+    /// so writing them would put this crate's bookkeeping in a file; the shape and the
+    /// area ids are what a workspace means, and both survive the trip.
+    pub(crate) fn write_expr(&self, out: &mut String) {
+        self.write_node(self.root, out);
+    }
+
+    fn write_node(&self, node: NodeId, out: &mut String) {
+        match self.nodes[node] {
+            Node::Area(area) => out.push_str(&format!("area {area}")),
+            Node::Split { axis, ratio, a, b } => {
+                let axis = match axis {
+                    Axis::Horizontal => 'h',
+                    Axis::Vertical => 'v',
+                };
+                // `{}` on an `f64` is the shortest decimal that reads back as the same
+                // number, which is what makes the round trip exact rather than close.
+                out.push_str(&format!("split {axis} {ratio} "));
+                self.write_node(a, out);
+                out.push(' ');
+                self.write_node(b, out);
+            },
+            Node::Free => {},
+        }
+    }
+
+    /// Reads back what [`write_expr`](Self::write_expr) wrote.
+    ///
+    /// The tree comes out with no free slots and with `next_area` past the largest id it
+    /// holds: ids that were free before the file was written are simply not free after it
+    /// is read, which nothing can observe — an id is opaque, and no live area moved.
+    pub(crate) fn parse_expr<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut tree = Self {
+            nodes: Vec::new(),
+            root: 0,
+            areas: 0,
+            free_nodes: Vec::new(),
+            free_areas: Vec::new(),
+            next_area: 0,
+            maximized: None,
+        };
+        tree.root = tree.parse_node(tokens)?;
+        if tokens.next().is_some() {
+            return None;
+        }
+        Some(tree)
+    }
+
+    fn parse_node<'a>(&mut self, tokens: &mut impl Iterator<Item = &'a str>) -> Option<NodeId> {
+        match tokens.next()? {
+            "area" => {
+                let area: AreaId = tokens.next()?.parse().ok()?;
+                if self.holds(area) {
+                    // Two leaves with one id would give two widgets one identity.
+                    return None;
+                }
+                self.areas += 1;
+                self.next_area = self.next_area.max(area + 1);
+                Some(self.alloc_node(Node::Area(area)))
+            },
+            "split" => {
+                let axis = match tokens.next()? {
+                    "h" => Axis::Horizontal,
+                    "v" => Axis::Vertical,
+                    _ => return None,
+                };
+                let ratio: f64 = tokens.next()?.parse().ok()?;
+                if !ratio.is_finite() {
+                    return None;
+                }
+                let a = self.parse_node(tokens)?;
+                let b = self.parse_node(tokens)?;
+                Some(self.alloc_node(Node::Split {
+                    axis,
+                    ratio: ratio.clamp(0.0, 1.0),
+                    a,
+                    b,
+                }))
+            },
+            _ => None,
+        }
+    }
+
+    /// Sets the maximized area while reading a file, if it is one the tree holds.
+    pub(crate) fn set_maximized(&mut self, area: AreaId) -> bool {
+        self.maximize(area)
+    }
+
+    /// Puts a node in a free slot, or at the end.
+    fn alloc_node(&mut self, node: Node) -> NodeId {
+        match self.free_nodes.pop() {
+            Some(at) => {
+                self.nodes[at] = node;
+                at
+            },
+            None => {
+                self.nodes.push(node);
+                self.nodes.len() - 1
+            },
+        }
+    }
+
+    /// Empties a slot and offers it to the next allocation.
+    fn free_node(&mut self, node: NodeId) {
+        self.nodes[node] = Node::Free;
+        self.free_nodes.push(node);
+    }
+
     /// The share of its span the first child of `split` takes, if `split` is one.
     pub fn ratio(&self, split: NodeId) -> Option<f64> {
         match self.nodes.get(split)? {
             Node::Split { ratio, .. } => Some(*ratio),
-            Node::Area(_) => None,
+            Node::Area(_) | Node::Free => None,
         }
     }
 
@@ -178,6 +462,13 @@ impl SplitTree {
     pub fn layout(&self, rect: Rect, bar_thickness: f64, areas: &mut Vec<(AreaId, Rect)>, bars: &mut Vec<Bar>) {
         areas.clear();
         bars.clear();
+        // Maximized: one area, the whole rect, and no splitter to grab. The tree is not
+        // consulted beyond checking that the area is still in it, which is what makes
+        // restoring exact.
+        if let Some(area) = self.maximized {
+            areas.push((area, rect));
+            return;
+        }
         self.layout_node(self.root, rect, bar_thickness, areas, bars);
     }
 
@@ -191,6 +482,9 @@ impl SplitTree {
     ) {
         match self.nodes[node] {
             Node::Area(area) => areas.push((area, rect)),
+            // Unreachable from the root: a slot is freed only when its node leaves the
+            // tree, and nothing points at it afterwards.
+            Node::Free => {},
             Node::Split { axis, ratio, a, b } => {
                 let (first, bar, second) = split_rect(rect, axis, ratio, bar_thickness);
                 bars.push(Bar {
@@ -348,6 +642,185 @@ mod tests {
         assert!(tree.set_ratio(split, 5.0));
         assert_eq!(tree.ratio(split), Some(1.0), "past the end pins to the end");
         assert_eq!(tree.ratio(usize::MAX), None);
+    }
+
+    /// Whether two laid-out areas share a whole border, which is what Blender needs to
+    /// offer a join.
+    ///
+    /// They do not touch — a splitter sits between them — so the test is that the gap is
+    /// exactly the bar and that the other axis matches end to end.
+    fn share_a_border(a: Rect, b: Rect) -> bool {
+        let gap_x = (a.x1 + BAR - b.x0).abs() < 0.5 || (b.x1 + BAR - a.x0).abs() < 0.5;
+        let same_y = (a.y0 - b.y0).abs() < 0.5 && (a.y1 - b.y1).abs() < 0.5;
+        let gap_y = (a.y1 + BAR - b.y0).abs() < 0.5 || (b.y1 + BAR - a.y0).abs() < 0.5;
+        let same_x = (a.x0 - b.x0).abs() < 0.5 && (a.x1 - b.x1).abs() < 0.5;
+        (gap_x && same_y) || (gap_y && same_x)
+    }
+
+    /// Pairs that share a whole border, and how many of them the tree can actually join.
+    fn joinable_pairs(count: usize) -> (usize, usize) {
+        let tree = SplitTree::balanced(count);
+        let (areas, _) = laid_out(&tree);
+        let (mut bordering, mut siblings) = (0, 0);
+        for (i, (a, ra)) in areas.iter().enumerate() {
+            for (b, rb) in areas.iter().skip(i + 1) {
+                if share_a_border(*ra, *rb) {
+                    bordering += 1;
+                    if tree.can_join(*a, *b) {
+                        siblings += 1;
+                    }
+                }
+            }
+        }
+        (bordering, siblings)
+    }
+
+    /// **The question this whole subsystem was asked**: does a binary tree survive join?
+    ///
+    /// It does not, and this is where. Blender merges any two areas whose border
+    /// coincides; a tree can only merge **siblings**, and the two sets part company as
+    /// soon as the screen is deeper than one split. The numbers are pinned rather than
+    /// described, because "a tree is not enough" is a claim that has to be checkable.
+    #[test]
+    fn the_tree_can_join_only_some_of_the_pairs_that_share_a_border() {
+        // (areas, pairs sharing a border, pairs the tree can join)
+        for (count, bordering, joinable) in [(2, 1, 1), (4, 4, 2), (8, 10, 4), (16, 24, 8)] {
+            assert_eq!(
+                joinable_pairs(count),
+                (bordering, joinable),
+                "{count} areas: bordering pairs and the subset that are siblings"
+            );
+        }
+    }
+
+    /// The smallest screen where the difference above is a real screen, spelled out.
+    ///
+    /// Four areas: two columns of two. The two top areas share a whole border and are
+    /// cousins, not siblings — Blender would offer that join and this tree cannot.
+    #[test]
+    fn two_areas_sharing_a_border_may_still_be_unjoinable() {
+        let tree = SplitTree::balanced(4);
+        let (areas, _) = laid_out(&tree);
+        let rect = |id: AreaId| areas.iter().find(|(a, _)| *a == id).expect("area exists").1;
+
+        assert!(
+            share_a_border(rect(0), rect(2)),
+            "the two top areas sit either side of the root splitter: {:?} and {:?}",
+            rect(0),
+            rect(2)
+        );
+        assert!(!tree.can_join(0, 2), "and the tree cannot express it");
+        assert_eq!(tree.joinable(0), Some(1), "0 can only be joined with its sibling below");
+    }
+
+    #[test]
+    fn joining_siblings_keeps_the_survivor_and_frees_the_other() {
+        let mut tree = SplitTree::balanced(4);
+        let before = laid_out(&tree).0;
+        assert!(tree.can_join(0, 1));
+
+        assert!(tree.join(0, 1));
+        assert_eq!(tree.area_count(), 3);
+        assert!(tree.holds(0) && !tree.holds(1));
+
+        let (areas, bars) = laid_out(&tree);
+        assert_eq!(areas.len(), 3);
+        assert_eq!(bars.len(), 2, "three areas need two splitters");
+
+        // Area 0 took the whole rectangle the pair shared, and nobody else moved.
+        let rect = |list: &[(AreaId, Rect)], id: AreaId| list.iter().find(|(a, _)| *a == id).map(|(_, r)| *r);
+        assert_eq!(rect(&areas, 2), rect(&before, 2), "the other column did not move");
+        assert_eq!(rect(&areas, 3), rect(&before, 3));
+        let grown = rect(&areas, 0).expect("area 0 survives");
+        assert!(grown.height() > rect(&before, 0).expect("area 0 was there").height());
+    }
+
+    /// Ids are the caller's index into its own arrays, so a join must not renumber.
+    #[test]
+    fn a_join_renumbers_nothing_and_the_id_comes_back() {
+        let mut tree = SplitTree::balanced(4);
+        assert!(tree.join(2, 3));
+        let mut left: Vec<AreaId> = tree.areas().collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![0, 1, 2], "everyone kept the id they had");
+
+        // The freed id is handed out again rather than retired.
+        assert_eq!(tree.split(0, Axis::Horizontal, 0.5), Some(3));
+        assert_eq!(tree.area_count(), 4);
+    }
+
+    #[test]
+    fn a_join_needs_two_areas_that_are_siblings() {
+        let mut tree = SplitTree::balanced(4);
+        assert!(!tree.join(0, 0), "an area is not its own sibling");
+        assert!(!tree.join(0, 9), "a missing area joins nothing");
+        assert!(!tree.join(0, 2), "cousins are not siblings");
+        assert_eq!(tree.area_count(), 4, "and nothing happened");
+    }
+
+    /// An area whose sibling is a split, not a leaf, has no partner at all.
+    #[test]
+    fn an_area_whose_sibling_is_a_split_cannot_join() {
+        let mut tree = SplitTree::single();
+        let right = tree.split(0, Axis::Horizontal, 0.5).expect("area 0 exists");
+        tree.split(right, Axis::Vertical, 0.5).expect("the new area exists");
+        assert_eq!(tree.joinable(0), None, "area 0's sibling is a split");
+    }
+
+    /// Restoring has to give back the rectangles that were there, not ones like them.
+    #[test]
+    fn maximize_and_restore_return_the_same_rectangles() {
+        let mut tree = SplitTree::balanced(8);
+        let (before, bars_before) = laid_out(&tree);
+
+        assert!(tree.maximize(3));
+        assert_eq!(tree.maximized(), Some(3));
+        let (areas, bars) = laid_out(&tree);
+        assert_eq!(areas, vec![(3, SCREEN)], "one area, the whole screen");
+        assert!(bars.is_empty(), "nothing to drag while maximized");
+
+        assert!(tree.restore());
+        assert_eq!(tree.maximized(), None);
+        let (after, bars_after) = laid_out(&tree);
+        assert_eq!(after, before, "bit for bit, not approximately");
+        assert_eq!(bars_after, bars_before);
+    }
+
+    #[test]
+    fn maximizing_what_is_not_there_changes_nothing() {
+        let mut tree = SplitTree::balanced(4);
+        assert!(!tree.maximize(9));
+        assert!(!tree.restore(), "nothing was maximized");
+        assert!(tree.maximize(1));
+        assert!(!tree.maximize(1), "already maximized");
+    }
+
+    /// A maximized area that is joined away must not leave the screen showing nothing.
+    #[test]
+    fn joining_the_maximized_area_restores_the_screen() {
+        let mut tree = SplitTree::balanced(4);
+        assert!(tree.maximize(1));
+        assert!(tree.join(0, 1));
+        assert_eq!(tree.maximized(), None);
+        assert_eq!(laid_out(&tree).0.len(), 3);
+    }
+
+    /// Swap moves the areas, so whatever is keyed by an id moves with it.
+    #[test]
+    fn swapping_exchanges_the_rectangles_and_nothing_else() {
+        let mut tree = SplitTree::balanced(4);
+        let before = laid_out(&tree).0;
+        let rect = |list: &[(AreaId, Rect)], id: AreaId| list.iter().find(|(a, _)| *a == id).map(|(_, r)| *r);
+
+        assert!(tree.swap(0, 3));
+        let after = laid_out(&tree).0;
+
+        assert_eq!(rect(&after, 0), rect(&before, 3));
+        assert_eq!(rect(&after, 3), rect(&before, 0));
+        assert_eq!(rect(&after, 1), rect(&before, 1), "the others stayed put");
+        assert_eq!(tree.area_count(), 4);
+        assert!(!tree.swap(2, 2), "an area does not swap with itself");
+        assert!(!tree.swap(2, 9), "nor with one that is not there");
     }
 
     /// `ratio_at` is the inverse of the layout, and an inverse that drifts from its

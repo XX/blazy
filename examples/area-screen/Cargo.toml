@@ -33,6 +33,8 @@ blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
 blazy-ops = { workspace = true }
 clap = { workspace = true }
+# The window says out loud what a key did, and whether a workspace file could be read.
+tracing = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
 # With the GPU frame path: on any window worth the name it is the faster one, and
 # it falls back to the blit path on a machine without a device (§27.4).
