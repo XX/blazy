@@ -128,7 +128,7 @@ impl GpuFrames {
 
     /// Sets how many bytes of texture the layer cache may hold before it evicts (§37.2).
     ///
-    /// The default follows the frame — [`CACHE_FRAMES_OF_TEXTURE`] frames' worth, reset
+    /// The default follows the frame — two frames' worth, reset
     /// whenever the window resizes — because cached layers tile the window and their
     /// pixels therefore add up to about one frame however many of them there are. A
     /// caller with a different arrangement can say so.
@@ -141,15 +141,18 @@ impl GpuFrames {
         default_cache_budget(self.size)
     }
 
+    /// Fills the frame with `color` before the plan is drawn over it.
     pub fn with_background(mut self, color: Color) -> Self {
         self.background = Some(color);
         self
     }
 
+    /// The device the frames are drawn on, for a caller that draws into the holes.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
+    /// The queue the frames are submitted on.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
@@ -159,18 +162,22 @@ impl GpuFrames {
         &self.target
     }
 
+    /// A view of [`texture`](Self::texture).
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
 
+    /// The rectangles the last frame left for the host to fill (§4.3).
     pub fn holes(&self) -> &[Hole] {
         &self.holes
     }
 
+    /// What these frames have cost so far.
     pub fn counters(&self) -> PresentCounters {
         self.counters
     }
 
+    /// The frame size, in physical pixels.
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
     }
@@ -236,10 +243,6 @@ impl GpuFrames {
         self.resize(frame);
 
         let (composition, kept) = self.compose(plan, device_scale);
-        let composition = match self.background {
-            Some(color) => composition.on_background(color, self.size.width, self.size.height),
-            None => composition,
-        };
 
         // Before anything is submitted: a scene over one of the rasteriser's fixed
         // buffers is not drawn, and vello does not say so (§33, §34). Cheap next to
@@ -277,15 +280,24 @@ impl GpuFrames {
     /// where it sat. With no cache registered every layer is drawn and this is the
     /// ordinary composition.
     fn compose(&mut self, plan: &VisualLayerPlan, device_scale: f64) -> (Composition, Kept) {
+        // The base colour goes in as the walk's first command rather than over the
+        // finished composition: the frame is opaque either way, and the alternative
+        // copies every command of it into a second scene once per frame (§26.4, §31.1).
+        // A kept layer's pixels are copied in after rasterisation, so the fill under
+        // them is the same fill it always was.
+        let background = self.background.map(|color| (color, self.size.width, self.size.height));
         let mut kept = Kept::default();
         if !self.cache.is_active() {
-            return (Composition::new(plan, device_scale), kept);
+            return (
+                Composition::build(plan, device_scale, background, |_, _, _, _| LayerChoice::Draw),
+                kept,
+            );
         }
 
         let size = self.size;
         let cache = &mut self.cache;
         let mut offered = 0;
-        let composition = Composition::build(plan, device_scale, |index, layer, scene, transform| {
+        let composition = Composition::build(plan, device_scale, background, |index, layer, scene, transform| {
             if !cache.wants(layer.widget_id) {
                 return LayerChoice::Draw;
             }

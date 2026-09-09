@@ -65,22 +65,48 @@ impl Composition {
     /// HiDPI one. It multiplies each layer's own transform, so it reaches the
     /// rasteriser as part of the final transform and never as a resample.
     pub fn new(plan: &VisualLayerPlan, device_scale: f64) -> Self {
-        Self::build(plan, device_scale, |_, _, _, _| LayerChoice::Draw)
+        Self::build(plan, device_scale, None, |_, _, _, _| LayerChoice::Draw)
+    }
+
+    /// The same walk, over an opaque fill covering `width` x `height` physical pixels.
+    ///
+    /// A widget tree is under no obligation to cover the window — `AreaScreen` paints
+    /// its splitter bars and leaves the rest to its areas — and every path to the
+    /// screen flattens alpha away in the end. Doing the fill here means the rasteriser
+    /// blends the edges, which is what keeps a curve from becoming a staircase (§26.4).
+    ///
+    /// A constructor rather than something done to a finished composition, and that is
+    /// the whole difference: prepending the fill afterwards means copying every command
+    /// of the frame into a second scene, once per frame, and a command is not free to
+    /// append (§31.1). Painted first, it is one command in front of the walk.
+    pub fn on_background(plan: &VisualLayerPlan, device_scale: f64, color: Color, width: u32, height: u32) -> Self {
+        Self::build(plan, device_scale, Some((color, width, height)), |_, _, _, _| {
+            LayerChoice::Draw
+        })
     }
 
     /// The same walk, with the caller deciding which scene layers are drawn.
     ///
-    /// One walk rather than two: the device scale and the external holes are decided
-    /// here and nowhere else, so a frame that keeps some layers (§36) cannot drift from
-    /// a frame that draws them all — which it would, since the two differ by one
-    /// `if` and are three hundred lines apart.
+    /// One walk rather than two: the device scale, the background and the external
+    /// holes are decided here and nowhere else, so a frame that keeps some layers (§36)
+    /// cannot drift from a frame that draws them all — which it would, since the two
+    /// differ by one `if` and are three hundred lines apart.
     pub(crate) fn build(
         plan: &VisualLayerPlan,
         device_scale: f64,
+        background: Option<(Color, u32, u32)>,
         mut choose: impl FnMut(usize, &VisualLayer, &Scene, Affine) -> LayerChoice,
     ) -> Self {
         let to_physical = Affine::scale(device_scale);
         let mut composition = Self::default();
+
+        // First, so everything the plan draws lands on top of it. The rectangle is
+        // already in physical coordinates, which is the space this scene is in.
+        if let Some((color, width, height)) = background {
+            Painter::new(&mut composition.scene)
+                .fill(Rect::new(0.0, 0.0, f64::from(width), f64::from(height)), color)
+                .draw();
+        }
 
         for (index, layer) in plan.layers.iter().enumerate() {
             composition.layers += 1;
@@ -102,24 +128,6 @@ impl Composition {
         }
 
         composition
-    }
-
-    /// Prepends an opaque fill, so the frame is opaque before anything presents it.
-    ///
-    /// A widget tree is under no obligation to cover the window — `AreaScreen` paints
-    /// its splitter bars and leaves the rest to its areas — and every path to the
-    /// screen flattens alpha away in the end. Doing the fill here means the rasteriser
-    /// blends the edges, which is what keeps a curve from becoming a staircase
-    /// (§26.4).
-    #[must_use]
-    pub fn on_background(self, color: Color, width: u32, height: u32) -> Self {
-        let mut scene = Scene::new();
-        Painter::new(&mut scene)
-            .fill(Rect::new(0.0, 0.0, f64::from(width), f64::from(height)), color)
-            .draw();
-        // Identity: the composition is already in physical coordinates.
-        scene.append_transformed(&self.scene, Affine::IDENTITY);
-        Self { scene, ..self }
     }
 
     /// Physical pixels for a logical window size, rounded outwards.
@@ -228,6 +236,34 @@ mod tests {
 
         assert_eq!(plan.overlay_layers().count(), 0, "upstream skips it");
         assert_eq!(Composition::new(&plan, 1.0).holes.len(), 1);
+    }
+
+    /// The base colour goes under everything, and nothing else about the walk changes.
+    ///
+    /// It used to be prepended to a finished composition, which meant copying the whole
+    /// frame into a second scene once per frame. Painting it first has to produce the
+    /// same commands in the same order, and this is where that is checked rather than
+    /// assumed.
+    #[test]
+    fn the_background_is_the_first_command_and_the_plan_follows() {
+        let plan = plan(vec![VisualLayer {
+            kind: VisualLayerKind::Scene(scene_of(Rect::new(0.0, 0.0, 10.0, 10.0))),
+            transform: Affine::IDENTITY,
+            widget_id: some_id(),
+        }]);
+        let base = Color::from_rgb8(0x14, 0x14, 0x18);
+
+        let composed = Composition::on_background(&plan, 1.0, base, 40, 20);
+
+        let mut expected = Scene::new();
+        Painter::new(&mut expected)
+            .fill(Rect::new(0.0, 0.0, 40.0, 20.0), base)
+            .draw();
+        expected.append_transformed(&Composition::new(&plan, 1.0).scene, Affine::IDENTITY);
+
+        assert_eq!(composed.scene, expected);
+        assert_eq!(composed.scenes, 1, "the background is not a layer of the plan");
+        assert_eq!(composed.layers, 1);
     }
 
     /// The device scale multiplies the layer transform rather than replacing it.

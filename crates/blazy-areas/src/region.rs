@@ -91,6 +91,7 @@ impl UiScale {
 
 /// Cumulative counters, for spotting work that should not be happening.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RegionCounters {
     /// Layout passes run on the area's region stack.
     pub layouts: u64,
@@ -181,11 +182,6 @@ impl AreaContent {
         ])
     }
 
-    /// Builder form of [`set_ui_scale`](Self::set_ui_scale), for a scale known before
-    /// the widget is in a tree.
-    ///
-    /// The queued value is pushed down by the first layout pass, so a region built
-    /// this way is never briefly shown at the wrong size.
     /// Asks to be recorded as a scene layer of its own.
     ///
     /// What it buys is the possibility of caching: a host that sees this area as its own
@@ -201,6 +197,12 @@ impl AreaContent {
         self
     }
 
+    /// Builder form of [`set_ui_scale`](Self::set_ui_scale), for a scale known before
+    /// the widget is in a tree.
+    ///
+    /// The queued value is pushed down by the first layout pass, so a region built
+    /// this way is never briefly shown at the wrong size.
+    #[must_use]
     pub fn with_ui_scale(mut self, index: usize, scale: f64) -> Self {
         if let Some(slot) = self.slots.get_mut(index) {
             slot.ui_scale = scale.clamp(0.1, 8.0);

@@ -10,6 +10,8 @@
 //! [`Seat`] is how a driver says where an event came from, and it is what turns "the
 //! modal operator got the events" from an assertion into [`OpCounters::tree_first`].
 
+use std::collections::HashMap;
+
 use masonry::core::keyboard::Modifiers;
 use masonry::kurbo::Point;
 use masonry::ui_events::pointer::PointerButton;
@@ -70,6 +72,7 @@ pub enum Feed {
 }
 
 impl Feed {
+    /// Whether the driver should stop the event here.
     pub fn is_consumed(self) -> bool {
         self == Self::Consumed
     }
@@ -185,6 +188,13 @@ struct Modal {
 pub struct OpRuntime<W> {
     ops: Vec<Option<Box<dyn Operator<W>>>>,
     names: Vec<&'static str>,
+    /// Where each name sits in `ops`.
+    ///
+    /// A map rather than a scan of `names`, because the lookup is per *binding* per
+    /// *event*: a press consults the keymap twice (§39.3), and a keymap the size of
+    /// Blender's answers with several candidates each time. The registry is small today
+    /// and the scan cost nothing today; the shape is what a keymap as data grows into.
+    by_name: HashMap<&'static str, usize>,
     keymap: Keymap,
     stack: Vec<Modal>,
     undo: UndoStack<W>,
@@ -192,19 +202,29 @@ pub struct OpRuntime<W> {
     /// A press whose meaning is not decided yet (§39.3).
     pending: Option<Pending>,
     last_click: Option<LastClick>,
+    /// Reused buffers for the candidates a lookup produces, so an event allocates
+    /// nothing. Taken out while they are filled, because the keymap they are filled
+    /// from and the operators they are spent on are both fields of `self`.
+    scratch_bindings: Vec<(usize, Props)>,
+    scratch_holds: Vec<usize>,
 }
 
 impl<W> OpRuntime<W> {
+    /// An empty registry over `keymap`. Operators are added with
+    /// [`register`](Self::register).
     pub fn new(keymap: Keymap) -> Self {
         Self {
             ops: Vec::new(),
             names: Vec::new(),
+            by_name: HashMap::new(),
             keymap,
             stack: Vec::new(),
             undo: UndoStack::new(),
             counters: OpCounters::default(),
             pending: None,
             last_click: None,
+            scratch_bindings: Vec::new(),
+            scratch_holds: Vec::new(),
         }
     }
 
@@ -214,13 +234,19 @@ impl<W> OpRuntime<W> {
     /// test swaps one operator for a stub without rebuilding the keymap.
     pub fn register(&mut self, op: impl Operator<W> + 'static) {
         let name = op.name();
-        match self.names.iter().position(|known| *known == name) {
-            Some(at) => self.ops[at] = Some(Box::new(op)),
+        match self.by_name.get(name) {
+            Some(&at) => self.ops[at] = Some(Box::new(op)),
             None => {
+                self.by_name.insert(name, self.names.len());
                 self.names.push(name);
                 self.ops.push(Some(Box::new(op)));
             },
         }
+    }
+
+    /// Where an operator sits in the registry, if it is registered at all.
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
     }
 
     /// The keymap in force.
@@ -258,6 +284,7 @@ impl<W> OpRuntime<W> {
         self.stack.last().map(|modal| self.names[modal.op])
     }
 
+    /// The counters, for a criterion or a status line.
     pub fn counters(&self) -> OpCounters {
         self.counters
     }
@@ -454,19 +481,23 @@ impl<W> OpRuntime<W> {
     /// turns into a no there costs a held gesture that does nothing; that is the whole
     /// price of asking early, and it is paid in moves the tree did not see (§39.4).
     fn would_hold(&mut self, world: &mut W, button: PointerButton, press: &OpEvent, scope: Scope<'_>) -> bool {
-        let candidates: Vec<usize> = self
-            .keymap
-            .sections_for(scope)
-            .filter(|binding| binding.pattern.wants_gesture(button))
-            .filter_map(|binding| self.names.iter().position(|name| *name == binding.op))
-            .collect();
+        let mut candidates = std::mem::take(&mut self.scratch_holds);
+        candidates.clear();
+        candidates.extend(
+            self.keymap
+                .sections_for(scope)
+                .filter(|binding| binding.pattern.wants_gesture(button))
+                .filter_map(|binding| self.by_name.get(binding.op).copied()),
+        );
 
-        candidates.into_iter().any(|at| {
+        let empty = Props::new();
+        let mut holds = false;
+        for &at in &candidates {
             let op = self.ops[at].take().expect("an operator is not running twice");
             let cx = OpCtx {
                 world,
                 event: Some(press),
-                props: &Props::new(),
+                props: &empty,
                 scope: scope.0,
                 undo: &mut self.undo,
             };
@@ -476,8 +507,14 @@ impl<W> OpRuntime<W> {
                 self.counters.refused += 1;
             }
             self.ops[at] = Some(op);
-            allowed
-        })
+            if allowed {
+                holds = true;
+                break;
+            }
+        }
+        candidates.clear();
+        self.scratch_holds = candidates;
+        holds
     }
 
     /// Records what a pre-tree seat kept from the tree, and answers the driver.
@@ -506,35 +543,40 @@ impl<W> OpRuntime<W> {
         }
 
         self.counters.lookups += 1;
-        let candidates: Vec<(usize, Props)> = self
-            .keymap
-            .matches(scope, event)
-            .filter_map(|binding| {
-                self.names
-                    .iter()
-                    .position(|name| *name == binding.op)
-                    .map(|at| (at, binding.props.clone()))
-            })
-            .collect();
+        let mut candidates = std::mem::take(&mut self.scratch_bindings);
+        candidates.clear();
+        candidates.extend(
+            self.keymap
+                .matches(scope, event)
+                .filter_map(|binding| self.by_name.get(binding.op).map(|&at| (at, binding.props.clone()))),
+        );
         if candidates.is_empty() {
+            self.scratch_bindings = candidates;
             return Dispatch::NoBinding;
         }
         self.counters.matched += 1;
 
-        for (at, props) in candidates {
+        let mut outcome = Dispatch::NoBinding;
+        for (at, props) in candidates.drain(..) {
             match self.run(world, at, Some(event), &props, scope, Path::Invoke) {
                 Some(OpResult::Running) => {
                     self.counters.modal_starts += 1;
                     self.stack.push(Modal { op: at, props });
-                    return Dispatch::Consumed;
+                    outcome = Dispatch::Consumed;
+                    break;
                 },
-                Some(OpResult::Finished | OpResult::Cancelled) => return Dispatch::Consumed,
+                Some(OpResult::Finished | OpResult::Cancelled) => {
+                    outcome = Dispatch::Consumed;
+                    break;
+                },
                 // The operator matched and declined the event: the next binding gets
                 // its turn, which is what makes a keymap layered rather than a switch.
                 Some(OpResult::PassThrough) | None => {},
             }
         }
-        Dispatch::NoBinding
+        candidates.clear();
+        self.scratch_bindings = candidates;
+        outcome
     }
 
     /// Runs an operator by name, from a script, a test or a redo.
@@ -543,7 +585,7 @@ impl<W> OpRuntime<W> {
     /// only the event is missing. That is what makes "the key and the script do the
     /// same thing" a claim a test can check by comparing state.
     pub fn exec(&mut self, world: &mut W, name: &str, props: &Props) -> OpResult {
-        let Some(at) = self.names.iter().position(|known| *known == name) else {
+        let Some(at) = self.index_of(name) else {
             return OpResult::PassThrough;
         };
         let props = props.clone();
@@ -584,16 +626,18 @@ impl<W> OpRuntime<W> {
 
     /// Hands one event to the operator on top of the stack.
     fn deliver_modal(&mut self, world: &mut W, event: &OpEvent, scope: Scope<'_>) -> Dispatch {
-        let modal = self.stack.last().expect("called with a non-empty stack");
+        // Taken off the stack and put back, rather than read in place and its properties
+        // cloned: this runs on every event of a gesture, and an operator cannot reach
+        // the runtime from its context, so nothing can observe the gap.
+        let modal = self.stack.pop().expect("called with a non-empty stack");
         let at = modal.op;
-        let props = modal.props.clone();
         self.counters.modal_events += 1;
 
         let mut op = self.ops[at].take().expect("an operator is not running twice");
         let mut cx = OpCtx {
             world,
             event: Some(event),
-            props: &props,
+            props: &modal.props,
             scope: scope.0,
             undo: &mut self.undo,
         };
@@ -601,19 +645,21 @@ impl<W> OpRuntime<W> {
         self.ops[at] = Some(op);
 
         match result {
-            OpResult::Running => Dispatch::Consumed,
+            OpResult::Running => {
+                self.stack.push(modal);
+                Dispatch::Consumed
+            },
             OpResult::Finished => {
-                self.stack.pop();
                 self.counters.modal_finishes += 1;
                 Dispatch::Consumed
             },
             OpResult::Cancelled => {
-                self.stack.pop();
                 self.counters.modal_cancels += 1;
                 Dispatch::Consumed
             },
             OpResult::PassThrough => {
                 self.counters.passthrough += 1;
+                self.stack.push(modal);
                 Dispatch::PassedThrough
             },
         }
@@ -624,6 +670,14 @@ impl<W> OpRuntime<W> {
     /// Returns `None` when the poll refused. Both entry points come through here, so
     /// there is one place where "was the poll asked" can be true or false — which is
     /// what [`OpCounters::unpolled`] is a criterion on.
+    ///
+    /// The operator is moved out of the registry for the call, because it is given a
+    /// context that borrows the rest of the runtime. The slot cannot be found empty:
+    /// every entry point takes `&mut self`, and an [`OpCtx`] offers no way back to the
+    /// runtime, so nothing can be running while this runs. The `expect` states that
+    /// invariant rather than guarding a case a caller can reach — if a driver ever
+    /// holds the runtime behind shared mutability, this is the line that has to be
+    /// revisited.
     fn run(
         &mut self,
         world: &mut W,

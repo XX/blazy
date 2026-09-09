@@ -25,6 +25,7 @@ use crate::compose::Hole;
 /// whether a frame passes through main memory is a fact about the path, not about the
 /// machine it ran on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PresentCounters {
     /// Frames presented.
     pub frames: u64,
@@ -52,6 +53,7 @@ pub struct PresentCounters {
 
 /// Errors from putting a frame on the screen.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PresentError {
     /// The frame could not be composed or rasterised.
     Host(crate::HostError),
@@ -101,7 +103,23 @@ impl std::fmt::Display for PresentError {
     }
 }
 
-impl std::error::Error for PresentError {}
+impl std::error::Error for PresentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Host(error) => Some(error),
+            // The two overflows are this crate's own findings and wrap nothing; the
+            // platform's error arrives as text on purpose (§15.1), so it has no cause
+            // to hand on either.
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::HostError> for PresentError {
+    fn from(error: crate::HostError) -> Self {
+        Self::Host(error)
+    }
+}
 
 /// A path from a [`VisualLayerPlan`] to the screen.
 pub trait Presenter {
@@ -123,6 +141,7 @@ pub trait Presenter {
     /// The rectangles the last frame left for the host to fill (§4.3).
     fn holes(&self) -> &[Hole];
 
+    /// What this presenter's frames have cost so far.
     fn counters(&self) -> PresentCounters;
 
     /// Tells the presenter the window changed size, in physical pixels.

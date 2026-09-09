@@ -2,12 +2,12 @@
 //!
 //! §29 measured the frame as the cost of walking the widget tree and bounded it in
 //! widgets. That left the other half unbounded: below the far-field threshold a canvas
-//! holds no widgets at all and still cost 33 ms a frame on 20 000 nodes, because the
-//! paint pass rebuilds the whole [`VisualLayerPlan`] every frame and re-appends every
-//! widget's cached scene into it (`masonry_core/src/passes/paint.rs`). What it appends
-//! is **draw commands**, and a command is charged in every frame it sits in the scene
-//! whether or not anything about it changed — an idle area pays the same as a busy one
-//! (§31).
+//! holds no widgets at all and was still the most expensive thing on screen (§31 has
+//! the figures), because the paint pass rebuilds the whole [`VisualLayerPlan`] every
+//! frame and re-appends every widget's cached scene into it
+//! (`masonry_core/src/passes/paint.rs`). What it appends is **draw commands**, and a
+//! command is charged in every frame it sits in the scene whether or not anything about
+//! it changed — an idle area pays the same as a busy one.
 //!
 //! So the quantity to count is commands, and the right place to count them is the plan
 //! itself:

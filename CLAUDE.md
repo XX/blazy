@@ -219,6 +219,18 @@ tolerance is in **screen pixels** and divided by the scale at test time (canvas 
 span a factor of 400 across the zoom range), and a pick must not run layout — which is
 why its counters are published by the pick itself rather than by the layout pass.
 
+**A link pick is rejected by a stored box, and the box has to follow the node (§40.1).**
+Candidates come from the *recorded* set, which is bounded by the region rather than by
+the viewport, so it grows as the view pulls back: one pointer move used to rebuild
+10 042 cubics at an overview zoom. The box each curve occupies is already computed when
+the set is chosen (the short-link rule) and is now kept beside it, so a pick rejects
+before it builds anything. Two things hold it up: `node_moved` re-measures the boxes of
+the moved node's curves, because a drag moves a curve without re-choosing the set and
+nothing else would notice; and the cost is counted **twice** — `hit_curve_tests` for
+curves built, `hit_curve_scans` for boxes walked — because a filter that makes the
+per-candidate work free would otherwise hide the number of candidates growing (§28.4
+again).
+
 **`ui_scale` goes into layout; `view` goes only into paint (§9, §22).** Mixing them
 means re-running layout on every frame of a zoom. Four criteria and seven tests hold
 that line.
@@ -385,7 +397,18 @@ both are already argued in §15.1 and §18:
 - **A measured number lives in one place.** The argument, the sweep and the figures go
   into `rnd/architecture.md`; a module doc says what the module does, what a caller has
   to promise, and which way its approximations err, then points at the section. Two
-  copies of a number drift, and the copy in the code is the one nobody re-measures.
+  copies of a number drift, and the copy in the code is the one nobody re-measures —
+  §40.4 found the price of a draw command restated in the code as three different pairs
+  of numbers.
+- **The six published crates carry `#![warn(missing_docs, unreachable_pub)]`**, so a new
+  public item needs a doc comment. That is also what catches a doc comment orphaned by a
+  reordering: four of them had come adrift and were documenting the wrong function.
+- **Counter and error types are `#[non_exhaustive]`; configuration types are not.** A
+  counter grows every phase and nobody constructs one from outside; a config is
+  constructed with `..Default::default()` and that is its interface (§40.4).
+- **New public surface reaches an application through `crates/blazy`, features
+  included.** The facade forwards `window` and `vello` in both directions — an
+  application that wants no window system has to be able to say so (§14, §40.4).
 - `issues/` holds tasks. When one is finished, append the outcome to the file **in
   place** — moving it into `issues/done/` is the user's call, not yours.
 - Do not commit unless asked.

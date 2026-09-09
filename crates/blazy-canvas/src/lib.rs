@@ -15,9 +15,9 @@
 //!    paint pass still copies every visible widget's commands into the layer scene every frame (`passes/paint.rs`,
 //!    `Scene::append_transformed`). Frame cost is proportional to the volume of *visible* commands, so off-screen nodes
 //!    must be stashed to be skipped. The same sentence applies to the commands the canvas draws itself, and it is the
-//!    reason links and far-field nodes are batched rather than drawn one shape at a time: a command costs ~0.2-0.4 us
-//!    in every frame it sits in the scene, the same geometry inside a shared command ~0.03 us, and an idle canvas pays
-//!    that bill as surely as a busy one (§31).
+//!    reason links and far-field nodes are batched rather than drawn one shape at a time: a command is charged in every
+//!    frame it sits in the scene and costs an order of magnitude more than the same geometry inside a shared one, and
+//!    an idle canvas pays that bill as surely as a busy one (§31.1 has the prices).
 //!
 //! 3. **Ordinary widgets work inside nodes.** Masonry already inverts `window_transform` when routing pointer events,
 //!    so sliders and checkboxes inside a zoomed node need no special handling from us.
@@ -63,6 +63,8 @@
 //! serialisation of the graph. Those are domain work on top of a canvas whose shape
 //! is no longer in question.
 
+#![warn(missing_docs, unreachable_pub)]
+
 mod index;
 mod links;
 
@@ -106,6 +108,7 @@ pub enum Detail {
 }
 
 impl Detail {
+    /// The level's name, for a status line or a report.
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
@@ -161,9 +164,10 @@ impl DetailThresholds {
 /// widget tree, and a node is not one widget: at [`Detail::Full`] the example's node
 /// carries a slider and a checkbox (which carries a label) and costs four, at
 /// [`Detail::Simplified`] it costs one. Measured across the whole zoom range and two
-/// graph sizes, a panned frame costs 6.5–8.5 us per widget in the tree and does not
-/// otherwise care which level produced them (§29.1) — so widgets are the unit the
-/// ceiling belongs in, and the per-level cost is what converts a node count into it.
+/// graph sizes, a panned frame costs the same per widget in the tree whatever level
+/// produced them (§29.1, and [`DEFAULT_WIDGET_BUDGET`] is derived from that figure) —
+/// so widgets are the unit the ceiling belongs in, and the per-level cost is what
+/// converts a node count into it.
 ///
 /// **Why the costs are given rather than counted.** The canvas builds a node through
 /// [`NodeSource`] and never looks inside the result; how many widgets a level costs is
@@ -326,6 +330,7 @@ impl CanvasDetail {
 /// file to retune a demo.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkStyle {
+    /// Colour of an ordinary link.
     pub color: Color,
     /// Colour of the link under the pointer.
     pub hover_color: Color,
@@ -342,9 +347,8 @@ pub struct LinkStyle {
     /// Below this on-screen length, a link is not drawn at all, in **logical pixels**.
     ///
     /// A curve two pixels long carries no information and still costs a subpath in
-    /// every frame it is recorded for. Measured on the curve's bounding box, at
-    /// selection time rather than at paint time, so a link leaves the picture and the
-    /// pointer's reach in one action (§31.4).
+    /// every frame it is recorded for. Measured on the curve's bounding box, when the
+    /// recorded set is chosen — see `CanvasContent::drop_short_links` for why there.
     ///
     /// The rule needs no "only when zoomed out" clause: an on-screen length grows
     /// with the zoom, so it stops firing on its own. Set to zero to switch it off.
@@ -378,9 +382,19 @@ impl Default for LinkStyle {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CanvasHit {
     /// A node, with the canvas-space position of its top-left corner.
-    Node { index: usize, pos: Point },
+    Node {
+        /// Index into the node array the canvas was built over.
+        index: usize,
+        /// Canvas-space position of the node's top-left corner.
+        pos: Point,
+    },
     /// A link, by its index in the edge list.
-    Link { edge: usize, link: Link },
+    Link {
+        /// Index into the edge list given to [`CanvasLayer::with_links`].
+        edge: usize,
+        /// The edge itself, so the caller need not index the list again.
+        link: Link,
+    },
 }
 
 impl CanvasHit {
@@ -409,6 +423,7 @@ impl CanvasHit {
 /// Captured during the canvas's layout. That matters for [`CanvasCounters::far_repaints`],
 /// which is bumped during *paint* and is therefore always one frame behind the rest.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct CanvasStats {
     /// Total number of nodes.
     pub total: usize,
@@ -458,6 +473,7 @@ pub struct CanvasStats {
 
 /// Cumulative counters, for spotting work that should not be happening.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CanvasCounters {
     /// Layout passes run on the content widget.
     pub content_layouts: u64,
@@ -529,12 +545,23 @@ pub struct CanvasCounters {
     /// by node *density* and not by the size of the graph — which is the difference
     /// between a pointer that stays cheap on a million nodes and one that does not.
     pub hit_node_tests: u64,
-    /// Link curves examined while answering picks, summed.
+    /// Link curves whose geometry a pick actually rebuilt and measured, summed.
     ///
-    /// Candidates are the links the canvas has actually recorded, so what can be
-    /// clicked is exactly what can be seen and the count is bounded by the viewport
-    /// region rather than by the edge list.
+    /// The expensive half, and the one that must not follow the zoom: a curve counted
+    /// here was reconstructed from its endpoints and handed to `near_segment`. What
+    /// keeps it small is the box stored with the recorded set — see
+    /// [`hit_curve_scans`](Self::hit_curve_scans) for the other half.
     pub hit_curve_tests: u64,
+    /// Recorded curves a pick walked past, summed — box tests, not curve tests.
+    ///
+    /// The candidate set is the links the canvas has recorded, so what can be clicked
+    /// is exactly what can be seen; but that set is bounded by the recorded *region*
+    /// and not by the viewport, so it grows as the view pulls back (§28). Counted
+    /// separately from [`hit_curve_tests`](Self::hit_curve_tests) precisely because the
+    /// box filter would otherwise hide it: a counter that only measures the work per
+    /// candidate cannot see a defect that lives in the number of candidates, which is
+    /// the lesson of §28.4.
+    pub hit_curve_scans: u64,
 }
 
 /// Builds the widget for a node when it scrolls into view.
@@ -596,7 +623,7 @@ pub trait NodeSource: 'static {
     /// **The whole set rather than one node at a time, and that is the point.** What a
     /// far-field frame costs is the number of *draw commands* in the recorded scene,
     /// not the geometry in them: the paint pass re-appends the scene every frame, and
-    /// a command costs ~0.2 us there against ~0.014 us for the same rectangle inside a
+    /// a command there costs fifteen times what the same rectangle costs inside a
     /// shared one (§31.1). A per-node signature forces the expensive shape and gives
     /// an implementation no way out; this one lets it group — by colour, by kind — and
     /// pay for the groups instead. The example draws six tints in six commands where
@@ -816,6 +843,19 @@ fn diff_sorted(
     }
 }
 
+/// The canvas-space box the curve between two nodes occupies.
+///
+/// One place, because the box is used for three different decisions — whether a link is
+/// too short to draw, whether the pointer can be near it, and nothing else may disagree
+/// with either.
+fn link_bounds(from: &Slot, to: &Slot) -> Rect {
+    link_curve(
+        Rect::from_origin_size(from.pos, from.size),
+        Rect::from_origin_size(to.pos, to.size),
+    )
+    .bounding_box()
+}
+
 /// Whether `outer` fully contains `inner`.
 pub(crate) fn contains_rect(outer: Rect, inner: Rect) -> bool {
     outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
@@ -897,6 +937,14 @@ pub struct CanvasContent {
     scratch_added: Vec<usize>,
     /// Reused buffer for index candidates, so culling allocates nothing either.
     scratch_candidates: Vec<usize>,
+    /// A spare index buffer, so the set handed to the mutate pass is not a fresh
+    /// allocation every frame.
+    ///
+    /// `pending` and `live` swap through here: the cull fills this one, `apply_pending`
+    /// makes it the live set and hands back the buffer it replaced. Without it a pan —
+    /// which changes the set on most frames — allocates and frees one `Vec` per frame
+    /// per canvas, which is exactly what the other `scratch_*` fields exist to avoid.
+    scratch_desired: Vec<usize>,
     /// Reused paths for the two link batches, so a repaint allocates nothing.
     ///
     /// One holds every ordinary link, the other the hovered one; each is stroked with
@@ -909,8 +957,13 @@ pub struct CanvasContent {
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
-    /// Visible region in canvas coordinates, pushed down by the parent.
-    visible_rect: Rect,
+    /// The canvas-space region nodes are kept live in: the viewport **plus the
+    /// overscan margin**, pushed down by the parent.
+    ///
+    /// Not the viewport, and the name says so because the difference is load-bearing:
+    /// `region_covers` compares a recorded region against this rect by proportion as
+    /// well as by containment (§35.3), and the margin is part of the proportion.
+    live_rect: Rect,
     /// How many screen pixels one canvas unit covers, pushed down by the parent.
     ///
     /// The zoom only. The rest of the chain — a region's `ui_scale`, the device scale
@@ -941,6 +994,7 @@ pub struct CanvasContent {
     hit_queries: u64,
     hit_node_tests: u64,
     hit_curve_tests: u64,
+    hit_curve_scans: u64,
 }
 
 // `CanvasLayer` owns this widget completely and reaches into it during layout to
@@ -978,11 +1032,12 @@ impl CanvasContent {
             scratch_removed: Vec::new(),
             scratch_added: Vec::new(),
             scratch_candidates: Vec::new(),
+            scratch_desired: Vec::new(),
             scratch_links: BezPath::new(),
             scratch_hot_links: BezPath::new(),
             scratch_far: Vec::new(),
             pending: None,
-            visible_rect: Rect::ZERO,
+            live_rect: Rect::ZERO,
             scale: 1.0,
             readable: None,
             budget: DetailBudget::default(),
@@ -999,6 +1054,7 @@ impl CanvasContent {
             hit_queries: 0,
             hit_node_tests: 0,
             hit_curve_tests: 0,
+            hit_curve_scans: 0,
         }
     }
 
@@ -1067,6 +1123,7 @@ impl CanvasContent {
             };
 
         let mut examined = 0_u64;
+        let mut scanned = 0_u64;
         let mut found = None;
         // Any of the links under the pointer, not the topmost one: the curves are
         // stroked batched by style, so recorded order is no longer drawing order and
@@ -1075,7 +1132,18 @@ impl CanvasContent {
         // command per style change, which is the cost the batch exists to remove. What
         // still holds is the property that matters: the candidates are exactly the
         // links that are drawn.
-        for &edge in self.links.recorded() {
+        for (at, &edge) in self.links.recorded().iter().enumerate() {
+            scanned += 1;
+            // The stored box first, and it is what keeps this off the zoom: the
+            // candidate set is bounded by the recorded region rather than by the
+            // viewport, so at an overview zoom it holds thousands of curves and all but
+            // a handful are nowhere near the pointer. A box that has not been measured
+            // yet answers `None` and the curve is tested, which is the safe direction.
+            if let Some(box_of_a_curve) = self.links.recorded_bounds(at)
+                && !box_of_a_curve.inflate(radius, radius).contains(canvas_pos)
+            {
+                continue;
+            }
             let link = self.links.edge(edge);
             let (Some(from), Some(to)) = (self.slots.get(link.from as usize), self.slots.get(link.to as usize)) else {
                 continue;
@@ -1094,6 +1162,7 @@ impl CanvasContent {
             }
         }
         self.hit_curve_tests += examined;
+        self.hit_curve_scans += scanned;
         found
     }
 
@@ -1182,7 +1251,9 @@ impl CanvasContent {
 
         this.widget.scratch_removed = removed;
         this.widget.scratch_added = added;
-        this.widget.live = desired;
+        // The set becomes the live one and the buffer it replaces goes to the pool,
+        // which is what makes the next cull allocation-free.
+        this.widget.scratch_desired = std::mem::replace(&mut this.widget.live, desired);
         if changed {
             this.ctx.children_changed();
             this.ctx.request_layout();
@@ -1205,7 +1276,13 @@ impl CanvasContent {
         }
         slot.pos = pos;
         self.index.moved(index, pos);
-        self.links.node_moved(index);
+        let slots = &self.slots;
+        self.links.node_moved(index, |link| {
+            match (slots.get(link.from as usize), slots.get(link.to as usize)) {
+                (Some(from), Some(to)) => link_bounds(from, to),
+                _ => Rect::ZERO,
+            }
+        });
         if far_field {
             self.far.region = None;
             Invalidate::LayoutAndPaint
@@ -1221,15 +1298,18 @@ impl CanvasContent {
     /// Asks the grid for candidates and tests their rectangles exactly. The grid is
     /// what keeps this proportional to what is on screen rather than to the graph:
     /// the linear scan it replaced was invisible up to about 64 000 nodes and cost
-    /// 6.8 ms a frame at a million (§24).
+    /// milliseconds a frame beyond that — `index.rs` has the figures (§24).
     fn cull(&mut self) {
         let mut candidates = std::mem::take(&mut self.scratch_candidates);
-        self.index.candidates(self.visible_rect, &mut candidates);
+        self.index.candidates(self.live_rect, &mut candidates);
 
-        let mut visible = Vec::with_capacity(self.visible.len() + 8);
+        // The last frame's buffer, emptied: the visible set is rebuilt on every layout
+        // and is the same size from one frame to the next.
+        let mut visible = std::mem::take(&mut self.visible);
+        visible.clear();
         for &index in &candidates {
             let slot = &self.slots[index];
-            if Rect::from_origin_size(slot.pos, slot.size).overlaps(self.visible_rect) {
+            if Rect::from_origin_size(slot.pos, slot.size).overlaps(self.live_rect) {
                 visible.push(index);
             }
         }
@@ -1264,7 +1344,16 @@ impl CanvasContent {
         // visible set stops bounding the cost, so the cost must stop depending on
         // widgets. See `paint`.
         let far_field = level == Detail::Box;
-        let desired: Vec<usize> = if far_field { Vec::new() } else { visible.clone() };
+        // A cull whose `pending` nobody applied yet owns a buffer; otherwise the pool
+        // has one. Either way this is the last allocation of it.
+        let mut desired = self
+            .pending
+            .take()
+            .unwrap_or_else(|| std::mem::take(&mut self.scratch_desired));
+        desired.clear();
+        if !far_field {
+            desired.extend_from_slice(&visible);
+        }
 
         self.visible = visible;
 
@@ -1289,6 +1378,8 @@ impl CanvasContent {
             self.pending_stale = stale;
             self.pending = Some(desired);
         } else {
+            // Nothing to apply, so the buffer goes back to the pool rather than away.
+            self.scratch_desired = desired;
             self.pending = None;
         }
     }
@@ -1302,11 +1393,11 @@ impl CanvasContent {
         if self.links.is_empty() {
             return;
         }
-        let region = self.visible_rect.inflate(
-            self.visible_rect.width() * self.far_overscan,
-            self.visible_rect.height() * self.far_overscan,
+        let region = self.live_rect.inflate(
+            self.live_rect.width() * self.far_overscan,
+            self.live_rect.height() * self.far_overscan,
         );
-        if !self.links.needs_reselect(self.visible_rect) {
+        if !self.links.needs_reselect(self.live_rect) {
             return;
         }
 
@@ -1314,72 +1405,75 @@ impl CanvasContent {
         self.index.candidates(region, &mut candidates);
         self.visits += candidates.len() as u64;
         candidates.retain(|&i| Rect::from_origin_size(self.slots[i].pos, self.slots[i].size).overlaps(region));
-        let reselected = self.links.refresh(region, self.visible_rect, &candidates);
+        let reselected = self.links.refresh(region, self.live_rect, &candidates);
         self.scratch_candidates = candidates;
         if reselected {
-            self.drop_short_links();
+            self.measure_links();
         }
     }
 
-    /// Drops the links too short to be seen at the current zoom.
+    /// Measures the recorded curves and drops the ones too short to be seen.
     ///
     /// Here rather than in `paint`, and that placement is the design (§31.4). The set
     /// chosen here is the one both the picture and the pointer read, so a link leaves
     /// both at once and they cannot disagree — the property `link_curve` exists to
-    /// protect. It also adds no invalidation of its own: the threshold is evaluated
-    /// when the set is re-chosen anyway, and between selections it is simply a little
-    /// stale, which shows a hairline slightly longer than needed and costs a few
-    /// curves. There is no error in the other direction.
-    fn drop_short_links(&mut self) {
-        let min_screen = self.link_style.min_screen_length;
-        if min_screen <= 0.0 || self.scale <= f64::EPSILON {
-            return;
-        }
+    /// protect. It also adds no invalidation of its own: the rule is evaluated when the
+    /// set is re-chosen anyway, and between selections it is simply a little stale,
+    /// which shows a hairline slightly longer than needed and costs a few curves. There
+    /// is no error in the other direction.
+    ///
+    /// The bounding box each curve occupies is *kept* rather than thrown away with the
+    /// verdict, because a pick needs exactly the same box: the candidate set is the
+    /// recorded one, which is bounded by the region and therefore grows as the view
+    /// pulls back (§28), and rebuilding every curve to answer a hover is what that cost
+    /// used to be spent on.
+    fn measure_links(&mut self) {
         // Screen pixels into canvas units, the same conversion the pick tolerance
         // makes and for the same reason: canvas units span a factor of 400 across the
         // zoom range, so a threshold expressed in them would mean something different
-        // at each end (§25.2).
-        let min_canvas = min_screen / self.scale;
+        // at each end (§25.2). A threshold of zero, or a degenerate scale, measures the
+        // curves and drops none.
+        let min_screen = self.link_style.min_screen_length;
+        let min_canvas = if min_screen > 0.0 && self.scale > f64::EPSILON {
+            min_screen / self.scale
+        } else {
+            0.0
+        };
         let slots = &self.slots;
-        self.links.retain_recorded(|link| {
+        self.links.measure_recorded(|link| {
             let (Some(from), Some(to)) = (slots.get(link.from as usize), slots.get(link.to as usize)) else {
                 // An edge naming a node that does not exist is skipped when drawn.
-                // Keeping it here keeps "hidden" meaning "too short to see".
-                return true;
+                // Keeping it here keeps "hidden" meaning "too short to see"; the empty
+                // box it gets rejects it from every pick, which is the same answer.
+                return Some(Rect::ZERO);
             };
-            let bounds = link_curve(
-                Rect::from_origin_size(from.pos, from.size),
-                Rect::from_origin_size(to.pos, to.size),
-            )
-            .bounding_box()
-            .size();
+            let bounds = link_bounds(from, to);
             // The diagonal of the box the curve occupies, not the chord: a link that
             // bows away and comes back is visible even when its endpoints nearly
             // coincide. It is also the conservative choice — never smaller than either
             // side — and a rule that removes picture should err towards keeping it.
-            bounds.width.hypot(bounds.height) >= min_canvas
+            let size = bounds.size();
+            (size.width.hypot(size.height) >= min_canvas).then_some(bounds)
         });
     }
 
     /// Re-records the far-field node set when the viewport leaves the painted region.
     ///
     /// The recorded scene lives in canvas coordinates, so panning and zooming inside
-    /// the region cost one `Affine` and nothing else. The margin is what turns
-    /// "re-record every frame" into "re-record when you have travelled half a
-    /// screen": it is bought with a larger scene, which the paint pass appends every
-    /// frame either way, so it should be generous but not unbounded.
+    /// the region cost one `Affine` and nothing else. How wide the region is, and what
+    /// that margin trades against, is [`FAR_OVERSCAN`].
     fn refresh_far_region(&mut self) {
         if self
             .far
             .region
-            .is_some_and(|r| region_covers(r, self.visible_rect, region_slack(self.far_overscan)))
+            .is_some_and(|r| region_covers(r, self.live_rect, region_slack(self.far_overscan)))
         {
             return;
         }
 
-        let region = self.visible_rect.inflate(
-            self.visible_rect.width() * self.far_overscan,
-            self.visible_rect.height() * self.far_overscan,
+        let region = self.live_rect.inflate(
+            self.live_rect.width() * self.far_overscan,
+            self.live_rect.height() * self.far_overscan,
         );
 
         self.far_records += 1;
@@ -1549,6 +1643,7 @@ fn publish_hit_stats(stats: &Cell<CanvasStats>, content: &CanvasContent) {
     current.counters.hit_queries = content.hit_queries;
     current.counters.hit_node_tests = content.hit_node_tests;
     current.counters.hit_curve_tests = content.hit_curve_tests;
+    current.counters.hit_curve_scans = content.hit_curve_scans;
     stats.set(current);
 }
 
@@ -1652,19 +1747,6 @@ impl CanvasLayer {
         }
     }
 
-    /// Materialises interactive controls only for the node under the pointer.
-    ///
-    /// Off by default. When on, every other node gets whatever its `Simplified` form
-    /// paints instead of real control widgets, which at 140 visible nodes is roughly
-    /// five times cheaper per frame — a control nobody is touching is still three or
-    /// four widgets that every pass has to walk.
-    ///
-    /// The catch is visual: the painted stand-in is swapped for real widgets as the
-    /// pointer arrives, so unless it matches them closely the interface appears to
-    /// change under the cursor. Matching Masonry's themed controls by hand is also
-    /// fragile — a theme change silently breaks the resemblance. Turn this on only
-    /// where the node body is drawn by the application anyway, or where nodes are
-    /// small enough that the difference does not read.
     /// Adds edges between nodes.
     ///
     /// Indices into the node array given to [`new`](Self::new); an edge naming a node
@@ -1679,28 +1761,42 @@ impl CanvasLayer {
         self
     }
 
-    /// Restyles the links.
     /// Sets how far past the viewport the far field and the link set are recorded, as
     /// a fraction of the viewport.
     ///
     /// The margin that turns "re-record every frame" into "re-record every few hundred"
     /// (§20.6a). It is bought with a bigger recorded scene, and the scene is what the
     /// rasteriser is charged for every frame (§32.3), so the two sides of the trade are
-    /// re-recordings and path segments. [`FAR_OVERSCAN`](Self::DEFAULT_FAR_OVERSCAN) is
-    /// what §35.2 measured the trade at.
+    /// re-recordings and path segments. [`DEFAULT_FAR_OVERSCAN`](Self::DEFAULT_FAR_OVERSCAN)
+    /// is what §35.2 measured the trade at.
     pub fn with_far_overscan(mut self, fraction: f64) -> Self {
         self.far_overscan = fraction.max(0.0);
         self
     }
 
-    /// The default of [`Self::with_far_overscan`]: half a viewport on each side.
+    /// The default of [`Self::with_far_overscan`]: a quarter of the viewport on each
+    /// side, measured down from a half in §35.2.
     pub const DEFAULT_FAR_OVERSCAN: f64 = FAR_OVERSCAN;
 
+    /// Restyles the links.
     pub fn with_link_style(mut self, style: LinkStyle) -> Self {
         self.link_style = style;
         self
     }
 
+    /// Materialises interactive controls only for the node under the pointer.
+    ///
+    /// Off by default. When on, every other node gets whatever its `Simplified` form
+    /// paints instead of real control widgets, which at 140 visible nodes is roughly
+    /// five times cheaper per frame — a control nobody is touching is still three or
+    /// four widgets that every pass has to walk.
+    ///
+    /// The catch is visual: the painted stand-in is swapped for real widgets as the
+    /// pointer arrives, so unless it matches them closely the interface appears to
+    /// change under the cursor. Matching Masonry's themed controls by hand is also
+    /// fragile — a theme change silently breaks the resemblance. Turn this on only
+    /// where the node body is drawn by the application anyway, or where nodes are
+    /// small enough that the difference does not read.
     pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
         self.controls_on_hover = enabled;
         self
@@ -1771,8 +1867,9 @@ impl CanvasLayer {
         self.stats.get()
     }
 
-    /// The region of canvas space currently visible, plus the overscan margin.
-    fn visible_canvas_rect(&self) -> Rect {
+    /// The region of canvas space nodes are kept live in: what the viewport covers,
+    /// plus the overscan margin on each side.
+    fn live_canvas_rect(&self) -> Rect {
         let viewport = Rect::from_origin_size(Point::ORIGIN, self.viewport);
         let rect = self.view.inverse().transform_rect_bbox(viewport);
         rect.inflate(rect.width() * self.overscan, rect.height() * self.overscan)
@@ -2198,7 +2295,7 @@ impl Widget for CanvasLayer {
         // surrounding UI, and so Masonry excludes them from hit testing.
         ctx.set_clip_path(Rect::from_origin_size(Point::ORIGIN, size));
 
-        let visible_rect = self.visible_canvas_rect();
+        let live_rect = self.live_canvas_rect();
         let zoom = self.zoom();
         // Only the readability half of the decision can be taken here: the cost half
         // needs the number of visible nodes, which the cull computes (§29.2).
@@ -2229,7 +2326,7 @@ impl Widget for CanvasLayer {
             content.far_overscan = self.far_overscan;
             content.links.set_slack(region_slack(self.far_overscan));
             content.controls_on_hover = self.controls_on_hover;
-            content.visible_rect = visible_rect;
+            content.live_rect = live_rect;
             content.scale = zoom;
             content.readable = Some(readable);
             content.budget = self.budget;
@@ -2282,6 +2379,7 @@ impl Widget for CanvasLayer {
                 hit_queries: content.hit_queries,
                 hit_node_tests: content.hit_node_tests,
                 hit_curve_tests: content.hit_curve_tests,
+                hit_curve_scans: content.hit_curve_scans,
             },
         });
     }
@@ -2411,7 +2509,7 @@ mod tests {
         content.links = LinkLayer::new(edges, rects.len());
         content.links.invalidate();
         content.detail = Some(Detail::Full);
-        content.visible_rect = visible;
+        content.live_rect = visible;
         content.scale = scale;
         content.cull();
         content

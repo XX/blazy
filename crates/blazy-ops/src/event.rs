@@ -20,10 +20,14 @@ use masonry::ui_events::pointer::PointerButton;
 /// Masonry carries this on every pointer event, so a driver has it for free.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Device {
+    /// A mouse, or anything the platform reports as one.
     #[default]
     Mouse,
+    /// A pen or stylus.
     Pen,
+    /// A finger.
     Touch,
+    /// Anything else, measured as a mouse.
     Other,
 }
 
@@ -38,8 +42,11 @@ pub enum Device {
 ///   threshold measured on it would mean something different at every zoom (§25.2 learned this once already).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Sample {
+    /// The platform's own timestamp, in nanoseconds.
     pub time_ns: u64,
+    /// What produced the event, which is what chooses the drag threshold.
     pub device: Device,
+    /// Where the pointer was, in screen pixels.
     pub screen: Point,
 }
 
@@ -62,21 +69,39 @@ impl Sample {
 pub enum OpEvent {
     /// A pointer button went down.
     Press {
+        /// The button that went down.
         button: PointerButton,
+        /// Where the pointer was, in the driver's own space.
         pos: Point,
+        /// The modifiers held at the time.
         mods: Modifiers,
     },
     /// A pointer button came up.
     Release {
+        /// The button that came up.
         button: PointerButton,
+        /// Where the pointer was, in the driver's own space.
         pos: Point,
+        /// The modifiers held at the time.
         mods: Modifiers,
     },
     /// The pointer moved. Never matched by a binding — a keymap that could start an
     /// operator on a bare move would start one on every frame of a drag.
-    Move { pos: Point, mods: Modifiers },
+    Move {
+        /// Where the pointer is now, in the driver's own space.
+        pos: Point,
+        /// The modifiers held at the time.
+        mods: Modifiers,
+    },
     /// A key went down or came up.
-    Key { key: Key, mods: Modifiers, down: bool },
+    Key {
+        /// The key itself.
+        key: Key,
+        /// The modifiers held at the time.
+        mods: Modifiers,
+        /// Whether this is the key going down.
+        down: bool,
+    },
     /// A press that turned out to be a click: the button went down and came up again
     /// without travelling past the drag threshold.
     ///
@@ -84,7 +109,9 @@ pub enum OpEvent {
     /// `pos` is **the press's** position rather than the release's — an operator started
     /// by a gesture wants where the gesture began.
     Click {
+        /// The button that was clicked.
         button: PointerButton,
+        /// Where the **press** was, in the driver's own space.
         pos: Point,
         /// The same point in screen pixels, for an operator that works in that space.
         ///
@@ -92,6 +119,7 @@ pub enum OpEvent {
         /// operator that moves a node thinks in the driver's space, one that moves the
         /// view thinks in pixels, and neither should have to ask the other's question.
         screen: Point,
+        /// The modifiers held at the time.
         mods: Modifiers,
         /// 1 for a single click, 2 for the second click of a double, and so on.
         count: u8,
@@ -100,10 +128,13 @@ pub enum OpEvent {
     /// while the button was down. `pos` is the press's position, which is the anchor a
     /// transform operator needs.
     Drag {
+        /// The button holding the drag.
         button: PointerButton,
+        /// Where the **press** was, in the driver's own space.
         pos: Point,
         /// The press's position in screen pixels. See [`Click::screen`](Self::Click).
         screen: Point,
+        /// The modifiers held at the time.
         mods: Modifiers,
     },
 }
@@ -206,7 +237,9 @@ pub enum Trigger {
 /// operator — the difference between a keymap a user can edit and one they cannot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
+    /// What has to happen.
     pub trigger: Trigger,
+    /// Which modifiers have to be held while it does. Matched exactly.
     pub mods: Modifiers,
 }
 

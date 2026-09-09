@@ -32,6 +32,7 @@ enum Node {
 pub struct Bar {
     /// The split this bar divides. Pass it to [`SplitTree::set_ratio`].
     pub split: NodeId,
+    /// The axis the split divides along.
     pub axis: Axis,
     /// The bar itself, for hit testing and painting.
     pub rect: Rect,
@@ -242,7 +243,7 @@ fn split_rect(rect: Rect, axis: Axis, ratio: f64, bar: f64) -> (Rect, Rect, Rect
 /// The ratio a pointer at `pos` implies for a bar.
 ///
 /// Lives here rather than in the widget because it is the exact inverse of
-/// [`split_rect`], and an inverse that drifts from its forward function is a bug
+/// `split_rect`, and an inverse that drifts from its forward function is a bug
 /// nobody sees until the splitter starts lagging the pointer.
 pub fn ratio_at(bar: &Bar, pos: Point, bar_thickness: f64) -> f64 {
     let (extent, origin, at) = match bar.axis {

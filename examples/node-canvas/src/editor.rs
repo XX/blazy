@@ -200,33 +200,33 @@ impl NodeEditor {
 
     /// Applies what the operators changed, from a `WidgetMut`.
     ///
-    /// The twin of [`flush`](Self::flush), for the path that has no `EventCtx`. The
-    /// two differ only in how they reach the canvas, which is the whole reason both
-    /// exist rather than one.
+    /// The twin of [`flush`](Self::flush), and what the two share — draining the world,
+    /// and what a peer does with the result — is [`Changes`] and [`apply_moves`]. What
+    /// is left here is the only thing that really differs: which context reaches the
+    /// canvas.
     fn flush_mut(this: &mut WidgetMut<'_, Self>) {
         let Some(ops) = this.widget.ops.as_mut() else {
             return;
         };
-        let moved = mem::take(&mut ops.world.moved);
-        let pan = mem::replace(&mut ops.world.pan, Vec2::ZERO);
-        let dirty = mem::take(&mut ops.world.dirty);
-        let positions = positions_of(&ops.world, moved);
-        if dirty {
+        let changes = ops.take_changes();
+        if changes.dirty {
             this.ctx.request_post_paint();
         }
-        if positions.is_empty() && pan == Vec2::ZERO {
+        if changes.is_empty() {
             return;
         }
         {
             let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
-            for &(index, pos) in &positions {
+            for &(index, pos) in &changes.positions {
                 CanvasLayer::move_child(&mut canvas, index, pos);
             }
-            if pan != Vec2::ZERO {
-                CanvasLayer::pan(&mut canvas, pan);
+            if changes.pan != Vec2::ZERO {
+                CanvasLayer::pan(&mut canvas, changes.pan);
             }
         }
-        if positions.is_empty() {
+        if changes.positions.is_empty() {
+            // A pan is this view's business alone: the view is not model state, so the
+            // other views of the graph are not following it (§30).
             return;
         }
         let peers = peers_of(
@@ -234,14 +234,53 @@ impl NodeEditor {
             this.widget.canvas.id(),
         );
         for peer in peers {
-            let positions = positions.clone();
-            this.ctx.mutate_later(peer, move |mut widget| {
-                let mut canvas = widget.downcast::<CanvasLayer>();
-                for (index, pos) in positions {
-                    CanvasLayer::move_child(&mut canvas, index, pos);
-                }
-            });
+            let positions = changes.positions.clone();
+            this.ctx
+                .mutate_later(peer, move |widget| apply_moves(widget, positions));
         }
+    }
+}
+
+/// What the operators changed and the driver has not carried into the tree yet.
+///
+/// Drained in one place because the two flush paths used to drain it in two, in
+/// slightly different orders — the `EventCtx` one asked for a post-paint before it
+/// computed the positions and the `WidgetMut` one after, which is the kind of
+/// difference that survives a review and then diverges.
+struct Changes {
+    positions: Vec<(usize, Point)>,
+    pan: Vec2,
+    dirty: bool,
+}
+
+impl Changes {
+    /// Whether anything has to reach the canvas. A repaint is not "something": it is
+    /// asked for before this is consulted.
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty() && self.pan == Vec2::ZERO
+    }
+}
+
+impl Ops {
+    /// Takes what the operators changed, leaving the world clean.
+    fn take_changes(&mut self) -> Changes {
+        let moved = mem::take(&mut self.world.moved);
+        Changes {
+            positions: positions_of(&self.world, moved),
+            pan: mem::replace(&mut self.world.pan, Vec2::ZERO),
+            dirty: mem::take(&mut self.world.dirty),
+        }
+    }
+}
+
+/// Moves nodes in another view of the same graph (§30).
+///
+/// The body of every `mutate_later` this driver schedules, in one place: a peer is
+/// reached the same way whichever path found the change.
+fn apply_moves(mut widget: WidgetMut<'_, dyn Widget>, positions: Vec<(usize, Point)>) {
+    let mut canvas = widget.downcast::<CanvasLayer>();
+    for (index, pos) in positions {
+        CanvasLayer::move_child(&mut canvas, index, pos);
     }
 }
 
@@ -273,9 +312,9 @@ fn peers_of(ops: &Ops, own_canvas: WidgetId) -> Vec<WidgetId> {
 /// materialised, the zoom, the detail level, and how many widgets have been built.
 /// The cumulative pass counters live in [`CanvasStats`] for the benchmark; putting
 /// them on screen would change the text every frame and defeat the cache.
-/// The status line, and the second half of it is a measurement rather than a caption.
 ///
-/// A gesture is decided from the events themselves — the travel since the press and the
+/// The second line is a measurement rather than a caption. A gesture is decided from
+/// the events themselves — the travel since the press and the
 /// platform's own timestamps (§39.2) — so the only way to know that the platform really
 /// gives us what the mechanism assumes is to watch the counters move in a real window.
 /// A double click that never registers because `PointerState::time` arrives as zero on
@@ -414,36 +453,31 @@ impl NodeEditor {
         let Some(ops) = self.ops.as_mut() else {
             return;
         };
-        let moved = mem::take(&mut ops.world.moved);
-        let pan = mem::replace(&mut ops.world.pan, Vec2::ZERO);
-        if mem::take(&mut ops.world.dirty) {
+        let changes = ops.take_changes();
+        if changes.dirty {
             ctx.request_post_paint();
         }
-        let positions = positions_of(&ops.world, moved);
-        if positions.is_empty() && pan == Vec2::ZERO {
+        if changes.is_empty() {
             return;
         }
         {
             let (canvas, mut raw) = ctx.get_raw_mut(&mut self.canvas);
-            for &(index, pos) in &positions {
+            for &(index, pos) in &changes.positions {
                 canvas.move_child_raw(index, pos, &mut raw);
             }
-            if pan != Vec2::ZERO {
-                canvas.pan_raw(pan, &mut raw);
+            if changes.pan != Vec2::ZERO {
+                canvas.pan_raw(changes.pan, &mut raw);
             }
         }
-        if positions.is_empty() {
+        if changes.positions.is_empty() {
+            // A pan is this view's business alone: the view is not model state, so the
+            // other views of the graph are not following it (§30).
             return;
         }
         let peers = peers_of(self.ops.as_ref().expect("checked above"), self.canvas.id());
         for peer in peers {
-            let positions = positions.clone();
-            ctx.mutate_later(peer, move |mut widget| {
-                let mut canvas = widget.downcast::<CanvasLayer>();
-                for (index, pos) in positions {
-                    CanvasLayer::move_child(&mut canvas, index, pos);
-                }
-            });
+            let positions = changes.positions.clone();
+            ctx.mutate_later(peer, move |widget| apply_moves(widget, positions));
         }
     }
 

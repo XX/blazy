@@ -530,6 +530,45 @@ fn a_link_can_be_picked_and_highlights_under_the_pointer() {
     assert_eq!(canvas_stats(&mut harness).hovered, hit);
 }
 
+/// A link whose node has moved is pickable where it is now, not where it was.
+///
+/// The pick rejects a recorded curve by the bounding box stored when the set was
+/// chosen, and a drag moves the curve without re-choosing the set (§24.3) — so the box
+/// has to be re-measured as the node moves or the link becomes unpickable until the
+/// next selection. Nothing else would notice: the picture is redrawn from the
+/// endpoints and looks perfectly right.
+#[test]
+fn a_link_follows_the_node_that_moved() {
+    let (mut harness, _graph) = harness(500);
+    let index = node_inside_the_viewport(&mut harness);
+    let midpoint = |harness: &mut TestHarness<NodeEditor>| {
+        let from = node_pos(harness, index);
+        let to = node_pos(harness, index + 1);
+        Point::new(
+            (from.x + NODE_SIZE.width + to.x) / 2.0,
+            (from.y + to.y) / 2.0 + NODE_SIZE.height / 2.0,
+        )
+    };
+    let before = midpoint(&mut harness);
+    assert!(matches!(pick(&mut harness, before), Some(CanvasHit::Link { .. })));
+
+    // Down and to the right, far enough that the old box does not cover the new curve.
+    let was = node_pos(&mut harness, index);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::move_child(&mut canvas, index, Point::new(was.x, was.y + 220.0));
+        });
+    });
+    let _ = harness.redraw();
+
+    let now = midpoint(&mut harness);
+    let hit = pick(&mut harness, now);
+    assert!(
+        matches!(hit, Some(CanvasHit::Link { .. })),
+        "the link moved with the node, so it is pickable at {now:?}; got {hit:?}"
+    );
+}
+
 /// Below the far-field threshold nothing is a widget, and picking still works.
 ///
 /// The point of answering from the model: `find_widget_under_pointer` has nothing

@@ -27,6 +27,7 @@ pub struct Frame {
 
 /// Why a frame could not be produced.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HostError {
     /// The chosen backend could not be opened.
     Backend(BackendError),
@@ -43,10 +44,24 @@ impl std::fmt::Display for HostError {
     }
 }
 
-impl std::error::Error for HostError {}
+impl std::error::Error for HostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error),
+            Self::Render(error) => Some(error),
+        }
+    }
+}
+
+impl From<BackendError> for HostError {
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
+}
 
 /// Counters, for the criteria and for anyone wondering what a frame cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HostCounters {
     /// Frames composed and rasterised.
     pub frames: u64,
@@ -66,6 +81,25 @@ pub struct HostCounters {
     /// that never asks the host for an image never adds to it, which is what the
     /// criteria of §27.4 are about.
     pub image_bytes: u64,
+}
+
+impl HostCounters {
+    /// What has happened since `before`, field by field.
+    ///
+    /// The counters are cumulative for the life of the host, and every caller of them
+    /// wants a window: a benchmark brackets a scenario, a test brackets a frame. Doing
+    /// the subtraction here rather than at each call site is what lets a new counter be
+    /// added without every one of them having to hear about it.
+    #[must_use]
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            frames: self.frames.saturating_sub(before.frames),
+            layers: self.layers.saturating_sub(before.layers),
+            scenes: self.scenes.saturating_sub(before.scenes),
+            holes: self.holes.saturating_sub(before.holes),
+            image_bytes: self.image_bytes.saturating_sub(before.image_bytes),
+        }
+    }
 }
 
 /// Composes plans and rasterises them, with the backend chosen at startup.
@@ -126,6 +160,7 @@ impl Host {
         self.device_scale = scale;
     }
 
+    /// Builder form of [`set_device_scale`](Self::set_device_scale).
     pub fn with_device_scale(mut self, scale: f64) -> Self {
         self.set_device_scale(scale);
         self
@@ -137,6 +172,7 @@ impl Host {
         self
     }
 
+    /// What this host's frames have cost so far.
     pub fn counters(&self) -> HostCounters {
         self.counters
     }
@@ -158,7 +194,10 @@ impl Host {
     /// that round trip can land a pixel away from the surface it has to cover.
     pub fn render_sized(&mut self, plan: &VisualLayerPlan, size: PhysicalSize<u32>) -> Result<Frame, HostError> {
         let (width, height) = (size.width.max(1), size.height.max(1));
-        let composition = Composition::new(plan, self.device_scale);
+        let composition = match self.background {
+            Some(color) => Composition::on_background(plan, self.device_scale, color, width, height),
+            None => Composition::new(plan, self.device_scale),
+        };
 
         self.counters.frames += 1;
         self.counters.layers += composition.layers as u64;
@@ -166,10 +205,6 @@ impl Host {
         self.counters.holes += composition.holes.len() as u64;
         self.counters.image_bytes += u64::from(width) * u64::from(height) * 4;
 
-        let composition = match self.background {
-            Some(color) => composition.on_background(color, width, height),
-            None => composition,
-        };
         let mut scene = composition.scene;
         let image = self
             .renderer

@@ -51,6 +51,8 @@
 //! The test `masonry_widgets_do_not_follow_ui_scale` pins that down, and §22.1 says
 //! what would have to change upstream.
 
+#![warn(missing_docs, unreachable_pub)]
+
 mod region;
 mod tree;
 
@@ -80,14 +82,17 @@ const GRAB_SLOP: f64 = 3.0;
 
 /// What the screen is doing right now, plus counters for the Phase 0.5 measurements.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScreenStats {
     /// Areas the screen currently holds.
     pub areas: usize,
+    /// Cumulative work counters.
     pub counters: ScreenCounters,
 }
 
 /// Cumulative counters, for spotting work that should not be happening.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScreenCounters {
     /// Layout passes run on the screen itself.
     pub layouts: u64,
@@ -181,12 +186,22 @@ impl AreaScreen {
     /// The scripted form of a drag: what [`Widget::on_pointer_event`] does with a
     /// real pointer, exposed so the benchmark can do it without synthesising input.
     pub fn drag_bar(this: &mut WidgetMut<'_, Self>, split: NodeId, pos: Point) {
-        let Some(bar) = this.widget.bars.iter().find(|b| b.split == split).copied() else {
-            return;
-        };
-        if this.widget.tree.set_ratio(split, ratio_at(&bar, pos, BAR_THICKNESS)) {
+        if this.widget.move_bar(split, pos) {
             this.ctx.request_layout();
         }
+    }
+
+    /// Puts splitter `split` under `pos`. Returns whether anything moved.
+    ///
+    /// Both drag routes come through here — the scripted one above and the pointer
+    /// handler below — because the two differ only in which context they ask for the
+    /// relayout with, and a second copy of "find the bar, invert the layout, clamp" is
+    /// a second place for the splitter to start lagging the pointer.
+    fn move_bar(&mut self, split: NodeId, pos: Point) -> bool {
+        let Some(bar) = self.bars.iter().find(|b| b.split == split).copied() else {
+            return false;
+        };
+        self.tree.set_ratio(split, ratio_at(&bar, pos, BAR_THICKNESS))
     }
 
     /// The splitter under `pos`, if the pointer is close enough to grab one.
@@ -222,10 +237,7 @@ impl Widget for AreaScreen {
                     return;
                 };
                 let pos = ctx.local_position(current.position);
-                let Some(bar) = self.bars.iter().find(|b| b.split == split).copied() else {
-                    return;
-                };
-                if self.tree.set_ratio(split, ratio_at(&bar, pos, BAR_THICKNESS)) {
+                if self.move_bar(split, pos) {
                     ctx.request_layout();
                 }
                 ctx.set_handled();

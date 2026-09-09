@@ -14,8 +14,8 @@
 //!
 //! Selected through the adjacency list rather than through a spatial index of their
 //! own: a link is recorded when **either endpoint** lies in the recorded region. That
-//! is exact for a graph whose edges are shorter than the region margin — half a
-//! viewport — which is what a node editor is, and it makes a drag cheap, because the
+//! is exact for a graph whose edges are shorter than the region margin — a quarter of
+//! a viewport — which is what a node editor is, and it makes a drag cheap, because the
 //! links a moved node disturbs are exactly its own.
 //!
 //! It is not exact in general. A link whose two endpoints both lie outside the region
@@ -34,10 +34,10 @@
 //! All the recorded curves go into **one path per style** and are stroked with one
 //! command; a `move_to` per link is what keeps them apart, and each subpath is capped
 //! on its own (`kurbo::stroke` finishes the previous one on every `MoveTo`). A command
-//! costs ~0.4 us in every frame it sits in the scene against ~0.03 us for the same
-//! curve inside a shared one, and the paint pass re-appends the whole scene every
-//! frame whether or not anything changed — so N commands is the one thing a link layer
-//! must not be (§31).
+//! is charged in every frame it sits in the scene and costs fifteen times what the same
+//! curve costs inside a shared one (§31.1), and the paint pass re-appends the whole
+//! scene every frame whether or not anything changed — so N commands is the one thing a
+//! link layer must not be.
 //!
 //! The price is that **the drawing order between links is not defined**. Curves are
 //! grouped by style, not by index, so two overlapping links stack by group. Picking
@@ -49,11 +49,14 @@ use masonry::kurbo::{BezPath, CubicBez, Point, Rect};
 /// A connection between two nodes, by index into the canvas's node array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
+    /// The node the curve leaves, by index.
     pub from: u32,
+    /// The node the curve arrives at, by index.
     pub to: u32,
 }
 
 impl Link {
+    /// An edge between two nodes, by index into the canvas's node array.
     pub fn new(from: usize, to: usize) -> Self {
         Self {
             from: from as u32,
@@ -66,12 +69,27 @@ impl Link {
 #[derive(Default)]
 pub(crate) struct LinkLayer {
     edges: Vec<Link>,
-    /// Edge indices incident to each node.
-    adjacency: Vec<Vec<u32>>,
+    /// Edge indices incident to each node, packed: `incident[offsets[n]..offsets[n+1]]`
+    /// are node `n`'s edges.
+    ///
+    /// One array rather than a `Vec` per node, because the topology never changes after
+    /// [`new`](Self::new) — there is no API to add an edge — and a vector per node is a
+    /// vector per node: on a million-node graph that is a million allocations to build
+    /// and 24 MB of headers to hold, for lists that average two entries.
+    offsets: Vec<u32>,
+    incident: Vec<u32>,
     /// The region the recorded set was chosen for, in canvas coordinates.
     region: Option<Rect>,
     /// Edges in the recorded scene, ascending and without duplicates.
     recorded: Vec<u32>,
+    /// The canvas-space bounding box of each recorded curve, in step with `recorded`.
+    ///
+    /// Kept because it is computed anyway when the set is chosen, and because without it
+    /// a pick rebuilds every recorded curve to find the one under the pointer — a set
+    /// bounded by the *region*, which is what grows when the view pulls back (§28). It
+    /// is a conservative filter: a box that is missing or stale can only cost a curve
+    /// that would have been tested anyway.
+    bounds: Vec<Rect>,
     /// Set when the recorded scene no longer matches the curves and must be redrawn.
     ///
     /// Distinct from [`reselect`](Self::reselect) on purpose: a node being dragged
@@ -94,19 +112,40 @@ pub(crate) struct LinkLayer {
 
 impl LinkLayer {
     pub(crate) fn new(edges: Vec<Link>, node_count: usize) -> Self {
-        let mut adjacency = vec![Vec::new(); node_count];
+        // A counting sort into one array: count each node's edges, prefix-sum the
+        // counts into offsets, then fill. An edge naming a node outside the graph is
+        // dropped here rather than rejected — the graph is the application's to
+        // validate, and it is skipped when drawn for the same reason.
+        let mut offsets = vec![0_u32; node_count + 1];
+        let ends = |link: &Link| [link.from, link.to];
+        for link in &edges {
+            for end in ends(link) {
+                if (end as usize) < node_count {
+                    offsets[end as usize + 1] += 1;
+                }
+            }
+        }
+        for node in 0..node_count {
+            offsets[node + 1] += offsets[node];
+        }
+        let mut incident = vec![0_u32; offsets[node_count] as usize];
+        let mut cursor = offsets.clone();
         for (i, link) in edges.iter().enumerate() {
-            for end in [link.from, link.to] {
-                if let Some(list) = adjacency.get_mut(end as usize) {
-                    list.push(i as u32);
+            for end in ends(link) {
+                if (end as usize) < node_count {
+                    let at = &mut cursor[end as usize];
+                    incident[*at as usize] = i as u32;
+                    *at += 1;
                 }
             }
         }
         Self {
             edges,
-            adjacency,
+            offsets,
+            incident,
             region: None,
             recorded: Vec::new(),
+            bounds: Vec::new(),
             repaint: false,
             reselect: false,
             hidden: 0,
@@ -119,8 +158,25 @@ impl LinkLayer {
         self.edges.is_empty()
     }
 
+    /// The edges incident to `node`, or nothing for a node outside the graph.
+    fn incident(&self, node: usize) -> &[u32] {
+        let (Some(&from), Some(&to)) = (self.offsets.get(node), self.offsets.get(node + 1)) else {
+            return &[];
+        };
+        &self.incident[from as usize..to as usize]
+    }
+
     pub(crate) fn recorded(&self) -> &[u32] {
         &self.recorded
+    }
+
+    /// The bounding box of the recorded curve at `at`, if it has been measured.
+    ///
+    /// `None` between a selection and the measurement that follows it, which is the
+    /// only moment the two lists can be out of step. A caller that gets `None` has to
+    /// fall back to testing the curve.
+    pub(crate) fn recorded_bounds(&self, at: usize) -> Option<Rect> {
+        self.bounds.get(at).copied()
     }
 
     pub(crate) fn edge(&self, index: u32) -> Link {
@@ -136,20 +192,30 @@ impl LinkLayer {
         self.hidden
     }
 
-    /// Drops recorded links that `keep` rejects.
+    /// Measures every recorded link, dropping the ones `measure` answers `None` for.
     ///
-    /// Meant to be called straight after [`refresh`](Self::refresh), so a filter that
+    /// Meant to be called straight after [`refresh`](Self::refresh), so a rule that
     /// depends on the zoom runs once per *selection* rather than once per frame. That
     /// is the whole trick: the set is then slightly stale between selections — a link
     /// that shrank below the threshold after the last one keeps being drawn for a
     /// while — and that is the affordable direction of the error. It also keeps
     /// drawing and picking honest for free, because both read this one set.
     ///
-    /// `retain` preserves order, so `recorded` stays ascending.
-    pub(crate) fn retain_recorded(&mut self, mut keep: impl FnMut(Link) -> bool) {
+    /// The box that comes back is kept: the caller computes it to apply its rule, and a
+    /// pick needs the same box to reject a curve without rebuilding it. Order is
+    /// preserved, so `recorded` stays ascending and the boxes stay in step with it.
+    pub(crate) fn measure_recorded(&mut self, mut measure: impl FnMut(Link) -> Option<Rect>) {
         let before = self.recorded.len();
         let edges = &self.edges;
-        self.recorded.retain(|&edge| keep(edges[edge as usize]));
+        let bounds = &mut self.bounds;
+        bounds.clear();
+        self.recorded.retain(|&edge| match measure(edges[edge as usize]) {
+            Some(rect) => {
+                bounds.push(rect);
+                true
+            },
+            None => false,
+        });
         self.hidden = before - self.recorded.len();
     }
 
@@ -162,25 +228,35 @@ impl LinkLayer {
     ///
     /// Only if the node has links at all, and only if some of them are on screen: a
     /// drag in an empty corner of the graph should cost nothing.
-    pub(crate) fn node_moved(&mut self, node: usize) {
-        if self.repaint || self.edges.is_empty() {
+    /// `bounds_of` re-measures a curve whose node has just moved: the stored boxes are
+    /// what a pick rejects against, so a curve that moved without them would be
+    /// unpickable until the next selection.
+    pub(crate) fn node_moved(&mut self, node: usize, mut bounds_of: impl FnMut(Link) -> Rect) {
+        if self.edges.is_empty() {
             return;
         }
-        let Some(incident) = self.adjacency.get(node) else {
+        let (Some(&from), Some(&to)) = (self.offsets.get(node), self.offsets.get(node + 1)) else {
             return;
         };
-        if incident.iter().any(|edge| self.recorded.binary_search(edge).is_ok()) {
+        for i in from as usize..to as usize {
+            let edge = self.incident[i];
+            let Ok(at) = self.recorded.binary_search(&edge) else {
+                continue;
+            };
+            if let Some(box_of_a_curve) = self.bounds.get_mut(at) {
+                *box_of_a_curve = bounds_of(self.edges[edge as usize]);
+            }
             self.repaint = true;
         }
     }
 
     /// Whether the recorded set has to be re-chosen for this viewport.
-    pub(crate) fn needs_reselect(&self, visible_rect: Rect) -> bool {
+    pub(crate) fn needs_reselect(&self, live_rect: Rect) -> bool {
         !self.edges.is_empty()
             && (self.reselect
                 || !self
                     .region
-                    .is_some_and(|region| crate::region_covers(region, visible_rect, self.slack)))
+                    .is_some_and(|region| crate::region_covers(region, live_rect, self.slack)))
     }
 
     /// Sets how much larger than the viewport the recorded region may be, which follows
@@ -196,22 +272,27 @@ impl LinkLayer {
     /// avoid the index query it would need to produce `nodes` at all; this re-checks
     /// rather than trusting it, because the two are far apart in the source and the
     /// cost of asking again is a rectangle comparison.
-    pub(crate) fn refresh(&mut self, region: Rect, visible_rect: Rect, nodes: &[usize]) -> bool {
-        if !self.needs_reselect(visible_rect) {
+    pub(crate) fn refresh(&mut self, region: Rect, live_rect: Rect, nodes: &[usize]) -> bool {
+        if !self.needs_reselect(live_rect) {
             return false;
         }
         self.reselect = false;
 
-        self.recorded.clear();
+        // The recorded set is taken out so the incident lists can be read while it is
+        // filled; both live in `self`.
+        let mut recorded = std::mem::take(&mut self.recorded);
+        recorded.clear();
         for &node in nodes {
-            if let Some(incident) = self.adjacency.get(node) {
-                self.recorded.extend_from_slice(incident);
-            }
+            recorded.extend_from_slice(self.incident(node));
         }
+        self.recorded = recorded;
         // A link with both endpoints in the region is reached from each of them.
         self.recorded.sort_unstable();
         self.recorded.dedup();
 
+        // The boxes belong to the set that has just been replaced; the caller's
+        // `measure_recorded` fills them for the new one.
+        self.bounds.clear();
         self.region = Some(region);
         self.hidden = 0;
         self.refreshes += 1;
@@ -313,15 +394,15 @@ mod tests {
     fn a_drag_repaints_without_reselecting() {
         let mut layer = chain();
         // The proportions a viewport really produces: the region is the visible rect
-        // plus half of it on each side.
+        // plus a quarter of it on each side (§35.2).
         let visible = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let region = visible.inflate(50.0, 50.0);
+        let region = visible.inflate(25.0, 25.0);
         layer.refresh(region, visible, &[0, 1, 2]);
         layer.take_repaint();
         let refreshes = layer.refreshes();
 
         for _ in 0..10 {
-            layer.node_moved(1);
+            layer.node_moved(1, |_| Rect::ZERO);
             assert!(layer.take_repaint());
             assert!(!layer.refresh(region, visible, &[0, 1, 2]));
         }
@@ -383,11 +464,31 @@ mod tests {
         layer.refresh(region, region, &[0]);
         layer.take_repaint();
 
-        layer.node_moved(4);
+        layer.node_moved(4, |_| Rect::ZERO);
         assert!(!layer.take_repaint(), "node 4's link is not recorded");
 
-        layer.node_moved(0);
+        layer.node_moved(0, |_| Rect::ZERO);
         assert!(layer.take_repaint(), "node 0's link is");
+    }
+
+    /// The promise the crate makes about a graph it did not validate: an edge naming a
+    /// node that is not there is skipped, not rejected, and takes nothing with it.
+    ///
+    /// Worth a test of its own now that the adjacency is packed: with a vector per node
+    /// the out-of-range end simply found no list, and with offsets it is an index that
+    /// has to be checked before it is counted.
+    #[test]
+    fn an_edge_naming_a_missing_node_is_skipped() {
+        let mut layer = LinkLayer::new(vec![Link::new(0, 1), Link::new(1, 9), Link::new(2, 2)], 3);
+        let region = Rect::new(0.0, 0.0, 100.0, 100.0);
+
+        layer.refresh(region, region, &[0, 1, 2]);
+        // Edge 1 is reachable from node 1 only, and edge 2 is a self-link recorded once.
+        assert_eq!(layer.recorded(), &[0, 1, 2]);
+
+        let mut layer = LinkLayer::new(vec![Link::new(0, 1), Link::new(1, 9)], 3);
+        layer.refresh(region, region, &[2]);
+        assert!(layer.recorded().is_empty(), "node 2 has no edges");
     }
 
     #[test]
@@ -395,7 +496,7 @@ mod tests {
         let mut layer = LinkLayer::new(Vec::new(), 4);
         assert!(layer.is_empty());
         assert!(!layer.refresh(Rect::ZERO, Rect::ZERO, &[0, 1, 2, 3]));
-        layer.node_moved(0);
+        layer.node_moved(0, |_| Rect::ZERO);
         assert!(!layer.take_repaint());
     }
 
@@ -434,7 +535,7 @@ mod tests {
         layer.refresh(region, region, &[0, 1, 2, 3, 4]);
         assert_eq!(layer.recorded(), &[0, 1, 2, 3]);
 
-        layer.retain_recorded(|link| link.from % 2 == 0);
+        layer.measure_recorded(|link| (link.from % 2 == 0).then_some(Rect::ZERO));
         assert_eq!(layer.recorded(), &[0, 2], "ascending order survives the filter");
         assert_eq!(layer.hidden(), 2);
 

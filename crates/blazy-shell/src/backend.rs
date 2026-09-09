@@ -45,6 +45,7 @@ pub const COMPILED: &[Backend] = &[
 
 /// Why a backend could not be opened.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BackendError {
     /// The backend is not part of this build.
     ///
@@ -56,7 +57,12 @@ pub enum BackendError {
     /// A fact about the machine, not a defect in the build, and the reason the
     /// registry reports it rather than panicking: an application that cannot open
     /// the GPU backend should fall back to the CPU one, not fail to start.
-    Unavailable { backend: Backend, reason: String },
+    Unavailable {
+        /// The backend that could not be opened.
+        backend: Backend,
+        /// What the platform said about it.
+        reason: String,
+    },
 }
 
 impl fmt::Display for BackendError {

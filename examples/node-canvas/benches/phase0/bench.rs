@@ -613,6 +613,7 @@ pub fn run(opts: &Options) -> Outcome {
     let sweep = scaling_sweep(opts);
     let links = link_sweep(opts, count);
     let picks = pick_sweep(opts);
+    let pick_zooms = pick_zoom_sweep(opts);
     let zoom_picks = zoom_pick_sweep(opts);
     // Two graph sizes, because a ceiling that quietly follows the graph is exactly
     // what the zoom thresholds did (§29.1) and the criterion has to be able to see it.
@@ -638,7 +639,18 @@ pub fn run(opts: &Options) -> Outcome {
     let undo = crate::ops::undo_table(opts);
 
     let criteria = evaluate(
-        &reports, count, &sweep, &links, &picks, zoom_picks, &zooms, &dense, wobble, &far, &gestures,
+        &reports,
+        count,
+        &sweep,
+        &links,
+        &picks,
+        &pick_zooms,
+        zoom_picks,
+        &zooms,
+        &dense,
+        wobble,
+        &far,
+        &gestures,
     );
     zooms.extend(dense);
     let outcome = Outcome {
@@ -961,6 +973,77 @@ fn pick_sweep(opts: &Options) -> Vec<PickRecord> {
     points
 }
 
+/// One point of the picking sweep over the zoom.
+struct PickZoomRecord {
+    zoom: f64,
+    /// Link curves recorded for this viewport — the candidate set a pick walks.
+    recorded_links: usize,
+    /// Node geometries examined per pick.
+    node_tests: f64,
+    /// Link curves rebuilt and measured per pick.
+    curve_tests: f64,
+    /// Recorded curves walked past per pick — box tests, the cheap half.
+    curve_scans: f64,
+}
+
+/// Measures the cost of one pick against the **zoom**, which is the other axis.
+///
+/// [`pick_sweep`] sweeps the graph and holds the zoom still; this holds the graph and
+/// sweeps the zoom, because the two quantities a pick walks are bounded by different
+/// things. Nodes come from the grid and are bounded by density, which the zoom does not
+/// change. Curves come from the *recorded* set, and that is bounded by the region the
+/// canvas records for — the viewport plus its margin, in canvas units — so it grows as
+/// the view pulls back: §28 measured 9857 curves recorded at a zoom whose viewport held
+/// 96 nodes. A pointer moving over empty canvas at an overview zoom asks that question
+/// on every move.
+///
+/// Sampled over empty canvas as well as over nodes, deliberately: a pick that lands on
+/// a node never reaches the curves at all (§25.3), so a sweep that only touched nodes
+/// would report the cheap half.
+fn pick_zoom_sweep(opts: &Options) -> Vec<PickZoomRecord> {
+    const ZOOMS: [f64; 5] = [1.0, 0.4, 0.15, 0.08, 0.03];
+    const QUICK_ZOOMS: [f64; 3] = [1.0, 0.15, 0.03];
+
+    let zooms: &[f64] = if opts.quick { &QUICK_ZOOMS } else { &ZOOMS };
+    let nodes = 16_000;
+    let mut harness = linked_harness(nodes, node_canvas::generated_links(nodes).len());
+
+    println!("\npicking: cost of one pick vs zoom, {nodes} nodes");
+    let mut points = Vec::new();
+    for &zoom in zooms {
+        zoom_to(&mut harness, zoom);
+        let before = stats(&mut harness).counters;
+
+        let mut picks = 0_u64;
+        for row in 0..20 {
+            for col in 0..20 {
+                pick(
+                    &mut harness,
+                    Point::new(40.0 + col as f64 * 52.0, 30.0 + row as f64 * 36.0),
+                );
+                picks += 1;
+            }
+        }
+
+        let settled = stats(&mut harness);
+        let after = settled.counters;
+        let point = PickZoomRecord {
+            zoom: settled.zoom,
+            recorded_links: settled.recorded_links,
+            node_tests: per_pick(after.hit_node_tests - before.hit_node_tests, picks),
+            curve_tests: per_pick(after.hit_curve_tests - before.hit_curve_tests, picks),
+            curve_scans: per_pick(after.hit_curve_scans - before.hit_curve_scans, picks),
+        };
+        println!(
+            "  zoom {:>6.3}  recorded links {:>6}  node geometries/pick {:>6.1}  \
+             curves measured/pick {:>7.2}  boxes walked/pick {:>8.1}",
+            point.zoom, point.recorded_links, point.node_tests, point.curve_tests, point.curve_scans,
+        );
+        points.push(point);
+    }
+    points
+}
+
 /// Checks that a pick means the same thing at every zoom.
 ///
 /// The tolerance is in screen pixels and the test is in canvas units, so the two are
@@ -1038,6 +1121,7 @@ fn evaluate(
     sweep: &[SweepRecord],
     links: &[SweepRecord],
     picks: &[PickRecord],
+    pick_zooms: &[PickZoomRecord],
     zoom_picks: (usize, usize),
     zooms: &[ZoomRecord],
     dense_zooms: &[ZoomRecord],
@@ -1241,6 +1325,30 @@ fn evaluate(
             kind: Kind::Counter,
             measured: large.curve_tests,
             bound: small.curve_tests * 1.5 + 8.0,
+            unit: "curves/pick",
+        });
+    }
+
+    if let (Some(near), Some(far)) = (pick_zooms.first(), pick_zooms.last())
+        && near.zoom > far.zoom
+    {
+        // The other axis of the same claim, and the one the graph-size sweep cannot
+        // see: candidates come from the *recorded* set, which is bounded by the region
+        // the canvas records for and therefore grows as the view pulls back — 70 curves
+        // recorded at zoom 1 against 12 582 at zoom 0.03 on the same graph. Bounded
+        // against the near zoom rather than against a constant, so the criterion keeps
+        // meaning the same thing if the graph's density changes.
+        //
+        // The margin is wide on purpose and it is not slack: the pick tolerance is in
+        // screen pixels and divided by the scale (§25.2), so at zoom 0.03 the pointer
+        // reaches a hundred canvas units and legitimately has more curves near it than
+        // at zoom 1. What the criterion forbids is the cost following the *set*.
+        criteria.push(Criterion {
+            name: "link_picking_does_not_follow_the_zoom",
+            claim: "picking a link examines a bounded number of curves at any zoom",
+            kind: Kind::Counter,
+            measured: far.curve_tests,
+            bound: near.curve_tests * 4.0 + 16.0,
             unit: "curves/pick",
         });
     }

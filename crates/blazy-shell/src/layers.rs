@@ -38,6 +38,7 @@ use masonry::kurbo::{Affine, Rect};
 
 /// What the cache did, summed over frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LayerCounters {
     /// Layers offered to the cache — registered, and present in the plan.
     pub offered: u64,
@@ -95,9 +96,13 @@ struct Entry {
 /// decision is this rectangle plus a scene comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelRect {
+    /// Left edge, in physical pixels.
     pub x: u32,
+    /// Top edge, in physical pixels.
     pub y: u32,
+    /// Width in physical pixels.
     pub width: u32,
+    /// Height in physical pixels.
     pub height: u32,
 }
 

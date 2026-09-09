@@ -64,9 +64,13 @@ use crate::present::{PresentCounters, PresentError, Presenter};
 
 /// How the window should be created.
 pub struct WindowConfig {
+    /// The window's title.
     pub title: String,
+    /// Its initial inner size, in logical pixels.
     pub size: LogicalSize<f64>,
+    /// The smallest the user may make it, if it is bounded at all.
     pub min_size: Option<LogicalSize<f64>>,
+    /// Whether the user may resize it.
     pub resizable: bool,
     /// What the window shows where the widget tree drew nothing.
     ///
@@ -98,21 +102,26 @@ impl Default for WindowConfig {
 }
 
 impl WindowConfig {
+    /// The same configuration, with the window's title.
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
     }
 
+    /// The same configuration, with the initial inner size in logical pixels.
     pub fn with_size(mut self, width: f64, height: f64) -> Self {
         self.size = LogicalSize::new(width, height);
         self
     }
 
+    /// The same configuration, with the rasteriser named — or `None` for the first
+    /// one that opens.
     pub fn with_backend(mut self, backend: Option<Backend>) -> Self {
         self.backend = backend;
         self
     }
 
+    /// The same configuration, with the colour behind the widget tree.
     pub fn with_base_color(mut self, color: Color) -> Self {
         self.base_color = color;
         self
@@ -125,6 +134,7 @@ impl WindowConfig {
 /// strictly has to handle is a widget's action. Everything else the window knows is
 /// available through the widget tree.
 pub trait ShellDriver {
+    /// A widget emitted an action. The default drops it.
     fn on_action(&mut self, action: ErasedAction, from: WidgetId) {
         let _ = (action, from);
     }
@@ -217,7 +227,9 @@ impl<F: FnMut(ErasedAction, WidgetId)> ShellDriver for F {
 
 /// Why the shell could not run.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
+    /// No rasteriser could be opened.
     Backend(crate::BackendError),
     /// A frame could not be composed, rasterised or shown.
     ///
@@ -226,7 +238,9 @@ pub enum Error {
     /// library that leaks it into its public error type passes every upstream rename
     /// on to everyone downstream (§15.1).
     Presented(PresentError),
+    /// The event loop refused to start or to run.
     EventLoop(winit::error::EventLoopError),
+    /// The platform refused to create the window.
     Os(winit::error::OsError),
 }
 
@@ -241,7 +255,28 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error),
+            Self::Presented(error) => Some(error),
+            Self::EventLoop(error) => Some(error),
+            Self::Os(error) => Some(error),
+        }
+    }
+}
+
+impl From<crate::BackendError> for Error {
+    fn from(error: crate::BackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+impl From<PresentError> for Error {
+    fn from(error: PresentError) -> Self {
+        Self::Presented(error)
+    }
+}
 
 /// Runs an application in its own window until it exits.
 pub fn run(
@@ -290,6 +325,7 @@ pub struct BlitPresenter {
 }
 
 impl BlitPresenter {
+    /// Opens `backend` and a `softbuffer` surface on `window`.
     pub fn new(backend: Backend, window: Arc<Window>, background: Color) -> Result<Self, Error> {
         let platform = |error: softbuffer::SoftBufferError| Error::Presented(PresentError::Platform(error.to_string()));
         let host = Host::new(backend).map_err(Error::Backend)?.with_background(background);
@@ -391,7 +427,7 @@ impl ShellApp {
         tracing::info!(presenter = presenter.name(), "blazy shell");
 
         let signals = self.signals.clone();
-        let render_root = RenderRoot::new(
+        let mut render_root = RenderRoot::new(
             self.root.take().expect("the root widget is taken once"),
             move |signal| signals.borrow_mut().push(signal),
             RenderRootOptions {
@@ -404,7 +440,6 @@ impl ShellApp {
             },
         );
 
-        let mut render_root = render_root;
         self.driver.started(&mut render_root);
 
         window.request_redraw();

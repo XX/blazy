@@ -11,12 +11,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
-# The shell's own features, forwarded. An application depends on `blazy`, so anything
-# it cannot turn on here it cannot have at all — the GPU frame path included.
+# The shell's own features, forwarded in both directions. An application depends on
+# `blazy`, so anything it cannot turn on here it cannot have at all — and anything it
+# cannot turn *off* here it has to carry. The second half matters as much as the first:
+# guest mode (§14) hands us somebody else's device and wants no window system at all,
+# and a headless test wants the same, so `window` has to be refusable.
 [features]
-# `window` comes with the shell's own defaults; `vello` is the one an application has
-# to ask for, exactly as it does when depending on the shell directly.
-default = []
+# `window` is on by default, exactly as it is when depending on the shell directly;
+# `vello` is the one an application has to ask for.
+default = ["window"]
+window = ["blazy-shell/window"]
 vello = ["blazy-shell/vello"]
 
 [dependencies]

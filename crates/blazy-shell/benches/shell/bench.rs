@@ -379,13 +379,7 @@ fn measure<W: Widget>(
         frames,
         total,
         worst,
-        counters: HostCounters {
-            frames: after.frames - before.frames,
-            layers: after.layers - before.layers,
-            scenes: after.scenes - before.scenes,
-            holes: after.holes - before.holes,
-            image_bytes: after.image_bytes - before.image_bytes,
-        },
+        counters: after.since(before),
         layouts: layouts.get() - layouts_before,
         declared: declared(harness) - declared_before,
     }

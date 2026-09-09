@@ -15,6 +15,8 @@
 //! possible, and a ceiling is what keeps a journal of a long session from being the
 //! same problem as a snapshot.
 
+use std::collections::VecDeque;
+
 /// One reversible change.
 ///
 /// `&mut self` on both halves so a step may keep whatever it needs to invert itself
@@ -40,7 +42,10 @@ pub trait Step<W> {
 
 /// The history: what has been done, and what has been undone.
 pub struct UndoStack<W> {
-    done: Vec<Box<dyn Step<W>>>,
+    /// A deque rather than a `Vec`, and the ceiling is the reason: steps are pushed and
+    /// undone at the back, and [`trim`](Self::trim) drops them at the *front*, which on
+    /// a `Vec` is a move of the whole history per dropped step.
+    done: VecDeque<Box<dyn Step<W>>>,
     undone: Vec<Box<dyn Step<W>>>,
     bytes: usize,
     limit: usize,
@@ -54,9 +59,10 @@ impl<W> Default for UndoStack<W> {
 }
 
 impl<W> UndoStack<W> {
+    /// An empty history with no ceiling. See [`with_limit`](Self::with_limit).
     pub fn new() -> Self {
         Self {
-            done: Vec::new(),
+            done: VecDeque::new(),
             undone: Vec::new(),
             bytes: 0,
             limit: usize::MAX,
@@ -81,14 +87,14 @@ impl<W> UndoStack<W> {
     /// departed from, what was undone is no longer reachable.
     pub fn push(&mut self, step: Box<dyn Step<W>>) {
         self.bytes += step.bytes();
-        self.done.push(step);
+        self.done.push_back(step);
         self.forget_undone();
         self.trim();
     }
 
     /// Undoes the most recent step. Returns its name, or `None` if there was none.
     pub fn undo(&mut self, world: &mut W) -> Option<&'static str> {
-        let mut step = self.done.pop()?;
+        let mut step = self.done.pop_back()?;
         step.undo(world);
         let name = step.name();
         self.undone.push(step);
@@ -100,7 +106,7 @@ impl<W> UndoStack<W> {
         let mut step = self.undone.pop()?;
         step.redo(world);
         let name = step.name();
-        self.done.push(step);
+        self.done.push_back(step);
         Some(name)
     }
 
@@ -141,10 +147,14 @@ impl<W> UndoStack<W> {
     ///
     /// The oldest rather than the largest: history is only useful as an unbroken
     /// sequence backwards from now, and a hole in the middle of it is worse than a
-    /// shorter one.
+    /// shorter one. The most recent step is never dropped, so a ceiling smaller than
+    /// one step leaves one rather than none — an empty history is not a smaller one,
+    /// it is a different thing.
     fn trim(&mut self) {
         while self.bytes > self.limit && self.done.len() > 1 {
-            let step = self.done.remove(0);
+            let Some(step) = self.done.pop_front() else {
+                return;
+            };
             self.bytes = self.bytes.saturating_sub(step.bytes());
             self.dropped += 1;
         }
@@ -224,5 +234,27 @@ mod tests {
         // The two that are left still work, and history stops where it was trimmed.
         while stack.undo(&mut world).is_some() {}
         assert_eq!(world.value, 2, "what was dropped cannot be undone");
+    }
+
+    /// Trimming has to keep the *order* of what survives, not merely the count.
+    ///
+    /// The steps are distinguishable here, unlike in the test above: a history that
+    /// drops from the wrong end, or reorders what it keeps, undoes the wrong amount and
+    /// nothing but the final value would show it.
+    #[test]
+    fn what_a_ceiling_keeps_is_the_most_recent_in_order() {
+        let mut world = World::default();
+        // Four steps of 64 bytes, room for three.
+        let mut stack = UndoStack::new().with_limit(192);
+        for step in 1..=4 {
+            world.value += step;
+            stack.push(Box::new(Add(step)));
+        }
+        assert_eq!(world.value, 10);
+        assert_eq!(stack.depth(), 3);
+        assert_eq!(stack.dropped(), 1, "the oldest went, and only the oldest");
+
+        while stack.undo(&mut world).is_some() {}
+        assert_eq!(world.value, 1, "2, 3 and 4 came back off, in that order");
     }
 }

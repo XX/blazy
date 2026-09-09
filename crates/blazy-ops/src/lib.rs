@@ -25,19 +25,56 @@
 //!
 //! ## The shape of a use
 //!
-//! ```ignore
-//! let mut ops = OpRuntime::new(keymap());          // keymap is data
-//! ops.register(SelectOp::default());               // operators are named
+//! ```
+//! use blazy_ops::event::{OpEvent, Pattern};
+//! use blazy_ops::keymap::{Binding, Keymap, Props, Scope};
+//! use blazy_ops::runtime::{OpCtx, OpRuntime, Seat};
+//! use blazy_ops::{OpResult, Operator};
+//! use masonry::core::keyboard::{Key, Modifiers};
+//!
+//! // The world is the application's: the model, the selection, nothing of ours.
+//! #[derive(Default)]
+//! struct World {
+//!     dx: f64,
+//! }
+//!
+//! struct MoveOp;
+//! impl Operator<World> for MoveOp {
+//!     fn name(&self) -> &'static str {
+//!         "node.move"
+//!     }
+//!     fn invoke(&mut self, cx: &mut OpCtx<'_, World>) -> OpResult {
+//!         cx.world_mut().dx += cx.props().float("dx", 0.0);
+//!         OpResult::Finished
+//!     }
+//! }
+//!
+//! // The keymap is data: a context, a pattern, an operator's name and its arguments.
+//! let keymap = Keymap::new().with("canvas", vec![
+//!     Binding::new(Pattern::key("g"), "node.move").with_props(Props::new().with_float("dx", 30.0)),
+//! ]);
+//! let mut ops = OpRuntime::new(keymap);
+//! ops.register(MoveOp);
+//!
+//! let mut world = World::default();
 //! // …from a widget's event handler:
-//! ops.dispatch(&mut world, &OpEvent::Press { .. }, &scope, Seat::Bubbled);
-//! // …from a test or a script:
+//! let key = OpEvent::Key {
+//!     key: Key::Character("g".into()),
+//!     mods: Modifiers::empty(),
+//!     down: true,
+//! };
+//! ops.dispatch(&mut world, &key, Scope(&["canvas"]), Seat::Bubbled);
+//! // …and from a test or a script, through the same poll and the same history:
 //! ops.exec(&mut world, "node.move", &Props::new().with_float("dx", 30.0));
+//! assert_eq!(world.dx, 60.0);
 //! ```
 //!
 //! The world type `W` is the application's: everything an operator may touch goes
 //! through it, and nothing else does. Widgets cannot be touched from an operator at
 //! all — an operator changes the model and leaves the driver to carry the consequences
 //! into the tree (§30 already requires the model to be the truth).
+
+#![warn(missing_docs, unreachable_pub)]
 
 pub mod event;
 pub mod keymap;
@@ -118,6 +155,7 @@ pub trait Operator<W> {
 /// §37.4 repeated: a claim about an interaction system that can be stated as a count
 /// has to be, because a count is the same number on a laptop and on a CI runner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpCounters {
     /// Times a poll was asked.
     pub polled: u64,

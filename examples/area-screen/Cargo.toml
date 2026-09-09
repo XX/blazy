@@ -36,7 +36,7 @@ clap = { workspace = true }
 masonry = { workspace = true, features = ["testing"] }
 # With the GPU frame path: on any window worth the name it is the faster one, and
 # it falls back to the blit path on a machine without a device (§27.4).
-blazy-shell = { workspace = true, features = ["vello"] }
+blazy-shell = { workspace = true, features = ["window", "vello"] }
 # The area experiment measures many views of the graph Phase 0 already measured one
 # view of. Depending on that example rather than copying its model is what keeps the
 # two sets of numbers comparable.

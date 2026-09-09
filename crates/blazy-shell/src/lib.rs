@@ -23,6 +23,8 @@
 //! this crate owes it is to composite by walking the plan's layers rather than
 //! flattening them, which [`Composition`] does.
 
+#![warn(missing_docs, unreachable_pub)]
+
 mod backend;
 mod bounds;
 mod compose;

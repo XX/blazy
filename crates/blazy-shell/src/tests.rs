@@ -590,3 +590,31 @@ mod host_seat {
         assert!(widget_seen.get() > 0, "the tree got what the seat did not take");
     }
 }
+
+/// The cause of a failure has to survive the trip to the caller.
+///
+/// A library that wraps somebody else's error and drops it makes every downstream
+/// `anyhow` chain end at our variant name (§15.1). Cheap to keep, invisible to lose,
+/// so it is pinned here rather than trusted.
+#[test]
+fn an_error_hands_on_its_cause() {
+    let backend = crate::BackendError::Unavailable {
+        backend: crate::Backend::VelloCpu,
+        reason: "no device".to_string(),
+    };
+    let host = crate::HostError::from(backend);
+    let presented = crate::PresentError::from(host);
+    let shell = crate::window::Error::from(presented);
+
+    let mut causes = 0;
+    let mut error: &(dyn std::error::Error + 'static) = &shell;
+    while let Some(source) = error.source() {
+        causes += 1;
+        error = source;
+    }
+    assert_eq!(
+        causes, 3,
+        "shell -> present -> host -> backend, all the way to the leaf"
+    );
+    assert!(shell.to_string().contains("no device"), "{shell}");
+}

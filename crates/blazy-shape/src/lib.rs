@@ -38,6 +38,8 @@
 //! endpoints every frame, so there is nothing to cache, and the cheap rejection is
 //! the control polygon rather than a stored bounding box.
 
+#![warn(missing_docs, unreachable_pub)]
+
 use std::cell::RefCell;
 
 use masonry::core::{QueryCtx, Widget, WidgetRef, find_widget_under_pointer};
@@ -76,13 +78,21 @@ pub enum HitMode {
     /// `rule` decides what "inside" means where a path crosses itself, and it should
     /// be the same rule the shape is painted with — otherwise the hole a user can see
     /// is not the hole they can click through.
-    Fill { rule: Fill },
+    Fill {
+        /// Which winding rule decides what "inside" means.
+        rule: Fill,
+    },
     /// Within half of `width` of the outline, plus `slop` screen pixels.
     ///
     /// `width` is in local units, because it is the width the shape is stroked with
     /// and that is how a stroke is specified. `slop` is in screen pixels, because it
     /// is about the pointer rather than about the drawing.
-    Stroke { width: f64, slop: f64 },
+    Stroke {
+        /// The stroke width, in the shape's own units.
+        width: f64,
+        /// How far the pointer may miss the outline, in screen pixels.
+        slop: f64,
+    },
 }
 
 /// A precise hit shape, with the caches that make testing it cheap.
@@ -90,6 +100,17 @@ pub enum HitMode {
 /// Built once and kept by the widget, typically rebuilt in `layout` when the size it
 /// is derived from changes. The path is in the widget's **content-box coordinates**,
 /// which is the space `QueryCtx::to_local` maps a window position into.
+///
+/// ```
+/// use blazy_shape::ShapeHit;
+/// use masonry::kurbo::{Point, Rect, RoundedRect};
+///
+/// let body = ShapeHit::fill(RoundedRect::from_rect(Rect::new(0.0, 0.0, 160.0, 96.0), 24.0));
+/// // The scale turns a tolerance in screen pixels into one in local units; a fill has
+/// // no tolerance to convert, so any scale answers the same.
+/// assert!(body.contains(Point::new(80.0, 48.0), 1.0), "the middle is inside");
+/// assert!(!body.contains(Point::new(1.0, 1.0), 1.0), "the cut corner is not");
+/// ```
 #[derive(Debug)]
 pub struct ShapeHit {
     path: BezPath,
@@ -140,10 +161,12 @@ impl ShapeHit {
         }
     }
 
+    /// What counts as a hit on this shape.
     pub fn mode(&self) -> HitMode {
         self.mode
     }
 
+    /// The shape itself, in the widget's content-box coordinates.
     pub fn path(&self) -> &BezPath {
         &self.path
     }
@@ -182,9 +205,10 @@ impl ShapeHit {
 
     /// The precise phase, in front of Masonry's coarse one.
     ///
-    /// Drop-in body for [`Widget::find_widget_under_pointer`]:
+    /// Drop-in body for [`Widget::find_widget_under_pointer`] — a shape rather than an
+    /// example, because the widget around it is the caller's:
     ///
-    /// ```ignore
+    /// ```text
     /// fn find_widget_under_pointer<'c>(&'c self, ctx: QueryCtx<'c>, pos: Point)
     ///     -> Option<WidgetRef<'c, dyn Widget>> {
     ///     self.hit.find_widget(self, ctx, pos)

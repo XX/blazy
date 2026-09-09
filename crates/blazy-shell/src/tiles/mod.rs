@@ -81,6 +81,7 @@ const SPILL_PER_TILE: u64 = (TILE_PX as u64) * (TILE_PX as u64);
 
 /// What one composed scene asks the rasteriser for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Demand {
     /// Tiles across every path — compare against [`TILE_BUDGET`].
     pub tiles: u64,
@@ -90,6 +91,7 @@ pub struct Demand {
 
 /// A buffer a scene does not fit in, and by how much.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Overflow {
     /// More tiles than [`TILE_BUDGET`]: too many large paths (§33.1).
     Tiles {
@@ -122,11 +124,15 @@ pub enum Overflow {
 /// proportional to the geometry, and the expensive half of this — runs only for a scene
 /// that could plausibly be over (§33.3).
 pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> {
-    if !needs_walk(scene, frame) {
+    // Read once and handed to both halves: it is the cheap bound *and* the switch that
+    // decides whether the walk allocates a blend map at all, and the two used to count
+    // it separately.
+    let depth = nesting_depth(scene);
+    if !over_cheap_bounds(scene, frame, depth) {
         return None;
     }
 
-    let demand = demand(scene, frame);
+    let demand = demand_at_depth(scene, frame, depth);
     if demand.tiles > TILE_BUDGET {
         return Some(Overflow::Tiles {
             tiles: demand.tiles,
@@ -149,8 +155,13 @@ pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> 
 /// is asserting something about the machine, while this is the same claim as a
 /// deterministic counter (§20.9).
 pub fn needs_walk(scene: &Scene, frame: PhysicalSize<u32>) -> bool {
+    over_cheap_bounds(scene, frame, nesting_depth(scene))
+}
+
+/// [`needs_walk`], for a caller that already knows how deep the scene nests.
+fn over_cheap_bounds(scene: &Scene, frame: PhysicalSize<u32>, depth: u32) -> bool {
     let ceiling = (scene.commands().len() as u64).saturating_mul(frame_tiles(frame));
-    ceiling > TILE_BUDGET || nesting_depth(scene) > BLEND_STACK_SPLIT
+    ceiling > TILE_BUDGET || depth > BLEND_STACK_SPLIT
 }
 
 /// What a composed scene will ask vello for, at this frame size.
@@ -158,11 +169,15 @@ pub fn needs_walk(scene: &Scene, frame: PhysicalSize<u32>) -> bool {
 /// The exact walk. [`over_budget`] is what a frame path should call; this is for a test
 /// or a measurement that wants the numbers themselves.
 pub fn demand(scene: &Scene, frame: PhysicalSize<u32>) -> Demand {
+    demand_at_depth(scene, frame, nesting_depth(scene))
+}
+
+/// [`demand`], for a caller that already knows how deep the scene nests.
+fn demand_at_depth(scene: &Scene, frame: PhysicalSize<u32>, depth: u32) -> Demand {
     // The blend map is only allocated for a scene that could reach the spill at all:
     // four levels live in registers, so a shallower scene asks for zero words and the
     // per-tile bookkeeping would measure nothing.
-    let deep = nesting_depth(scene) > BLEND_STACK_SPLIT;
-    let mut counter = Counter::new(frame, deep);
+    let mut counter = Counter::new(frame, depth > BLEND_STACK_SPLIT);
     replay(scene, &mut counter);
     counter.finish()
 }

@@ -12,6 +12,31 @@
 //! young crates pinned to a git commit. Re-exporting through one surface is what makes
 //! it possible to absorb upstream churn in one place instead of in every application
 //! that depends on this one.
+//!
+//! ```
+//! use blazy::areas::SplitTree;
+//! use blazy::canvas::{Detail, DetailBudget, DetailThresholds};
+//! use blazy::ops::keymap::Keymap;
+//!
+//! // A screen of eight areas, each holding a canvas over one graph: the widget budget
+//! // is a window quantity, so it is divided rather than repeated (§29.1).
+//! let screen = SplitTree::balanced(8);
+//! let per_area = DetailBudget::default().split(screen.area_count());
+//! assert_eq!(per_area.widgets, DetailBudget::default().widgets / 8);
+//!
+//! // Zoom decides readability, the budget decides affordability, and the coarser wins.
+//! assert_eq!(DetailThresholds::default().for_scale(0.01), Detail::Box);
+//! assert!(Keymap::new().is_empty());
+//! ```
+//!
+//! # Features
+//!
+//! * `window` (default) — owner mode: our own window and event loop. Turn it off for guest mode (§14) or a headless
+//!   host, and nothing below pulls in a window system.
+//! * `vello` — the GPU rasteriser, chosen at startup rather than at compile time (§26.2). Off by default, because it
+//!   needs a graphics device.
+
+#![warn(missing_docs, unreachable_pub)]
 
 pub use blazy_areas as areas;
 pub use blazy_canvas as canvas;

@@ -22,8 +22,11 @@ use crate::event::{Device, OpEvent, Pattern};
 /// one will want an enum, and an enum written as a string is a bug waiting for a typo.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
+    /// A flag, e.g. `extend`.
     Bool(bool),
+    /// A whole number, e.g. `index`.
     Int(i64),
+    /// A distance or a fraction, e.g. `dx`.
     Float(f64),
 }
 
@@ -35,22 +38,26 @@ pub enum Value {
 pub struct Props(Vec<(&'static str, Value)>);
 
 impl Props {
+    /// No properties at all.
     pub fn new() -> Self {
         Self(Vec::new())
     }
 
+    /// The same properties, with a flag set.
     #[must_use]
     pub fn with_bool(mut self, name: &'static str, value: bool) -> Self {
         self.0.push((name, Value::Bool(value)));
         self
     }
 
+    /// The same properties, with a whole number set.
     #[must_use]
     pub fn with_int(mut self, name: &'static str, value: i64) -> Self {
         self.0.push((name, Value::Int(value)));
         self
     }
 
+    /// The same properties, with a float set.
     #[must_use]
     pub fn with_float(mut self, name: &'static str, value: f64) -> Self {
         self.0.push((name, Value::Float(value)));
@@ -98,13 +105,16 @@ impl Props {
 /// One entry of a keymap.
 #[derive(Clone, Debug)]
 pub struct Binding {
+    /// The event this binding fires on.
     pub pattern: Pattern,
     /// The operator's name, as [`Operator::name`](crate::Operator::name) gives it.
     pub op: &'static str,
+    /// The arguments the operator is run with.
     pub props: Props,
 }
 
 impl Binding {
+    /// A binding with no properties.
     pub fn new(pattern: Pattern, op: &'static str) -> Self {
         Self {
             pattern,
@@ -113,6 +123,7 @@ impl Binding {
         }
     }
 
+    /// The same binding, with the operator's arguments.
     #[must_use]
     pub fn with_props(mut self, props: Props) -> Self {
         self.props = props;
@@ -198,9 +209,13 @@ pub struct Keymap {
 /// the modal end handled by the runtime's stack rather than by a name here. The names
 /// are the application's: this crate never invents one.
 #[derive(Clone, Copy, Debug)]
-pub struct Scope<'a>(pub &'a [&'static str]);
+pub struct Scope<'a>(
+    /// The context names, innermost first.
+    pub &'a [&'static str],
+);
 
 impl Keymap {
+    /// A keymap with no bindings and the default [`Thresholds`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -232,25 +247,23 @@ impl Keymap {
     /// Returns every match rather than the first, because whether a binding runs is
     /// decided by its operator's poll and the runtime is the one holding the
     /// operators. A keymap that answered "the binding" would have to know them.
-    pub fn matches<'a>(&'a self, scope: Scope<'_>, event: &'a OpEvent) -> impl Iterator<Item = &'a Binding> + 'a {
-        let contexts: Vec<&'static str> = scope.0.to_vec();
-        contexts.into_iter().flat_map(move |context| {
-            self.sections
-                .iter()
-                .filter(move |section| section.context == context)
-                .flat_map(|section| section.bindings.iter())
-                .filter(move |binding| binding.pattern.matches(event))
-        })
+    pub fn matches<'a>(&'a self, scope: Scope<'a>, event: &'a OpEvent) -> impl Iterator<Item = &'a Binding> + 'a {
+        self.sections_for(scope)
+            .filter(move |binding| binding.pattern.matches(event))
     }
 
     /// Every binding in scope, innermost context first, whatever the event.
     ///
     /// [`matches`](Self::matches) answers "what fires on this event"; this answers "what
     /// could fire on this button at all", which is what the runtime needs *before* it
-    /// knows whether a press will become a click or a drag.
-    pub fn sections_for<'a>(&'a self, scope: Scope<'_>) -> impl Iterator<Item = &'a Binding> + 'a {
-        let contexts: Vec<&'static str> = scope.0.to_vec();
-        contexts.into_iter().flat_map(move |context| {
+    /// knows whether a press will become a click or a drag. The one is the other with a
+    /// filter, and they are written that way so the *order* they walk the scope in
+    /// cannot come apart.
+    ///
+    /// The scope is borrowed for as long as the iterator lives rather than copied into
+    /// one: a lookup happens on every input event, and this is called twice on a press.
+    pub fn sections_for<'a>(&'a self, scope: Scope<'a>) -> impl Iterator<Item = &'a Binding> + 'a {
+        scope.0.iter().flat_map(move |&context| {
             self.sections
                 .iter()
                 .filter(move |section| section.context == context)
@@ -268,6 +281,7 @@ impl Keymap {
         self.sections.iter().map(|section| section.bindings.len()).sum()
     }
 
+    /// Whether the keymap binds anything at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
