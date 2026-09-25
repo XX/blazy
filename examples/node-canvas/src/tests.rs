@@ -4,13 +4,13 @@
 //! is *correct*, which is the harder half: a canvas that quietly loses the user's
 //! edits when a node scrolls off screen would post excellent numbers.
 
-use blazy_canvas::{CanvasHit, CanvasLayer, DetailBudget};
-use masonry::core::{NewWidget, WidgetId, WidgetRef};
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Point, Vec2};
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
-use masonry::ui_events::pointer::PointerButton;
+use blazy::canvas::{CanvasHit, CanvasLayer, DetailBudget};
+use blazy::masonry::core::{NewWidget, WidgetId, WidgetRef};
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Point, Vec2};
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
+use blazy::masonry::ui_events::pointer::PointerButton;
 
 use crate::CanvasSpec;
 use crate::editor::NodeEditor;
@@ -25,7 +25,7 @@ fn harness_with(count: usize, controls_on_hover: bool) -> (TestHarness<NodeEdito
     let (canvas, graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
+        NewWidget::new(crate::editor::new(canvas)),
         PhysicalSize::new(1100, 750),
     );
     let _ = harness.redraw();
@@ -41,7 +41,7 @@ fn pan(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
     let _ = harness.redraw();
 }
 
-fn live(harness: &mut TestHarness<NodeEditor>) -> Vec<(usize, masonry::core::WidgetId)> {
+fn live(harness: &mut TestHarness<NodeEditor>) -> Vec<(usize, blazy::masonry::core::WidgetId)> {
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
     })
@@ -73,7 +73,7 @@ fn hover_node(harness: &mut TestHarness<NodeEditor>, index: usize) {
     let centre = harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             let pos = CanvasLayer::child_pos(&mut canvas, index).expect("node exists");
-            masonry::kurbo::Point::new(pos.x + NODE_SIZE.width / 2.0, pos.y + 6.0)
+            blazy::masonry::kurbo::Point::new(pos.x + NODE_SIZE.width / 2.0, pos.y + 6.0)
         })
     });
     harness.mouse_move(centre);
@@ -193,7 +193,7 @@ fn controls_write_back_to_the_model() {
 fn zoom_out(harness: &mut TestHarness<NodeEditor>, factor: f64) {
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
-            CanvasLayer::zoom_around(&mut canvas, masonry::kurbo::Point::new(550.0, 375.0), factor);
+            CanvasLayer::zoom_around(&mut canvas, blazy::masonry::kurbo::Point::new(550.0, 375.0), factor);
         });
     });
     let _ = harness.redraw();
@@ -245,7 +245,7 @@ fn far_field_nodes_stay_draggable() {
     let before = harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             let p = CanvasLayer::child_pos(&mut canvas, 7).unwrap();
-            CanvasLayer::move_child(&mut canvas, 7, masonry::kurbo::Point::new(p.x + 500.0, p.y));
+            CanvasLayer::move_child(&mut canvas, 7, blazy::masonry::kurbo::Point::new(p.x + 500.0, p.y));
             p
         })
     });
@@ -426,7 +426,7 @@ fn under_pointer(harness: &TestHarness<NodeEditor>, pos: Point) -> Option<Widget
 ///
 /// Not `NodeEditor::stats`, which is a copy taken during layout: a pick deliberately
 /// does not run one (§25.4), so the copy would be from before the pointer moved.
-fn canvas_stats(harness: &mut TestHarness<NodeEditor>) -> blazy_canvas::CanvasStats {
+fn canvas_stats(harness: &mut TestHarness<NodeEditor>) -> blazy::canvas::CanvasStats {
     harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats()))
 }
 
@@ -656,7 +656,7 @@ fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEdito
     let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
+        NewWidget::new(crate::editor::new(canvas)),
         PhysicalSize::new(1100, 750),
     );
     let _ = harness.redraw();

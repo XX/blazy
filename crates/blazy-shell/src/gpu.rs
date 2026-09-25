@@ -20,6 +20,7 @@ use masonry::app::VisualLayerPlan;
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Affine, Size};
 use masonry::peniko::Color;
+#[cfg(feature = "window")]
 use wgpu::CurrentSurfaceTexture;
 
 use crate::backend::{Backend, BackendError};

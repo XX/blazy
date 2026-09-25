@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 pub(crate) use bench_utils::criteria::ScenarioRecord;
 use bench_utils::criteria::{Criterion, Kind, Outcome, SweepRecord, ZoomRecord};
 use bench_utils::plan;
-use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, DetailBudget};
-use masonry::core::NewWidget;
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Affine, Point, Vec2};
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
+use blazy::canvas::{CanvasHit, CanvasLayer, CanvasStats, DetailBudget};
+use blazy::masonry::core::NewWidget;
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Affine, Point, Vec2};
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
 use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::{GRID_STEP, GraphModel, NODE_SIZE, share};
@@ -240,7 +240,7 @@ pub(crate) fn pan_step(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
 }
 
 /// Sets an absolute zoom about the centre of the viewport.
-fn zoom_to(harness: &mut TestHarness<NodeEditor>, target: f64) {
+pub(crate) fn zoom_to(harness: &mut TestHarness<NodeEditor>, target: f64) {
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             let zoom = canvas.widget.zoom();
@@ -289,13 +289,13 @@ fn pick(harness: &mut TestHarness<NodeEditor>, pos: Point) -> Option<CanvasHit> 
 }
 
 /// The canvas-space rectangle of a node.
-pub(crate) fn node_rect(harness: &mut TestHarness<NodeEditor>, index: usize) -> masonry::kurbo::Rect {
+pub(crate) fn node_rect(harness: &mut TestHarness<NodeEditor>, index: usize) -> blazy::masonry::kurbo::Rect {
     let pos = harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             CanvasLayer::child_pos(&mut canvas, index).unwrap_or(Point::ORIGIN)
         })
     });
-    masonry::kurbo::Rect::from_origin_size(pos, NODE_SIZE)
+    blazy::masonry::kurbo::Rect::from_origin_size(pos, NODE_SIZE)
 }
 
 fn new_harness(count: usize) -> TestHarness<NodeEditor> {
@@ -309,7 +309,7 @@ fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
     let (canvas, _graph) = CanvasSpec::new(count).with_links(edges).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
+        NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
     let _ = harness.redraw();
@@ -318,7 +318,7 @@ fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
 
 fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEditor> {
     let (canvas, _graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
-    let editor = NodeEditor::new(canvas);
+    let editor = node_canvas::editor::new(canvas);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(editor),
@@ -341,7 +341,7 @@ fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
     let canvas = CanvasSpec::new(count).over(&graph);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
+        NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
     let _ = harness.redraw();
@@ -354,7 +354,7 @@ fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEdito
     let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
+        NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
     let _ = harness.redraw();
@@ -637,6 +637,8 @@ pub fn run(opts: &Options) -> Outcome {
     // What a gesture costs and where the operator layer can sit (§38).
     let gestures = crate::ops::ops_table(opts, count);
     let undo = crate::ops::undo_table(opts);
+    // What editing the shape of the graph costs, and what it must leave behind (§43).
+    let edits = crate::edits::edit_table(opts);
 
     let criteria = evaluate(
         &reports,
@@ -651,6 +653,7 @@ pub fn run(opts: &Options) -> Outcome {
         wobble,
         &far,
         &gestures,
+        &edits,
     );
     zooms.extend(dense);
     let outcome = Outcome {
@@ -664,6 +667,7 @@ pub fn run(opts: &Options) -> Outcome {
             .chain(far.iter().map(crate::far::FarRow::record))
             .chain(gestures.iter().map(crate::ops::OpsRow::record))
             .chain(undo.iter().map(crate::ops::UndoRow::record))
+            .chain(edits.iter().map(crate::edits::EditRow::record))
             .collect(),
         sweep,
         zoom_sweep: zooms,
@@ -1128,9 +1132,11 @@ fn evaluate(
     wobble: f64,
     far: &[crate::far::FarRow],
     gestures: &[crate::ops::OpsRow],
+    edits: &[crate::edits::EditRow],
 ) -> Vec<Criterion> {
     let find = |name: &str| reports.iter().find(|r| r.name == name);
     let mut criteria = Vec::new();
+    criteria.extend(crate::edits::criteria(edits));
 
     if let Some(pan) = find("pan") {
         // A pan should only lay out nodes newly entering the viewport. Anything

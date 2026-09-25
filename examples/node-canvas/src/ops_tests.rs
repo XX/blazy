@@ -7,16 +7,16 @@
 
 use std::collections::BTreeSet;
 
-use blazy_canvas::CanvasLayer;
-use blazy_ops::OpResult;
-use blazy_ops::keymap::Props;
-use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
-use masonry::core::{NewWidget, TextEvent};
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Point, Vec2};
-use masonry::testing::{TestHarness, TestHarnessParams};
-use masonry::theme::default_property_set;
-use masonry::ui_events::pointer::PointerButton;
+use blazy::canvas::CanvasLayer;
+use blazy::masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
+use blazy::masonry::core::{NewWidget, TextEvent};
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Point, Vec2};
+use blazy::masonry::testing::{TestHarness, TestHarnessParams};
+use blazy::masonry::theme::default_property_set;
+use blazy::masonry::ui_events::pointer::PointerButton;
+use blazy::ops::OpResult;
+use blazy::ops::keymap::Props;
 
 use crate::CanvasSpec;
 use crate::editor::NodeEditor;
@@ -31,7 +31,7 @@ fn ops_harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
     let (canvas, graph) = CanvasSpec::new(count).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::with_ops(canvas, &graph)),
+        NewWidget::new(crate::editor::with_ops(canvas, &graph)),
         PhysicalSize::new(1100, 750),
     );
     let _ = harness.redraw();
@@ -89,7 +89,7 @@ fn selection(harness: &TestHarness<NodeEditor>) -> BTreeSet<usize> {
     harness.root_widget().selection()
 }
 
-fn snapshot(graph: &SharedGraph) -> Vec<NodeState> {
+fn snapshot(graph: &SharedGraph) -> Vec<Option<NodeState>> {
     graph.borrow().snapshot()
 }
 
@@ -240,7 +240,7 @@ fn a_pan_on_a_scaled_display_moves_by_what_the_pointer_did() {
     let (canvas, graph) = CanvasSpec::new(500).build();
     let mut harness = TestHarness::create_with(
         default_property_set(),
-        NewWidget::new(NodeEditor::with_ops(canvas, &graph)),
+        NewWidget::new(crate::editor::with_ops(canvas, &graph)),
         {
             let mut params = TestHarnessParams::default();
             params.window_size = PhysicalSize::new(1100, 750);
@@ -447,9 +447,9 @@ fn a_box_select_takes_what_it_covers() {
 
     // Every selected node really is inside the band, checked against the model rather
     // than against whatever the canvas had materialised.
-    let band = masonry::kurbo::Rect::from_points(start, corner);
+    let band = blazy::masonry::kurbo::Rect::from_points(start, corner);
     for index in selected {
-        let rect = masonry::kurbo::Rect::from_origin_size(graph.borrow().node(index).pos, NODE_SIZE);
+        let rect = blazy::masonry::kurbo::Rect::from_origin_size(graph.borrow().node(index).pos, NODE_SIZE);
         let overlap = rect.intersect(band);
         assert!(
             overlap.width() > 0.0 && overlap.height() > 0.0,

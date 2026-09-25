@@ -12,17 +12,17 @@
 
 use std::time::Instant;
 
-use blazy_canvas::CanvasLayer;
-use blazy_ops::event::{Device, Sample};
-use blazy_ops::keymap::{Props, Scope};
-use blazy_ops::runtime::Seat;
-use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
-use masonry::core::{NewWidget, TextEvent};
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Point, Vec2};
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
-use masonry::ui_events::pointer::PointerButton;
+use blazy::canvas::CanvasLayer;
+use blazy::masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
+use blazy::masonry::core::{NewWidget, TextEvent};
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Point, Vec2};
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
+use blazy::masonry::ui_events::pointer::PointerButton;
+use blazy::ops::event::{Device, Sample};
+use blazy::ops::keymap::{Props, Scope};
+use blazy::ops::runtime::Seat;
 use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::{NODE_SIZE, SharedGraph};
@@ -108,11 +108,11 @@ pub(crate) struct UndoRow {
 }
 
 /// A harness whose editor drives operators, with the keymap hearing keys.
-fn ops_harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
+pub(crate) fn ops_harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
     let (canvas, graph) = CanvasSpec::new(count).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::with_ops(canvas, &graph)),
+        NewWidget::new(node_canvas::editor::with_ops(canvas, &graph)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
     let _ = harness.redraw();
@@ -126,7 +126,7 @@ fn plain_harness(count: usize, builtin_gestures: bool) -> (TestHarness<NodeEdito
     let (canvas, graph) = CanvasSpec::new(count).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas.with_builtin_gestures(builtin_gestures))),
+        NewWidget::new(node_canvas::editor::new(canvas.with_builtin_gestures(builtin_gestures))),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
     let _ = harness.redraw();
@@ -182,7 +182,7 @@ struct Before {
     child_layouts: u64,
     content_layouts: u64,
     picks: u64,
-    ops: blazy_ops::OpCounters,
+    ops: blazy::ops::OpCounters,
 }
 
 fn before(harness: &mut TestHarness<NodeEditor>) -> Before {
@@ -430,7 +430,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
         // its other half: it decides for itself that this key is the keymap's.
         world.pointer = at;
         world.hover = probe(&mut harness, at, &mut probes);
-        let key_event = blazy_ops::event::OpEvent::Key {
+        let key_event = blazy::ops::event::OpEvent::Key {
             key: Key::Character("g".into()),
             mods: Modifiers::empty(),
             down: true,
@@ -450,7 +450,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
             // gets is the point — a consumed event is not forwarded at all.
             world.hover = probe(&mut harness, pos, &mut probes);
             world.pointer = pos;
-            let moved = blazy_ops::event::OpEvent::Move {
+            let moved = blazy::ops::event::OpEvent::Move {
                 pos,
                 mods: Modifiers::empty(),
             };
@@ -472,7 +472,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
             let _ = harness.redraw();
         }
 
-        let confirm = blazy_ops::event::OpEvent::Press {
+        let confirm = blazy::ops::event::OpEvent::Press {
             button: PointerButton::Primary,
             pos: at,
             mods: Modifiers::empty(),
@@ -521,7 +521,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
 ///
 /// One `RenderRoot::edit_widget`, which runs the whole rewrite battery afterwards —
 /// the price of the host seat, and the reason it is a column.
-fn probe(harness: &mut TestHarness<NodeEditor>, pos: Point, probes: &mut usize) -> Option<blazy_canvas::CanvasHit> {
+fn probe(harness: &mut TestHarness<NodeEditor>, pos: Point, probes: &mut usize) -> Option<blazy::canvas::CanvasHit> {
     *probes += 1;
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::hit_test(&mut canvas, pos))
@@ -616,7 +616,7 @@ pub(crate) fn undo_table(opts: &Options) -> Vec<UndoRow> {
 /// Moves `moved` nodes with one operator and prices the step it leaves behind.
 fn undo_case(mode: UndoMode, name: &'static str, nodes: usize, moved: usize) -> UndoRow {
     let (mut harness, _graph) = ops_harness(nodes);
-    harness.edit_root_widget(|mut editor| NodeEditor::set_undo_mode(&mut editor, mode));
+    harness.edit_root_widget(|mut editor| node_canvas::ops::set_undo_mode(&mut editor, mode));
     // Selected through the operator, so the two rows differ in one thing only.
     harness.edit_root_widget(|mut editor| {
         for index in 0..moved {

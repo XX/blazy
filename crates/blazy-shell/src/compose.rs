@@ -55,6 +55,10 @@ pub(crate) enum LayerChoice {
     /// Replay it into the frame's scene, which is what an ordinary frame does.
     Draw,
     /// Leave it out: its pixels are coming from somewhere else (§36).
+    #[cfg_attr(
+        not(feature = "vello"),
+        expect(dead_code, reason = "only the layer cache keeps a layer")
+    )]
     Keep,
 }
 

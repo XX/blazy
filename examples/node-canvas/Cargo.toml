@@ -37,15 +37,10 @@ harness = false
 workspace = true
 
 [dependencies]
-blazy-canvas = { workspace = true }
-blazy-ops = { workspace = true }
-blazy-shape = { workspace = true }
+blazy = { workspace = true, features = ["vello"] }
 clap = { workspace = true }
-masonry = { workspace = true, features = ["testing"] }
-# With the GPU frame path: on any window worth the name it is the faster one, and
-# it falls back to the blit path on a machine without a device (§27.4).
-blazy-shell = { workspace = true, features = ["window", "vello"] }
 
 [dev-dependencies]
+blazy = { workspace = true, features = ["vello", "testing"] }
 bench-utils = { workspace = true }
 image = { workspace = true }

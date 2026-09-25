@@ -12,15 +12,15 @@
 
 use std::any::TypeId;
 
-use blazy_areas::UiScale;
-use masonry::accesskit::{Node, Role};
-use masonry::core::{
+use blazy::areas::UiScale;
+use blazy::masonry::accesskit::{Node, Role};
+use blazy::masonry::core::{
     AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PropertiesRef, RegisterCtx, UpdateCtx, Widget,
 };
-use masonry::imaging::Painter;
-use masonry::kurbo::{Axis, Rect, RoundedRect, Size};
-use masonry::layout::{LenReq, Length};
-use masonry::peniko::Color;
+use blazy::masonry::imaging::Painter;
+use blazy::masonry::kurbo::{Axis, Rect, RoundedRect, Size};
+use blazy::masonry::layout::{LenReq, Length};
+use blazy::masonry::peniko::Color;
 
 /// Number of mock controls in the header.
 const CONTROLS: usize = 5;

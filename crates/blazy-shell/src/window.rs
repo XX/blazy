@@ -279,6 +279,12 @@ impl From<PresentError> for Error {
 }
 
 /// Runs an application in its own window until it exits.
+///
+/// # Errors
+///
+/// If the event loop cannot start, or the window or the path its frames take to the
+/// screen cannot be created. A frame that fails later is logged rather than returned:
+/// by then the application is running, and one bad frame is not a reason to end it.
 pub fn run(
     config: WindowConfig,
     root: NewWidget<dyn Widget>,
@@ -303,8 +309,10 @@ pub fn run(
         reducer: WindowEventReducer::default(),
         last_anim: Instant::now(),
         refusing: false,
+        failure: None,
     };
-    event_loop.run_app(&mut app).map_err(Error::EventLoop)
+    event_loop.run_app(&mut app).map_err(Error::EventLoop)?;
+    app.failure.map_or(Ok(()), Err)
 }
 
 // --- MARK: BLIT
@@ -409,6 +417,12 @@ struct ShellApp {
     /// Kept so the warning is logged when the state changes rather than sixty times a
     /// second: a scene over the tile budget stays over it while nothing moves.
     refusing: bool,
+    /// Why the window could not be started, handed back by [`run`] once the loop stops.
+    ///
+    /// Kept rather than raised where it happens: `resumed` has no way to return an
+    /// error, and a panic there unwinds through the platform's event loop and takes the
+    /// `Result` that `run` promises its caller with it.
+    failure: Option<Error>,
 }
 
 impl ShellApp {
@@ -611,9 +625,14 @@ fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &Rgb
 
 impl ApplicationHandler for ShellApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            self.start(event_loop).expect("the window could not be created");
-            self.drain_signals(event_loop);
+        if self.window.is_none() && self.failure.is_none() {
+            match self.start(event_loop) {
+                Ok(()) => self.drain_signals(event_loop),
+                Err(error) => {
+                    self.failure = Some(error);
+                    event_loop.exit();
+                },
+            }
         }
     }
 

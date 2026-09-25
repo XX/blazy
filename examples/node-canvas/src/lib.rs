@@ -34,7 +34,7 @@ mod ops_tests;
 #[cfg(test)]
 mod tests;
 
-use blazy_canvas::{CanvasLayer, Link};
+use blazy::canvas::{CanvasLayer, Link};
 
 use crate::model::{GraphModel, NODE_SIZE, SharedGraph, share};
 use crate::node::GraphSource;
@@ -112,19 +112,23 @@ impl CanvasSpec {
     /// measurements need: comparing one area against sixteen only means something if
     /// all sixteen are looking at the same graph rather than sixteen graphs of their own.
     pub fn over(self, graph: &SharedGraph) -> CanvasLayer {
-        let nodes = self.nodes;
+        // Names rather than nodes: a graph that has been edited has holes, and the view
+        // has to agree about them (§43).
+        let names = graph.borrow().names();
         let geometry = {
             let graph = graph.clone();
-            move |i: usize| (graph.borrow().node(i).pos, NODE_SIZE)
+            move |i: usize| graph.borrow().try_node(i).map(|node| (node.pos, NODE_SIZE))
         };
         let source = GraphSource::new(graph.clone()).with_far_min_radius(self.far.min_radius_px);
-        CanvasLayer::new(nodes, geometry, source)
+        CanvasLayer::new(names, geometry, source)
             .with_controls_on_hover(self.controls_on_hover)
-            .with_links(self.links.unwrap_or_else(|| generated_links(nodes)))
+            // The graph's links unless the caller names its own, because topology is the
+            // model's (§43): two views over one graph must not hold two copies of it.
+            .with_links(self.links.unwrap_or_else(|| graph.borrow().links().to_vec()))
             .with_far_overscan(self.far.overscan)
-            .with_link_style(blazy_canvas::LinkStyle {
+            .with_link_style(blazy::canvas::LinkStyle {
                 min_screen_length: self.far.min_link_px,
-                ..blazy_canvas::LinkStyle::default()
+                ..blazy::canvas::LinkStyle::default()
             })
     }
 }
@@ -176,7 +180,7 @@ impl Default for FarTuning {
         Self {
             overscan: CanvasLayer::DEFAULT_FAR_OVERSCAN,
             min_radius_px: crate::node::FAR_MIN_RADIUS_PX,
-            min_link_px: blazy_canvas::LinkStyle::default().min_screen_length,
+            min_link_px: blazy::canvas::LinkStyle::default().min_screen_length,
         }
     }
 }

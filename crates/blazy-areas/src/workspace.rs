@@ -26,6 +26,11 @@
 //! `tree` is a prefix expression — `area <id>` or `split <h|v> <ratio> <expr> <expr>`.
 //! The rest of a `content` line is the application's own name, spaces included.
 //!
+//! A file is input, and it is read as input: an area id at or above
+//! [`MAX_AREAS`](crate::MAX_AREAS), or splits nested deeper than that many areas could
+//! need, is [`WorkspaceError::Malformed`] — never an allocation the size of the number,
+//! and never a stack overflow. No tree a split can build is past either bound.
+//!
 //! **No `serde`, and that is a decision rather than an omission (§41.6).** A dependency
 //! in `blazy-areas` is a dependency for everyone who sits on this library; behind a
 //! feature flag it is also a flag the facade has to forward (§40.4). What it would buy is
@@ -358,6 +363,85 @@ mod tests {
         assert_eq!(
             Workspace::parse("blazy-workspace 1\ntree split h 0.5 area 0 area 0\n").err(),
             Some(WorkspaceError::Malformed { line: 2 })
+        );
+    }
+
+    /// An id is a size somebody allocates — `AreaScreen` keys its widgets by it — so a
+    /// file is not allowed to name one past [`MAX_AREAS`](crate::MAX_AREAS). Both sides of
+    /// the bound, and the one that used to overflow.
+    #[test]
+    fn an_area_id_past_the_bound_is_refused_rather_than_allocated() {
+        let last = crate::MAX_AREAS - 1;
+        let read = Workspace::parse(&format!("blazy-workspace 1\ntree area {last}\n"));
+        assert!(read.is_ok(), "the largest id a tree can hand out reads back");
+
+        for area in [
+            crate::MAX_AREAS.to_string(),
+            "4000000000".to_string(),
+            usize::MAX.to_string(),
+        ] {
+            assert_eq!(
+                Workspace::parse(&format!("blazy-workspace 1\ntree area {area}\n")).err(),
+                Some(WorkspaceError::Malformed { line: 2 }),
+                "area {area}"
+            );
+        }
+    }
+
+    /// Nesting is refused on the way down, before a leaf could bound it: a file of nothing
+    /// but `split` must be an error, not a stack overflow.
+    #[test]
+    fn nesting_deeper_than_any_tree_is_refused() {
+        let text = format!("blazy-workspace 1\ntree {}area 0\n", "split h 0.5 ".repeat(100_000));
+        assert_eq!(
+            Workspace::parse(&text).err(),
+            Some(WorkspaceError::Malformed { line: 2 })
+        );
+    }
+
+    /// The other end of the same bound: the deepest tree splitting can actually build — a
+    /// chain, each split taking the area the last one made — has to read back. A reader
+    /// strict enough to refuse it would make a layout the user built unloadable.
+    #[test]
+    fn the_deepest_tree_a_split_can_build_survives_the_trip() {
+        let mut tree = SplitTree::single();
+        let mut last = 0;
+        // Bounded, so a split that never refuses fails here rather than hanging.
+        for _ in 0..2 * crate::MAX_AREAS {
+            match tree.split(last, Axis::Horizontal, 0.5) {
+                Some(fresh) => last = fresh,
+                None => break,
+            }
+        }
+        assert_eq!(
+            tree.area_count(),
+            crate::MAX_AREAS,
+            "the split refused exactly at the bound"
+        );
+
+        let read = Workspace::parse(&Workspace::new(tree.clone()).write()).expect("reads back");
+        assert_eq!(laid_out(read.tree()), laid_out(&tree));
+    }
+
+    /// Holes in the id space a file brings in have to count as free, or the bound leaks:
+    /// with only `0` and the last id held, a tree that never looked at the holes would hand
+    /// out ids past [`MAX_AREAS`](crate::MAX_AREAS) long before it held that many areas.
+    #[test]
+    fn a_loaded_tree_reuses_its_holes_and_stays_under_the_bound() {
+        let last = crate::MAX_AREAS - 1;
+        let read =
+            Workspace::parse(&format!("blazy-workspace 1\ntree split h 0.5 area 0 area {last}\n")).expect("reads");
+        let mut tree = read.tree().clone();
+        for _ in 0..2 * crate::MAX_AREAS {
+            let Some(fresh) = tree.split(0, Axis::Vertical, 0.5) else {
+                break;
+            };
+            assert!(fresh < crate::MAX_AREAS, "split handed out {fresh}");
+        }
+        assert_eq!(
+            tree.area_count(),
+            crate::MAX_AREAS,
+            "every hole was handed out before the split refused"
         );
     }
 }

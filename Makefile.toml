@@ -27,6 +27,12 @@ toolchain = "stable"
 args = ["run", "-p", "area-screen", "--profile", "${PROFILE}", "--", "${@}"]
 dependencies = ["choose-profile"]
 
+[tasks.run-hello]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "hello", "--profile", "${PROFILE}", "--", "${@}"]
+dependencies = ["choose-profile"]
+
 
 [tasks.fmt-check]
 command = "cargo"
@@ -50,6 +56,45 @@ args = ["test", "--workspace"]
 
 [tasks.lint]
 dependencies = ["fmt-check", "clippy"]
+
+# The configurations the workspace build never compiles. Both examples ask for
+# `window` and `vello`, and cargo unifies features across everything it builds at once,
+# so `clippy --workspace` only ever sees the shell with both on — while the facade
+# promises an application it can turn either off (§14, §40.4). Each package on its own
+# is built with exactly the features named here, which is what makes these real checks.
+[tasks.check-shell-bare]
+command = "cargo"
+toolchain = "stable"
+args = ["clippy", "-p", "blazy-shell", "--no-default-features", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.check-shell-vello]
+command = "cargo"
+toolchain = "stable"
+args = ["clippy", "-p", "blazy-shell", "--no-default-features", "--features", "vello", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.check-shell-window]
+command = "cargo"
+toolchain = "stable"
+args = ["clippy", "-p", "blazy-shell", "--no-default-features", "--features", "window", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.check-facade-bare]
+command = "cargo"
+toolchain = "stable"
+args = ["clippy", "-p", "blazy", "--no-default-features", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.check-features]
+description = "Every feature combination an application can ask the facade for."
+dependencies = ["check-shell-bare", "check-shell-vello", "check-shell-window", "check-facade-bare"]
+
+# Rustdoc as a gate: six crates carry `missing_docs`, and a doc comment that links to
+# nothing is as broken as one that is missing. Built with every feature on, because that
+# is the configuration the documentation describes — without `window`, the links to the
+# `window` module have nothing to point at, by construction rather than by mistake.
+[tasks.doc]
+env = { RUSTDOCFLAGS = "-D warnings" }
+command = "cargo"
+toolchain = "stable"
+args = ["doc", "--workspace", "--no-deps", "--all-features"]
 
 [tasks.lint-test]
 dependencies = ["lint", "test"]
@@ -102,28 +147,5 @@ dependencies = ["bench-canvas", "bench-areas", "bench-shell"]
 [tasks.bench-report]
 dependencies = ["bench-canvas-report", "bench-areas-report", "bench-shell-report"]
 
-# The fourth criterion of the shell task, and the one that is a fact about the
-# dependency graph rather than about a frame: everything that knows about a window
-# lives in `blazy-shell` (architecture §3). A criterion in a benchmark could not see
-# this — by the time a benchmark runs, the tree is already linked.
-[tasks.deps-rule]
-description = "Core crates must not depend on a window system."
-script_runner = "@shell"
-script = '''
-status=0
-for crate in blazy-areas blazy-canvas blazy-ops blazy-shape; do
-    found=$(cargo tree -e normal -p $crate 2>/dev/null | grep -Eo '^[^a-z]*(winit|wgpu|softbuffer|ui-events-winit) v[0-9.]+' | sort -u)
-    if [ -n "$found" ]; then
-        echo "$crate depends on a window system:"
-        echo "$found"
-        status=1
-    fi
-done
-if [ $status -eq 0 ]; then
-    echo "dependency rule holds: blazy-areas, blazy-canvas, blazy-ops and blazy-shape know nothing about windows"
-fi
-exit $status
-'''
-
 [tasks.ci]
-dependencies = ["lint", "test", "deps-rule", "bench-report"]
+dependencies = ["lint", "check-features", "doc", "test", "bench-report"]

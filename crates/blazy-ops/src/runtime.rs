@@ -487,7 +487,7 @@ impl<W> OpRuntime<W> {
             self.keymap
                 .sections_for(scope)
                 .filter(|binding| binding.pattern.wants_gesture(button))
-                .filter_map(|binding| self.by_name.get(binding.op).copied()),
+                .filter_map(|binding| self.by_name.get(binding.op.as_ref()).copied()),
         );
 
         let empty = Props::new();
@@ -545,11 +545,11 @@ impl<W> OpRuntime<W> {
         self.counters.lookups += 1;
         let mut candidates = std::mem::take(&mut self.scratch_bindings);
         candidates.clear();
-        candidates.extend(
-            self.keymap
-                .matches(scope, event)
-                .filter_map(|binding| self.by_name.get(binding.op).map(|&at| (at, binding.props.clone()))),
-        );
+        candidates.extend(self.keymap.matches(scope, event).filter_map(|binding| {
+            self.by_name
+                .get(binding.op.as_ref())
+                .map(|&at| (at, binding.props.clone()))
+        }));
         if candidates.is_empty() {
             self.scratch_bindings = candidates;
             return Dispatch::NoBinding;
@@ -1127,6 +1127,37 @@ mod tests {
 
         assert_eq!(from_key, from_script);
         assert_eq!(from_key.value, 2);
+    }
+
+    /// A keymap is data, so it has to work when every name in it was read at runtime —
+    /// the context, the operator and the property — rather than written as a literal.
+    /// Built from owned strings, as a file reader would build it, it runs the same
+    /// operator with the same argument as the keymap written in code.
+    #[test]
+    fn a_keymap_of_owned_names_runs_like_one_of_literals() {
+        let read = |text: &str| text.to_string();
+        let keymap = crate::keymap::Keymap::new().with(read("test"), vec![
+            Binding::new(Pattern::key("a"), read("test.add")).with_props(Props::new().with_int(read("by"), 2)),
+        ]);
+        let mut from_data = OpRuntime::new(keymap);
+        from_data.register(Add);
+        let mut world = World {
+            available: true,
+            ..World::default()
+        };
+        assert!(
+            from_data
+                .dispatch(&mut world, &key("a"), SCOPE, Seat::Tree)
+                .is_consumed()
+        );
+
+        let mut from_code = World {
+            available: true,
+            ..World::default()
+        };
+        runtime().dispatch(&mut from_code, &key("a"), SCOPE, Seat::Tree);
+        assert_eq!(world, from_code);
+        assert_eq!(world.value, 2, "the property arrived too, not just the operator");
     }
 
     /// Poll is asked on both paths, and refusing means the world is untouched.

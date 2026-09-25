@@ -11,21 +11,22 @@ publish.workspace = true
 [lints]
 workspace = true
 
-# The shell's own features, forwarded in both directions. An application depends on
-# `blazy`, so anything it cannot turn on here it cannot have at all — and anything it
-# cannot turn *off* here it has to carry. The second half matters as much as the first:
-# guest mode (§14) hands us somebody else's device and wants no window system at all,
-# and a headless test wants the same, so `window` has to be refusable.
 [features]
 # `window` is on by default, exactly as it is when depending on the shell directly;
 # `vello` is the one an application has to ask for.
 default = ["window"]
 window = ["blazy-shell/window"]
 vello = ["blazy-shell/vello"]
+# Masonry's `TestHarness`, for an application's own tests. Through the facade because the
+# harness has to come from the same Masonry as the widgets it drives, and the only way an
+# application gets that one without repeating the git pin is from here.
+testing = ["masonry/testing"]
 
 [dependencies]
 blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
+blazy-node-editor = { workspace = true }
 blazy-ops = { workspace = true }
 blazy-shape = { workspace = true }
 blazy-shell = { workspace = true }
+masonry = { workspace = true }

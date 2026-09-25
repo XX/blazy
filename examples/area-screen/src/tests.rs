@@ -13,17 +13,17 @@
 //! harness; the third cannot, and §23 says why.
 
 use bench_utils::render::{block_magnified, differing_fraction, sharpness_gain};
-use blazy_areas::{AreaContent, AreaScreen, RegionKind, UiScale};
-use blazy_canvas::CanvasLayer;
-use blazy_shell::Host;
+use blazy::areas::{AreaContent, AreaScreen, RegionKind, UiScale};
+use blazy::canvas::CanvasLayer;
+use blazy::masonry::core::{NewWidget, WidgetId};
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Point, Size, Vec2};
+use blazy::masonry::peniko::Color;
+use blazy::masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
+use blazy::masonry::theme::default_property_set;
+use blazy::masonry::ui_events::pointer::PointerButton;
+use blazy::shell::Host;
 use image::RgbaImage;
-use masonry::core::{NewWidget, WidgetId};
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Point, Size, Vec2};
-use masonry::peniko::Color;
-use masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
-use masonry::theme::default_property_set;
-use masonry::ui_events::pointer::PointerButton;
 use node_canvas::build_canvas;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::SharedGraph;
@@ -413,7 +413,7 @@ fn editor_canvas_pos(harness: &mut TestHarness<AreaScreen>, area: usize, index: 
 /// are the same sentence.
 #[test]
 fn an_operator_move_in_one_area_reaches_the_others() {
-    use blazy_ops::keymap::Props;
+    use blazy::ops::keymap::Props;
 
     let (mut harness, graph) = ops_screen(2, 200);
     let live = harness.edit_widget_with_id(editor_id(&harness, 0), |mut widget| {
@@ -455,6 +455,63 @@ fn an_operator_move_in_one_area_reaches_the_others() {
     );
 }
 
+/// A structural edit in one area reaches the other view of the same graph (§43).
+///
+/// The §30 rule again, for the shape of the graph rather than for a position — and it
+/// needs two views for the same reason: with one, "the truth is in the model" and "the
+/// truth is in the view" are indistinguishable. A node added in one area has to exist in
+/// both, under the same name, and a node deleted has to be gone from both.
+#[test]
+fn a_structural_edit_in_one_area_reaches_the_others() {
+    use blazy::ops::keymap::Props;
+
+    let (mut harness, graph) = ops_screen(2, 200);
+    let names_before = graph.borrow().names();
+    let id = editor_id(&harness, 0);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(
+            &mut editor,
+            "node.add",
+            &Props::new().with_float("x", 40.0).with_float("y", 40.0),
+        );
+    });
+    let _ = harness.redraw();
+
+    let added = names_before;
+    let place = Point::new(40.0, 40.0);
+    assert_eq!(graph.borrow().try_node(added).map(|node| node.pos), Some(place));
+    assert_eq!(
+        editor_canvas_pos(&mut harness, 0, added),
+        Some(place),
+        "the area that added it has it"
+    );
+    assert_eq!(
+        editor_canvas_pos(&mut harness, 1, added),
+        Some(place),
+        "and so does the other view"
+    );
+
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(
+            &mut editor,
+            "node.delete",
+            &Props::new().with_int("index", added as i64),
+        );
+    });
+    let _ = harness.redraw();
+
+    assert_eq!(graph.borrow().try_node(added), None);
+    for area in [0, 1] {
+        assert_eq!(
+            editor_canvas_pos(&mut harness, area, added),
+            None,
+            "area {area} still shows a node the graph does not have"
+        );
+    }
+}
+
 /// Selecting in one area is that area's business.
 ///
 /// The other half of §30: the *graph* is shared and the *selection* is not, which is
@@ -464,7 +521,7 @@ fn an_operator_move_in_one_area_reaches_the_others() {
 /// rather than by accident.
 #[test]
 fn a_selection_stays_in_the_area_that_made_it() {
-    use blazy_ops::keymap::Props;
+    use blazy::ops::keymap::Props;
 
     let (mut harness, _graph) = ops_screen(2, 200);
     let id = editor_id(&harness, 0);
@@ -518,8 +575,8 @@ fn an_editor_inside_an_area_has_no_pre_tree_seat() {
 /// watch the depth, and §34.2 says at what number.
 #[test]
 fn a_real_frame_is_far_from_both_ceilings() {
-    use blazy_shell::Composition;
-    use masonry::imaging::record::Command;
+    use blazy::masonry::imaging::record::Command;
+    use blazy::shell::Composition;
 
     let (mut harness, _graph) = screen_harness(8, 5000);
     let (plan, _tree) = harness.redraw();
@@ -532,16 +589,16 @@ fn a_real_frame_is_far_from_both_ceilings() {
         .iter()
         .filter(|command| matches!(command, Command::PushGroup(_)))
         .count();
-    let depth = blazy_shell::tiles::nesting_depth(&composed.scene);
-    let demand = blazy_shell::tiles::demand(&composed.scene, frame);
+    let depth = blazy::shell::tiles::nesting_depth(&composed.scene);
+    let demand = blazy::shell::tiles::demand(&composed.scene, frame);
     println!(
         "eight areas over 5000 nodes: {} commands, {groups} groups, {depth} deep, \
          {} tiles of {}, {} words of {}",
         composed.scene.commands().len(),
         demand.tiles,
-        blazy_shell::TILE_BUDGET,
+        blazy::shell::TILE_BUDGET,
         demand.blend_words,
-        blazy_shell::BLEND_BUDGET,
+        blazy::shell::BLEND_BUDGET,
     );
 
     // One clip per area and nothing nested inside it: four levels are free, so the
@@ -551,10 +608,10 @@ fn a_real_frame_is_far_from_both_ceilings() {
     // And an order of magnitude of headroom in tiles, which is the §33.4 claim
     // measured on the real scene rather than on diagonals.
     assert!(
-        demand.tiles * 10 < blazy_shell::TILE_BUDGET,
+        demand.tiles * 10 < blazy::shell::TILE_BUDGET,
         "a real frame wants {} of {} tiles",
         demand.tiles,
-        blazy_shell::TILE_BUDGET
+        blazy::shell::TILE_BUDGET
     );
 }
 
@@ -622,7 +679,7 @@ fn a_kept_layer_is_the_same_picture() {
     // transparent pixel's colour channels are not part of the picture: without it the
     // two paths differ in the RGB of fully transparent pixels, which is nothing.
     let panel = Color::from_rgb8(0x14, 0x14, 0x18);
-    let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
+    let Ok(gpu) = blazy::shell::gpu::GpuFrames::offscreen(size) else {
         eprintln!("no graphics device: skipping");
         return;
     };
@@ -696,7 +753,7 @@ fn a_kept_layer_is_the_same_picture() {
 fn a_changed_layer_is_drawn_again() {
     let size = PhysicalSize::new(1400, 900);
     let panel = Color::from_rgb8(0x14, 0x14, 0x18);
-    let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(size) else {
+    let Ok(gpu) = blazy::shell::gpu::GpuFrames::offscreen(size) else {
         eprintln!("no graphics device: skipping");
         return;
     };

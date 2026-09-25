@@ -31,14 +31,16 @@ Everything goes through `cargo-make`. `cargo fmt` needs nightly; everything else
 stable.
 
 ```bash
-cargo make ci               # what CI runs: lint + tests + deps rule + three benchmark gates
+cargo make ci               # what CI runs: lint + feature matrix + docs + tests + deps rule + three benchmark gates
 cargo make lint             # fmt --check + clippy -D warnings
+cargo make check-features   # clippy on the shell and the facade with window/vello off (§14, §40.4)
+cargo make doc              # rustdoc -D warnings, all features
 cargo make fmt              # nightly rustfmt
 cargo make test             # cargo test --workspace
-cargo make deps-rule        # core crates must not depend on a window system (§3, §26.4)
 
 cargo make run-node-canvas  # Phase 0 window
 cargo make run-area-screen  # Phase 0.5/0.6 window
+cargo make run-hello        # the smallest application, through the facade only
 
 cargo make bench-canvas     # Phase 0 measurements and criteria
 cargo make bench-areas      # Phase 0.5/0.6 measurements and criteria
@@ -74,13 +76,16 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy-canvas` | Virtualised, zoomable canvas: nodes, links, spatial index. |
 | `crates/blazy-areas` | Split tree, areas, regions, per-region `ui_scale`. |
 | `crates/blazy-ops` | Operators, keymap as data, modal stack, undo journal. |
+| `crates/blazy-node-editor` | The node editor over the canvas: selection, box select, grab, pan, undo as operators, and the driver widget. |
 | `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
 | `crates/blazy-shell` | The host: window, event loop, composition, choice of rasteriser. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
+| `examples/hello` | The smallest application: two areas, two canvases, one dependency. |
 
-Each example is a **library plus a thin binary plus a bench target**, not one binary.
+Each experiment is a **library plus a thin binary plus a bench target**, not one binary
+(`examples/hello` measures nothing and is a binary alone).
 That is forced: `benches/` targets are separate crates and can only reach the
 package's lib, so a binary-only layout would mean duplicating the graph generator that
 every measurement depends on being identical. `[lib]` and `[[bin]]` carry
@@ -287,7 +292,7 @@ window.
 wrong (§27.3).
 
 **An external hole lives exactly one paint (§26.1).** `PaintCtx::set_paint_layer_mode`
-is public upstream now — §7.3 and §17 are out of date on that — but the mode is reset
+is public upstream now (§7.3 and §17 carry a note saying so) — but the mode is reset
 for every widget at the start of every paint pass, and a clean widget is not painted. A
 widget that wants to stay a host hole has to keep painting; `ExternalContent` does that
 through an animation frame, and a criterion counts frames in which the hole went
@@ -351,6 +356,24 @@ context an operator polls against is assembled *on hover*: the canvas picks on e
 pointer event, including the press, and publishes the answer, because a driver holding
 an `EventCtx` cannot hit-test a child.
 
+**A node's name is a hole in an array, never an index that shifts (§43).** A removed
+node leaves its slot behind, dead, and the next insertion takes the name back — the free
+list `SplitTree` keeps for areas (§41.2), for the same reason: a selection, a link, an
+undo step and the other views of the graph are all written in names. The *model* hands
+out names, not the canvas, because the model is the truth (§30) and a canvas is a mirror
+— which is also why topology moved into the model: links held by a view are two copies
+of the graph the moment there are two views. A structural edit invalidates both recorded
+sets by hand, because they are chosen by where the *view* is and an edit does not move
+it (§28.4 from the other side).
+
+**A node editor needs four things from a graph (§42), and nine to edit one (§43).** `blazy-node-editor`'s
+`NodeGraph` is a count, a rectangle, a position setter and the other views — and the
+last is required rather than defaulted, because "no peers" compiles, passes every
+single-view test and splits two views of one graph apart (§30). The one place the
+interaction layer ever knew what a node *holds* was the §38.4 snapshot, so that went
+behind `MoveRecorder` instead of into the trait. The example keeps its graph, its node
+widgets and the snapshot; its `editor` and `ops` modules are aliases and a HUD caption.
+
 **Undo is a journal, and the number decided it (§38.4).** A snapshot step costs the
 graph — 1.92 MB and 0.29 ms on 20 000 nodes — where a journal step costs what was
 touched: 40 bytes for a one-node drag. The graph is shared and the selection is not,
@@ -384,8 +407,12 @@ device request cost less than a second pinned crate. The GPU path sits on the pu
 `imaging_vello`, `imaging_wgpu` and `wgpu` instead, and `wgpu` is pinned to the version
 `imaging_wgpu` selects, because the texture types have to come from one crate version.
 
-Strategy towards upstream is **contribute, not fork** (§17). Nothing here patches
-Masonry.
+Strategy towards upstream is **contribute, not fork** (§17), with one recorded
+exception: the pin points at our fork `XX/xilem`, which is upstream `b81d8d7` plus a
+single commit — a return flag on `Layer::capture_pointer_event`, so a layer root can
+keep an event from the tree (§17 item 4, §39.1). It exists so the request went upstream
+with working code and numbers attached; the pin goes back to upstream once it is
+answered. Nothing else here patches Masonry, and nothing should be added to the fork.
 
 ## Because it is a library, not an application
 
@@ -395,6 +422,10 @@ both are already argued in §15.1 and §18:
 - **New public surface goes through `crates/blazy`.** A new subsystem crate is not
   finished until the facade re-exports it. That re-export is also the only place where
   upstream churn can be absorbed once instead of by every downstream application.
+  Masonry itself is re-exported as `blazy::masonry` (with `testing` forwarded), so an
+  application never repeats the git pin. **The examples depend on `blazy` alone** —
+  no `blazy-*` crate and no `masonry` in their manifests — which is what keeps the
+  facade exercised; `examples/hello` is the minimal case of that.
 - **The git pin is a graver risk here than it would be in an application.** An app can
   swallow a breaking change in a dependency on its own schedule; a published library
   passes it on. That is what the facade and the criteria in CI are insurance for.
@@ -417,7 +448,7 @@ both are already argued in §15.1 and §18:
   copies of a number drift, and the copy in the code is the one nobody re-measures —
   §40.4 found the price of a draw command restated in the code as three different pairs
   of numbers.
-- **The six published crates carry `#![warn(missing_docs, unreachable_pub)]`**, so a new
+- **The seven published crates carry `#![warn(missing_docs, unreachable_pub)]`**, so a new
   public item needs a doc comment. That is also what catches a doc comment orphaned by a
   reordering: four of them had come adrift and were documenting the wrong function.
 - **Counter and error types are `#[non_exhaustive]`; configuration types are not.** A

@@ -12,14 +12,13 @@
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-use blazy_canvas::{DEFAULT_WIDGET_BUDGET, DetailBudget};
-use blazy_shell::window::{ShellDriver, WindowConfig, run};
-use blazy_shell::{Backend, COMPILED};
+use blazy::canvas::{DEFAULT_WIDGET_BUDGET, DetailBudget};
+use blazy::masonry::app::RenderRoot;
+use blazy::masonry::core::NewWidget;
+use blazy::masonry::theme::default_property_set;
+use blazy::shell::window::{ShellDriver, WindowConfig, run};
+use blazy::shell::{Backend, COMPILED};
 use clap::Parser;
-use masonry::app::RenderRoot;
-use masonry::core::NewWidget;
-use masonry::theme::default_property_set;
-use node_canvas::editor::NodeEditor;
 use node_canvas::{DEFAULT_NODES, build_canvas};
 
 #[derive(Parser)]
@@ -63,7 +62,7 @@ fn main() {
     // `G` grabs, `B` boxes, Escape cancels, Ctrl+Z undoes (§38). The canvas's own
     // primary-button gestures step aside for the keymap; the middle button still pans
     // and the wheel still zooms.
-    let editor = NodeEditor::with_ops(canvas, &graph);
+    let editor = node_canvas::editor::with_ops(canvas, &graph);
 
     let config = WindowConfig::default()
         .with_title(format!("blazy - Phase 0 node canvas ({} nodes)", args.nodes))

@@ -14,12 +14,12 @@
 use std::time::{Duration, Instant};
 
 use area_screen::build_screen;
-use blazy_areas::{AreaId, AreaScreen, SplitTree, Workspace};
-use masonry::core::NewWidget;
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Axis, Size};
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
+use blazy::areas::{AreaId, AreaScreen, SplitTree, Workspace};
+use blazy::masonry::core::NewWidget;
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Axis, Size};
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
 
 use crate::bench::{Options, VIEWPORT};
 
@@ -56,7 +56,7 @@ fn harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 
 /// The border-box size of every area that has a widget, by area id.
 fn sizes(harness: &mut TestHarness<AreaScreen>) -> Vec<(AreaId, Size)> {
-    let ids: Vec<(AreaId, masonry::core::WidgetId)> = harness
+    let ids: Vec<(AreaId, blazy::masonry::core::WidgetId)> = harness
         .root_widget()
         .tree()
         .areas()
@@ -132,7 +132,8 @@ fn round_trip(areas: usize, nodes: usize) -> OpsRow {
     });
     let _ = harness.redraw();
     let awkward = harness.root_widget().bars()[0];
-    let off_centre = masonry::kurbo::Point::new(awkward.rect.center().x - 137.0, awkward.rect.center().y - 137.0);
+    let off_centre =
+        blazy::masonry::kurbo::Point::new(awkward.rect.center().x - 137.0, awkward.rect.center().y - 137.0);
     harness.edit_root_widget(|mut screen| AreaScreen::drag_bar(&mut screen, awkward.split, off_centre));
     let _ = harness.redraw();
 
@@ -148,7 +149,7 @@ fn round_trip(areas: usize, nodes: usize) -> OpsRow {
 
     // The screen moves on, so a load that does nothing cannot pass.
     let bar = harness.root_widget().bars()[0];
-    let moved = masonry::kurbo::Point::new(bar.rect.center().x + 211.0, bar.rect.center().y + 211.0);
+    let moved = blazy::masonry::kurbo::Point::new(bar.rect.center().x + 211.0, bar.rect.center().y + 211.0);
     harness.edit_root_widget(|mut screen| AreaScreen::drag_bar(&mut screen, bar.split, moved));
     let _ = harness.redraw();
     let drifted = sizes(&mut harness);

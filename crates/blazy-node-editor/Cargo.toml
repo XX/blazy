@@ -1,0 +1,20 @@
+[package]
+name = "blazy-node-editor"
+description = "A node editor over blazy's canvas: selection, box select, grab, pan and undo as operators, and the driver that seats them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blazy-canvas = { workspace = true }
+blazy-ops = { workspace = true }
+masonry = { workspace = true }
+
+[dev-dependencies]
+masonry = { workspace = true, features = ["testing"] }

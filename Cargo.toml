@@ -24,13 +24,18 @@ bench-utils = { path = "crates/bench-utils" }
 blazy = { path = "crates/blazy" }
 blazy-areas = { path = "crates/blazy-areas" }
 blazy-canvas = { path = "crates/blazy-canvas" }
+blazy-node-editor = { path = "crates/blazy-node-editor" }
 blazy-ops = { path = "crates/blazy-ops" }
 blazy-shape = { path = "crates/blazy-shape" }
 # `default-features = false` so a consumer can refuse the window system: the facade
 # forwards `window` as a feature of its own, and guest mode (§14) wants none of it.
-# Anything that does open a window asks for `window` explicitly.
+# Anything that does open a window asks for `window` explicitly, or has it from the facade's
+# defaults, which is how the examples get it.
 blazy-shell = { path = "crates/blazy-shell", default-features = false }
 node-canvas = { path = "examples/node-canvas" }
+# Our fork, not upstream: `linebender/xilem` at `b81d8d7` plus one commit, the return flag on
+# `Layer::capture_pointer_event` (architecture §17 item 4, §39.1). Back to upstream once that
+# request is answered; nothing else goes into the fork.
 masonry = { git = "https://github.com/XX/xilem.git", rev = "fc0391fc6312c37fc5d503a9bc7813a2132d01b6", default-features = false }
 winit = "0.30"
 softbuffer = "0.4"

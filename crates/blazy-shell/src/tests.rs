@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
-    AccessCtx, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PaintLayerMode,
-    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, Widget, WindowEvent,
+    AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PaintLayerMode, PropertiesRef,
+    RegisterCtx, Widget, WindowEvent,
 };
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::Painter;
@@ -27,49 +27,6 @@ struct Counting {
     layouts: Rc<Cell<u64>>,
     /// Whether to declare an external layer when painting.
     external: bool,
-}
-
-/// A widget that counts the pointer events that reach it.
-struct Probe {
-    seen: Rc<Cell<u64>>,
-}
-
-impl Widget for Probe {
-    type Action = NoAction;
-
-    fn on_pointer_event(&mut self, _ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, _event: &PointerEvent) {
-        self.seen.set(self.seen.get() + 1);
-    }
-
-    fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
-
-    fn measure(
-        &mut self,
-        _ctx: &mut MeasureCtx<'_>,
-        _props: &PropertiesRef<'_>,
-        _axis: Axis,
-        len_req: LenReq,
-        _cross_length: Option<Length>,
-    ) -> Length {
-        match len_req {
-            LenReq::MinContent | LenReq::MaxContent => Length::px(100.0),
-            LenReq::FitContent(space) => space,
-        }
-    }
-
-    fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
-
-    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
-
-    fn children_ids(&self) -> ChildrenIds {
-        ChildrenIds::new()
-    }
-
-    fn accessibility_role(&self) -> Role {
-        Role::GenericContainer
-    }
-
-    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
 }
 
 /// A widget that declares itself an isolated scene layer whenever it paints.
@@ -493,19 +450,62 @@ fn an_isolated_layer_lasts_one_paint() {
 }
 
 /// The host seat: what a driver in front of `RenderRoot` can do (§39.5).
+///
+/// Behind `window` because `ShellDriver` is: the seat is the window loop's.
+#[cfg(feature = "window")]
 mod host_seat {
-    use std::cell::Cell;
-    use std::rc::Rc;
     use std::sync::Arc;
 
     use masonry::app::{RenderRoot, RenderRootOptions, WindowSizePolicy};
-    use masonry::core::{Handled, NewWidget, PointerEvent, PointerInfo, PointerType, PointerUpdate};
-    use masonry::dpi::{PhysicalPosition, PhysicalSize};
-    use masonry::theme::default_property_set;
+    use masonry::core::{EventCtx, Handled, PointerEvent, PointerInfo, PointerType, PointerUpdate, PropertiesMut};
+    use masonry::dpi::PhysicalPosition;
     use masonry::ui_events::pointer::PointerState;
 
-    use super::Probe;
+    use super::*;
     use crate::window::{ShellDriver, deliver_pointer};
+
+    /// A widget that counts the pointer events that reach it.
+    struct Probe {
+        seen: Rc<Cell<u64>>,
+    }
+
+    impl Widget for Probe {
+        type Action = NoAction;
+
+        fn on_pointer_event(&mut self, _ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, _event: &PointerEvent) {
+            self.seen.set(self.seen.get() + 1);
+        }
+
+        fn register_children(&mut self, _ctx: &mut RegisterCtx<'_>) {}
+
+        fn measure(
+            &mut self,
+            _ctx: &mut MeasureCtx<'_>,
+            _props: &PropertiesRef<'_>,
+            _axis: Axis,
+            len_req: LenReq,
+            _cross_length: Option<Length>,
+        ) -> Length {
+            match len_req {
+                LenReq::MinContent | LenReq::MaxContent => Length::px(100.0),
+                LenReq::FitContent(space) => space,
+            }
+        }
+
+        fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
+
+        fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+
+        fn children_ids(&self) -> ChildrenIds {
+            ChildrenIds::new()
+        }
+
+        fn accessibility_role(&self) -> Role {
+            Role::GenericContainer
+        }
+
+        fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+    }
 
     /// A driver that takes everything, or nothing.
     struct Seat {
@@ -596,6 +596,7 @@ mod host_seat {
 /// A library that wraps somebody else's error and drops it makes every downstream
 /// `anyhow` chain end at our variant name (§15.1). Cheap to keep, invisible to lose,
 /// so it is pinned here rather than trusted.
+#[cfg(feature = "window")]
 #[test]
 fn an_error_hands_on_its_cause() {
     let backend = crate::BackendError::Unavailable {

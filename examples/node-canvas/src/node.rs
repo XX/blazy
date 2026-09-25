@@ -17,19 +17,19 @@
 
 use std::any::TypeId;
 
-use blazy_canvas::{CanvasDetail, CanvasLayer, Detail, NodeSource};
-use blazy_shape::ShapeHit;
-use masonry::accesskit::{Node as AccessNode, Role};
-use masonry::core::{
+use blazy::canvas::{CanvasDetail, CanvasLayer, Detail, NodeSource};
+use blazy::masonry::accesskit::{Node as AccessNode, Role};
+use blazy::masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx,
     PropertiesMut, PropertiesRef, QueryCtx, RegisterCtx, UpdateCtx, UsesProperty, Widget, WidgetId, WidgetPod,
     WidgetRef,
 };
-use masonry::imaging::Painter;
-use masonry::kurbo::{Axis, BezPath, Point, Rect, RoundedRect, Shape, Size, Stroke};
-use masonry::layout::{LenReq, Length, SizeDef};
-use masonry::peniko::Color;
-use masonry::widgets::{Checkbox, CheckboxToggled, Slider, SliderMoved};
+use blazy::masonry::imaging::Painter;
+use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, RoundedRect, Shape, Size, Stroke};
+use blazy::masonry::layout::{LenReq, Length, SizeDef};
+use blazy::masonry::peniko::Color;
+use blazy::masonry::widgets::{Checkbox, CheckboxToggled, Slider, SliderMoved};
+use blazy::shape::ShapeHit;
 
 use crate::model::SharedGraph;
 
@@ -184,7 +184,7 @@ impl GraphNode {
     /// The receiving half of [`broadcast`](Self::broadcast). Also the reason a node
     /// keeps `value` and `checked` of its own: at `Simplified` there are no control
     /// widgets and the values are painted, so both copies have to be refreshed.
-    fn reload(this: &mut masonry::core::WidgetMut<'_, Self>) {
+    fn reload(this: &mut blazy::masonry::core::WidgetMut<'_, Self>) {
         let state = this.widget.graph.borrow().node(this.widget.index);
         this.widget.value = state.value;
         this.widget.checked = state.checked;

@@ -44,7 +44,10 @@
 //! is written to match: it takes any of the links under the pointer rather than
 //! claiming the topmost one.
 
+use std::collections::HashMap;
+
 use masonry::kurbo::{BezPath, CubicBez, Point, Rect};
+use masonry::peniko::Color;
 
 /// A connection between two nodes, by index into the canvas's node array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,16 +71,39 @@ impl Link {
 /// Topology, plus which of it is currently recorded.
 #[derive(Default)]
 pub(crate) struct LinkLayer {
-    edges: Vec<Link>,
-    /// Edge indices incident to each node, packed: `incident[offsets[n]..offsets[n+1]]`
-    /// are node `n`'s edges.
+    /// Edges by name. A removed edge leaves a hole rather than moving its neighbours,
+    /// because its name is what `CanvasHit::Link` and the recorded set are written in
+    /// — the rule §41.2 made for areas, applied to links.
+    edges: Vec<Option<Link>>,
+    /// Names a removal freed, for the next insertion to hand out again.
+    free_edges: Vec<u32>,
+    /// Live edges, so "is there anything to draw" costs nothing.
+    live: usize,
+    /// Edge names incident to each node, packed: `incident[offsets[n]..offsets[n+1]]`
+    /// are node `n`'s edges **as of the last packing**.
     ///
-    /// One array rather than a `Vec` per node, because the topology never changes after
-    /// [`new`](Self::new) — there is no API to add an edge — and a vector per node is a
-    /// vector per node: on a million-node graph that is a million allocations to build
-    /// and 24 MB of headers to hold, for lists that average two entries.
+    /// One array rather than a `Vec` per node: a vector per node is a vector per node,
+    /// and on a million-node graph that is a million allocations to build and 24 MB of
+    /// headers to hold, for lists that average two entries.
+    ///
+    /// The packing is a snapshot, not the truth: it used to be both, because the
+    /// topology could not change after [`new`](Self::new). Edges added since live in
+    /// [`extra`](Self::extra) and edges removed since are holes in `edges`, so reading a
+    /// node's list means walking the packed slice, skipping holes, and then the extra
+    /// list. Re-packing on every edit would make one edit cost the whole graph; this
+    /// makes it cost what it touched, and the packing is redone when the extra lists
+    /// have grown to a fraction of the graph (§43).
     offsets: Vec<u32>,
     incident: Vec<u32>,
+    /// Edges added since the last packing, by node.
+    extra: HashMap<u32, Vec<u32>>,
+    /// Entries in `extra`, so the compaction threshold is a comparison rather than a walk.
+    extra_len: usize,
+    /// Times the packing has been redone.
+    compactions: u64,
+    /// Edge names walked by structural edits, so what an edit costs is a counter rather
+    /// than an argument (§20.9).
+    edit_scans: u64,
     /// The region the recorded set was chosen for, in canvas coordinates.
     region: Option<Rect>,
     /// Edges in the recorded scene, ascending and without duplicates.
@@ -112,37 +138,23 @@ pub(crate) struct LinkLayer {
 
 impl LinkLayer {
     pub(crate) fn new(edges: Vec<Link>, node_count: usize) -> Self {
+        let live = edges.len();
+        let edges: Vec<Option<Link>> = edges.into_iter().map(Some).collect();
         // A counting sort into one array: count each node's edges, prefix-sum the
         // counts into offsets, then fill. An edge naming a node outside the graph is
         // dropped here rather than rejected — the graph is the application's to
         // validate, and it is skipped when drawn for the same reason.
-        let mut offsets = vec![0_u32; node_count + 1];
-        let ends = |link: &Link| [link.from, link.to];
-        for link in &edges {
-            for end in ends(link) {
-                if (end as usize) < node_count {
-                    offsets[end as usize + 1] += 1;
-                }
-            }
-        }
-        for node in 0..node_count {
-            offsets[node + 1] += offsets[node];
-        }
-        let mut incident = vec![0_u32; offsets[node_count] as usize];
-        let mut cursor = offsets.clone();
-        for (i, link) in edges.iter().enumerate() {
-            for end in ends(link) {
-                if (end as usize) < node_count {
-                    let at = &mut cursor[end as usize];
-                    incident[*at as usize] = i as u32;
-                    *at += 1;
-                }
-            }
-        }
+        let (offsets, incident) = pack(&edges, node_count);
         Self {
             edges,
+            free_edges: Vec::new(),
+            live,
             offsets,
             incident,
+            extra: HashMap::new(),
+            extra_len: 0,
+            compactions: 0,
+            edit_scans: 0,
             region: None,
             recorded: Vec::new(),
             bounds: Vec::new(),
@@ -155,15 +167,148 @@ impl LinkLayer {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.edges.is_empty()
+        self.live == 0
     }
 
-    /// The edges incident to `node`, or nothing for a node outside the graph.
-    fn incident(&self, node: usize) -> &[u32] {
-        let (Some(&from), Some(&to)) = (self.offsets.get(node), self.offsets.get(node + 1)) else {
-            return &[];
+    /// The live edges incident to `node`, packed ones first.
+    ///
+    /// Holes are skipped here rather than compacted away, which is what keeps a removal
+    /// from touching the graph: the name stays, the edge does not.
+    fn incident(&self, node: usize) -> impl Iterator<Item = u32> + '_ {
+        let packed = match (self.offsets.get(node), self.offsets.get(node + 1)) {
+            (Some(&from), Some(&to)) => &self.incident[from as usize..to as usize],
+            _ => &[][..],
         };
-        &self.incident[from as usize..to as usize]
+        packed
+            .iter()
+            .copied()
+            .filter(|&edge| self.edges[edge as usize].is_some())
+            .chain(self.extra.get(&(node as u32)).into_iter().flatten().copied())
+    }
+
+    /// The edges incident to `node`, live or not, as they are named.
+    ///
+    /// For a removal, which has to visit every one of them; the count is what the
+    /// "a removal costs its own links" criterion is decided on.
+    fn incident_names(&self, node: usize) -> Vec<u32> {
+        self.incident(node).collect()
+    }
+
+    /// Times the packed adjacency has been rebuilt, and edge names walked by edits.
+    pub(crate) fn edit_counters(&self) -> (u64, u64) {
+        (self.compactions, self.edit_scans)
+    }
+
+    /// Adds an edge, and hands back the name it was filed under.
+    ///
+    /// The name comes from a removal if there is one to reuse, so the edge array grows
+    /// with the number of links rather than with the number of edits a session has made.
+    pub(crate) fn insert(&mut self, link: Link, node_count: usize) -> u32 {
+        let name = match self.free_edges.pop() {
+            Some(name) => {
+                self.edges[name as usize] = Some(link);
+                name
+            },
+            None => {
+                self.edges.push(Some(link));
+                (self.edges.len() - 1) as u32
+            },
+        };
+        self.live += 1;
+        for end in [link.from, link.to] {
+            self.extra.entry(end).or_default().push(name);
+            self.extra_len += 1;
+        }
+        self.edit_scans += 2;
+        self.compact_if_due(node_count);
+        // The set is chosen for a region, and a new edge may belong to it.
+        self.reselect = true;
+        self.repaint = true;
+        name
+    }
+
+    /// Removes the edge named `name`, if it is live.
+    pub(crate) fn remove(&mut self, name: u32) -> Option<Link> {
+        let link = self.edges.get_mut(name as usize)?.take()?;
+        self.live -= 1;
+        self.free_edges.push(name);
+        for end in [link.from, link.to] {
+            if let Some(list) = self.extra.get_mut(&end) {
+                self.edit_scans += list.len() as u64;
+                if let Some(at) = list.iter().position(|&edge| edge == name) {
+                    list.swap_remove(at);
+                    self.extra_len -= 1;
+                }
+            }
+        }
+        if let Ok(at) = self.recorded.binary_search(&name) {
+            self.recorded.remove(at);
+            if at < self.bounds.len() {
+                self.bounds.remove(at);
+            }
+        }
+        self.repaint = true;
+        Some(link)
+    }
+
+    /// The name of a live edge between `from` and `to`, in either direction.
+    pub(crate) fn name_of(&self, link: Link) -> Option<u32> {
+        self.incident(link.from as usize).find(|&name| {
+            let edge = self.edges[name as usize].expect("incident lists only name live edges");
+            edge == link || (edge.from == link.to && edge.to == link.from)
+        })
+    }
+
+    /// Removes every edge incident to `node` and hands them back, named.
+    ///
+    /// What undo needs: a node comes back with the links it had, under the names it had
+    /// (§41.2 again — a name nothing renumbers is what a view, a selection and a history
+    /// are keyed by).
+    pub(crate) fn remove_node(&mut self, node: usize) -> Vec<(u32, Link)> {
+        let names = self.incident_names(node);
+        self.edit_scans += names.len() as u64;
+        names
+            .into_iter()
+            .filter_map(|name| self.remove(name).map(|link| (name, link)))
+            .collect()
+    }
+
+    /// Puts an edge back under the name it had, for undo.
+    pub(crate) fn restore(&mut self, name: u32, link: Link, node_count: usize) {
+        if self.edges.len() <= name as usize {
+            self.edges.resize(name as usize + 1, None);
+        }
+        if let Some(at) = self.free_edges.iter().position(|&free| free == name) {
+            self.free_edges.swap_remove(at);
+        }
+        if self.edges[name as usize].is_none() {
+            self.live += 1;
+        }
+        self.edges[name as usize] = Some(link);
+        for end in [link.from, link.to] {
+            self.extra.entry(end).or_default().push(name);
+            self.extra_len += 1;
+        }
+        self.edit_scans += 2;
+        self.compact_if_due(node_count);
+        self.reselect = true;
+        self.repaint = true;
+    }
+
+    /// Re-packs the adjacency once the extra lists have grown to a fraction of it.
+    ///
+    /// A fraction rather than a fixed count, so the amortised cost of an edit does not
+    /// follow the graph: at a quarter, packing `E` edges is paid for by `E/4` edits.
+    fn compact_if_due(&mut self, node_count: usize) {
+        if self.extra_len * 4 < self.live.max(MIN_EXTRA_BEFORE_COMPACTION) {
+            return;
+        }
+        let (offsets, incident) = pack(&self.edges, node_count.max(self.offsets.len().saturating_sub(1)));
+        self.offsets = offsets;
+        self.incident = incident;
+        self.extra.clear();
+        self.extra_len = 0;
+        self.compactions += 1;
     }
 
     pub(crate) fn recorded(&self) -> &[u32] {
@@ -179,8 +324,9 @@ impl LinkLayer {
         self.bounds.get(at).copied()
     }
 
-    pub(crate) fn edge(&self, index: u32) -> Link {
-        self.edges[index as usize]
+    /// The edge named `index`, or `None` if a removal freed that name.
+    pub(crate) fn edge(&self, index: u32) -> Option<Link> {
+        self.edges.get(index as usize).copied().flatten()
     }
 
     pub(crate) fn refreshes(&self) -> u64 {
@@ -209,13 +355,14 @@ impl LinkLayer {
         let edges = &self.edges;
         let bounds = &mut self.bounds;
         bounds.clear();
-        self.recorded.retain(|&edge| match measure(edges[edge as usize]) {
-            Some(rect) => {
-                bounds.push(rect);
-                true
-            },
-            None => false,
-        });
+        self.recorded
+            .retain(|&edge| match edges[edge as usize].and_then(&mut measure) {
+                Some(rect) => {
+                    bounds.push(rect);
+                    true
+                },
+                None => false,
+            });
         self.hidden = before - self.recorded.len();
     }
 
@@ -232,19 +379,17 @@ impl LinkLayer {
     /// what a pick rejects against, so a curve that moved without them would be
     /// unpickable until the next selection.
     pub(crate) fn node_moved(&mut self, node: usize, mut bounds_of: impl FnMut(Link) -> Rect) {
-        if self.edges.is_empty() {
+        if self.is_empty() {
             return;
         }
-        let (Some(&from), Some(&to)) = (self.offsets.get(node), self.offsets.get(node + 1)) else {
-            return;
-        };
-        for i in from as usize..to as usize {
-            let edge = self.incident[i];
+        for edge in self.incident_names(node) {
             let Ok(at) = self.recorded.binary_search(&edge) else {
                 continue;
             };
-            if let Some(box_of_a_curve) = self.bounds.get_mut(at) {
-                *box_of_a_curve = bounds_of(self.edges[edge as usize]);
+            if let Some(box_of_a_curve) = self.bounds.get_mut(at)
+                && let Some(link) = self.edges[edge as usize]
+            {
+                *box_of_a_curve = bounds_of(link);
             }
             self.repaint = true;
         }
@@ -252,7 +397,7 @@ impl LinkLayer {
 
     /// Whether the recorded set has to be re-chosen for this viewport.
     pub(crate) fn needs_reselect(&self, live_rect: Rect) -> bool {
-        !self.edges.is_empty()
+        !self.is_empty()
             && (self.reselect
                 || !self
                     .region
@@ -283,7 +428,7 @@ impl LinkLayer {
         let mut recorded = std::mem::take(&mut self.recorded);
         recorded.clear();
         for &node in nodes {
-            recorded.extend_from_slice(self.incident(node));
+            recorded.extend(self.incident(node));
         }
         self.recorded = recorded;
         // A link with both endpoints in the region is reached from each of them.
@@ -305,6 +450,47 @@ impl LinkLayer {
         self.region = None;
         self.reselect = true;
     }
+}
+
+/// Extra entries a graph must have accumulated before re-packing is worth it at all.
+///
+/// Without a floor, a graph of four links would re-pack on its first edit and every
+/// second one after. The number is small enough to be free and big enough that building
+/// a graph one link at a time does not pack on the way.
+const MIN_EXTRA_BEFORE_COMPACTION: usize = 64;
+
+/// Packs the live edges into offsets and incident lists, by node.
+///
+/// A counting sort into one array: count each node's edges, prefix-sum the counts into
+/// offsets, then fill. An edge naming a node outside the graph is dropped here rather
+/// than rejected — the graph is the application's to validate, and it is skipped when
+/// drawn for the same reason.
+fn pack(edges: &[Option<Link>], node_count: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0_u32; node_count + 1];
+    let ends = |link: &Link| [link.from, link.to];
+    for link in edges.iter().flatten() {
+        for end in ends(link) {
+            if (end as usize) < node_count {
+                offsets[end as usize + 1] += 1;
+            }
+        }
+    }
+    for node in 0..node_count {
+        offsets[node + 1] += offsets[node];
+    }
+    let mut incident = vec![0_u32; offsets[node_count] as usize];
+    let mut cursor = offsets.clone();
+    for (i, link) in edges.iter().enumerate() {
+        let Some(link) = link else { continue };
+        for end in ends(link) {
+            if (end as usize) < node_count {
+                let at = &mut cursor[end as usize];
+                incident[*at as usize] = i as u32;
+                *at += 1;
+            }
+        }
+    }
+    (offsets, incident)
 }
 
 /// The curve for one link, from the right edge of `from` to the left edge of `to`.
@@ -343,6 +529,57 @@ pub(crate) fn push_link(path: &mut BezPath, from: Rect, to: Rect) {
     let curve = link_curve(from, to);
     path.move_to(curve.p0);
     path.curve_to(curve.p1, curve.p2, curve.p3);
+}
+
+/// How the canvas strokes its links.
+///
+/// Style rather than mechanism, like [`DetailThresholds`](crate::DetailThresholds): how a link should look
+/// depends on the application, and baking it into the crate would mean editing this
+/// file to retune a demo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinkStyle {
+    /// Colour of an ordinary link.
+    pub color: Color,
+    /// Colour of the link under the pointer.
+    pub hover_color: Color,
+    /// Stroke width in canvas units, so links thicken with the zoom like everything
+    /// else the canvas draws.
+    ///
+    /// Canvas units and not a minimum in screen pixels, which is a decision rather
+    /// than an oversight (§31.3): a constant on-screen width means the *recorded*
+    /// width depends on the zoom, and the scene is recorded in canvas coordinates
+    /// precisely so that panning and zooming reuse it untouched. `imaging` has no
+    /// non-scaling stroke — the transform is prepended to the whole draw — so buying
+    /// a constant hairline means giving the scene a second axis of invalidation.
+    pub width: f64,
+    /// Below this on-screen length, a link is not drawn at all, in **logical pixels**.
+    ///
+    /// A curve two pixels long carries no information and still costs a subpath in
+    /// every frame it is recorded for. Measured on the curve's bounding box, when the
+    /// recorded set is chosen — see `CanvasContent::drop_short_links` for why there.
+    ///
+    /// The rule needs no "only when zoomed out" clause: an on-screen length grows
+    /// with the zoom, so it stops firing on its own. Set to zero to switch it off.
+    pub min_screen_length: f64,
+    /// How far the pointer may miss a link and still pick it, in **screen pixels**.
+    ///
+    /// Screen pixels rather than canvas units, because the tolerance is about the
+    /// pointer and not about the drawing: four canvas units are 0.08 px at the bottom
+    /// of the zoom range and 32 px at the top, which would make a link unpickable
+    /// exactly where it is thinnest (`rnd/architecture.md` §25.2).
+    pub slop: f64,
+}
+
+impl Default for LinkStyle {
+    fn default() -> Self {
+        Self {
+            color: Color::from_rgb8(0x8a, 0x8a, 0x96),
+            hover_color: Color::from_rgb8(0xd8, 0xd8, 0xe4),
+            width: 2.0,
+            min_screen_length: 2.0,
+            slop: blazy_shape::DEFAULT_SLOP,
+        }
+    }
 }
 
 #[cfg(test)]

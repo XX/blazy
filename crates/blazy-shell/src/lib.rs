@@ -1,9 +1,9 @@
 //! The host: windows, input, composition, and the choice of rasteriser.
 //!
 //! `rnd/architecture.md` §16 item 1, and §3's rule about where platform knowledge
-//! lives: `blazy-areas`, `blazy-canvas` and `blazy-shape` know about `masonry_core`
-//! and `imaging` and nothing about windows; everything that knows about `winit` or a
-//! GPU is here.
+//! lives: `blazy-areas`, `blazy-canvas`, `blazy-ops` and `blazy-shape` know about
+//! `masonry_core` and `imaging` and nothing about windows; everything that knows about
+//! `winit` or a GPU is here.
 //!
 //! # What is here
 //!
@@ -12,16 +12,23 @@
 //!   factor and collects the [`Hole`]s Masonry left for the host to fill.
 //! * [`Host`] — the two of them together: a plan in, a [`Frame`] out.
 //! * [`ExternalContent`] — the widget that declares a hole.
-//! * [`window`] — owner mode: a window, an event loop, and a frame on the screen.
+//! * [`Presenter`] — how a composed frame reaches the screen: the seam sits after composition, not around the
+//!   rasteriser (§27.2).
+//! * [`tiles`] — what vello will allocate for a frame, counted before it is sent, so a scene it would drop in silence
+//!   is refused out loud (§33, §34).
+//! * `gpu`, `layers` and `encode`, behind `vello` — the frame kept on the GPU (§27), a texture per layer so an idle
+//!   area is copied rather than drawn (§36, §37.2), and the path segments a frame costs, counted without a device
+//!   (§35.1).
+//! * [`window`] — owner mode, behind `window`: a window, an event loop, a frame on the screen, and the host seat of the
+//!   operator layer (§39.5).
 //!
 //! # What is deliberately not here
 //!
 //! Guest mode (§14) — an engine handing us its device, queue and texture — is nearly
 //! free from upstream (`render_to_texture` already accepts them) but cannot be
 //! checked without a real engine, so it waits for `blazy-embed-*` (§16 item 13).
-//! Per-area render-to-texture (§7.3) is Phase 3 and belongs to `blazy-compose`; what
-//! this crate owes it is to composite by walking the plan's layers rather than
-//! flattening them, which [`Composition`] does.
+//! The owner-mode loop holds one window; a second one and detaching an area into it
+//! are §16 item 6, still open.
 
 #![warn(missing_docs, unreachable_pub)]
 

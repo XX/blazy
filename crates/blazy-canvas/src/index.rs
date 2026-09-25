@@ -36,6 +36,11 @@ const MAX_CELLS: usize = 1 << 20;
 /// Where a node currently sits in the grid.
 type CellId = u32;
 
+/// The cell of a node that is not in the grid: a slot never filled, or one emptied by
+/// a removal. A sentinel rather than an `Option<CellId>` so that `filed` stays four
+/// bytes a node — it is one of the two arrays that scale with the graph.
+const UNFILED: CellId = CellId::MAX;
+
 /// A uniform grid of node indices, keyed by canvas position.
 #[derive(Debug)]
 pub(crate) struct SpatialIndex {
@@ -129,7 +134,7 @@ impl SpatialIndex {
     pub(crate) fn moved(&mut self, index: usize, to: Point) {
         let cell = self.cell_of(to);
         let old = self.filed[index];
-        if old == cell {
+        if old == cell || old == UNFILED {
             return;
         }
         let bucket = &mut self.cells[old as usize];
@@ -138,6 +143,47 @@ impl SpatialIndex {
         }
         self.cells[cell as usize].push(index as u32);
         self.filed[index] = cell;
+    }
+
+    /// Files a node that was not in the grid before.
+    ///
+    /// The grid itself is not reshaped: a node landing outside the bounds it was built
+    /// for is clamped into a border cell, exactly as a node dragged out there is, and is
+    /// still found from out there (see [`cell_of`](Self::cell_of)). What does have to
+    /// grow is the query slack, which is derived from the widest node rather than
+    /// assumed — a node wider than the ones the grid was built from would otherwise stop
+    /// being found near the left edge, silently (§24.2).
+    pub(crate) fn insert(&mut self, index: usize, rect: Rect) {
+        if self.filed.len() <= index {
+            self.filed.resize(index + 1, UNFILED);
+        }
+        if self.filed[index] != UNFILED {
+            self.remove(index);
+        }
+        let cell = self.cell_of(rect.origin());
+        self.cells[cell as usize].push(index as u32);
+        self.filed[index] = cell;
+        self.slack.0 = self.slack.0.max((rect.width() / self.cell).ceil() as usize);
+        self.slack.1 = self.slack.1.max((rect.height() / self.cell).ceil() as usize);
+    }
+
+    /// Takes a node out of the grid. Filing it again is [`insert`](Self::insert).
+    ///
+    /// The slack is left where it is: it is a bound on how far back a query has to
+    /// look, and shrinking it would mean re-measuring every node that stayed. Too much
+    /// slack costs candidates; too little loses nodes (§24.2).
+    pub(crate) fn remove(&mut self, index: usize) {
+        let Some(&cell) = self.filed.get(index) else {
+            return;
+        };
+        if cell == UNFILED {
+            return;
+        }
+        let bucket = &mut self.cells[cell as usize];
+        if let Some(at) = bucket.iter().position(|&i| i == index as u32) {
+            bucket.swap_remove(at);
+        }
+        self.filed[index] = UNFILED;
     }
 
     /// Appends the indices of every node whose cell overlaps `rect`.

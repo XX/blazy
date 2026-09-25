@@ -24,6 +24,20 @@ pub type NodeId = usize;
 /// workspace file names areas by it.
 pub type AreaId = usize;
 
+/// The most areas one tree holds, and with it the bound on every [`AreaId`].
+///
+/// A policy rather than a measurement: a screen holds tens of areas, not thousands. It
+/// exists because an id is a size somebody allocates — a caller keys its own arrays by
+/// id, and `AreaScreen` does — so without a bound one line of a hand-edited workspace
+/// file, `area 4000000000`, is a multi-gigabyte allocation instead of an error.
+///
+/// One bound, enforced in both directions: [`SplitTree::split`] refuses to grow a tree
+/// past it and the workspace reader refuses a file that goes past it, so whatever a tree
+/// can become, a file can bring back. That rests on ids being reused before fresh ones
+/// are handed out — a tree holding fewer than `MAX_AREAS` areas never hands out an id at
+/// or above it.
+pub const MAX_AREAS: usize = 1024;
+
 #[derive(Clone, Copy, Debug)]
 enum Node {
     /// Two children laid out along `axis`, `ratio` of the usable space to the first.
@@ -113,10 +127,11 @@ impl SplitTree {
     ///
     /// # Panics
     ///
-    /// Panics if `areas` is zero: a screen with no area has no meaning, and every
-    /// caller here knows its count statically.
+    /// Panics if `areas` is zero, because a screen with no area has no meaning, or above
+    /// [`MAX_AREAS`], which no tree may hold.
     pub fn balanced(areas: usize) -> Self {
         assert!(areas > 0, "a screen needs at least one area");
+        assert!(areas <= MAX_AREAS, "a screen holds at most {MAX_AREAS} areas");
         let mut tree = Self {
             nodes: Vec::new(),
             root: 0,
@@ -183,8 +198,13 @@ impl SplitTree {
     /// built for `area` stays valid and stays where it was.
     ///
     /// The new id is one a join freed, if there is one, and a fresh one otherwise.
+    ///
+    /// `None` if `area` is not in the tree, or if the tree already holds [`MAX_AREAS`].
     pub fn split(&mut self, area: AreaId, axis: Axis, ratio: f64) -> Option<AreaId> {
         let node = self.node_of(area)?;
+        if self.areas >= MAX_AREAS {
+            return None;
+        }
         let fresh = self.free_areas.pop().unwrap_or_else(|| {
             let id = self.next_area;
             self.next_area += 1;
@@ -351,9 +371,16 @@ impl SplitTree {
 
     /// Reads back what [`write_expr`](Self::write_expr) wrote.
     ///
-    /// The tree comes out with no free slots and with `next_area` past the largest id it
-    /// holds: ids that were free before the file was written are simply not free after it
-    /// is read, which nothing can observe — an id is opaque, and no live area moved.
+    /// The tree comes out with `next_area` past the largest id it holds and every id below
+    /// that it does not hold on the free list, exactly as if the holes had been left by
+    /// joins. That is not tidiness: [`MAX_AREAS`] bounds the ids only because a hole is
+    /// reused before a fresh id is handed out, and a hole a file brought in has to count
+    /// too — otherwise `area 0` and `area 1023` would let the next split hand out 1024.
+    ///
+    /// `None` for anything the tree could not have become: an id at or above
+    /// [`MAX_AREAS`], or splits nested deeper than that many areas could need. The depth is
+    /// checked on the way down, before any leaf could bound it, so a file of nothing but
+    /// `split` cannot exhaust the stack.
     pub(crate) fn parse_expr<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<Self> {
         let mut tree = Self {
             nodes: Vec::new(),
@@ -364,18 +391,20 @@ impl SplitTree {
             next_area: 0,
             maximized: None,
         };
-        tree.root = tree.parse_node(tokens)?;
+        tree.root = tree.parse_node(tokens, 0)?;
         if tokens.next().is_some() {
             return None;
         }
+        // Descending, so that the lowest hole is the first one a split takes back.
+        tree.free_areas = (0..tree.next_area).rev().filter(|&area| !tree.holds(area)).collect();
         Some(tree)
     }
 
-    fn parse_node<'a>(&mut self, tokens: &mut impl Iterator<Item = &'a str>) -> Option<NodeId> {
+    fn parse_node<'a>(&mut self, tokens: &mut impl Iterator<Item = &'a str>, depth: usize) -> Option<NodeId> {
         match tokens.next()? {
             "area" => {
                 let area: AreaId = tokens.next()?.parse().ok()?;
-                if self.holds(area) {
+                if area >= MAX_AREAS || self.holds(area) {
                     // Two leaves with one id would give two widgets one identity.
                     return None;
                 }
@@ -390,11 +419,12 @@ impl SplitTree {
                     _ => return None,
                 };
                 let ratio: f64 = tokens.next()?.parse().ok()?;
-                if !ratio.is_finite() {
+                // A chain of `d` splits needs `d + 1` areas, so no tree is deeper than this.
+                if !ratio.is_finite() || depth + 1 >= MAX_AREAS {
                     return None;
                 }
-                let a = self.parse_node(tokens)?;
-                let b = self.parse_node(tokens)?;
+                let a = self.parse_node(tokens, depth + 1)?;
+                let b = self.parse_node(tokens, depth + 1)?;
                 Some(self.alloc_node(Node::Split {
                     axis,
                     ratio: ratio.clamp(0.0, 1.0),

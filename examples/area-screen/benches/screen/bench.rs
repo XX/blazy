@@ -13,13 +13,13 @@ use area_screen::header::ScaledHeader;
 use area_screen::{ScreenSpec, build_screen};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
 use bench_utils::plan;
-use blazy_areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
-use blazy_canvas::CanvasLayer;
-use masonry::core::{NewWidget, WidgetId, WindowEvent};
-use masonry::dpi::PhysicalSize;
-use masonry::kurbo::{Axis, Point, Vec2};
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
+use blazy::areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
+use blazy::canvas::CanvasLayer;
+use blazy::masonry::core::{NewWidget, WidgetId, WindowEvent};
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::kurbo::{Axis, Point, Vec2};
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
 
 /// Viewport used for all scenarios. A working screen, not a demo window.
 pub(crate) const VIEWPORT: (u32, u32) = (1400, 900);
@@ -184,7 +184,7 @@ fn area_ids(harness: &TestHarness<AreaScreen>) -> Vec<WidgetId> {
 }
 
 /// The region stack filling one area.
-fn content(harness: &TestHarness<AreaScreen>, id: WidgetId) -> masonry::core::WidgetRef<'_, AreaContent> {
+fn content(harness: &TestHarness<AreaScreen>, id: WidgetId) -> blazy::masonry::core::WidgetRef<'_, AreaContent> {
     harness
         .get_widget_with_id(id)
         .downcast::<AreaContent>()
@@ -198,7 +198,7 @@ fn region_id(harness: &TestHarness<AreaScreen>, area: usize, region: usize) -> W
 }
 
 /// The canvas of an area: the last region, whatever else the area carries.
-fn canvas_of(harness: &TestHarness<AreaScreen>, area: usize) -> masonry::core::WidgetRef<'_, CanvasLayer> {
+fn canvas_of(harness: &TestHarness<AreaScreen>, area: usize) -> blazy::masonry::core::WidgetRef<'_, CanvasLayer> {
     let area_id = area_ids(harness)[area];
     let id = *content(harness, area_id)
         .region_ids()
@@ -793,7 +793,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         claim: "areas share one widget budget rather than one each",
         kind: Kind::Counter,
         measured: overview_widgets as f64,
-        bound: blazy_canvas::DEFAULT_WIDGET_BUDGET as f64 + 10.0 * areas as f64,
+        bound: blazy::canvas::DEFAULT_WIDGET_BUDGET as f64 + 10.0 * areas as f64,
         unit: "widgets in the window",
     });
 

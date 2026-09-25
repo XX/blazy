@@ -8,12 +8,12 @@
 use std::time::{Duration, Instant};
 
 use area_screen::ScreenSpec;
-use blazy_areas::AreaScreen;
-use blazy_canvas::CanvasLayer;
-use masonry::core::NewWidget;
-use masonry::dpi::PhysicalSize;
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
+use blazy::areas::AreaScreen;
+use blazy::canvas::CanvasLayer;
+use blazy::masonry::core::NewWidget;
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
 use node_canvas::editor::NodeEditor;
 
 use crate::bench::{Options, PAN_STEP, VIEWPORT, pan_area, zoom_area};
@@ -111,11 +111,11 @@ fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 }
 
 /// The main region of an area, whatever kind of widget it is.
-fn main_region(harness: &TestHarness<AreaScreen>, area: usize) -> masonry::core::WidgetId {
+fn main_region(harness: &TestHarness<AreaScreen>, area: usize) -> blazy::masonry::core::WidgetId {
     let area_id = harness.root_widget().area_ids()[area];
     *harness
         .get_widget_with_id(area_id)
-        .downcast::<blazy_areas::AreaContent>()
+        .downcast::<blazy::areas::AreaContent>()
         .expect("every area holds a region stack")
         .region_ids()
         .last()
@@ -128,19 +128,19 @@ fn zoom_editor(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) 
     harness.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
-            CanvasLayer::zoom_around(&mut canvas, masonry::kurbo::Point::new(200.0, 150.0), factor);
+            CanvasLayer::zoom_around(&mut canvas, blazy::masonry::kurbo::Point::new(200.0, 150.0), factor);
         });
     });
 }
 
 /// Where a node of an area's graph is on screen, in window coordinates.
-fn node_on_screen(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> masonry::kurbo::Point {
+fn node_on_screen(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> blazy::masonry::kurbo::Point {
     let id = main_region(harness, area);
     let local = harness.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             let pos = CanvasLayer::child_pos(&mut canvas, index).unwrap_or_default();
-            let centre = pos + masonry::kurbo::Vec2::new(80.0, 48.0);
+            let centre = pos + blazy::masonry::kurbo::Vec2::new(80.0, 48.0);
             canvas.widget.view() * centre
         })
     });
@@ -154,8 +154,8 @@ fn node_on_screen(harness: &mut TestHarness<AreaScreen>, area: usize, index: usi
 fn click_node(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) {
     let at = node_on_screen(harness, area, index);
     harness.mouse_move(at);
-    harness.mouse_button_press(Some(masonry::ui_events::pointer::PointerButton::Secondary));
-    harness.mouse_button_release(Some(masonry::ui_events::pointer::PointerButton::Secondary));
+    harness.mouse_button_press(Some(blazy::masonry::ui_events::pointer::PointerButton::Secondary));
+    harness.mouse_button_release(Some(blazy::masonry::ui_events::pointer::PointerButton::Secondary));
 }
 
 /// One gesture, on one path.
@@ -178,7 +178,7 @@ struct CacheCase {
 }
 
 fn cache_case(
-    gpu: &mut blazy_shell::gpu::GpuFrames,
+    gpu: &mut blazy::shell::gpu::GpuFrames,
     case: CacheCase,
     mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
 ) -> Option<CacheRow> {
@@ -202,7 +202,7 @@ fn cache_case(
     } else {
         Vec::new()
     });
-    let logical = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+    let logical = blazy::masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
 
     // One frame to fill the cache, so the sweep measures the steady state rather than
     // the first frame of it.
@@ -216,7 +216,7 @@ fn cache_case(
     let mut layers = 0;
     let mut compare = Duration::ZERO;
     let mut walk = Duration::ZERO;
-    let mut previous: Vec<masonry::imaging::record::Scene> = Vec::new();
+    let mut previous: Vec<blazy::masonry::imaging::record::Scene> = Vec::new();
     for i in 0..CACHE_FRAMES {
         step(&mut harness, i);
         // Asked again every frame, exactly as `ShellDriver::layers` is: the set of areas
@@ -232,9 +232,9 @@ fn cache_case(
         // The cache's own decision, timed on its own rather than inferred from the
         // difference between two paths: the rectangle a layer occupies, and whether its
         // scene is the one from last frame.
-        previous.resize_with(plan.layers.len(), masonry::imaging::record::Scene::new);
+        previous.resize_with(plan.layers.len(), blazy::masonry::imaging::record::Scene::new);
         for (index, layer) in plan.layers.iter().enumerate() {
-            let masonry::app::VisualLayerKind::Scene(scene) = &layer.kind else {
+            let blazy::masonry::app::VisualLayerKind::Scene(scene) = &layer.kind else {
                 continue;
             };
             // What the cache does and in the order it does it: compare first, and only
@@ -244,7 +244,7 @@ fn cache_case(
             compare += start.elapsed();
             if changed {
                 let start = Instant::now();
-                let _ = blazy_shell::layers::scene_bounds(
+                let _ = blazy::shell::layers::scene_bounds(
                     scene,
                     layer.transform,
                     PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
@@ -282,11 +282,11 @@ fn cache_case(
 pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<CacheRow> {
     let mut rows = Vec::new();
     println!("\nlayer cache: {areas} areas over one graph, canvases at an overview zoom");
-    let Ok(gpu) = blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)) else {
+    let Ok(gpu) = blazy::shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)) else {
         print_cache(&rows);
         return rows;
     };
-    let mut gpu = gpu.with_background(masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
+    let mut gpu = gpu.with_background(blazy::masonry::peniko::Color::from_rgb8(0x14, 0x14, 0x18));
     for cached in [false, true] {
         let case = |what| CacheCase {
             what,

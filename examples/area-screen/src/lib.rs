@@ -27,12 +27,11 @@ pub mod header;
 #[cfg(test)]
 mod tests;
 
-use blazy_areas::{AreaContent, AreaScreen, SplitTree};
-use blazy_canvas::DetailBudget;
-use masonry::core::{NewWidget, Widget};
-use masonry::peniko::Color;
+use blazy::areas::{AreaContent, AreaScreen, SplitTree};
+use blazy::canvas::DetailBudget;
+use blazy::masonry::core::{NewWidget, Widget};
+use blazy::masonry::peniko::Color;
 use node_canvas::CanvasSpec;
-use node_canvas::editor::NodeEditor;
 use node_canvas::model::{GraphModel, SharedGraph, share};
 
 use crate::header::ScaledHeader;
@@ -175,7 +174,7 @@ impl ScreenSpec {
                 AreaContent::header_and_main(HEADER_HEIGHT, area_header(area), canvas)
                     .with_ui_scale(0, self.header_scale.of(area))
             } else {
-                AreaContent::new(vec![(blazy_areas::RegionKind::Main, 0.0, canvas)])
+                AreaContent::new(vec![(blazy::areas::RegionKind::Main, 0.0, canvas)])
             };
             NewWidget::new(content.with_isolated_layer(self.isolated)).erased()
         });
@@ -223,7 +222,7 @@ pub fn area_canvas(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> N
 /// have it, and it is not any of the editors (§38.1).
 pub fn area_editor(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
     let canvas = CanvasSpec::new(nodes).over(graph).with_budget(budget);
-    NewWidget::new(NodeEditor::with_ops(canvas, graph)).erased()
+    NewWidget::new(node_canvas::editor::with_ops(canvas, graph)).erased()
 }
 
 /// The header of area `area`, tinted so the areas are told apart by eye.

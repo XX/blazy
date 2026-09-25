@@ -29,21 +29,19 @@ harness = false
 workspace = true
 
 [dependencies]
-blazy-areas = { workspace = true }
-blazy-canvas = { workspace = true }
-blazy-ops = { workspace = true }
+# Through the facade, as an application would — see node-canvas's manifest.
+# With the GPU frame path: on any window worth the name it is the faster one, and it
+# falls back to the blit path on a machine without a device (§27.4).
+blazy = { workspace = true, features = ["vello"] }
 clap = { workspace = true }
 # The window says out loud what a key did, and whether a workspace file could be read.
 tracing = { workspace = true }
-masonry = { workspace = true, features = ["testing"] }
-# With the GPU frame path: on any window worth the name it is the faster one, and
-# it falls back to the blit path on a machine without a device (§27.4).
-blazy-shell = { workspace = true, features = ["window", "vello"] }
 # The area experiment measures many views of the graph Phase 0 already measured one
 # view of. Depending on that example rather than copying its model is what keeps the
 # two sets of numbers comparable.
 node-canvas = { workspace = true }
 
 [dev-dependencies]
+blazy = { workspace = true, features = ["vello", "testing"] }
 bench-utils = { workspace = true }
 image = { workspace = true }

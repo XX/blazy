@@ -38,15 +38,15 @@
 use std::path::PathBuf;
 
 use area_screen::{DEFAULT_AREAS, HeaderScale, ScreenSpec};
-use blazy_areas::{AreaId, AreaScreen, Workspace};
-use blazy_shell::window::{ShellDriver, WindowConfig, run};
-use blazy_shell::{Backend, COMPILED};
+use blazy::areas::{AreaId, AreaScreen, Workspace};
+use blazy::masonry::app::RenderRoot;
+use blazy::masonry::core::keyboard::{Key, KeyState, Modifiers};
+use blazy::masonry::core::{Handled, NewWidget, TextEvent, WidgetId};
+use blazy::masonry::kurbo::Axis;
+use blazy::masonry::theme::default_property_set;
+use blazy::shell::window::{ShellDriver, WindowConfig, run};
+use blazy::shell::{Backend, COMPILED};
 use clap::Parser;
-use masonry::app::RenderRoot;
-use masonry::core::keyboard::{Key, KeyState, Modifiers};
-use masonry::core::{Handled, NewWidget, TextEvent, WidgetId};
-use masonry::kurbo::Axis;
-use masonry::theme::default_property_set;
 use node_canvas::DEFAULT_NODES;
 
 #[derive(Parser)]
@@ -108,7 +108,10 @@ impl Areas {
     ///
     /// Every operation here needs both, and the screen is the window's root, so this is
     /// the whole of reaching them.
-    fn on_hovered_area(root: &mut RenderRoot, act: impl FnOnce(&mut masonry::core::WidgetMut<'_, AreaScreen>, AreaId)) {
+    fn on_hovered_area(
+        root: &mut RenderRoot,
+        act: impl FnOnce(&mut blazy::masonry::core::WidgetMut<'_, AreaScreen>, AreaId),
+    ) {
         root.edit_base_layer(|mut widget| {
             let mut screen = widget.downcast::<AreaScreen>();
             let Some(area) = screen.widget.hovered_area() else {

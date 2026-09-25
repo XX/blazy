@@ -561,6 +561,7 @@ const RASTER_SWEEP_WIDTHS: [f64; 2] = [0.5, 2.0];
 /// look like a fresh one.
 const RASTER_TINTS: [Color; 2] = [Color::from_rgb8(0x28, 0x30, 0x78), Color::from_rgb8(0xf0, 0xe4, 0xb0)];
 /// Rows of the frame read back to check that a frame was drawn.
+#[cfg(feature = "vello")]
 const RASTER_STRIP: u32 = 32;
 /// Ink a row has to have before its time means anything, as a fraction of the frame.
 ///
@@ -644,6 +645,7 @@ fn ink(pixels: &[u8], panel: Color) -> f64 {
 }
 
 /// `rows` rows of an RGBA image, starting at `first`.
+#[cfg(feature = "vello")]
 fn strip(pixels: &[u8], width: u32, first: u32, rows: u32) -> &[u8] {
     let row_bytes = (width * 4) as usize;
     let start = first as usize * row_bytes;
@@ -656,6 +658,7 @@ fn strip(pixels: &[u8], width: u32, first: u32, rows: u32) -> &[u8] {
 /// changed: two rasterisers antialias differently and disagree about nearly every
 /// edge pixel by one or two levels, so that fraction is near 1 for two frames that
 /// look identical. What matters here is whether the ink is in the same places.
+#[cfg(feature = "vello")]
 fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
     if a.len() != b.len() {
         return 1.0;
@@ -715,6 +718,7 @@ fn guard_walks(_plan: &masonry::app::VisualLayerPlan, _scale: f64, _frame: Physi
 ///
 /// What the texture holds after a frame that was not drawn — the baseline a forced
 /// draw of a refused scene is judged against.
+#[cfg(feature = "vello")]
 fn blank() -> masonry::app::VisualLayerPlan {
     masonry::app::VisualLayerPlan { layers: Vec::new() }
 }
@@ -1276,6 +1280,10 @@ fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> Nest
     };
     let words = blazy_shell::tiles::blend_demand(&blazy_shell::Composition::new(&plans[0], scale).scene, frame_size);
 
+    #[cfg_attr(
+        not(feature = "vello"),
+        expect(unused_mut, reason = "only the GPU path fills the row in")
+    )]
     let mut row = NestRow {
         depth,
         scale,
@@ -1343,7 +1351,7 @@ fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> Nest
         }
     }
     #[cfg(not(feature = "vello"))]
-    let _ = (gpu, frames);
+    let _ = (gpu, frames, references);
 
     row
 }
@@ -1572,7 +1580,7 @@ pub fn run(opts: &Options) -> Outcome {
 ///
 /// Three of the four the task set; the fourth — that the crates below the host do not
 /// depend on a window — is a fact about the dependency graph rather than about a
-/// frame, and is checked by `cargo make deps-rule` instead (§26.4).
+/// frame.
 struct Measured<'a> {
     external: &'a Report,
     backends: &'a BackendReport,

@@ -42,6 +42,14 @@ jobs:
         run: |
           cargo make lint
 
+      # The feature combinations the workspace build never compiles, because both
+      # examples turn `window` and `vello` on and cargo unifies features.
+      - name: Check feature combinations
+        run: cargo make check-features
+
+      - name: Build documentation
+        run: cargo make doc
+
       - name: Run tests
         run: cargo make test
 

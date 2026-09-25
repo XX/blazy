@@ -7,10 +7,10 @@
 
 use std::time::Instant;
 
-use masonry::core::NewWidget;
-use masonry::dpi::PhysicalSize;
-use masonry::testing::TestHarness;
-use masonry::theme::default_property_set;
+use blazy::masonry::core::NewWidget;
+use blazy::masonry::dpi::PhysicalSize;
+use blazy::masonry::testing::TestHarness;
+use blazy::masonry::theme::default_property_set;
 use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 
@@ -39,27 +39,27 @@ const FAR_RASTER_FRAMES: usize = 6;
 struct Rasterisers {
     /// `false` in the quick set, where the tables are read for counters and not times.
     timed: bool,
-    host: Option<blazy_shell::Host>,
-    gpu: Option<blazy_shell::gpu::GpuFrames>,
+    host: Option<blazy::shell::Host>,
+    gpu: Option<blazy::shell::gpu::GpuFrames>,
 }
 
 impl Rasterisers {
     fn open(timed: bool) -> Self {
         Self {
             timed,
-            host: timed.then(|| blazy_shell::Host::any().ok()).flatten(),
+            host: timed.then(|| blazy::shell::Host::any().ok()).flatten(),
             gpu: timed
-                .then(|| blazy_shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)).ok())
+                .then(|| blazy::shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)).ok())
                 .flatten(),
         }
     }
 
     /// Rasterises the plan on the blit path and returns milliseconds per frame.
-    fn blit_ms(&mut self, plan: &masonry::app::VisualLayerPlan) -> f64 {
+    fn blit_ms(&mut self, plan: &blazy::masonry::app::VisualLayerPlan) -> f64 {
         let Some(host) = self.host.as_mut() else {
             return 0.0;
         };
-        let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+        let size = blazy::masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
         let _ = host.render(plan, size);
         let start = Instant::now();
         for _ in 0..FAR_RASTER_FRAMES {
@@ -69,11 +69,11 @@ impl Rasterisers {
     }
 
     /// The same on the GPU path, where a device opened. Zero where none did.
-    fn gpu_ms(&mut self, plan: &masonry::app::VisualLayerPlan) -> f64 {
+    fn gpu_ms(&mut self, plan: &blazy::masonry::app::VisualLayerPlan) -> f64 {
         let Some(gpu) = self.gpu.as_mut() else {
             return 0.0;
         };
-        let size = masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+        let size = blazy::masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
         if gpu.draw(plan, size, 1.0).is_err() {
             return 0.0;
         }
@@ -118,8 +118,8 @@ pub(crate) struct FarRow {
 /// measurement, not the frame (§35.1).
 pub(crate) fn segments_of(harness: &mut TestHarness<NodeEditor>) -> u64 {
     let (plan, _) = harness.redraw();
-    let composed = blazy_shell::Composition::new(&plan, 1.0).scene;
-    blazy_shell::encode::segments(&composed, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
+    let composed = blazy::shell::Composition::new(&plan, 1.0).scene;
+    blazy::shell::encode::segments(&composed, PhysicalSize::new(VIEWPORT.0, VIEWPORT.1))
 }
 
 /// One row of the far-field table: a graph, a zoom, and one decision changed.
@@ -128,7 +128,7 @@ struct FarCase {
     pub(crate) what: &'static str,
     count: usize,
     pub(crate) zoom: f64,
-    links: Vec<blazy_canvas::Link>,
+    links: Vec<blazy::canvas::Link>,
     tuning: node_canvas::FarTuning,
     frames: usize,
 }
@@ -146,7 +146,7 @@ fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
     let (canvas, _graph) = CanvasSpec::new(count).with_links(links).with_far(tuning).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
-        NewWidget::new(NodeEditor::new(canvas)),
+        NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
     let _ = harness.redraw();
@@ -161,8 +161,8 @@ fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
 
     let (plan, _) = harness.redraw();
     let frame = PhysicalSize::new(VIEWPORT.0, VIEWPORT.1);
-    let composed = blazy_shell::Composition::new(&plan, 1.0).scene;
-    let encoded = blazy_shell::encode::encoded(&composed, frame);
+    let composed = blazy::shell::Composition::new(&plan, 1.0).scene;
+    let encoded = blazy::shell::encode::encoded(&composed, frame);
 
     let (mut cpu_ms, mut gpu_ms) = (0.0, 0.0);
     if paths.timed {
@@ -208,7 +208,7 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
         tuning: default,
         frames,
     };
-    let row = |what: &'static str, tuning, links: Option<Vec<blazy_canvas::Link>>| FarCase {
+    let row = |what: &'static str, tuning, links: Option<Vec<blazy::canvas::Link>>| FarCase {
         what,
         tuning,
         links: links.unwrap_or_else(|| base.links.clone()),

@@ -84,7 +84,7 @@ use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerButton, PointerUpdate};
 
 pub use crate::region::{AreaContent, RegionCounters, RegionKind, UiScale};
-pub use crate::tree::{AreaId, Bar, NodeId, SplitTree, ratio_at};
+pub use crate::tree::{AreaId, Bar, MAX_AREAS, NodeId, SplitTree, ratio_at};
 pub use crate::workspace::{Workspace, WorkspaceError};
 
 /// Thickness of a splitter, in logical pixels.
@@ -233,7 +233,7 @@ impl AreaScreen {
     ///
     /// Read-only on purpose: every change goes through an operation on the screen, so
     /// the widgets can follow it. This is what an application serialises (see
-    /// [`Workspace`](crate::Workspace)).
+    /// [`Workspace`]).
     pub fn tree(&self) -> &SplitTree {
         &self.tree
     }
@@ -278,9 +278,9 @@ impl AreaScreen {
 
     /// Splits `area` in two, building a widget for the area that appears.
     ///
-    /// Returns the new area's id, or `None` if `area` is not on the screen. The existing
-    /// area keeps its id, its rectangle's first `ratio` and — the point — its widget:
-    /// nothing about it is rebuilt.
+    /// Returns the new area's id, or `None` if `area` is not on the screen or the screen
+    /// already holds [`MAX_AREAS`]. The existing area keeps its id, its rectangle's first
+    /// `ratio` and — the point — its widget: nothing about it is rebuilt.
     ///
     /// This is the operation the builder is kept for. Everything else here only ever
     /// moves or hides areas that already exist.

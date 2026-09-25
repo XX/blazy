@@ -1,0 +1,21 @@
+[package]
+name = "hello"
+description = "The smallest application on blazy: the facade, and nothing underneath it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# One dependency, and that is the point: no `masonry` of its own and no `blazy-*` crate
+# named directly. What this example needs and cannot reach through `blazy` is what an
+# application would not be able to reach either.
+[dependencies]
+blazy = { workspace = true }
+
+[dev-dependencies]
+blazy = { workspace = true, features = ["testing"] }

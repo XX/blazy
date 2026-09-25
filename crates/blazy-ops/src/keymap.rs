@@ -13,7 +13,21 @@
 //! operator's poll agrees, so a canvas binding shadows a window one, and a window
 //! binding still catches what no canvas claimed.
 
+use std::borrow::Cow;
+
 use crate::event::{Device, OpEvent, Pattern};
+
+/// A name in a keymap: an operator's, a context's or a property's.
+///
+/// `Cow` rather than `&'static str`, because a keymap is data (see the module docs). One
+/// written in code borrows its literals and costs what it cost before; one read from a
+/// file owns what it read. With `&'static str` the second kind could only be built by
+/// leaking every string it contained, and user overrides — the reason the keymap is
+/// data at all — would have had nothing to be made of.
+///
+/// An operator's own [`name`](crate::Operator::name) stays `&'static str`: operators are
+/// code, registered from code, and it is only the keymap that has to survive a file.
+pub type Name = Cow<'static, str>;
 
 /// One property value.
 ///
@@ -35,7 +49,7 @@ pub enum Value {
 /// A short association list rather than a map: a binding carries one or two of these
 /// and is looked up on an event, so a hash would cost more than the scan it replaces.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Props(Vec<(&'static str, Value)>);
+pub struct Props(Vec<(Name, Value)>);
 
 impl Props {
     /// No properties at all.
@@ -45,22 +59,22 @@ impl Props {
 
     /// The same properties, with a flag set.
     #[must_use]
-    pub fn with_bool(mut self, name: &'static str, value: bool) -> Self {
-        self.0.push((name, Value::Bool(value)));
+    pub fn with_bool(mut self, name: impl Into<Name>, value: bool) -> Self {
+        self.0.push((name.into(), Value::Bool(value)));
         self
     }
 
     /// The same properties, with a whole number set.
     #[must_use]
-    pub fn with_int(mut self, name: &'static str, value: i64) -> Self {
-        self.0.push((name, Value::Int(value)));
+    pub fn with_int(mut self, name: impl Into<Name>, value: i64) -> Self {
+        self.0.push((name.into(), Value::Int(value)));
         self
     }
 
     /// The same properties, with a float set.
     #[must_use]
-    pub fn with_float(mut self, name: &'static str, value: f64) -> Self {
-        self.0.push((name, Value::Float(value)));
+    pub fn with_float(mut self, name: impl Into<Name>, value: f64) -> Self {
+        self.0.push((name.into(), Value::Float(value)));
         self
     }
 
@@ -98,7 +112,7 @@ impl Props {
     }
 
     fn get(&self, name: &str) -> Option<Value> {
-        self.0.iter().find(|(key, _)| *key == name).map(|(_, value)| *value)
+        self.0.iter().find(|(key, _)| key == name).map(|(_, value)| *value)
     }
 }
 
@@ -108,17 +122,17 @@ pub struct Binding {
     /// The event this binding fires on.
     pub pattern: Pattern,
     /// The operator's name, as [`Operator::name`](crate::Operator::name) gives it.
-    pub op: &'static str,
+    pub op: Name,
     /// The arguments the operator is run with.
     pub props: Props,
 }
 
 impl Binding {
     /// A binding with no properties.
-    pub fn new(pattern: Pattern, op: &'static str) -> Self {
+    pub fn new(pattern: Pattern, op: impl Into<Name>) -> Self {
         Self {
             pattern,
-            op,
+            op: op.into(),
             props: Props::new(),
         }
     }
@@ -135,7 +149,7 @@ impl Binding {
 #[derive(Clone, Debug)]
 pub struct Section {
     /// The context this section belongs to, e.g. `"canvas"`.
-    pub context: &'static str,
+    pub context: Name,
     /// Bindings, in the order they are tried.
     ///
     /// Order is meaning: two bindings may share a pattern and be told apart by their
@@ -234,7 +248,8 @@ impl Keymap {
 
     /// Adds a section, or appends to the one that is already there.
     #[must_use]
-    pub fn with(mut self, context: &'static str, bindings: Vec<Binding>) -> Self {
+    pub fn with(mut self, context: impl Into<Name>, bindings: Vec<Binding>) -> Self {
+        let context = context.into();
         match self.sections.iter_mut().find(|section| section.context == context) {
             Some(section) => section.bindings.extend(bindings),
             None => self.sections.push(Section { context, bindings }),
@@ -322,7 +337,7 @@ mod tests {
         let keymap = keymap();
         let names: Vec<_> = keymap
             .matches(Scope(&["canvas", "window"]), &press(Modifiers::empty()))
-            .map(|binding| binding.op)
+            .map(|binding| binding.op.to_string())
             .collect();
         assert_eq!(names, ["node.select", "node.box_select", "window.click"]);
     }
@@ -334,7 +349,7 @@ mod tests {
         let keymap = keymap();
         let names: Vec<_> = keymap
             .matches(Scope(&["window"]), &press(Modifiers::empty()))
-            .map(|binding| binding.op)
+            .map(|binding| binding.op.to_string())
             .collect();
         assert_eq!(names, ["window.click"]);
     }
