@@ -31,7 +31,7 @@ Everything goes through `cargo-make`. `cargo fmt` needs nightly; everything else
 stable.
 
 ```bash
-cargo make ci               # what CI runs: lint + feature matrix + docs + tests + deps rule + three benchmark gates
+cargo make ci               # what CI runs: lint + feature matrix + docs + tests + three benchmark gates
 cargo make lint             # fmt --check + clippy -D warnings
 cargo make check-features   # clippy on the shell and the facade with window/vello off (§14, §40.4)
 cargo make doc              # rustdoc -D warnings, all features
