@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use area_screen::ScreenSpec;
+use area_screen::{Screen, ScreenSpec};
 use blazy::areas::AreaScreen;
 use blazy::canvas::CanvasLayer;
 use blazy::masonry::core::NewWidget;
@@ -54,6 +54,19 @@ pub(crate) struct CacheRow {
     /// it (§37.2).
     pub(crate) budget_kib: u64,
     pub(crate) evictions: f64,
+    /// Per frame: layers the cache said it would copy and then had no pixels for.
+    ///
+    /// Zero by construction, and measured because it was not: an eviction could drop a
+    /// texture the same frame had already decided to reuse, and the copy then did
+    /// nothing at all. The area went empty for a frame while every other counter here
+    /// said the cache was working (§44.9).
+    pub(crate) dropped: f64,
+    /// Per frame: registered layers whose rectangle overlapped another's.
+    ///
+    /// The half of §36's precondition the host can check, and the one that failed: an
+    /// area painting outside its own box moves its layer rectangle onto its neighbour,
+    /// which is what put the cache over its ceiling in the first place.
+    pub(crate) overlaps: f64,
 }
 
 /// Asks every area to repaint, the way the shell does before a frame (§36.1).
@@ -61,14 +74,14 @@ pub(crate) struct CacheRow {
 /// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
 /// loop does it for the ids `ShellDriver::layers` returns — and a library method that
 /// exists only so a harness can imitate the host is a second way to say one thing.
-fn keep_layers(harness: &mut TestHarness<AreaScreen>) {
+fn keep_layers(harness: &mut TestHarness<Screen>) {
     for id in harness.root_widget().area_ids() {
         harness.edit_widget_with_id(id, |mut widget| widget.ctx.request_paint_only());
     }
 }
 
 /// A screen whose areas declare scene layers, at a zoom where the frame is expensive.
-fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+fn layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = ScreenSpec::new(areas, nodes).with_isolated_layers(true).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -92,7 +105,7 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 /// other; an overlay across the window would dirty every one of them, and worse, it
 /// would break the condition the cache cannot check — that a cached layer owns its
 /// rectangle (§36.4).
-fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = ScreenSpec::new(areas, nodes)
         .with_isolated_layers(true)
         .with_ops(true)
@@ -111,7 +124,7 @@ fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 }
 
 /// The main region of an area, whatever kind of widget it is.
-fn main_region(harness: &TestHarness<AreaScreen>, area: usize) -> blazy::masonry::core::WidgetId {
+fn main_region(harness: &TestHarness<Screen>, area: usize) -> blazy::masonry::core::WidgetId {
     let area_id = harness.root_widget().area_ids()[area];
     *harness
         .get_widget_with_id(area_id)
@@ -123,7 +136,7 @@ fn main_region(harness: &TestHarness<AreaScreen>, area: usize) -> blazy::masonry
 }
 
 /// Zooms the canvas inside an area's editor.
-fn zoom_editor(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
+fn zoom_editor(harness: &mut TestHarness<Screen>, area: usize, factor: f64) {
     let id = main_region(harness, area);
     harness.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
@@ -134,7 +147,7 @@ fn zoom_editor(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) 
 }
 
 /// Where a node of an area's graph is on screen, in window coordinates.
-fn node_on_screen(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> blazy::masonry::kurbo::Point {
+fn node_on_screen(harness: &mut TestHarness<Screen>, area: usize, index: usize) -> blazy::masonry::kurbo::Point {
     let id = main_region(harness, area);
     let local = harness.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
@@ -151,7 +164,7 @@ fn node_on_screen(harness: &mut TestHarness<AreaScreen>, area: usize, index: usi
 ///
 /// At this zoom no node has a widget at all: the press is answered from the model
 /// (§25.3), which is the whole reason a selection works in the far field.
-fn click_node(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) {
+fn click_node(harness: &mut TestHarness<Screen>, area: usize, index: usize) {
     let at = node_on_screen(harness, area, index);
     harness.mouse_move(at);
     harness.mouse_button_press(Some(blazy::masonry::ui_events::pointer::PointerButton::Secondary));
@@ -180,7 +193,7 @@ struct CacheCase {
 fn cache_case(
     gpu: &mut blazy::shell::gpu::GpuFrames,
     case: CacheCase,
-    mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
+    mut step: impl FnMut(&mut TestHarness<Screen>, usize),
 ) -> Option<CacheRow> {
     let CacheCase {
         what,
@@ -275,6 +288,8 @@ fn cache_case(
         kib: counters.bytes / 1024,
         budget_kib: budget / 1024,
         evictions: (counters.evictions - before.evictions) as f64 / frames,
+        dropped: (counters.dropped - before.dropped) as f64 / frames,
+        overlaps: (counters.overlaps - before.overlaps) as f64 / frames,
     })
 }
 
@@ -327,7 +342,7 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
         // changes what the cache holds — §41.2 asks whether it survives that. The join
         // happens once, part way through, so the row measures the frames on both sides of
         // it rather than the frame it happened in.
-        let join = |h: &mut TestHarness<AreaScreen>, i: usize| {
+        let join = |h: &mut TestHarness<Screen>, i: usize| {
             if i != CACHE_FRAMES / 2 {
                 return;
             }
@@ -375,7 +390,7 @@ fn print_cache(rows: &[CacheRow]) {
         return;
     }
     println!(
-        "  {:<20} {:>5} {:>6} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8}",
+        "  {:<20} {:>5} {:>6} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8}",
         "gesture",
         "cache",
         "layers",
@@ -383,6 +398,8 @@ fn print_cache(rows: &[CacheRow]) {
         "drawn/f",
         "walks/f",
         "evict/f",
+        "drop/f",
+        "over/f",
         "cmp ms",
         "walk ms",
         "gpu ms",
@@ -391,7 +408,7 @@ fn print_cache(rows: &[CacheRow]) {
     );
     for row in rows {
         println!(
-            "  {:<20} {:>5} {:>6} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>7.3} {:>7.3} {:>8.2} {:>7} {:>8}",
+            "  {:<20} {:>5} {:>6} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.3} {:>7.3} {:>8.2} {:>7} {:>8}",
             row.what,
             if row.cached { "on" } else { "off" },
             row.layers,
@@ -399,6 +416,8 @@ fn print_cache(rows: &[CacheRow]) {
             row.drawn,
             row.walks,
             row.evictions,
+            row.dropped,
+            row.overlaps,
             row.compare_ms,
             row.walk_ms,
             row.gpu_ms,

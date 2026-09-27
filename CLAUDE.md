@@ -325,9 +325,16 @@ Two things are load-bearing. The layer lives one paint, exactly like a hole, so 
 asks the layer owners to repaint on frames that are happening anyway
 (`ShellDriver::layers`) rather than through an animation frame, which would stop the
 window from ever idling. And a cached layer **owns its rectangle** — nothing else may
-draw into it — which the host cannot check and therefore asks for. The cache is bounded:
+draw into it — which the host cannot fully check and therefore asks for, though it now
+counts the half it can: registered layers whose rectangles overlap. The cache is bounded:
 the layers tile the window, so all of them together are about one frame of pixels, and the
-default ceiling is two frames with eviction by least recent use (§37.2).
+default ceiling is two frames with eviction by least recent use (§37.2). Both of those were
+assumptions until they broke (§44.9). A widget painting its **own** overlay — a selection
+outline, a status line — is clipped by nobody, so an area's layer claimed its neighbour's
+pixels and eight areas claimed 1.8 windows' worth; and an eviction could then drop a
+texture the same frame had already decided to copy, which leaves that area blank while
+every counter still says the cache reused it. A layer the current frame is copying is now
+off limits to eviction: the ceiling bounds what is kept *between* frames.
 
 **There is no one place to intercept an event, and the layer is not a widget (§38).**
 Masonry calls `Layer::capture_pointer_event` on every *layer root* before it even works
@@ -355,6 +362,27 @@ so "the key and the script do the same thing" is checked by comparing model stat
 context an operator polls against is assembled *on hover*: the canvas picks on every
 pointer event, including the press, and publishes the answer, because a driver holding
 an `EventCtx` cannot hit-test a child.
+
+**A window is a map entry, and what an area knows lives beside the tree (§44).** The
+loop holds several windows, each with its own `RenderRoot`, presenter, device and layer
+cache; one `ShellDriver` per process names the window in every method, because detach has
+two ends. What an area holds beyond the graph — the view, the selection, the undo history
+— is an `EditorSession` kept as `AreaScreen`'s per-area payload, so a widget rebuilt in
+another window loses nothing and a joined area takes its session with it. **The §30
+fan-out does not cross a window**: `mutate_later` names a widget in one arena and is
+dropped silently for any other, so the model records what each view still owes and each
+window pulls its share in `ShellDriver::frame`. Waking the other windows belongs in
+`ShellDriver::settled`, after the event: both seats are offered an event *before* the tree
+acts on it, so a wake-up decided there is one gesture late — which is how a change made
+with the mouse failed to cross while one made with a key did (§44.3). And the pull has to
+know **every shape the application builds**: the tests and the benchmarks built areas with
+the operator layer, the window built them without, and a pull that looked only for a
+`NodeEditor` applied nothing at all there — silently, since a `try_downcast` that misses
+has nothing to fail. A test whose scene is not the shape the application builds is testing
+another product. And **everything a node widget copies out of the model** has to be
+recorded, not only its geometry: a slider and a checkbox are read once, when the node is
+built, so recording positions alone left two windows disagreeing about a checkbox for
+good (§44.9).
 
 **A node's name is a hole in an array, never an index that shifts (§43).** A removed
 node leaves its slot behind, dead, and the next insertion takes the name back — the free

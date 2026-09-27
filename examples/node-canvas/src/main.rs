@@ -16,7 +16,7 @@ use blazy::canvas::{DEFAULT_WIDGET_BUDGET, DetailBudget};
 use blazy::masonry::app::RenderRoot;
 use blazy::masonry::core::NewWidget;
 use blazy::masonry::theme::default_property_set;
-use blazy::shell::window::{ShellDriver, WindowConfig, run};
+use blazy::shell::window::{ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use blazy::shell::{Backend, COMPILED};
 use clap::Parser;
 use node_canvas::{DEFAULT_NODES, build_canvas};
@@ -86,7 +86,7 @@ fn main() {
 struct KeymapFocus;
 
 impl ShellDriver for KeymapFocus {
-    fn started(&mut self, root: &mut RenderRoot) {
+    fn started(&mut self, _cx: &mut ShellCtx, _window: WindowKey, root: &mut RenderRoot) {
         let id = root.get_layer_root(0).id();
         root.set_focus_fallback(Some(id));
     }

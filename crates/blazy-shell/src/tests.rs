@@ -462,7 +462,7 @@ mod host_seat {
     use masonry::ui_events::pointer::PointerState;
 
     use super::*;
-    use crate::window::{ShellDriver, deliver_pointer};
+    use crate::window::{ShellCtx, ShellDriver, WindowKey, deliver_pointer};
 
     /// A widget that counts the pointer events that reach it.
     struct Probe {
@@ -514,7 +514,13 @@ mod host_seat {
     }
 
     impl ShellDriver for Seat {
-        fn pointer_event(&mut self, _root: &mut RenderRoot, _event: &PointerEvent) -> Handled {
+        fn pointer_event(
+            &mut self,
+            _cx: &mut ShellCtx,
+            _window: WindowKey,
+            _root: &mut RenderRoot,
+            _event: &PointerEvent,
+        ) -> Handled {
             self.seen.set(self.seen.get() + 1);
             if self.withhold { Handled::Yes } else { Handled::No }
         }
@@ -533,6 +539,13 @@ mod host_seat {
                 test_font: None,
             },
         )
+    }
+
+    /// A context and a name for a window nobody opened: the seat works without a loop.
+    fn seat_ctx() -> (ShellCtx, WindowKey) {
+        let mut cx = ShellCtx::new();
+        let window = cx.name_window();
+        (cx, window)
     }
 
     fn moved(x: f64, y: f64) -> PointerEvent {
@@ -562,8 +575,15 @@ mod host_seat {
             seen: seat_seen.clone(),
         };
 
+        let (mut cx, window) = seat_ctx();
         for step in 0..5 {
-            let handled = deliver_pointer(&mut driver, &mut root, moved(10.0 + f64::from(step), 10.0));
+            let handled = deliver_pointer(
+                &mut driver,
+                &mut cx,
+                window,
+                &mut root,
+                moved(10.0 + f64::from(step), 10.0),
+            );
             assert!(handled.is_handled(), "the seat took it");
         }
 
@@ -582,13 +602,76 @@ mod host_seat {
             seen: seat_seen.clone(),
         };
 
+        let (mut cx, window) = seat_ctx();
         for step in 0..5 {
-            deliver_pointer(&mut driver, &mut root, moved(10.0 + f64::from(step), 10.0));
+            deliver_pointer(
+                &mut driver,
+                &mut cx,
+                window,
+                &mut root,
+                moved(10.0 + f64::from(step), 10.0),
+            );
         }
 
         assert_eq!(seat_seen.get(), 5);
         assert!(widget_seen.get() > 0, "the tree got what the seat did not take");
     }
+}
+
+/// What a driver asks for is queued, named immediately, and drained once.
+///
+/// The naming is the part worth pinning: a driver detaching an area needs the name of
+/// the window it is moving into *before* the window exists, because the move is written
+/// against that name. Everything else here is the queue being a queue.
+#[cfg(feature = "window")]
+#[test]
+fn a_driver_names_a_window_before_it_exists() {
+    use masonry::core::NewWidget;
+
+    use crate::window::{ShellCtx, ShellRequest, WindowConfig};
+
+    let mut cx = ShellCtx::new();
+    let first = cx.open_window(
+        WindowConfig::default(),
+        NewWidget::new(Layered {
+            paints: Rc::new(Cell::new(0)),
+        })
+        .erased(),
+    );
+    let second = cx.open_window(
+        WindowConfig::default(),
+        NewWidget::new(Layered {
+            paints: Rc::new(Cell::new(0)),
+        })
+        .erased(),
+    );
+    assert_ne!(first, second, "two windows are two names");
+    cx.close_window(first);
+
+    let requests = cx.drain();
+    assert_eq!(requests.len(), 3, "everything asked for, in one drain");
+    match (&requests[0], &requests[1], &requests[2]) {
+        (ShellRequest::Open(one), ShellRequest::Open(two), ShellRequest::Close(closing)) => {
+            assert_eq!(one.window, first, "the name the driver got is the name the shell gets");
+            assert_eq!(two.window, second);
+            assert_eq!(*closing, first);
+        },
+        _ => panic!("the requests came back in a different order than they were made"),
+    }
+    assert!(cx.drain().is_empty(), "draining empties the queue");
+}
+
+/// A window nobody opened still has a name, which is what lets the host seat be used
+/// outside the shell's own loop — by an embedder, or by the tests above.
+#[cfg(feature = "window")]
+#[test]
+fn a_window_the_shell_did_not_open_can_be_named() {
+    use crate::window::ShellCtx;
+
+    let mut cx = ShellCtx::new();
+    let (first, second) = (cx.name_window(), cx.name_window());
+    assert_ne!(first, second);
+    assert!(cx.drain().is_empty(), "naming a window asks for nothing");
 }
 
 /// The cause of a failure has to survive the trip to the caller.

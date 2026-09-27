@@ -138,25 +138,41 @@ pub struct ScreenCounters {
     pub area_layouts: u64,
 }
 
+/// Makes what an area is: its widget, and what the application keeps beside it.
+///
+/// Both at once, because between the two there is a moment when an area has a widget and
+/// no state, and a widget that needs that state cannot be built in it (decision 1a of the
+/// detach task).
+type AreaBuilder<P> = dyn FnMut(AreaId) -> (NewWidget<dyn Widget>, P);
+
 /// A window tiled into areas, each holding one widget.
 ///
 /// The screen owns the rects. Areas are laid out at exactly the size the split tree
 /// computed, never at a size they asked for: §8's "layout of an area runs against
 /// rectangles we computed, so Masonry does not recompute the split layout".
-pub struct AreaScreen {
+pub struct AreaScreen<P = ()> {
     tree: SplitTree,
     /// Builds the widget for an area that appears.
     ///
     /// Kept rather than consumed by the constructor, and that is what an operation which
     /// *adds* an area runs into first: a split needs a child for the id the tree just
     /// handed out, and there is nobody else to ask.
-    build: Box<dyn FnMut(AreaId) -> NewWidget<dyn Widget>>,
+    build: Box<AreaBuilder<P>>,
     /// One child per area, indexed by [`AreaId`]; `None` where an area was joined away.
     ///
     /// A tombstone rather than a compacted list, for the same reason the tree keeps free
     /// slots: the id is the caller's index, so removing an entry would move everyone
     /// after it. The hole is filled again when the id is handed out again.
     pods: Vec<Option<WidgetPod<dyn Widget>>>,
+    /// What the application keeps beside each area's widget, by the same key and with
+    /// the same tombstones.
+    ///
+    /// The place for state that has to outlive the widget — a view, a selection, an undo
+    /// history — because a widget does not survive being rebuilt in another window and
+    /// that state must (the detach task, decision 1a). Keyed by [`AreaId`], so it follows
+    /// the area through a swap and goes with it through a join without anything else
+    /// being written: the id is what everything here is keyed by (§41.2, §41.4).
+    payloads: Vec<Option<P>>,
     /// The border-box size each area was last given, for counting real resizes.
     sizes: Vec<Option<Size>>,
     /// Where each area goes, recomputed every layout. Reused, so a resize allocates
@@ -179,19 +195,36 @@ pub struct AreaScreen {
     area_layouts: u64,
 }
 
-impl AreaScreen {
+impl AreaScreen<()> {
     /// Builds a screen over `tree`, calling `build` once per area.
     ///
     /// Every area is materialised up front, unlike the canvas's nodes: an area is
     /// on screen by definition, and there are tens of them rather than thousands.
     pub fn new(tree: SplitTree, mut build: impl FnMut(AreaId) -> NewWidget<dyn Widget> + 'static) -> Self {
+        Self::with_payloads(tree, move |area| (build(area), ()))
+    }
+}
+
+impl<P: 'static> AreaScreen<P> {
+    /// Builds a screen whose areas carry something of the application's beside them.
+    ///
+    /// One call per area, and it makes both at once on purpose: between building the
+    /// widget and filling a map there is a moment when an area has a widget and no state,
+    /// and an editor that needs its session to exist cannot be built in it.
+    pub fn with_payloads(
+        tree: SplitTree,
+        mut build: impl FnMut(AreaId) -> (NewWidget<dyn Widget>, P) + 'static,
+    ) -> Self {
         // By area id rather than by count: a tree loaded from a workspace, or one that
         // has been joined, holds ids that are not dense.
         let slots = tree.areas().map(|area| area + 1).max().unwrap_or(0);
         let mut pods: Vec<Option<WidgetPod<dyn Widget>>> = (0..slots).map(|_| None).collect();
+        let mut payloads: Vec<Option<P>> = (0..slots).map(|_| None).collect();
         let mut builds = 0;
         for area in tree.areas() {
-            pods[area] = Some(build(area).to_pod());
+            let (widget, payload) = build(area);
+            pods[area] = Some(widget.to_pod());
+            payloads[area] = Some(payload);
             builds += 1;
         }
         let count = tree.area_count();
@@ -199,6 +232,7 @@ impl AreaScreen {
             tree,
             build: Box::new(build),
             pods,
+            payloads,
             sizes: vec![None; slots],
             rects: Vec::with_capacity(count),
             bars: Vec::with_capacity(count.saturating_sub(1)),
@@ -286,12 +320,14 @@ impl AreaScreen {
     /// moves or hides areas that already exist.
     pub fn split(this: &mut WidgetMut<'_, Self>, area: AreaId, axis: Axis, ratio: f64) -> Option<AreaId> {
         let fresh = this.widget.tree.split(area, axis, ratio)?;
-        let widget = (this.widget.build)(fresh);
+        let (widget, payload) = (this.widget.build)(fresh);
         if fresh >= this.widget.pods.len() {
             this.widget.pods.resize_with(fresh + 1, || None);
+            this.widget.payloads.resize_with(fresh + 1, || None);
             this.widget.sizes.resize(fresh + 1, None);
         }
         this.widget.pods[fresh] = Some(widget.to_pod());
+        this.widget.payloads[fresh] = Some(payload);
         // A reused id may carry the size its previous occupant was given, and a stale
         // one would swallow the first resize of the new area.
         this.widget.sizes[fresh] = None;
@@ -314,10 +350,42 @@ impl AreaScreen {
         if let Some(pod) = this.widget.pods.get_mut(dropped).and_then(Option::take) {
             this.ctx.remove_child(pod);
         }
+        // And what the application kept beside it. This is the half of decision 1a that
+        // makes a session's lifetime a property of the construction rather than of
+        // somebody remembering: the area went, so its state goes.
+        this.widget.payloads[dropped] = None;
         this.widget.sizes[dropped] = None;
         this.ctx.children_changed();
         this.ctx.request_layout();
         true
+    }
+
+    /// Takes an area off this screen and hands back what it carried.
+    ///
+    /// The screen half of detach. The widget is dropped — a tree cannot move between
+    /// windows, because `RenderRoot` owns its arena and upstream has no reparenting — and
+    /// the payload is not: it is handed to the caller, who builds a new area over it
+    /// somewhere else. That asymmetry is the whole design (decisions 1 and 1a): what the
+    /// user would miss lives beside the widget, so rebuilding the widget costs nothing.
+    ///
+    /// `None` when nothing happened, and there is one such case: the last area of a
+    /// screen, because a screen with no areas is not expressible and refusing is the
+    /// answer (decision 5, and the precedent of a join without a sibling in §41.1).
+    ///
+    /// The space goes to whatever shared the split, whatever shape it has — unlike
+    /// [`join`](Self::join), which needs two leaves.
+    pub fn detach(this: &mut WidgetMut<'_, Self>, area: AreaId) -> Option<P> {
+        if !this.widget.tree.remove(area) {
+            return None;
+        }
+        let payload = this.widget.payloads.get_mut(area).and_then(Option::take);
+        if let Some(pod) = this.widget.pods.get_mut(area).and_then(Option::take) {
+            this.ctx.remove_child(pod);
+        }
+        this.widget.sizes[area] = None;
+        this.ctx.children_changed();
+        this.ctx.request_layout();
+        payload
     }
 
     /// Exchanges the places of two areas. Returns whether anything happened.
@@ -367,6 +435,7 @@ impl AreaScreen {
             .unwrap_or(0)
             .max(this.widget.pods.len());
         this.widget.pods.resize_with(slots, || None);
+        this.widget.payloads.resize_with(slots, || None);
         this.widget.sizes.resize(slots, None);
 
         for area in 0..slots {
@@ -375,11 +444,13 @@ impl AreaScreen {
                     if let Some(pod) = this.widget.pods[area].take() {
                         this.ctx.remove_child(pod);
                     }
+                    this.widget.payloads[area] = None;
                     this.widget.sizes[area] = None;
                 },
                 (true, false) => {
-                    let widget = (this.widget.build)(area);
+                    let (widget, payload) = (this.widget.build)(area);
                     this.widget.pods[area] = Some(widget.to_pod());
+                    this.widget.payloads[area] = Some(payload);
                     this.widget.sizes[area] = None;
                     this.widget.builds += 1;
                 },
@@ -390,6 +461,28 @@ impl AreaScreen {
         this.widget.tree = tree;
         this.ctx.children_changed();
         this.ctx.request_layout();
+    }
+
+    /// What the application keeps beside an area, if anything.
+    pub fn payload(&self, area: AreaId) -> Option<&P> {
+        self.payloads.get(area).and_then(Option::as_ref)
+    }
+
+    /// Takes it away, leaving the area without one.
+    ///
+    /// For detach: the state moves to the window the area is rebuilt in, and the area
+    /// here is about to go. An area whose payload was taken and which stays on screen is
+    /// an area whose widget is showing state nobody owns, so the two go together.
+    pub fn take_payload(this: &mut WidgetMut<'_, Self>, area: AreaId) -> Option<P> {
+        this.widget.payloads.get_mut(area).and_then(Option::take)
+    }
+
+    /// Puts one there, replacing whatever was.
+    pub fn set_payload(this: &mut WidgetMut<'_, Self>, area: AreaId, payload: P) {
+        if area >= this.widget.payloads.len() {
+            this.widget.payloads.resize_with(area + 1, || None);
+        }
+        this.widget.payloads[area] = Some(payload);
     }
 
     /// The area under a screen-space point, if the point is on one rather than on a
@@ -420,7 +513,7 @@ impl AreaScreen {
     }
 }
 
-impl Widget for AreaScreen {
+impl<P: 'static> Widget for AreaScreen<P> {
     type Action = NoAction;
 
     fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &PointerEvent) {
@@ -553,6 +646,8 @@ impl Widget for AreaScreen {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use masonry::dpi::PhysicalSize;
     use masonry::kurbo::Axis;
     use masonry::testing::{ModularWidget, TestHarness};
@@ -586,6 +681,110 @@ mod tests {
         );
         let _ = harness.redraw();
         harness
+    }
+
+    /// A screen whose areas carry something of the application's: a counted handle, so
+    /// the test can see when it is dropped.
+    fn payload_harness(areas: usize) -> (TestHarness<AreaScreen<Rc<()>>>, Rc<()>) {
+        let token = Rc::new(());
+        let handed = token.clone();
+        let screen = AreaScreen::with_payloads(SplitTree::balanced(areas), move |_| (leaf(), handed.clone()));
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new(screen),
+            PhysicalSize::new(SCREEN.0, SCREEN.1),
+        );
+        let _ = harness.redraw();
+        (harness, token)
+    }
+
+    /// Decision 1a: what an area carries beside its widget lives and dies with the area.
+    #[test]
+    fn a_joined_area_takes_its_payload_with_it() {
+        let (mut harness, token) = payload_harness(4);
+        // One per area, one the test holds, and one the builder keeps so that a split
+        // can make another area later.
+        assert_eq!(Rc::strong_count(&token), 6);
+
+        harness.edit_root_widget(|mut screen| {
+            let sibling = screen
+                .widget
+                .tree()
+                .joinable(0)
+                .expect("a balanced screen has siblings");
+            assert!(AreaScreen::join(&mut screen, 0, sibling));
+            assert!(screen.widget.payload(sibling).is_none(), "the area that went took it");
+            assert!(screen.widget.payload(0).is_some(), "the one that stayed kept it");
+        });
+        let _ = harness.redraw();
+
+        assert_eq!(Rc::strong_count(&token), 5, "and the handle the area held is gone");
+    }
+
+    /// And a payload can be taken out and put back, which is all detach needs from it.
+    #[test]
+    fn a_payload_can_be_taken_and_given() {
+        let (mut harness, _token) = payload_harness(2);
+        harness.edit_root_widget(|mut screen| {
+            let taken = AreaScreen::take_payload(&mut screen, 1).expect("area 1 has one");
+            assert!(screen.widget.payload(1).is_none(), "and now it does not");
+            AreaScreen::set_payload(&mut screen, 1, taken);
+            assert!(screen.widget.payload(1).is_some(), "until it is given back");
+        });
+    }
+
+    /// Detach: the area goes, its state comes back, and nothing else is rebuilt.
+    #[test]
+    fn detaching_an_area_hands_back_its_payload_and_rebuilds_nothing() {
+        let (mut harness, token) = payload_harness(4);
+        let before = harness.root_widget().stats().counters.builds;
+
+        let taken = harness.edit_root_widget(|mut screen| AreaScreen::detach(&mut screen, 1));
+        let _ = harness.redraw();
+
+        assert!(taken.is_some(), "the area's state came out with it");
+        assert_eq!(harness.root_widget().stats().areas, 3, "and the area is off the screen");
+        assert_eq!(
+            harness.root_widget().stats().counters.builds,
+            before,
+            "the areas that stayed kept their widgets (§41.2)"
+        );
+        assert_eq!(Rc::strong_count(&token), 6, "nothing was cloned and nothing dropped");
+        drop(taken);
+        assert_eq!(Rc::strong_count(&token), 5);
+    }
+
+    /// Decision 5: the last area of a screen does not detach.
+    #[test]
+    fn the_last_area_does_not_detach() {
+        let (mut harness, _token) = payload_harness(1);
+        let taken = harness.edit_root_widget(|mut screen| AreaScreen::detach(&mut screen, 0));
+        assert!(taken.is_none(), "nothing came out");
+        assert_eq!(harness.root_widget().stats().areas, 1, "and nothing went");
+        assert!(
+            harness.root_widget().payload(0).is_some(),
+            "the area still has its state"
+        );
+    }
+
+    /// The space goes to the sibling subtree, which is what makes detach work where join
+    /// refuses (§41.1).
+    #[test]
+    fn detach_works_where_join_has_no_partner() {
+        let (mut harness, _token) = payload_harness(4);
+        harness.edit_root_widget(|mut screen| {
+            AreaScreen::split(&mut screen, 1, Axis::Horizontal, 0.5);
+        });
+        let _ = harness.redraw();
+
+        let areas = harness.root_widget().stats().areas;
+        harness.edit_root_widget(|mut screen| {
+            let joinable = screen.widget.tree().joinable(0);
+            let taken = AreaScreen::detach(&mut screen, 0);
+            assert!(taken.is_some(), "detach took it anyway: {joinable:?}");
+        });
+        let _ = harness.redraw();
+        assert_eq!(harness.root_widget().stats().areas, areas - 1);
     }
 
     /// What the split tree says the areas should be, computed independently.

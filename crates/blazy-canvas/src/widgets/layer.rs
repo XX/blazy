@@ -239,6 +239,18 @@ impl CanvasLayer {
 
     /// The canvas-space to viewport-space transform.
     ///
+    /// The same canvas, showing what `view` says.
+    ///
+    /// For a canvas built to take over from another one — the area rebuilt in a second
+    /// window — because the view is a view's own state and nothing else remembers it:
+    /// §22 keeps it out of layout, and §30 kept it out of the model.
+    #[must_use]
+    pub fn with_view(mut self, view: Affine) -> Self {
+        self.view = view;
+        self.view_dirty = true;
+        self
+    }
+
     /// Public because anything drawing over the canvas — an overlay, a rubber band,
     /// a tooltip anchored to a node — has to agree with it about where things are,
     /// and rederiving it from the zoom and the pan is how two answers start to

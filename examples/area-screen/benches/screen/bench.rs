@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use area_screen::header::ScaledHeader;
-use area_screen::{ScreenSpec, build_screen};
+use area_screen::{Screen, ScreenSpec, build_screen};
 use bench_utils::criteria::{Criterion, Kind, Outcome, ScenarioRecord, SweepRecord};
 use bench_utils::plan;
 use blazy::areas::{AreaContent, AreaScreen, Bar, NodeId, ScreenStats};
@@ -153,7 +153,7 @@ impl Report {
 }
 
 /// Reads the screen's counters and sums its areas' and regions'.
-fn snapshot(harness: &TestHarness<AreaScreen>) -> Snapshot {
+fn snapshot(harness: &TestHarness<Screen>) -> Snapshot {
     let screen = harness.root_widget().stats();
     let mut live = 0;
     let mut child_layouts = 0;
@@ -179,12 +179,12 @@ fn snapshot(harness: &TestHarness<AreaScreen>) -> Snapshot {
     }
 }
 
-fn area_ids(harness: &TestHarness<AreaScreen>) -> Vec<WidgetId> {
+fn area_ids(harness: &TestHarness<Screen>) -> Vec<WidgetId> {
     harness.root_widget().area_ids()
 }
 
 /// The region stack filling one area.
-fn content(harness: &TestHarness<AreaScreen>, id: WidgetId) -> blazy::masonry::core::WidgetRef<'_, AreaContent> {
+fn content(harness: &TestHarness<Screen>, id: WidgetId) -> blazy::masonry::core::WidgetRef<'_, AreaContent> {
     harness
         .get_widget_with_id(id)
         .downcast::<AreaContent>()
@@ -192,13 +192,13 @@ fn content(harness: &TestHarness<AreaScreen>, id: WidgetId) -> blazy::masonry::c
 }
 
 /// The widget id of one region inside one area.
-fn region_id(harness: &TestHarness<AreaScreen>, area: usize, region: usize) -> WidgetId {
+fn region_id(harness: &TestHarness<Screen>, area: usize, region: usize) -> WidgetId {
     let area_id = area_ids(harness)[area];
     content(harness, area_id).region_ids()[region]
 }
 
 /// The canvas of an area: the last region, whatever else the area carries.
-fn canvas_of(harness: &TestHarness<AreaScreen>, area: usize) -> blazy::masonry::core::WidgetRef<'_, CanvasLayer> {
+fn canvas_of(harness: &TestHarness<Screen>, area: usize) -> blazy::masonry::core::WidgetRef<'_, CanvasLayer> {
     let area_id = area_ids(harness)[area];
     let id = *content(harness, area_id)
         .region_ids()
@@ -211,7 +211,7 @@ fn canvas_of(harness: &TestHarness<AreaScreen>, area: usize) -> blazy::masonry::
 }
 
 /// The scale an area's header last laid itself out at.
-fn header_seen(harness: &TestHarness<AreaScreen>, area: usize) -> f64 {
+fn header_seen(harness: &TestHarness<Screen>, area: usize) -> f64 {
     let id = region_id(harness, area, 0);
     harness
         .get_widget_with_id(id)
@@ -221,7 +221,7 @@ fn header_seen(harness: &TestHarness<AreaScreen>, area: usize) -> f64 {
 }
 
 /// Sets the interface scale of an area's header region.
-fn set_header_scale(harness: &mut TestHarness<AreaScreen>, area: usize, scale: f64) {
+fn set_header_scale(harness: &mut TestHarness<Screen>, area: usize, scale: f64) {
     let id = area_ids(harness)[area];
     harness.edit_widget_with_id(id, |mut widget| {
         let mut content = widget.downcast::<AreaContent>();
@@ -229,7 +229,7 @@ fn set_header_scale(harness: &mut TestHarness<AreaScreen>, area: usize, scale: f
     });
 }
 
-fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+fn new_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -243,7 +243,7 @@ fn new_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 }
 
 /// A screen of one region per area: the canvas, with no header above it.
-fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = ScreenSpec::new(areas, nodes).without_header().build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -257,9 +257,9 @@ fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 /// Times `frames` iterations of `step`, each followed by a full redraw.
 fn measure(
     name: &'static str,
-    harness: &mut TestHarness<AreaScreen>,
+    harness: &mut TestHarness<Screen>,
     frames: usize,
-    mut step: impl FnMut(&mut TestHarness<AreaScreen>, usize),
+    mut step: impl FnMut(&mut TestHarness<Screen>, usize),
 ) -> Report {
     let before = snapshot(harness);
     let mut total = Duration::ZERO;
@@ -289,7 +289,7 @@ fn measure(
 }
 
 /// The splitter dividing the smallest span, i.e. one between two leaf areas.
-fn leaf_bar(harness: &TestHarness<AreaScreen>) -> Option<Bar> {
+fn leaf_bar(harness: &TestHarness<Screen>) -> Option<Bar> {
     harness
         .root_widget()
         .bars()
@@ -299,7 +299,7 @@ fn leaf_bar(harness: &TestHarness<AreaScreen>) -> Option<Bar> {
 }
 
 /// The splitter dividing the largest span, i.e. the root of the tree.
-fn root_bar(harness: &TestHarness<AreaScreen>) -> Option<Bar> {
+fn root_bar(harness: &TestHarness<Screen>) -> Option<Bar> {
     harness
         .root_widget()
         .bars()
@@ -317,7 +317,7 @@ fn span_area(bar: &Bar) -> f64 {
 /// One pixel because the split tree rounds a ratio to whole pixels: a sub-pixel
 /// step would leave every rect unchanged and the scenario would measure an idle
 /// screen while looking like a drag.
-fn drag_step(harness: &mut TestHarness<AreaScreen>, split: NodeId, base: Point, axis: Axis, i: usize) {
+fn drag_step(harness: &mut TestHarness<Screen>, split: NodeId, base: Point, axis: Axis, i: usize) {
     let offset = ((i % 40) as f64) - 20.0;
     let pos = match axis {
         Axis::Horizontal => Point::new(base.x + offset, base.y),
@@ -327,7 +327,7 @@ fn drag_step(harness: &mut TestHarness<AreaScreen>, split: NodeId, base: Point, 
 }
 
 /// Pans the canvas in area `area` by one step.
-pub(crate) fn pan_area(harness: &mut TestHarness<AreaScreen>, area: usize, delta: Vec2) {
+pub(crate) fn pan_area(harness: &mut TestHarness<Screen>, area: usize, delta: Vec2) {
     let id = canvas_of(harness, area).ctx().widget_id();
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
@@ -336,7 +336,7 @@ pub(crate) fn pan_area(harness: &mut TestHarness<AreaScreen>, area: usize, delta
 }
 
 /// Zooms the canvas in area `area` about its centre.
-pub(crate) fn zoom_area(harness: &mut TestHarness<AreaScreen>, area: usize, factor: f64) {
+pub(crate) fn zoom_area(harness: &mut TestHarness<Screen>, area: usize, factor: f64) {
     let id = canvas_of(harness, area).ctx().widget_id();
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
@@ -348,7 +348,7 @@ pub(crate) fn zoom_area(harness: &mut TestHarness<AreaScreen>, area: usize, fact
 ///
 /// Counted from the tree rather than summed from the canvases' own numbers, because
 /// the claim is about the window and every area contributes its own furniture to it.
-fn widgets_in_window(harness: &mut TestHarness<AreaScreen>) -> usize {
+fn widgets_in_window(harness: &mut TestHarness<Screen>) -> usize {
     let mut widgets = 0;
     harness.inspect_widgets(|_| widgets += 1);
     widgets
@@ -528,23 +528,39 @@ pub fn run(opts: &Options) -> Outcome {
     let (overview_widgets, overview_commands, ..) = overview_screen(opts, areas, nodes);
     let cache = crate::cache::cache_table(opts, areas, nodes);
     let operations = crate::ops::ops_table(opts, areas, nodes);
+    // Two windows over one graph: what they cost each other, and what one changes in the
+    // other (the detach task, phase 1).
+    let windows = crate::windows::window_table(opts, areas.min(4), nodes);
+    let cross = crate::windows::cross_window(areas.min(4), nodes);
+    let detach = crate::windows::detach_row(areas.min(4), nodes);
 
     let outcome = Outcome {
         nodes: areas,
         viewport: VIEWPORT,
         quick: opts.quick,
-        criteria: evaluate(&Measured {
-            reports: &reports,
-            sweep: &sweep,
-            scale_misses,
-            regions,
-            overview_widgets,
-            overview_commands,
-            areas,
-            cache: &cache,
-            operations: &operations,
-        }),
-        scenarios: reports.iter().map(Report::record).collect(),
+        criteria: {
+            let mut criteria = crate::windows::criteria(&windows, &cross);
+            criteria.extend(crate::windows::detach_criteria(&detach));
+            criteria.extend(evaluate(&Measured {
+                reports: &reports,
+                sweep: &sweep,
+                scale_misses,
+                regions,
+                overview_widgets,
+                overview_commands,
+                areas,
+                cache: &cache,
+                operations: &operations,
+            }));
+            criteria
+        },
+        scenarios: reports
+            .iter()
+            .map(Report::record)
+            .chain(windows.iter().map(crate::windows::WindowRow::record))
+            .chain(std::iter::once(cross.record()))
+            .chain(std::iter::once(detach.record()))
+            .collect(),
         sweep,
         zoom_sweep: Vec::new(),
     };
@@ -900,6 +916,34 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
                 .unwrap_or(0) as f64,
             bound: 1.0,
             unit: "KiB over the ceiling",
+        });
+
+        // The cache promises a rectangle and then copies it; between the two it may
+        // evict. What it must never evict is a layer *this frame* is copying, whose
+        // pixels are in the cache and nowhere else — the copy then finds nothing, the
+        // area is empty for a frame, and `reused` has already been counted, so every
+        // other number here says the cache did its job (§44.9).
+        criteria.push(Criterion {
+            name: "the_cache_keeps_the_pixels_it_promised",
+            claim: "a layer the cache said it would copy was there to copy",
+            kind: Kind::Counter,
+            measured: cache.iter().map(|row| row.dropped).fold(0.0, f64::max),
+            bound: 1.0,
+            unit: "kept layers with no pixels/frame",
+        });
+
+        // The precondition §36 asks a caller for, in the only half a host can check:
+        // layers registered as disjoint have to *be* disjoint. They stopped being so
+        // the moment an area painted outside its own box — a selection outline and a
+        // status line — and overlapping rectangles also add up to more pixels than the
+        // window they tile, which is how the ceiling above came to be exceeded at all.
+        criteria.push(Criterion {
+            name: "cached_layers_do_not_overlap",
+            claim: "layers registered as tiling the window claim disjoint pixels",
+            kind: Kind::Counter,
+            measured: cache.iter().map(|row| row.overlaps).fold(0.0, f64::max),
+            bound: 1.0,
+            unit: "layers overlapping another/frame",
         });
 
         // And the partner: a sweep that never fills the cache says nothing about what

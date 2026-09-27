@@ -58,6 +58,23 @@ pub struct LayerCounters {
     pub walks: u64,
     /// Bytes of texture the cache is holding.
     pub bytes: u64,
+    /// Layers whose pixels were promised and then were not there to copy.
+    ///
+    /// Zero by construction now, and counted because it was not: an eviction used to be
+    /// able to drop a texture that *this frame* had already decided to reuse, and the
+    /// copy then found nothing and did nothing. What that looks like on screen is an
+    /// area that blinks, and what it looked like in the counters was a cache working
+    /// perfectly — `reused` had already been raised (§44.9). A promise the cache cannot
+    /// keep is a fault, so it is a number.
+    pub dropped: u64,
+    /// Registered layers whose rectangles overlapped another's, this frame.
+    ///
+    /// The precondition §36 asks a caller for — a cached layer owns its rectangle — and
+    /// the only half of it the host can check cheaply, since it has the rectangles
+    /// anyway. It is not free to be wrong about: overlapping layers copy over each
+    /// other, and they also add up to more pixels than the window, which is what put
+    /// the cache over its ceiling (§44.9).
+    pub overlaps: u64,
     /// Textures dropped to stay inside the ceiling.
     ///
     /// An eviction is not a fault — it costs the layer a redraw on the frame it comes
@@ -72,6 +89,11 @@ pub(crate) struct LayerCache {
     entries: HashMap<WidgetId, Entry>,
     /// Bytes of texture the cache may hold before it starts evicting.
     budget: u64,
+    /// The layers this frame has already decided to copy rather than draw.
+    ///
+    /// Held so that storing a layer cannot evict one of them: their pixels are not in
+    /// the frame, they are only in the cache, and dropping one leaves its area empty.
+    protected: HashSet<WidgetId>,
     /// Ticks once per store or reuse, so "least recently used" is a number rather than
     /// a guess. A frame counter would do as well; this one does not need the frame.
     clock: u64,
@@ -112,6 +134,17 @@ impl PixelRect {
         (self.x, self.y)
     }
 
+    /// Whether two rectangles share a pixel.
+    ///
+    /// Touching edges do not: areas tile, so the area to the right starts at the pixel
+    /// after this one ends.
+    fn overlaps(self, other: Self) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
+
     /// The pixels a bounding box covers, rounded outwards and clipped to the frame.
     fn of(bounds: Rect, frame: PhysicalSize<u32>) -> Option<Self> {
         let x0 = bounds.x0.floor().max(0.0) as u32;
@@ -133,6 +166,7 @@ impl LayerCache {
             wanted: HashSet::new(),
             entries: HashMap::new(),
             budget: u64::MAX,
+            protected: HashSet::new(),
             clock: 0,
             counters: LayerCounters::default(),
         }
@@ -163,12 +197,17 @@ impl LayerCache {
     /// `keep` is the entry that has just been filled, which is never worth evicting: it
     /// is the most recently used by definition, and dropping it would mean drawing it
     /// again next frame for nothing.
+    /// Layers this frame is copying rather than drawing are off limits as well, and
+    /// that is not a refinement: their pixels exist nowhere else, so evicting one to
+    /// stay inside a ceiling trades a bounded cache for an empty area. The ceiling
+    /// bounds what is kept *between* frames; this frame's own layers are not part of
+    /// what there is to save.
     fn evict_to_fit(&mut self, keep: Option<WidgetId>) {
         while self.counters.bytes > self.budget {
             let oldest = self
                 .entries
                 .iter()
-                .filter(|(id, _)| Some(**id) != keep)
+                .filter(|(id, _)| Some(**id) != keep && !self.protected.contains(*id))
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(id, _)| *id);
             let Some(id) = oldest else {
@@ -215,6 +254,36 @@ impl LayerCache {
             .filter(|entry| entry.transform == transform && entry.scene == *scene)?;
         entry.used = clock;
         Some(entry.rect)
+    }
+
+    /// Names the layers this frame will copy, so storing another cannot evict them.
+    ///
+    /// Cleared by [`Self::release`] once the copies are encoded.
+    pub(crate) fn protect(&mut self, ids: impl IntoIterator<Item = WidgetId>) {
+        self.protected.clear();
+        self.protected.extend(ids);
+    }
+
+    /// Ends the protection [`Self::protect`] gave, and re-applies the ceiling.
+    pub(crate) fn release(&mut self) {
+        self.protected.clear();
+        self.evict_to_fit(None);
+    }
+
+    pub(crate) fn note_dropped(&mut self) {
+        self.counters.dropped += 1;
+    }
+
+    /// Counts the registered layers that overlap another one this frame.
+    ///
+    /// Counted from the failing side, like every other criterion: the claim is that a
+    /// caller registered layers that tile, so what is measured is how many did not.
+    pub(crate) fn note_overlaps(&mut self, rects: &[PixelRect]) {
+        for (i, a) in rects.iter().enumerate() {
+            if rects[i + 1..].iter().any(|b| a.overlaps(*b)) {
+                self.counters.overlaps += 1;
+            }
+        }
     }
 
     pub(crate) fn note_offered(&mut self, count: u64) {

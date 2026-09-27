@@ -13,7 +13,7 @@
 //! harness; the third cannot, and §23 says why.
 
 use bench_utils::render::{block_magnified, differing_fraction, sharpness_gain};
-use blazy::areas::{AreaContent, AreaScreen, RegionKind, UiScale};
+use blazy::areas::{AreaContent, RegionKind, UiScale};
 use blazy::canvas::CanvasLayer;
 use blazy::masonry::core::{NewWidget, WidgetId};
 use blazy::masonry::dpi::PhysicalSize;
@@ -29,8 +29,8 @@ use node_canvas::editor::NodeEditor;
 use node_canvas::model::SharedGraph;
 use node_canvas::node::GraphNode;
 
-use crate::build_screen;
 use crate::header::ScaledHeader;
+use crate::{Screen, build_screen};
 
 /// Base viewport for the magnification tests, kept small so the images stay cheap.
 const BASE: (u32, u32) = (160, 40);
@@ -225,7 +225,7 @@ fn the_snapshot_scales_are_the_ones_that_were_set() {
 // --- MARK: several views of one graph (§30)
 
 /// A screen of `areas` areas over one shared graph.
-fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, SharedGraph) {
+fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<Screen>, SharedGraph) {
     let (screen, graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -237,7 +237,7 @@ fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, Share
 }
 
 /// The canvas region of one area.
-fn canvas_id(harness: &TestHarness<AreaScreen>, area: usize) -> WidgetId {
+fn canvas_id(harness: &TestHarness<Screen>, area: usize) -> WidgetId {
     let area_id = harness.root_widget().area_ids()[area];
     *harness
         .get_widget_with_id(area_id)
@@ -248,7 +248,7 @@ fn canvas_id(harness: &TestHarness<AreaScreen>, area: usize) -> WidgetId {
         .expect("an area has regions")
 }
 
-fn child_pos(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> Point {
+fn child_pos(harness: &mut TestHarness<Screen>, area: usize, index: usize) -> Point {
     let id = canvas_id(harness, area);
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
@@ -256,7 +256,7 @@ fn child_pos(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -
     })
 }
 
-fn live_nodes(harness: &mut TestHarness<AreaScreen>, area: usize) -> Vec<(usize, WidgetId)> {
+fn live_nodes(harness: &mut TestHarness<Screen>, area: usize) -> Vec<(usize, WidgetId)> {
     let id = canvas_id(harness, area);
     harness.edit_widget_with_id(id, |mut widget| {
         let mut canvas = widget.downcast::<CanvasLayer>();
@@ -265,7 +265,7 @@ fn live_nodes(harness: &mut TestHarness<AreaScreen>, area: usize) -> Vec<(usize,
 }
 
 /// Where a canvas-space point of area `area` lands in the window.
-fn to_window(harness: &TestHarness<AreaScreen>, area: usize, canvas_pos: Point) -> Point {
+fn to_window(harness: &TestHarness<Screen>, area: usize, canvas_pos: Point) -> Point {
     let canvas = harness
         .get_widget_with_id(canvas_id(harness, area))
         .downcast::<CanvasLayer>()
@@ -360,7 +360,7 @@ fn a_control_edit_in_one_area_reaches_the_others() {
         !before,
         "the model records the edit"
     );
-    let shows = |harness: &TestHarness<AreaScreen>, id: WidgetId| {
+    let shows = |harness: &TestHarness<Screen>, id: WidgetId| {
         harness
             .get_widget_with_id(id)
             .downcast::<GraphNode>()
@@ -374,7 +374,7 @@ fn a_control_edit_in_one_area_reaches_the_others() {
 // --- MARK: operators inside an area (§38)
 
 /// A screen whose areas carry the operator layer, over one shared graph.
-fn ops_screen(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, SharedGraph) {
+fn ops_screen(areas: usize, nodes: usize) -> (TestHarness<Screen>, SharedGraph) {
     let (screen, graph) = crate::ScreenSpec::new(areas, nodes).with_ops(true).build();
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -385,8 +385,36 @@ fn ops_screen(areas: usize, nodes: usize) -> (TestHarness<AreaScreen>, SharedGra
     (harness, graph)
 }
 
+/// A harness over a screen that was built elsewhere: the second window of a test.
+fn harness_of(screen: Screen) -> TestHarness<Screen> {
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(screen),
+        PhysicalSize::new(1400, 900),
+    );
+    let _ = harness.redraw();
+    harness
+}
+
+/// Brings every editor of a window up to date with the graph, and counts the changes.
+///
+/// What an application's driver does through `sync_window`; a harness does not hand out
+/// its `RenderRoot`, so a test walks the areas itself.
+fn sync(harness: &mut TestHarness<Screen>, graph: &SharedGraph) -> usize {
+    let areas = harness.root_widget().area_ids().len();
+    let mut applied = 0;
+    for area in 0..areas {
+        let id = editor_id(harness, area);
+        applied += harness.edit_widget_with_id(id, |mut widget| {
+            let mut editor = widget.downcast::<NodeEditor>();
+            crate::sync_editor(&mut editor, graph)
+        });
+    }
+    applied
+}
+
 /// The editor of one area.
-fn editor_id(harness: &TestHarness<AreaScreen>, area: usize) -> WidgetId {
+fn editor_id(harness: &TestHarness<Screen>, area: usize) -> WidgetId {
     let area_id = harness.root_widget().area_ids()[area];
     *harness
         .get_widget_with_id(area_id)
@@ -397,7 +425,7 @@ fn editor_id(harness: &TestHarness<AreaScreen>, area: usize) -> WidgetId {
         .expect("an area has regions")
 }
 
-fn editor_canvas_pos(harness: &mut TestHarness<AreaScreen>, area: usize, index: usize) -> Option<Point> {
+fn editor_canvas_pos(harness: &mut TestHarness<Screen>, area: usize, index: usize) -> Option<Point> {
     let id = editor_id(harness, area);
     harness.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
@@ -512,6 +540,241 @@ fn a_structural_edit_in_one_area_reaches_the_others() {
     }
 }
 
+/// §30 stops at the window boundary, and the pull is what carries it across.
+///
+/// Two screens over one graph, each in its own `RenderRoot` — which is what two windows
+/// are. The push fan-out reaches the canvases of one of them and is silently dropped for
+/// the other, because `mutate_later` names a widget in one arena. Measured rather than
+/// argued: the model moves, the second window shows the old place, and one `sync_window`
+/// puts it right.
+#[test]
+fn a_change_in_one_window_reaches_the_other_through_the_model() {
+    use blazy::ops::keymap::Props;
+
+    let (screen_a, graph) = crate::ScreenSpec::new(2, 200).with_ops(true).build();
+    let screen_b = crate::ScreenSpec::new(2, 200).with_ops(true).over(&graph);
+    let mut a = harness_of(screen_a);
+    let mut b = harness_of(screen_b);
+
+    let before = graph.borrow().node(0).pos;
+    let id = editor_id(&a, 0);
+    a.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 0));
+        NodeEditor::exec(&mut editor, "node.move", &Props::new().with_float("dx", 40.0));
+    });
+    let _ = a.redraw();
+    let _ = b.redraw();
+
+    let moved = graph.borrow().node(0).pos;
+    assert_ne!(moved, before, "the operator wrote the model");
+    assert_eq!(
+        editor_canvas_pos(&mut a, 0, 0),
+        Some(moved),
+        "the window that ran it follows"
+    );
+    assert_eq!(
+        editor_canvas_pos(&mut b, 0, 0),
+        Some(before),
+        "and the other window does not: `mutate_later` cannot cross a `RenderRoot`"
+    );
+
+    let applied = sync(&mut b, &graph);
+    assert!(applied > 0, "the second window had something to catch up on");
+    let _ = b.redraw();
+    assert_eq!(
+        editor_canvas_pos(&mut b, 0, 0),
+        Some(moved),
+        "and after the pull it shows what the model says"
+    );
+    assert_eq!(sync(&mut b, &graph), 0, "a window that is up to date pulls nothing");
+}
+
+/// The areas' layers tile the window rather than overlapping it.
+///
+/// The promise §36 asks a caller for — a cached layer owns its rectangle — checked at the
+/// one place it can be: the rectangle a layer claims is the one the host works out by
+/// walking its scene, so anything an area paints outside its own box moves that
+/// rectangle onto its neighbour. Two things did: the outline of a selected node and the
+/// status line, neither of which is a child and neither of which anything clipped. The
+/// cost was not cosmetic — eight layers claiming 1.8 windows' worth of pixels put the
+/// cache over its ceiling, and the eviction blanked whichever area was copied that frame
+/// (§44.9).
+#[test]
+fn the_areas_layers_tile_the_window() {
+    use blazy::shell::layers::scene_bounds;
+
+    let (screen, _graph) = crate::ScreenSpec::new(8, 200)
+        .with_ops(true)
+        .with_isolated_layers(true)
+        .build();
+    let mut harness = harness_of(screen);
+    // A selection, because the outline of a selected node is one of the two things that
+    // used to spill, and an area with nothing selected cannot show it.
+    let id = editor_id(&harness, 0);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(
+            &mut editor,
+            "node.select",
+            &blazy::ops::keymap::Props::new().with_int("index", 0),
+        );
+    });
+    // What the host does on every frame, and without which there are no layers to
+    // check: a layer lives exactly one paint, so an area that is clean is not painted
+    // and stops being one (§26.1). This is `ShellDriver::layers` by hand.
+    let areas: Vec<WidgetId> = harness.root_widget().area_ids();
+    for area in &areas {
+        harness.edit_widget_with_id(*area, |mut widget| widget.ctx.request_paint_only());
+    }
+    let (plan, _) = harness.redraw();
+
+    let frame = PhysicalSize::new(1400, 900);
+    let rects: Vec<_> = plan
+        .layers
+        .iter()
+        .filter(|layer| areas.contains(&layer.widget_id))
+        .filter_map(|layer| match &layer.kind {
+            blazy::masonry::app::VisualLayerKind::Scene(scene) => {
+                scene_bounds(scene, layer.transform, frame).map(|rect| (layer.widget_id, rect))
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rects.len(), areas.len(), "every area is a layer of its own");
+
+    for (i, (id, a)) in rects.iter().enumerate() {
+        for (other, b) in &rects[i + 1..] {
+            let overlap =
+                (a.x < b.x + b.width) && (b.x < a.x + a.width) && (a.y < b.y + b.height) && (b.y < a.y + a.height);
+            assert!(
+                !overlap,
+                "layers of {id:?} and {other:?} claim the same pixels: {a:?} and {b:?}"
+            );
+        }
+    }
+
+    // And they add up to about the window, which is the arithmetic §37.2's ceiling rests
+    // on: a layer that claims more than its area would pass the test above only by
+    // luck.
+    let claimed: u64 = rects
+        .iter()
+        .map(|(_, r)| u64::from(r.width) * u64::from(r.height))
+        .sum();
+    let window = u64::from(frame.width) * u64::from(frame.height);
+    assert!(
+        claimed <= window,
+        "eight areas claimed {claimed} pixels of a {window}-pixel window"
+    );
+}
+
+/// A slider or a checkbox inside a node reaches the other window.
+///
+/// Node geometry was not the only thing a view copies out of the model when it builds a
+/// node: `value`, `checked` and the tint are copied too, and a node already on screen
+/// reads none of them again. Inside one window the edit travels as a push
+/// (`GraphNode::broadcast`), which is dropped across a `RenderRoot` like every other
+/// (§44.3) — and the model recorded nothing for the other window to collect, so the two
+/// windows disagreed about a checkbox for good (§44.9).
+#[test]
+fn an_edit_inside_a_node_reaches_the_other_window() {
+    let (screen_a, graph) = crate::ScreenSpec::new(1, 200).with_ops(true).build();
+    let screen_b = crate::ScreenSpec::new(1, 200).with_ops(true).over(&graph);
+    let mut a = harness_of(screen_a);
+    let mut b = harness_of(screen_b);
+
+    let before = node_state(&mut b, 0, 0).expect("node 0 is on screen in both windows");
+    let (value, checked) = (before.0 + 0.25, !before.1);
+
+    // Through the model, which is what a node widget does when its slider moves.
+    graph.borrow_mut().set_value(0, value);
+    graph.borrow_mut().set_checked(0, checked);
+    let _ = a.redraw();
+
+    assert_eq!(
+        node_state(&mut b, 0, 0),
+        Some(before),
+        "before the pull the other window still shows what it read when it built the node"
+    );
+    assert!(sync(&mut b, &graph) >= 2, "two edits are two changes to collect");
+    let _ = b.redraw();
+    assert_eq!(node_state(&mut b, 0, 0), Some((value, checked)));
+}
+
+/// What a node widget of one area is showing: the slider value and the checkbox.
+fn node_state(harness: &mut TestHarness<Screen>, area: usize, index: usize) -> Option<(f64, bool)> {
+    let id = editor_id(harness, area);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            let mut state = None;
+            CanvasLayer::update_child(&mut canvas, index, |mut node| {
+                let node = node.downcast::<GraphNode>();
+                state = Some((node.widget.value(), node.widget.checked()));
+            });
+            state
+        })
+    })
+}
+
+/// Detach: the area is rebuilt in another window and loses nothing (decision 1).
+///
+/// The widget cannot move — `RenderRoot` owns its arena — so what is carried is the
+/// session, and the test is that everything a user would miss comes through it: the view,
+/// the selection and the depth of the history. The areas that stayed keep their widgets,
+/// which is §41.2's rule and the `builds` counter that holds it.
+#[test]
+fn a_detached_area_arrives_with_its_view_its_selection_and_its_history() {
+    use blazy::masonry::kurbo::Vec2;
+    use blazy::ops::keymap::Props;
+
+    let (mut screen, graph) = ops_screen(4, 200);
+
+    // Give area 1 something to lose.
+    let id = editor_id(&screen, 1);
+    screen.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 3));
+        NodeEditor::exec(&mut editor, "node.move", &Props::new().with_float("dx", 15.0));
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::pan(&mut canvas, Vec2::new(-30.0, -12.0));
+        });
+    });
+    let _ = screen.redraw();
+    let (selection, depth, view) = {
+        let editor = screen.get_widget_with_id(id).downcast::<NodeEditor>().expect("editor");
+        (editor.selection(), editor.history_depth(), editor.stats().zoom)
+    };
+    assert!(!selection.is_empty() && depth > 0);
+
+    let builds_before = screen.root_widget().stats().counters.builds;
+    let taken = screen.edit_root_widget(|mut screen| crate::Screen::detach(&mut screen, 1));
+    let _ = screen.redraw();
+    let session = taken.expect("an area of four detaches");
+
+    assert_eq!(screen.root_widget().stats().areas, 3, "the area left this screen");
+    assert_eq!(
+        screen.root_widget().stats().counters.builds,
+        builds_before,
+        "and the areas that stayed were not rebuilt (§41.2)"
+    );
+
+    // The other window: a new screen of one area over the session that was carried.
+    let detached = crate::ScreenSpec::new(1, 200)
+        .with_ops(true)
+        .over_with(&graph, Some(session));
+    let window = harness_of(detached);
+    let arrived = editor_id(&window, 0);
+    let editor = window
+        .get_widget_with_id(arrived)
+        .downcast::<NodeEditor>()
+        .expect("editor");
+
+    assert_eq!(editor.selection(), selection, "the selection arrived");
+    assert_eq!(editor.history_depth(), depth, "and the history");
+    assert_eq!(editor.stats().zoom, view, "and the view");
+}
+
 /// Selecting in one area is that area's business.
 ///
 /// The other half of §30: the *graph* is shared and the *selection* is not, which is
@@ -531,7 +794,7 @@ fn a_selection_stays_in_the_area_that_made_it() {
     });
     let _ = harness.redraw();
 
-    let selected = |harness: &TestHarness<AreaScreen>, area: usize| {
+    let selected = |harness: &TestHarness<Screen>, area: usize| {
         harness
             .get_widget_with_id(editor_id(harness, area))
             .downcast::<NodeEditor>()
@@ -622,7 +885,7 @@ fn a_real_frame_is_far_from_both_ceilings() {
 /// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
 /// loop does it for the ids `ShellDriver::layers` returns — and a library method that
 /// exists only so a harness can imitate the host is a second way to say one thing.
-fn keep_layers(harness: &mut TestHarness<AreaScreen>) {
+fn keep_layers(harness: &mut TestHarness<Screen>) {
     for id in harness.root_widget().area_ids() {
         harness.edit_widget_with_id(id, |mut widget| widget.ctx.request_paint_only());
     }

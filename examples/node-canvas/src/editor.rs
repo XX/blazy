@@ -7,6 +7,7 @@
 //! checks while dragging a node around — and because the tests read it back.
 
 use blazy::canvas::CanvasLayer;
+use blazy::node_editor::SessionHandle;
 
 use crate::model::{GraphModel, SharedGraph};
 
@@ -25,4 +26,12 @@ pub fn new(canvas: CanvasLayer) -> NodeEditor {
 /// An editor with the operator layer and the statistics overlay.
 pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph) -> NodeEditor {
     NodeEditor::with_ops(canvas, graph).with_hud(HUD_CAPTION)
+}
+
+/// The same, over a session that already exists.
+///
+/// What an area rebuilt in another window is made of: a new widget showing the state the
+/// old one showed (the detach task, decision 1).
+pub fn with_session(canvas: CanvasLayer, session: SessionHandle<GraphModel>) -> NodeEditor {
+    NodeEditor::with_session(canvas, session).with_hud(HUD_CAPTION)
 }

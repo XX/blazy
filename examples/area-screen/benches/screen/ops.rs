@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use area_screen::build_screen;
+use area_screen::{Screen, build_screen};
 use blazy::areas::{AreaId, AreaScreen, SplitTree, Workspace};
 use blazy::masonry::core::NewWidget;
 use blazy::masonry::dpi::PhysicalSize;
@@ -43,7 +43,7 @@ pub(crate) struct OpsRow {
 }
 
 /// A screen of `areas` areas over one graph, settled.
-fn harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
+fn harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
@@ -55,7 +55,7 @@ fn harness(areas: usize, nodes: usize) -> TestHarness<AreaScreen> {
 }
 
 /// The border-box size of every area that has a widget, by area id.
-fn sizes(harness: &mut TestHarness<AreaScreen>) -> Vec<(AreaId, Size)> {
+fn sizes(harness: &mut TestHarness<Screen>) -> Vec<(AreaId, Size)> {
     let ids: Vec<(AreaId, blazy::masonry::core::WidgetId)> = harness
         .root_widget()
         .tree()
@@ -75,7 +75,7 @@ fn row(
     what: &'static str,
     areas: usize,
     nodes: usize,
-    act: impl FnOnce(&mut TestHarness<AreaScreen>),
+    act: impl FnOnce(&mut TestHarness<Screen>),
     expected: impl FnOnce(&[(AreaId, Size)]) -> Option<Vec<(AreaId, Size)>>,
 ) -> OpsRow {
     let mut harness = harness(areas, nodes);

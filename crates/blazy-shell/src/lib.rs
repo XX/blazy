@@ -19,8 +19,8 @@
 //! * `gpu`, `layers` and `encode`, behind `vello` — the frame kept on the GPU (§27), a texture per layer so an idle
 //!   area is copied rather than drawn (§36, §37.2), and the path segments a frame costs, counted without a device
 //!   (§35.1).
-//! * [`window`] — owner mode, behind `window`: a window, an event loop, a frame on the screen, and the host seat of the
-//!   operator layer (§39.5).
+//! * [`window`] — owner mode, behind `window`: windows, an event loop, frames on the screen, and the host seat of the
+//!   operator layer (§39.5). One driver per process, and every window it hears from is named (§44).
 //!
 //! # What is deliberately not here
 //!

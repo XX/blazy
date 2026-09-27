@@ -23,6 +23,7 @@ use self::bench::Options;
 mod bench;
 mod cache;
 mod ops;
+mod windows;
 
 #[derive(Parser)]
 #[command(

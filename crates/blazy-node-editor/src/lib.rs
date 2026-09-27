@@ -47,7 +47,7 @@ pub use blazy_canvas::Link;
 use masonry::core::WidgetId;
 use masonry::kurbo::{Point, Rect};
 
-pub use crate::editor::{NodeEditor, OverlayStyle};
+pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SessionHandle};
 pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, journal};
 
 /// What a node editor needs from the graph behind it.

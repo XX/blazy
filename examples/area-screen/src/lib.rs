@@ -27,12 +27,16 @@ pub mod header;
 #[cfg(test)]
 mod tests;
 
-use blazy::areas::{AreaContent, AreaScreen, SplitTree};
-use blazy::canvas::DetailBudget;
-use blazy::masonry::core::{NewWidget, Widget};
+use blazy::areas::{AreaContent, AreaId, AreaScreen, SplitTree};
+use blazy::canvas::{CanvasLayer, DetailBudget};
+use blazy::masonry::app::RenderRoot;
+use blazy::masonry::core::{NewWidget, Widget, WidgetId, WidgetMut};
 use blazy::masonry::peniko::Color;
+use blazy::node_editor::{EditorSession, SessionHandle};
 use node_canvas::CanvasSpec;
-use node_canvas::model::{GraphModel, SharedGraph, share};
+use node_canvas::editor::NodeEditor;
+use node_canvas::model::{Change, GraphModel, NODE_SIZE, SharedGraph, share};
+use node_canvas::node::GraphNode;
 
 use crate::header::ScaledHeader;
 
@@ -158,15 +162,40 @@ impl ScreenSpec {
     ///
     /// The canvases keep only a shared borrow, and the model is the source of truth that
     /// outlives every view (§30).
-    pub fn build(self) -> (AreaScreen, SharedGraph) {
+    pub fn build(self) -> (Screen, SharedGraph) {
         let graph = share(GraphModel::generated(self.nodes));
+        let screen = self.over(&graph);
+        (screen, graph)
+    }
+
+    /// Builds a screen over a graph that already exists.
+    ///
+    /// What a second window is made of: another screen over the same models, not another
+    /// application. The rule it rests on is §30's — the graph is the truth and a view is
+    /// a view — and the second window is the case that makes the rule cross a window
+    /// boundary rather than an area one.
+    pub fn over(self, graph: &SharedGraph) -> Screen {
+        self.over_with(graph, None)
+    }
+
+    /// The same, with the first area taking over a session that already exists.
+    ///
+    /// What detach builds: the window is new, the tree is new, the widget is new — and
+    /// the session is the one the area had, so the user arrives looking at what they were
+    /// looking at, with what they had selected and what they could undo (decision 1).
+    pub fn over_with(self, graph: &SharedGraph, carried: Option<AreaSession>) -> Screen {
         let budget = window_budget(self.budget_widgets, self.areas);
         // The builder outlives this call: the screen keeps it so a split can ask for the
         // widget of an area that does not exist yet.
         let building = graph.clone();
-        let screen = AreaScreen::new(SplitTree::balanced(self.areas), move |area| {
+        let mut carried = carried;
+        AreaScreen::with_payloads(SplitTree::balanced(self.areas), move |area| {
+            // The carried session goes to the first area asked for and to no other: an
+            // area that appears later is a new view and needs a session of its own, or
+            // two areas would share one selection.
+            let session = carried.take().unwrap_or_else(|| EditorSession::new(&building).share());
             let canvas = if self.ops {
-                area_editor(&building, self.nodes, budget)
+                area_editor(&building, self.nodes, budget, &session)
             } else {
                 area_canvas(&building, self.nodes, budget)
             };
@@ -176,14 +205,16 @@ impl ScreenSpec {
             } else {
                 AreaContent::new(vec![(blazy::areas::RegionKind::Main, 0.0, canvas)])
             };
-            NewWidget::new(content.with_isolated_layer(self.isolated)).erased()
-        });
-        (screen, graph)
+            (
+                NewWidget::new(content.with_isolated_layer(self.isolated)).erased(),
+                session,
+            )
+        })
     }
 }
 
 /// The screen the benchmarks measure: headers, uniform scale, no layers.
-pub fn build_screen(areas: usize, nodes: usize, budget_widgets: Option<usize>) -> (AreaScreen, SharedGraph) {
+pub fn build_screen(areas: usize, nodes: usize, budget_widgets: Option<usize>) -> (Screen, SharedGraph) {
     ScreenSpec::new(areas, nodes).with_budget(budget_widgets).build()
 }
 
@@ -208,6 +239,17 @@ pub fn window_budget(widgets: Option<usize>, areas: usize) -> DetailBudget {
         .unwrap_or_else(|| DetailBudget::default().split(areas))
 }
 
+/// What an area of this application carries beside its widget: the session its editor
+/// shows (decision 1a of the detach task).
+///
+/// Every area has one, whether or not it has an editor to show it: the payload type is
+/// the screen's, so it is the same for every area, and an area without an editor simply
+/// never looks at its own.
+pub type AreaSession = SessionHandle<GraphModel>;
+
+/// A screen of this application: areas that carry their sessions.
+pub type Screen = AreaScreen<AreaSession>;
+
 /// The canvas inside an area, as a `dyn Widget`, holding `budget` of the window's
 /// widgets.
 pub fn area_canvas(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
@@ -220,9 +262,14 @@ pub fn area_canvas(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> N
 /// §11's nesting asks for — and it is also the only shape available: Masonry's pre-tree
 /// hook belongs to a *layer root*, so in a window of eight areas exactly one widget can
 /// have it, and it is not any of the editors (§38.1).
-pub fn area_editor(graph: &SharedGraph, nodes: usize, budget: DetailBudget) -> NewWidget<dyn Widget> {
+pub fn area_editor(
+    graph: &SharedGraph,
+    nodes: usize,
+    budget: DetailBudget,
+    session: &AreaSession,
+) -> NewWidget<dyn Widget> {
     let canvas = CanvasSpec::new(nodes).over(graph).with_budget(budget);
-    NewWidget::new(node_canvas::editor::with_ops(canvas, graph)).erased()
+    NewWidget::new(node_canvas::editor::with_session(canvas, session.clone())).erased()
 }
 
 /// The header of area `area`, tinted so the areas are told apart by eye.
@@ -234,4 +281,129 @@ pub fn area_header(area: usize) -> NewWidget<dyn Widget> {
         Color::from_rgb8(0x44, 0x6b, 0x3c),
     ];
     NewWidget::new(ScaledHeader::new(TINTS[area % TINTS.len()])).erased()
+}
+
+/// Takes an area out of a screen, ready to be built in another window.
+///
+/// `AreaScreen::detach` removes the area and hands back what it carried; this adds the
+/// one thing the library cannot know to do — **cancelling whatever was modal in the
+/// session** (decision 6). A gesture belongs to the window it was made in: pointer
+/// capture is that window's `RenderRoot`'s, and the area is about to stop being there.
+///
+/// `None` for the last area of a screen, which does not detach (decision 5).
+pub fn detach_area(screen: &mut WidgetMut<'_, Screen>, area: AreaId) -> Option<AreaSession> {
+    let session = Screen::detach(screen, area)?;
+    {
+        let session = &mut *session.borrow_mut();
+        session.runtime.cancel_all(&mut session.world);
+    }
+    Some(session)
+}
+
+/// Brings one window's canvases up to date with the graph.
+///
+/// The half of §30 that stops at the window boundary. Inside a window the fan-out is a
+/// push: an operator writes the model, the driver carries the change into its own canvas
+/// and schedules `mutate_later` for the graph's other views — and that call names a
+/// widget in *this* `RenderRoot`'s arena. A canvas in another window is not in it, so the
+/// call is dropped without a word, and the second window goes on showing a node where it
+/// used to be.
+///
+/// So the model also records what each view still owes (`GraphModel::take_pending`), and
+/// each window pulls its own share when it next runs. Applying a change twice writes the
+/// same truth twice, so the two paths need not know about each other.
+///
+/// Returns how many changes were applied, which is what the criterion counts: a window
+/// that is up to date does nothing, and one that is behind does as much work as there
+/// were changes — not as much as there are nodes.
+pub fn sync_window(root: &mut RenderRoot, graph: &SharedGraph) -> usize {
+    let editors: Vec<WidgetId> = root.edit_base_layer(|mut widget| {
+        let screen = widget.downcast::<Screen>();
+        screen.widget.area_ids()
+    });
+
+    let mut applied = 0;
+    for area in editors {
+        // The area holds its regions; the editor is the main one, and a header does not
+        // show the graph.
+        let Some(editor_id) = root
+            .get_widget(area)
+            .and_then(|widget| widget.downcast::<AreaContent>())
+            .and_then(|content| content.region_ids().last().copied())
+        else {
+            continue;
+        };
+        root.edit_widget(editor_id, |mut widget| {
+            // Two shapes, because this example builds both: an area with the operator
+            // layer holds a `NodeEditor` over the canvas, and one without holds the canvas
+            // itself. Looking only for the editor is how the running window — which is
+            // built without operators — came to collect nothing at all.
+            if let Some(mut editor) = widget.try_downcast::<NodeEditor>() {
+                applied += sync_editor(&mut editor, graph);
+            } else if let Some(mut canvas) = widget.try_downcast::<CanvasLayer>() {
+                applied += sync_canvas(&mut canvas, graph);
+            }
+        });
+    }
+    applied
+}
+
+/// Brings one editor up to date, and says how many changes that took.
+///
+/// Split out from [`sync_window`] because the two callers hold different contexts: an
+/// application's driver has a `RenderRoot`, and a test or a benchmark has a harness that
+/// does not hand one out (§39.5, upstream candidate 5). What they share is this.
+pub fn sync_editor(editor: &mut WidgetMut<'_, NodeEditor>, graph: &SharedGraph) -> usize {
+    let canvas = editor.widget.canvas_id();
+    let changes = graph.borrow_mut().take_pending(canvas);
+    for &change in &changes {
+        apply_change(editor, graph, change);
+    }
+    changes.len()
+}
+
+/// Brings one canvas up to date, for an area built without the operator layer.
+///
+/// The same pull as [`sync_editor`], one widget lower: an area of this example holds either
+/// an editor over a canvas or a canvas on its own, and the change has to reach the canvas
+/// either way. The name a view is registered under is the canvas's own id — that is what
+/// `NodeSource::attached` hands the model — so both paths ask the same question.
+pub fn sync_canvas(canvas: &mut WidgetMut<'_, CanvasLayer>, graph: &SharedGraph) -> usize {
+    let name = canvas.ctx.widget_id();
+    let changes = graph.borrow_mut().take_pending(name);
+    for &change in &changes {
+        apply_to_canvas(canvas, graph, change);
+    }
+    changes.len()
+}
+
+/// Applies one change of the graph to one view.
+fn apply_change(editor: &mut WidgetMut<'_, NodeEditor>, graph: &SharedGraph, change: Change) {
+    NodeEditor::with_canvas(editor, |mut canvas| apply_to_canvas(&mut canvas, graph, change));
+}
+
+/// The change itself, against the canvas that shows it.
+fn apply_to_canvas(canvas: &mut WidgetMut<'_, CanvasLayer>, graph: &SharedGraph, change: Change) {
+    match change {
+        Change::Moved(index) | Change::Added(index) => {
+            let Some(node) = graph.borrow().try_node(index) else {
+                return;
+            };
+            if CanvasLayer::child_pos(canvas, index).is_some() {
+                CanvasLayer::move_child(canvas, index, node.pos);
+            } else {
+                CanvasLayer::insert_node(canvas, index, node.pos, NODE_SIZE);
+            }
+        },
+        Change::Removed(index) => {
+            CanvasLayer::remove_node(canvas, index);
+        },
+        // Nothing to do for a node this view is not showing: it will read the model when
+        // it is next built. `update_child` says so by returning false.
+        Change::Edited(index) => {
+            CanvasLayer::update_child(canvas, index, |mut node| {
+                GraphNode::reload(&mut node.downcast::<GraphNode>());
+            });
+        },
+    }
 }

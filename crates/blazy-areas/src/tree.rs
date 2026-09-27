@@ -331,6 +331,41 @@ impl SplitTree {
             .position(|n| matches!(n, Node::Area(id) if *id == area))
     }
 
+    /// Takes an area off the screen, giving its place to whatever shared the split.
+    ///
+    /// Not [`join`](Self::join) with one argument: join merges two *leaves* and refuses
+    /// an area whose sibling is a split (§41.1). This removes one leaf and hands its
+    /// space to the sibling subtree, whatever shape that has — which is always possible,
+    /// because every leaf but the root has a parent split. That difference is why detach
+    /// works on any area and join does not.
+    ///
+    /// `false` for the last area: a screen with no area is not expressible, and the
+    /// answer to "detach the only area" is that it refuses (decision 5 of the detach
+    /// task).
+    pub fn remove(&mut self, area: AreaId) -> bool {
+        let Some(node) = self.node_of(area) else {
+            return false;
+        };
+        let Some(parent) = self.parent_of(node) else {
+            // The root leaf: the only area of the screen.
+            return false;
+        };
+        let Node::Split { a, b, .. } = self.nodes[parent] else {
+            return false;
+        };
+        let sibling = if a == node { b } else { a };
+
+        self.nodes[parent] = self.nodes[sibling];
+        self.free_node(sibling);
+        self.free_node(node);
+        self.free_areas.push(area);
+        self.areas -= 1;
+        if self.maximized == Some(area) {
+            self.maximized = None;
+        }
+        true
+    }
+
     /// The node whose child `node` is.
     ///
     /// A search rather than a stored parent pointer: a screen holds tens of nodes, and a

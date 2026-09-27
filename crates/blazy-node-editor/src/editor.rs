@@ -24,9 +24,11 @@
 //! views of the same graph is this driver's job — §30's fan-out, moved from the
 //! canvas's own drag handler to here.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::mem;
+use std::rc::Rc;
 
 use blazy_canvas::{CanvasLayer, CanvasStats};
 use blazy_ops::event::{Device, OpEvent, Sample};
@@ -51,11 +53,57 @@ use masonry::{TextAlign, TextAlignOptions};
 use crate::ops::CANVAS_SCOPE;
 use crate::{Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
 
-/// The operator layer, when this editor drives one.
-struct Ops<G: NodeGraph> {
-    runtime: OpRuntime<EditorWorld<G>>,
-    world: EditorWorld<G>,
+/// What a view of a graph holds that the graph does not.
+///
+/// The three things §30 and §38.4 left outside the model on purpose — where the view is
+/// looking, what is selected in it, and what it can undo — and the one place they now
+/// live. **Beside the widget rather than inside it**, because a widget is temporary and
+/// a session is not: an area rebuilt in another window is the same session under a new
+/// tree, and a widget that owned its state would lose it (the detach task, decision 1).
+///
+/// Not in the model either, and that is a measured line rather than a taste: a selection
+/// shared by every view repaints every area showing the graph, 50.57 ms against 12.99
+/// (§38.4).
+pub struct EditorSession<G: NodeGraph> {
+    /// Everything the operators may touch, selection included.
+    pub world: EditorWorld<G>,
+    /// The operators, their keymap, the modal stack and the undo history.
+    pub runtime: OpRuntime<EditorWorld<G>>,
+    /// Where the canvas is looking, mirrored from it on every layout.
+    ///
+    /// The canvas owns the view while it exists (§22 keeps it out of layout, so nothing
+    /// else may drive it); this is the copy that outlives it.
+    pub view: Affine,
 }
+
+impl<G: NodeGraph> EditorSession<G> {
+    /// A session over `graph`, with [`ops::runtime`](crate::ops::runtime)'s operators.
+    pub fn new(graph: &SharedGraph<G>) -> Self {
+        Self::with_runtime(graph, crate::ops::runtime())
+    }
+
+    /// The same, with a runtime of the caller's own: another keymap, more operators.
+    pub fn with_runtime(graph: &SharedGraph<G>, runtime: OpRuntime<EditorWorld<G>>) -> Self {
+        Self {
+            world: EditorWorld::new(graph),
+            runtime,
+            view: Affine::IDENTITY,
+        }
+    }
+
+    /// Wraps the session in the handle an editor takes.
+    pub fn share(self) -> SessionHandle<G> {
+        Rc::new(RefCell::new(self))
+    }
+}
+
+/// A session as it is held: by the area that owns it and by the widget that shows it.
+///
+/// `Rc<RefCell<_>>` for the reason the model is (§30): everything here lives on the UI
+/// thread, and the alternative — a lock — buys no thread it could be used from, since
+/// Masonry's tree is not `Send`, while turning a re-entrant borrow from a loud panic
+/// into a silent deadlock.
+pub type SessionHandle<G> = Rc<RefCell<EditorSession<G>>>;
 
 /// The colours the editor draws with.
 ///
@@ -89,7 +137,7 @@ pub struct NodeEditor<G: NodeGraph> {
     /// Optional so that every measurement written before §38 still measures what it
     /// measured: an editor without operators is the widget it always was, down to the
     /// counter.
-    ops: Option<Ops<G>>,
+    session: Option<SessionHandle<G>>,
     /// How the overlays are drawn.
     style: OverlayStyle,
     /// The last line of the statistics overlay, or `None` for no overlay at all.
@@ -115,6 +163,16 @@ pub struct NodeEditor<G: NodeGraph> {
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
+    /// The canvas this editor drives.
+    ///
+    /// What a graph names its views by: a canvas tells the model its own id when it is
+    /// attached (`NodeSource::attached`), so an application that has to reach a view —
+    /// to carry a change into a window the push fan-out cannot reach — asks the editor
+    /// for it.
+    pub fn canvas_id(&self) -> WidgetId {
+        self.canvas.id()
+    }
+
     /// Statistics from the canvas, as of the last layout pass.
     pub fn stats(&self) -> CanvasStats {
         self.stats
@@ -133,7 +191,7 @@ impl<G: NodeGraph> NodeEditor<G> {
     pub fn new(canvas: CanvasLayer) -> Self {
         Self {
             canvas: WidgetPod::new(canvas),
-            ops: None,
+            session: None,
             style: OverlayStyle::default(),
             hud_caption: None,
             view: Affine::IDENTITY,
@@ -154,7 +212,7 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// the pick on every pointer event — the last of which is what the operators' poll
     /// reads as context.
     pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph<G>) -> Self {
-        Self::with_runtime(canvas, graph, crate::ops::runtime())
+        Self::with_session(canvas, EditorSession::new(graph).share())
     }
 
     /// As [`with_ops`](Self::with_ops), with a runtime of the caller's own.
@@ -164,13 +222,30 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// assembled here, because what goes into it is the application's decision and
     /// `blazy-ops` already has the vocabulary for it.
     pub fn with_runtime(canvas: CanvasLayer, graph: &SharedGraph<G>, runtime: OpRuntime<EditorWorld<G>>) -> Self {
+        Self::with_session(canvas, EditorSession::with_runtime(graph, runtime).share())
+    }
+
+    /// An editor over a session that already exists.
+    ///
+    /// The constructor detach is built on: the area is rebuilt — a widget tree cannot
+    /// move between windows — but what it was showing, what was selected in it and what
+    /// it could undo are the session's, and the session does not move at all. The canvas
+    /// is handed the session's view, so the new widget opens where the old one was
+    /// looking.
+    pub fn with_session(canvas: CanvasLayer, session: SessionHandle<G>) -> Self {
+        let canvas = canvas.with_builtin_gestures(false).with_view(session.borrow().view);
         Self {
-            ops: Some(Ops {
-                runtime,
-                world: EditorWorld::new(graph),
-            }),
-            ..Self::new(canvas.with_builtin_gestures(false))
+            session: Some(session),
+            ..Self::new(canvas)
         }
+    }
+
+    /// The session this editor shows, if it has one.
+    ///
+    /// What an area hands to the area that replaces it (decision 1a): the handle is the
+    /// state, and passing it is the whole of "moving" an editor.
+    pub fn session(&self) -> Option<&SessionHandle<G>> {
+        self.session.as_ref()
     }
 
     /// The same editor, drawing a statistics overlay whose last line is `caption`.
@@ -193,21 +268,26 @@ impl<G: NodeGraph> NodeEditor<G> {
 
     /// The selected nodes. Empty for an editor with no operator layer.
     pub fn selection(&self) -> BTreeSet<usize> {
-        self.ops
+        self.session
             .as_ref()
-            .map(|ops| ops.world.selection.clone())
+            .map(|session| session.borrow().world.selection.clone())
             .unwrap_or_default()
     }
 
     /// The operator counters, all zero when there is no operator layer.
     pub fn op_counters(&self) -> OpCounters {
-        self.ops.as_ref().map(|ops| ops.runtime.counters()).unwrap_or_default()
+        self.session
+            .as_ref()
+            .map(|session| session.borrow().runtime.counters())
+            .unwrap_or_default()
     }
 
     /// How many operators are running. Zero between gestures, and a gesture that ends
     /// with this non-zero is one that never finished.
     pub fn modal_depth(&self) -> usize {
-        self.ops.as_ref().map_or(0, |ops| ops.runtime.modal_depth())
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.borrow().runtime.modal_depth())
     }
 
     /// The status line as it was last painted. Empty without [`with_hud`](Self::with_hud).
@@ -223,17 +303,23 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// Between "nothing running" and "a modal operator running" there is now a third
     /// state, and a gesture that ends in it is one that never resolved (§39.3).
     pub fn is_holding(&self) -> bool {
-        self.ops.as_ref().is_some_and(|ops| ops.runtime.is_holding())
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.borrow().runtime.is_holding())
     }
 
     /// Steps in the undo history.
     pub fn history_depth(&self) -> usize {
-        self.ops.as_ref().map_or(0, |ops| ops.runtime.history().depth())
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.borrow().runtime.history().depth())
     }
 
     /// Bytes the undo history is holding, by its steps' own reckoning.
     pub fn history_bytes(&self) -> usize {
-        self.ops.as_ref().map_or(0, |ops| ops.runtime.history().bytes())
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.borrow().runtime.history().bytes())
     }
 
     /// Runs an operator by name, from outside the tree.
@@ -243,18 +329,24 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// does is what the interactive path does after a dispatch: carry the moved nodes
     /// into this canvas and into the other views of the graph.
     pub fn exec(this: &mut WidgetMut<'_, Self>, name: &str, props: &Props) -> OpResult {
-        let Some(ops) = this.widget.ops.as_mut() else {
+        let Some(session) = this.widget.session.clone() else {
             return OpResult::PassThrough;
         };
-        let result = ops.runtime.exec(&mut ops.world, name, props);
+        // The borrow ends before the flush, which takes one of its own: a session is
+        // shared now, and a borrow held across a call into the tree is how a `RefCell`
+        // turns into a panic.
+        let result = {
+            let session = &mut *session.borrow_mut();
+            session.runtime.exec(&mut session.world, name, props)
+        };
         Self::flush_mut(this);
         result
     }
 
     /// Sets how a finished move becomes an undo step. See [`EditorWorld::record_move`].
     pub fn set_move_recorder(this: &mut WidgetMut<'_, Self>, recorder: MoveRecorder<G>) {
-        if let Some(ops) = this.widget.ops.as_mut() {
-            ops.world.record_move = recorder;
+        if let Some(session) = this.widget.session.as_ref() {
+            session.borrow_mut().world.record_move = recorder;
         }
     }
 
@@ -265,10 +357,10 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// is left here is the only thing that really differs: which context reaches the
     /// canvas.
     fn flush_mut(this: &mut WidgetMut<'_, Self>) {
-        let Some(ops) = this.widget.ops.as_mut() else {
+        let Some(session) = this.widget.session.clone() else {
             return;
         };
-        let changes = ops.take_changes();
+        let changes = session.borrow_mut().take_changes();
         if changes.dirty {
             this.ctx.request_post_paint();
         }
@@ -290,10 +382,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             // other views of the graph are not following it (§30).
             return;
         }
-        let peers = peers_of(
-            this.widget.ops.as_ref().expect("checked above"),
-            this.widget.canvas.id(),
-        );
+        let peers = peers_of(&session.borrow(), this.widget.canvas.id());
         for peer in peers {
             let (positions, edits) = (changes.positions.clone(), changes.edits.clone());
             this.ctx
@@ -327,7 +416,7 @@ impl Changes {
     }
 }
 
-impl<G: NodeGraph> Ops<G> {
+impl<G: NodeGraph> EditorSession<G> {
     /// Takes what the operators changed, leaving the world clean.
     fn take_changes(&mut self) -> Changes {
         let moved = mem::take(&mut self.world.moved);
@@ -396,9 +485,9 @@ fn positions_of<G: NodeGraph>(world: &EditorWorld<G>, mut moved: Vec<usize>) -> 
 }
 
 /// The other canvases showing the same graph (§30).
-fn peers_of<G: NodeGraph>(ops: &Ops<G>, own_canvas: WidgetId) -> Vec<WidgetId> {
+fn peers_of<G: NodeGraph>(session: &EditorSession<G>, own_canvas: WidgetId) -> Vec<WidgetId> {
     let mut peers = Vec::new();
-    ops.world.graph.borrow().other_views(own_canvas, &mut peers);
+    session.world.graph.borrow().other_views(own_canvas, &mut peers);
     peers
 }
 
@@ -456,7 +545,7 @@ impl<G: NodeGraph> Layer for NodeEditor<G> {
         let Some((op_event, sample)) = to_op_event(ctx, event) else {
             return Handled::No;
         };
-        if self.ops.is_none() {
+        if self.session.is_none() {
             return Handled::No;
         }
         // Somebody below holds the pointer, so the event is going to the tree whatever
@@ -464,8 +553,8 @@ impl<G: NodeGraph> Layer for NodeEditor<G> {
         // widget in the middle of a gesture is told how it ends. Dispatching here as
         // well would deliver every event twice.
         if ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
-            if let Some(ops) = self.ops.as_mut() {
-                ops.runtime.observe(&op_event);
+            if let Some(session) = self.session.as_ref() {
+                session.borrow_mut().runtime.observe(&op_event);
             }
             return Handled::No;
         }
@@ -505,14 +594,16 @@ impl<G: NodeGraph> NodeEditor<G> {
         };
 
         let result = {
-            let ops = self.ops.as_mut().expect("checked by the caller");
-            ops.world.hover = hover;
+            let session = self.session.clone().expect("checked by the caller");
+            let session = &mut *session.borrow_mut();
+            session.world.hover = hover;
             if let Some(pos) = event.pos() {
-                ops.world.pointer = pos;
-                ops.world.pointer_screen = sample.screen;
+                session.world.pointer = pos;
+                session.world.pointer_screen = sample.screen;
             }
-            ops.runtime
-                .feed(&mut ops.world, &event, sample, Scope(&CANVAS_SCOPE), seat)
+            session
+                .runtime
+                .feed(&mut session.world, &event, sample, Scope(&CANVAS_SCOPE), seat)
         };
 
         // Masonry's own modality. It may be taken during a press and at no other time,
@@ -540,10 +631,10 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// The §30 fan-out, from here rather than from the canvas's drag: the operator
     /// wrote the model, and only the driver holds a widget context.
     fn flush(&mut self, ctx: &mut EventCtx<'_>) {
-        let Some(ops) = self.ops.as_mut() else {
+        let Some(session) = self.session.clone() else {
             return;
         };
-        let changes = ops.take_changes();
+        let changes = session.borrow_mut().take_changes();
         if changes.dirty {
             ctx.request_post_paint();
         }
@@ -571,7 +662,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             // other views of the graph are not following it (§30).
             return;
         }
-        let peers = peers_of(self.ops.as_ref().expect("checked above"), self.canvas.id());
+        let peers = peers_of(&session.borrow(), self.canvas.id());
         for peer in peers {
             let (positions, edits) = (changes.positions.clone(), changes.edits.clone());
             ctx.mutate_later(peer, move |widget| apply_moves(widget, positions, edits));
@@ -585,13 +676,65 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// operator draw": inside the area that owns the pixels. An overlay across areas
     /// would break the one condition the layer cache cannot check — that a cached
     /// layer owns its rectangle (§36.4).
-    fn paint_overlay(&self, ctx: &PaintCtx<'_>, painter: &mut Painter<'_>) {
-        let Some(ops) = self.ops.as_ref() else {
+    /// The status line and the panel under it.
+    ///
+    /// Split out of `post_paint` so that both halves of what this widget paints for
+    /// itself sit inside one clip; see there for why the clip is not optional.
+    fn paint_hud(&mut self, ctx: &mut PaintCtx<'_>, painter: &mut Painter<'_>) {
+        let Some(caption) = self.hud_caption.as_deref() else {
             return;
         };
+        let content_box = ctx.content_box();
+
+        // Formatted here rather than in `layout`, because half of what it says changes
+        // without the layout changing: a click moves the counters and relayouts nothing.
+        // Formatting into a scratch buffer and swapping only on a real difference is what
+        // keeps the shaped text — which is the expensive half — valid between frames.
+        let counters = self.op_counters();
+        format_hud(&self.stats, &counters, caption, &mut self.hud_next);
+        if self.hud_next != self.hud {
+            mem::swap(&mut self.hud, &mut self.hud_next);
+            self.hud_layout = None;
+        }
+
+        if self.hud_layout.is_none() {
+            let text = &self.hud;
+            let (fcx, lcx) = ctx.text_contexts();
+            let mut builder = lcx.ranged_builder(fcx, text, 1.0, true);
+            builder.push_default(StyleProperty::FontSize(12.0));
+            let mut layout = builder.build(text);
+            layout.break_all_lines(None);
+            layout.align(None, TextAlign::Start, TextAlignOptions::default());
+            self.hud_layout = Some(layout);
+        }
+        let Some(layout) = self.hud_layout.as_ref() else {
+            return;
+        };
+
+        // The panel is as tall as the text, rather than as tall as the text used to be:
+        // a line added to the status line should not disappear under the edge of a
+        // rectangle whose height someone typed in once.
+        let height = f64::from(layout.height()) + 16.0;
+        let panel = Rect::new(content_box.x0, content_box.y1 - height, content_box.x1, content_box.y1);
+        painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();
+
+        render_text(
+            painter,
+            Affine::translate((panel.x0 + 10.0, panel.y0 + 8.0)),
+            layout,
+            &[Color::from_rgb8(0xd0, 0xd0, 0xd8).into()],
+            true,
+        );
+    }
+
+    fn paint_overlay(&self, ctx: &PaintCtx<'_>, painter: &mut Painter<'_>) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let session = session.borrow();
         let viewport = ctx.content_box();
-        let graph = ops.world.graph.borrow();
-        for &index in &ops.world.selection {
+        let graph = session.world.graph.borrow();
+        for &index in &session.world.selection {
             if index >= graph.node_count() {
                 continue;
             }
@@ -603,7 +746,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             }
             painter.stroke(rect, &Stroke::new(2.0), self.style.selection).draw();
         }
-        if let Some(band) = ops.world.band {
+        if let Some(band) = session.world.band {
             let rect = self.view.transform_rect_bbox(band);
             painter.fill(rect, self.style.band_fill).draw();
             painter.stroke(rect, &Stroke::new(1.0), self.style.selection).draw();
@@ -684,14 +827,15 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
             ctx.request_post_paint();
         }
 
-        if self.ops.is_none() {
+        if self.session.is_none() {
             return;
         }
         // A cancel is the window telling us the gesture is over, and there is nobody
         // else to tell the operators.
         if let PointerEvent::Cancel(_) = event {
-            if let Some(ops) = self.ops.as_mut() {
-                ops.runtime.cancel_all(&mut ops.world);
+            if let Some(session) = self.session.clone() {
+                let session = &mut *session.borrow_mut();
+                session.runtime.cancel_all(&mut session.world);
             }
             self.flush(ctx);
             return;
@@ -725,12 +869,15 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     /// A text field keeps its keys: it is focused, it handles them, and this never
     /// sees them (§12).
     fn on_text_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &TextEvent) {
-        let Some(ops) = self.ops.as_mut() else {
+        let Some(session) = self.session.clone() else {
             return;
         };
         match event {
             TextEvent::WindowFocusChange(false) => {
-                ops.runtime.cancel_all(&mut ops.world);
+                {
+                    let session = &mut *session.borrow_mut();
+                    session.runtime.cancel_all(&mut session.world);
+                }
                 self.flush(ctx);
             },
             TextEvent::Keyboard(key) if !ctx.is_handled() => {
@@ -786,6 +933,12 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         let (canvas, _) = ctx.get_raw(&mut self.canvas);
         let stats = canvas.stats();
         self.view = canvas.view();
+        // And mirror the view into the session, which is what outlives this widget. The
+        // canvas owns it while it exists (§22 keeps it out of layout); the session is the
+        // copy an area rebuilt elsewhere opens with.
+        if let Some(session) = self.session.as_ref() {
+            session.borrow_mut().view = self.view;
+        }
         self.stats = stats;
     }
 
@@ -794,53 +947,21 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     }
 
     fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        // Clipped to this editor's own box, and that is load-bearing rather than tidy.
+        // Neither of the two things painted here is a child, so nothing else clips them:
+        // the outline of a selected node is a stroke around a node that may be half off
+        // the area, and the status line is one unwrapped line wider than an area of a
+        // screen of eight. Both landed on the neighbour — and, worse, they took the
+        // area's *layer rectangle* with them, which is measured by walking the scene
+        // (§36.2): a layer claiming two areas' worth of pixels puts the cache over its
+        // ceiling, and what the eviction dropped was somebody else's frame (§44.9).
+        // Pushed and popped rather than `with_fill_clip`, whose closure hands out a
+        // `Painter` with a shorter lifetime than the one these two take.
+        painter.push_fill_clip(ctx.content_box());
         // Under the HUD panel, so the numbers stay readable over a selected node.
         self.paint_overlay(ctx, painter);
-
-        let Some(caption) = self.hud_caption.as_deref() else {
-            return;
-        };
-        let content_box = ctx.content_box();
-
-        // Formatted here rather than in `layout`, because half of what it says changes
-        // without the layout changing: a click moves the counters and relayouts nothing.
-        // Formatting into a scratch buffer and swapping only on a real difference is what
-        // keeps the shaped text — which is the expensive half — valid between frames.
-        let counters = self.ops.as_ref().map(|ops| ops.runtime.counters()).unwrap_or_default();
-        format_hud(&self.stats, &counters, caption, &mut self.hud_next);
-        if self.hud_next != self.hud {
-            mem::swap(&mut self.hud, &mut self.hud_next);
-            self.hud_layout = None;
-        }
-
-        if self.hud_layout.is_none() {
-            let text = &self.hud;
-            let (fcx, lcx) = ctx.text_contexts();
-            let mut builder = lcx.ranged_builder(fcx, text, 1.0, true);
-            builder.push_default(StyleProperty::FontSize(12.0));
-            let mut layout = builder.build(text);
-            layout.break_all_lines(None);
-            layout.align(None, TextAlign::Start, TextAlignOptions::default());
-            self.hud_layout = Some(layout);
-        }
-        let Some(layout) = self.hud_layout.as_ref() else {
-            return;
-        };
-
-        // The panel is as tall as the text, rather than as tall as the text used to be:
-        // a line added to the status line should not disappear under the edge of a
-        // rectangle whose height someone typed in once.
-        let height = f64::from(layout.height()) + 16.0;
-        let panel = Rect::new(content_box.x0, content_box.y1 - height, content_box.x1, content_box.y1);
-        painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();
-
-        render_text(
-            painter,
-            Affine::translate((panel.x0 + 10.0, panel.y0 + 8.0)),
-            layout,
-            &[Color::from_rgb8(0xd0, 0xd0, 0xd8).into()],
-            true,
-        );
+        self.paint_hud(ctx, painter);
+        painter.pop_clip();
     }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {

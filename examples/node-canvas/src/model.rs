@@ -71,6 +71,16 @@ pub struct GraphModel {
     /// frame*, and the only code able to do that is code holding a widget context, i.e.
     /// the canvas and the node (§30).
     views: Vec<WidgetId>,
+    /// What each view has not been told about yet.
+    ///
+    /// The push fan-out of §30 reaches the canvases of *this* window and stops there:
+    /// `mutate_later` names a widget in one `RenderRoot`'s arena, and a canvas in another
+    /// window is not in it — the call is silently dropped, which is exactly how a second
+    /// window came to show a node where it used to be. So the model also keeps what each
+    /// view still owes, and a view pulls it when its window next runs. Applying a change
+    /// twice is applying the same truth twice, so the fast path and this one do not have
+    /// to know about each other.
+    pending: Vec<(WidgetId, Vec<Change>)>,
 }
 
 impl GraphModel {
@@ -120,6 +130,7 @@ impl GraphModel {
             })
             .collect();
         let mut model = Self {
+            pending: Vec::new(),
             links: Vec::new(),
             free_links: Vec::new(),
             by_node: HashMap::new(),
@@ -245,6 +256,7 @@ impl GraphModel {
     pub fn set_pos(&mut self, index: usize, pos: Point) {
         if let Some(Some(node)) = self.nodes.get_mut(index) {
             node.pos = pos;
+            self.note(Change::Moved(index));
         }
     }
 
@@ -252,7 +264,37 @@ impl GraphModel {
     pub fn register_view(&mut self, canvas: WidgetId) {
         if !self.views.contains(&canvas) {
             self.views.push(canvas);
+            self.pending.push((canvas, Vec::new()));
         }
+    }
+
+    /// Records a change for every view, so a window that was not there when it happened
+    /// can catch up.
+    fn note(&mut self, change: Change) {
+        for (_, owed) in &mut self.pending {
+            owed.push(change);
+        }
+    }
+
+    /// Whether any view is behind.
+    ///
+    /// What a driver asks before waking other windows: an idle window is idle on purpose
+    /// (§36), and waking it on every event would undo that.
+    pub fn has_pending(&self) -> bool {
+        self.pending.iter().any(|(_, owed)| !owed.is_empty())
+    }
+
+    /// Takes what `view` has not caught up with.
+    ///
+    /// Empty almost always: a view that ran in the same window as the change has already
+    /// applied it by the push path, and applying it again would only write the same
+    /// truth. What this is for is the view that could not be reached at all.
+    pub fn take_pending(&mut self, view: WidgetId) -> Vec<Change> {
+        self.pending
+            .iter_mut()
+            .find(|(id, _)| *id == view)
+            .map(|(_, owed)| std::mem::take(owed))
+            .unwrap_or_default()
     }
 
     /// The canvases showing this graph, except `this` one.
@@ -268,6 +310,7 @@ impl GraphModel {
     pub fn set_value(&mut self, index: usize, value: f64) {
         if let Some(Some(node)) = self.nodes.get_mut(index) {
             node.value = value;
+            self.note(Change::Edited(index));
         }
     }
 
@@ -275,6 +318,7 @@ impl GraphModel {
     pub fn set_checked(&mut self, index: usize, checked: bool) {
         if let Some(Some(node)) = self.nodes.get_mut(index) {
             node.checked = checked;
+            self.note(Change::Edited(index));
         }
     }
 }
@@ -309,7 +353,7 @@ impl NodeGraph for GraphModel {
             value: 0.5,
             checked: false,
         };
-        match self.free.pop() {
+        let index = match self.free.pop() {
             Some(index) => {
                 self.nodes[index] = Some(state);
                 index
@@ -318,7 +362,9 @@ impl NodeGraph for GraphModel {
                 self.nodes.push(Some(state));
                 self.nodes.len() - 1
             },
-        }
+        };
+        self.note(Change::Added(index));
+        index
     }
 
     fn restore_node(&mut self, index: usize, rect: Rect) {
@@ -338,6 +384,7 @@ impl NodeGraph for GraphModel {
             pos: rect.origin(),
             ..state
         });
+        self.note(Change::Added(index));
     }
 
     fn remove_node(&mut self, index: usize) -> Vec<Link> {
@@ -346,6 +393,7 @@ impl NodeGraph for GraphModel {
         }
         self.nodes[index] = None;
         self.free.push(index);
+        self.note(Change::Removed(index));
         // Its own links, through the adjacency: a scan of every edge in the graph is
         // what this used to be, and what made a delete cost the graph (§43).
         let names = self.by_node.remove(&(index as u32)).unwrap_or_default();
@@ -374,6 +422,31 @@ impl NodeGraph for GraphModel {
 /// Two links are the same link whichever way round they are written.
 fn same_link(a: Link, b: Link) -> bool {
     (a.from, a.to) == (b.from, b.to) || (a.from, a.to) == (b.to, b.from)
+}
+
+/// A change a view has not caught up with yet.
+///
+/// Everything a node widget copies out of the model when it is built, which is its
+/// geometry (§43, because the canvas keeps its own) *and* its contents: a node that is
+/// already on screen read the model once and keeps its own `value`, `checked` and tint,
+/// so nothing about it follows the model by itself. A node that is not built needs
+/// nothing — it reads the model when it next scrolls in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// The node moved, and the view has the old place.
+    Moved(usize),
+    /// The node appeared.
+    Added(usize),
+    /// The node went.
+    Removed(usize),
+    /// What the node holds changed — a slider, a checkbox — and a view showing it has
+    /// the old copy.
+    ///
+    /// Inside one window the edit reaches the other views as a push
+    /// (`GraphNode::broadcast`), and that push does not cross a window like any other
+    /// (§44.3): `mutate_later` names a widget in one arena. Recorded here so the other
+    /// window collects it on its next frame.
+    Edited(usize),
 }
 
 /// Shared handle to the graph.

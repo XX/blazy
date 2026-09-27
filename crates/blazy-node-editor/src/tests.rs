@@ -360,3 +360,67 @@ fn an_added_node_reaches_the_canvas() {
     let _ = harness.redraw();
     assert_eq!(harness.root_widget().stats().total, before, "and loses it again");
 }
+
+// --- MARK: SESSION (the detach task, phase 2)
+
+/// The point of a session: a new widget over the old state is the old view.
+///
+/// The widget is thrown away and built again — which is what a window boundary forces,
+/// because a tree cannot move between `RenderRoot`s — and the view, the selection and the
+/// history come back because they were never in the widget.
+#[test]
+fn a_new_widget_over_the_same_session_keeps_the_view_the_selection_and_the_history() {
+    use masonry::kurbo::{Affine, Vec2};
+
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut first = editor_harness(&graph, &session);
+
+    first.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 1));
+        NodeEditor::exec(&mut editor, "node.move", &Props::new().with_float("dx", 25.0));
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            CanvasLayer::pan(&mut canvas, Vec2::new(-40.0, -10.0));
+        });
+    });
+    let _ = first.redraw();
+
+    let view = first.root_widget().stats().zoom;
+    let selection = first.root_widget().selection();
+    let depth = first.root_widget().history_depth();
+    assert!(!selection.is_empty() && depth > 0, "there is something to lose");
+    assert_ne!(session.borrow().view, Affine::IDENTITY, "the session followed the view");
+
+    // The window closes: this widget is dropped and another is built over the same
+    // session, which is all detach can be.
+    drop(first);
+    let second = editor_harness(&graph, &session);
+
+    assert_eq!(second.root_widget().selection(), selection, "the selection came along");
+    assert_eq!(second.root_widget().history_depth(), depth, "and the history");
+    assert_eq!(
+        second.root_widget().stats().zoom,
+        view,
+        "and the new canvas opens where the old one was looking"
+    );
+}
+
+/// A harness over a fresh canvas and an existing session.
+fn editor_harness(graph: &SharedGraph<Row>, session: &crate::SessionHandle<Row>) -> TestHarness<NodeEditor<Row>> {
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let canvas = CanvasLayer::new(3, geometry, source);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(NodeEditor::with_session(canvas, session.clone())),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = harness.redraw();
+    harness
+}

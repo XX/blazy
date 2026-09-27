@@ -181,10 +181,15 @@ impl GraphNode {
 
     /// Re-reads this node's state from the model.
     ///
-    /// The receiving half of [`broadcast`](Self::broadcast). Also the reason a node
+    /// The receiving half of the push a control's edit starts (`broadcast`, private).
+    /// Also the reason a node
     /// keeps `value` and `checked` of its own: at `Simplified` there are no control
     /// widgets and the values are painted, so both copies have to be refreshed.
-    fn reload(this: &mut blazy::masonry::core::WidgetMut<'_, Self>) {
+    ///
+    /// Public because the push is not the only way in: a window that was not there when
+    /// the edit happened collects it from the model instead (`Change::Edited`), and the
+    /// widget it lands on is this one (§44.9).
+    pub fn reload(this: &mut blazy::masonry::core::WidgetMut<'_, Self>) {
         let state = this.widget.graph.borrow().node(this.widget.index);
         this.widget.value = state.value;
         this.widget.checked = state.checked;

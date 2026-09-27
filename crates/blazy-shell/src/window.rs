@@ -1,8 +1,20 @@
-//! Owner mode: our own window, our own event loop, our own frame on the screen.
+//! Owner mode: our own windows, our own event loop, our own frames on the screen.
 //!
 //! `rnd/architecture.md` §14 gives the host two modes; this is the first. The second —
 //! guest mode, where an engine hands us its device and its texture — is nearly free
 //! from upstream and waits for something real to embed into (§26.5).
+//!
+//! # Several windows
+//!
+//! The loop holds a map of them, each with its own `RenderRoot`, presenter, device and
+//! layer cache — everything per window, which is a decision with numbers behind it
+//! (§44): a second window costs 123 ms to open, of which 95 are the rasteriser's
+//! pipelines, and sharing a device would save the other 28.
+//!
+//! One [`ShellDriver`] for the process, and every method names the window it is about
+//! ([`WindowKey`]). A driver asks for windows through [`ShellCtx`], which also carries
+//! the one thing one window can do to another: ask it to draw, because an idle window
+//! cannot notice a change made elsewhere (§36, §30).
 //!
 //! # Why not `masonry_winit`
 //!
@@ -39,6 +51,7 @@
 //! question this crate exists to answer.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -128,18 +141,134 @@ impl WindowConfig {
     }
 }
 
-/// What an application wants to hear about from the shell.
+/// The name of a window, handed out by the shell.
 ///
-/// One method, and a blanket no-op, because the only thing a Masonry application
-/// strictly has to handle is a widget's action. Everything else the window knows is
-/// available through the widget tree.
-pub trait ShellDriver {
-    /// A widget emitted an action. The default drops it.
-    fn on_action(&mut self, action: ErasedAction, from: WidgetId) {
-        let _ = (action, from);
+/// Ours rather than winit's, and that is what makes it usable: a driver names a window
+/// *before* it exists — [`ShellCtx::open_window`] answers immediately and the window is
+/// created once the current event is done with — and the name it got then is the name it
+/// keeps. Routing winit's own id to this one is the shell's business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowKey(u64);
+
+/// What a driver asked the shell to do.
+///
+/// Public because [`deliver_pointer`] and [`deliver_text`] are: an embedder running its
+/// own loop gets the same seat as the shell's loop, and therefore the same obligation to
+/// honour what the driver asked for. The shell's own loop drains these itself.
+#[non_exhaustive]
+pub enum ShellRequest {
+    /// Open a window under the name the driver was given.
+    ///
+    /// Boxed because it is the heavy variant and `Close` is a number: an enum as wide as
+    /// its widest variant would make every queued close carry a window's worth of bytes.
+    Open(Box<NewWindow>),
+    /// Close a window. Closing the last one ends the loop.
+    Close(WindowKey),
+    /// Draw a window that may be idle.
+    ///
+    /// The only way one window can reach another: a change made in one window has to
+    /// wake the windows that have to follow it, and nothing else will — an idle window
+    /// stays idle by design (§36).
+    Redraw(WindowKey),
+}
+
+/// A window that has been asked for and not yet created.
+pub struct NewWindow {
+    /// The name it will answer to, already valid.
+    pub window: WindowKey,
+    /// How it should be created.
+    pub config: WindowConfig,
+    /// Its root widget. A tree cannot be moved between windows, so this is a fresh one:
+    /// `RenderRoot` owns its arena and upstream has no reparenting.
+    pub root: NewWidget<dyn Widget>,
+}
+
+/// What a driver may ask the shell for.
+///
+/// Passed to every method that could reasonably want a second window — which is every
+/// method that hears from the user. The requests are queued rather than performed on the
+/// spot because creating a window needs the event loop, and the driver is called from
+/// inside an event it is already holding.
+pub struct ShellCtx {
+    requests: Vec<ShellRequest>,
+    next: u64,
+}
+
+impl Default for ShellCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShellCtx {
+    /// A context with nothing asked for yet. For an embedder running its own loop.
+    pub fn new() -> Self {
+        Self {
+            requests: Vec::new(),
+            next: 0,
+        }
     }
 
-    /// Called once, with the tree built and before the first event.
+    /// Asks for a window, and names it.
+    ///
+    /// The key is valid from here on: it is what the driver's later calls are tagged
+    /// with, and what [`close_window`](Self::close_window) takes. The window itself
+    /// appears when the shell gets back to the event loop.
+    pub fn open_window(&mut self, config: WindowConfig, root: NewWidget<dyn Widget>) -> WindowKey {
+        let window = WindowKey(self.next);
+        self.next += 1;
+        self.requests
+            .push(ShellRequest::Open(Box::new(NewWindow { window, config, root })));
+        window
+    }
+
+    /// Names a window the shell did not open.
+    ///
+    /// For an embedder running its own loop, and for a test: [`deliver_pointer`] and
+    /// [`deliver_text`] take the name of the window an event came from, and a window
+    /// somebody else created still has to have one.
+    pub fn name_window(&mut self) -> WindowKey {
+        let window = WindowKey(self.next);
+        self.next += 1;
+        window
+    }
+
+    /// Asks for a window to be closed. Closing the last one ends the loop.
+    pub fn close_window(&mut self, window: WindowKey) {
+        self.requests.push(ShellRequest::Close(window));
+    }
+
+    /// Asks for a window to draw a frame.
+    ///
+    /// For a change that one window made and another has to follow: the model is shared
+    /// and the views are not, and a view that is not drawing cannot notice anything
+    /// (§30, and the pull it takes across a window boundary).
+    pub fn request_redraw(&mut self, window: WindowKey) {
+        self.requests.push(ShellRequest::Redraw(window));
+    }
+
+    /// Takes what has been asked for, leaving the context empty.
+    ///
+    /// The shell's loop calls this itself; an embedder running its own loop has to.
+    pub fn drain(&mut self) -> Vec<ShellRequest> {
+        std::mem::take(&mut self.requests)
+    }
+}
+
+/// What an application wants to hear about from the shell.
+///
+/// **One driver per process, and every method names the window it is about.** That is
+/// how `masonry_winit::AppDriver` is shaped, but the reason here is detach: moving an
+/// area from one window to another is an operation with two ends, and a driver that saw
+/// one window could not express it. An application that wants per-window state keys it
+/// by [`WindowKey`], which is the same thing the shell does.
+pub trait ShellDriver {
+    /// A widget emitted an action. The default drops it.
+    fn on_action(&mut self, cx: &mut ShellCtx, window: WindowKey, action: ErasedAction, from: WidgetId) {
+        let _ = (cx, window, action, from);
+    }
+
+    /// Called once per window, with its tree built and before its first event.
     ///
     /// The window's own startup, which an application cannot do for itself: a
     /// `RenderRoot` does not exist until the window does, and some of what an
@@ -150,8 +279,39 @@ pub trait ShellDriver {
     ///
     /// `root.get_layer_root(0).id()` is the application's own root widget, which saves
     /// threading a `WidgetId` out of a tree that has not been built yet.
-    fn started(&mut self, root: &mut RenderRoot) {
-        let _ = root;
+    fn started(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
+        let _ = (cx, window, root);
+    }
+
+    /// The event has been delivered, and whatever it changed has changed.
+    ///
+    /// The place to notice that *another* window has to follow: a change made here waits
+    /// in the application's model, and a window that is not drawing will not collect it
+    /// (§36 — an idle window is idle on purpose). So this is where an application asks
+    /// for the frames that are needed, with [`ShellCtx::request_redraw`].
+    ///
+    /// **After the event rather than in one of the seats**, because the seats are offered
+    /// an event *before* the tree acts on it: a driver that asked "is there anything to
+    /// carry" from [`pointer_event`](Self::pointer_event) would be asking about the
+    /// previous event, and a change made with the mouse would reach the other window one
+    /// gesture late — which is exactly what it did before this existed.
+    fn settled(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
+        let _ = (cx, window, root);
+    }
+
+    /// The window is about to draw a frame.
+    ///
+    /// Where an application catches a window up with whatever happened in another one.
+    /// Nothing else can do it: a driver is called with the root of the window the event
+    /// arrived at, and a widget in one `RenderRoot` cannot be reached from another — the
+    /// `mutate_later` that carries a change between the areas of one window is silently
+    /// dropped across the boundary of two. So the change waits in the application's model
+    /// and this is where the window collects it.
+    ///
+    /// Only on frames that are happening anyway. A window that has to be woken is woken
+    /// with [`ShellCtx::request_redraw`].
+    fn frame(&mut self, window: WindowKey, root: &mut RenderRoot) {
+        let _ = (window, root);
     }
 
     /// The subtrees that are layers of their own, asked for once per frame (§36).
@@ -165,8 +325,12 @@ pub trait ShellDriver {
     /// Only ever called on frames that are happening anyway, so an application that
     /// declares layers does not stop the window from going idle. The default declares
     /// none, and then nothing above happens at all.
-    fn layers(&mut self, root: &mut RenderRoot) -> Vec<WidgetId> {
-        let _ = root;
+    ///
+    /// No [`ShellCtx`] here, unlike the methods that hear from the user: this one is on
+    /// the frame path, and opening a window from inside a frame is not a thing an
+    /// application should be able to do by accident.
+    fn layers(&mut self, window: WindowKey, root: &mut RenderRoot) -> Vec<WidgetId> {
+        let _ = (window, root);
         Vec::new()
     }
 
@@ -183,8 +347,17 @@ pub trait ShellDriver {
     /// `RenderRoot::edit_widget` and the rewrite battery that follows it, at 41.2 probes
     /// per gesture — which is why an application with a layer root of its own should
     /// prefer that seat and keep this one for what only it can do.
-    fn pointer_event(&mut self, root: &mut RenderRoot, event: &PointerEvent) -> Handled {
-        let _ = (root, event);
+    ///
+    /// A gesture never crosses a window: pointer capture belongs to one `RenderRoot`, so
+    /// while a button is down its events go to the window that took it.
+    fn pointer_event(
+        &mut self,
+        cx: &mut ShellCtx,
+        window: WindowKey,
+        root: &mut RenderRoot,
+        event: &PointerEvent,
+    ) -> Handled {
+        let _ = (cx, window, root, event);
         Handled::No
     }
 
@@ -192,8 +365,14 @@ pub trait ShellDriver {
     ///
     /// Keys never reach a widget that has not been made the focus fallback, so this is
     /// also the seat that can hear a key when the tree would have dropped it (§38.3).
-    fn text_event(&mut self, root: &mut RenderRoot, event: &TextEvent) -> Handled {
-        let _ = (root, event);
+    fn text_event(
+        &mut self,
+        cx: &mut ShellCtx,
+        window: WindowKey,
+        root: &mut RenderRoot,
+        event: &TextEvent,
+    ) -> Handled {
+        let _ = (cx, window, root, event);
         Handled::No
     }
 }
@@ -202,16 +381,28 @@ pub trait ShellDriver {
 ///
 /// The whole of the host seat, and it is a free function so that an embedder running its
 /// own loop — or a test with no window at all — gets exactly what the shell's loop gets.
-pub fn deliver_pointer(driver: &mut dyn ShellDriver, root: &mut RenderRoot, event: PointerEvent) -> Handled {
-    if driver.pointer_event(root, &event).is_handled() {
+pub fn deliver_pointer(
+    driver: &mut dyn ShellDriver,
+    cx: &mut ShellCtx,
+    window: WindowKey,
+    root: &mut RenderRoot,
+    event: PointerEvent,
+) -> Handled {
+    if driver.pointer_event(cx, window, root, &event).is_handled() {
         return Handled::Yes;
     }
     root.handle_pointer_event(event)
 }
 
 /// As [`deliver_pointer`], for keys.
-pub fn deliver_text(driver: &mut dyn ShellDriver, root: &mut RenderRoot, event: TextEvent) -> Handled {
-    if driver.text_event(root, &event).is_handled() {
+pub fn deliver_text(
+    driver: &mut dyn ShellDriver,
+    cx: &mut ShellCtx,
+    window: WindowKey,
+    root: &mut RenderRoot,
+    event: TextEvent,
+) -> Handled {
+    if driver.text_event(cx, window, root, &event).is_handled() {
         return Handled::Yes;
     }
     root.handle_text_event(event)
@@ -220,7 +411,7 @@ pub fn deliver_text(driver: &mut dyn ShellDriver, root: &mut RenderRoot, event: 
 impl ShellDriver for () {}
 
 impl<F: FnMut(ErasedAction, WidgetId)> ShellDriver for F {
-    fn on_action(&mut self, action: ErasedAction, from: WidgetId) {
+    fn on_action(&mut self, _cx: &mut ShellCtx, _window: WindowKey, action: ErasedAction, from: WidgetId) {
         self(action, from);
     }
 }
@@ -297,18 +488,16 @@ pub fn run(
     let _ = masonry::app::try_init_tracing();
 
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
+    // The first window is asked for exactly the way a second one is, so there is one
+    // path that opens a window and not two that drift apart.
+    let mut cx = ShellCtx::new();
+    cx.open_window(config, root);
     let mut app = ShellApp {
-        config,
-        presenter: None,
-        default_properties: Some(default_properties),
-        root: Some(root),
+        windows: HashMap::new(),
+        routes: HashMap::new(),
+        default_properties: Arc::new(default_properties),
         driver: Box::new(driver),
-        window: None,
-        render_root: None,
-        signals: Rc::new(RefCell::new(Vec::new())),
-        reducer: WindowEventReducer::default(),
-        last_anim: Instant::now(),
-        refusing: false,
+        cx,
         failure: None,
     };
     event_loop.run_app(&mut app).map_err(Error::EventLoop)?;
@@ -395,19 +584,20 @@ impl Presenter for BlitPresenter {
     }
 }
 
-struct ShellApp {
-    config: WindowConfig,
-    /// How the frame reaches the screen. Chosen once the window exists.
-    presenter: Option<Box<dyn Presenter>>,
-    default_properties: Option<DefaultProperties>,
-    root: Option<NewWidget<dyn Widget>>,
-    driver: Box<dyn ShellDriver>,
-    window: Option<Arc<Window>>,
-    render_root: Option<RenderRoot>,
-    /// Where the render root drops its signals.
+/// One window the shell holds.
+///
+/// Everything in here is per window and stays per window (decision 2 of the detach
+/// task): its own presenter, and with it its own device, rasteriser and layer cache with
+/// its own ceiling (§37.2). Two windows cost two of each, once, when they open.
+struct ShellWindow {
+    window: Arc<Window>,
+    presenter: Box<dyn Presenter>,
+    root: RenderRoot,
+    /// Where this root drops its signals.
     ///
     /// Shared with the sink closure the root owns, because that closure cannot borrow
-    /// the structure that owns the root.
+    /// the structure that owns the root. One queue per window, so a signal cannot be
+    /// acted on against the wrong one.
     signals: Rc<RefCell<Vec<RenderRootSignal>>>,
     reducer: WindowEventReducer,
     /// When the last animation frame ran, for the interval the next one gets.
@@ -417,102 +607,133 @@ struct ShellApp {
     /// Kept so the warning is logged when the state changes rather than sixty times a
     /// second: a scene over the tile budget stays over it while nothing moves.
     refusing: bool,
-    /// Why the window could not be started, handed back by [`run`] once the loop stops.
+}
+
+struct ShellApp {
+    /// The windows, by the name the driver knows them under.
+    windows: HashMap<WindowKey, ShellWindow>,
+    /// Which of them a winit event belongs to.
+    routes: HashMap<WindowId, WindowKey>,
+    /// The theme, shared by every window: one map per application (§22.1).
+    default_properties: Arc<DefaultProperties>,
+    driver: Box<dyn ShellDriver>,
+    /// What the driver has asked for and the loop has not done yet.
+    cx: ShellCtx,
+    /// Why a window could not be opened, handed back by [`run`] once the loop stops.
     ///
-    /// Kept rather than raised where it happens: `resumed` has no way to return an
-    /// error, and a panic there unwinds through the platform's event loop and takes the
-    /// `Result` that `run` promises its caller with it.
+    /// Kept rather than raised where it happens: the handler methods have no way to
+    /// return an error, and a panic there unwinds through the platform's event loop and
+    /// takes the `Result` that `run` promises its caller with it.
     failure: Option<Error>,
 }
 
 impl ShellApp {
-    /// Creates the window, the surface and the render root.
-    fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Error> {
+    /// Does what the driver asked for while it was being called.
+    ///
+    /// Between events rather than during them: creating a window needs the event loop,
+    /// and the driver is called from inside an event that is already holding it.
+    fn apply_requests(&mut self, event_loop: &ActiveEventLoop) {
+        for request in self.cx.drain() {
+            match request {
+                ShellRequest::Open(new) => {
+                    if let Err(error) = self.open(event_loop, new.window, new.config, new.root) {
+                        // The first window failing is the application failing to start;
+                        // a later one is the same kind of failure and is reported the
+                        // same way, because there is nobody else to tell.
+                        self.failure = Some(error);
+                        event_loop.exit();
+                        return;
+                    }
+                },
+                ShellRequest::Close(window) => self.close(event_loop, window),
+                ShellRequest::Redraw(window) => {
+                    if let Some(shell) = self.windows.get(&window) {
+                        shell.window.request_redraw();
+                    }
+                },
+            }
+        }
+    }
+
+    /// Creates a window, its surface and its render root.
+    fn open(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        key: WindowKey,
+        config: WindowConfig,
+        root: NewWidget<dyn Widget>,
+    ) -> Result<(), Error> {
         let mut attributes = Window::default_attributes()
-            .with_title(self.config.title.clone())
-            .with_resizable(self.config.resizable)
-            .with_inner_size(self.config.size);
-        if let Some(min) = self.config.min_size {
+            .with_title(config.title.clone())
+            .with_resizable(config.resizable)
+            .with_inner_size(config.size);
+        if let Some(min) = config.min_size {
             attributes = attributes.with_min_inner_size(min);
         }
         let window = Arc::new(event_loop.create_window(attributes).map_err(Error::Os)?);
         let scale_factor = window.scale_factor();
-        let presenter = self.open_presenter(&window)?;
-        tracing::info!(presenter = presenter.name(), "blazy shell");
+        let presenter = open_presenter(&config, &window)?;
+        tracing::info!(presenter = presenter.name(), window = key.0, "blazy shell");
 
-        let signals = self.signals.clone();
-        let mut render_root = RenderRoot::new(
-            self.root.take().expect("the root widget is taken once"),
-            move |signal| signals.borrow_mut().push(signal),
-            RenderRootOptions {
-                default_properties: Arc::new(self.default_properties.take().expect("taken once")),
-                use_system_fonts: true,
-                size_policy: WindowSizePolicy::User,
-                size: window.inner_size(),
-                scale_factor,
-                test_font: None,
-            },
-        );
+        let signals: Rc<RefCell<Vec<RenderRootSignal>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = signals.clone();
+        let mut render_root = RenderRoot::new(root, move |signal| sink.borrow_mut().push(signal), RenderRootOptions {
+            default_properties: self.default_properties.clone(),
+            use_system_fonts: true,
+            size_policy: WindowSizePolicy::User,
+            size: window.inner_size(),
+            scale_factor,
+            test_font: None,
+        });
 
-        self.driver.started(&mut render_root);
+        self.driver.started(&mut self.cx, key, &mut render_root);
 
         window.request_redraw();
-        self.window = Some(window);
-        self.presenter = Some(presenter);
-        self.render_root = Some(render_root);
+        self.routes.insert(window.id(), key);
+        self.windows.insert(key, ShellWindow {
+            window,
+            presenter,
+            root: render_root,
+            signals,
+            reducer: WindowEventReducer::default(),
+            last_anim: Instant::now(),
+            refusing: false,
+        });
         Ok(())
     }
 
-    /// Chooses how frames will reach the screen.
+    /// Drops a window. The loop ends when the last one goes.
     ///
-    /// The GPU path when it was asked for and the machine can give it; the blit path
-    /// otherwise. A machine with no usable device gets a warning and a working
-    /// window, because "start without a GPU" is a requirement and not a courtesy.
-    fn open_presenter(&mut self, window: &Arc<Window>) -> Result<Box<dyn Presenter>, Error> {
-        let base = self.config.base_color;
-
-        #[cfg(feature = "vello")]
-        if self.config.backend.is_none_or(|backend| backend == Backend::Vello) {
-            match crate::gpu::SwapchainPresenter::new(window.clone(), window.inner_size(), base) {
-                Ok(presenter) => return Ok(Box::new(presenter)),
-                Err(error) => tracing::warn!("falling back to the blit path: {error}"),
-            }
+    /// Closing a window is not exiting: that distinction is what multi-window costs and
+    /// the whole of what the single-window loop got away without.
+    fn close(&mut self, event_loop: &ActiveEventLoop, key: WindowKey) {
+        if let Some(window) = self.windows.remove(&key) {
+            self.routes.remove(&window.window.id());
         }
-
-        // Whatever was asked for, the fallback has to be a rasteriser that does not
-        // need a device: arriving here after the GPU path failed usually means there
-        // is no usable device, and answering "no GPU" by asking for one again is how
-        // a promise of "starts without a GPU" turns into a window that never opens.
-        let backend = self
-            .config
-            .backend
-            .filter(|backend| !backend.needs_device())
-            .or_else(|| {
-                crate::backend::COMPILED
-                    .iter()
-                    .copied()
-                    .find(|backend| !backend.needs_device())
-            })
-            .unwrap_or(Backend::VelloCpu);
-        Ok(Box::new(BlitPresenter::new(backend, window.clone(), base)?))
+        if self.windows.is_empty() {
+            event_loop.exit();
+        }
     }
 
-    /// Composes, rasterises and presents one frame.
+    /// Composes, rasterises and presents one frame of one window.
     ///
     /// The whole of §4.2 variant 2 in one function: ask the tree for a plan, walk the
     /// plan rather than flattening it, and put the result on the screen. Anything the
     /// tree left to the host arrives as a hole and is handed to `fill_holes`.
-    fn redraw(&mut self) -> Result<(), Error> {
-        let (Some(root), Some(window), Some(presenter)) =
-            (self.render_root.as_mut(), self.window.as_ref(), self.presenter.as_mut())
-        else {
+    fn redraw(&mut self, key: WindowKey) -> Result<(), Error> {
+        let Some(shell) = self.windows.get_mut(&key) else {
             return Ok(());
         };
+        let root = &mut shell.root;
+
+        // Before anything this frame is decided: an application may have a change from
+        // another window to apply, and it has to land before the layout that draws it.
+        self.driver.frame(key, root);
 
         if root.needs_anim() {
             let now = Instant::now();
-            let interval = now.duration_since(self.last_anim);
-            self.last_anim = now;
+            let interval = now.duration_since(shell.last_anim);
+            shell.last_anim = now;
             root.handle_window_event(WindowEvent::AnimFrame(interval));
         }
 
@@ -520,12 +741,12 @@ impl ShellApp {
         // painting when the paint pass reaches it (§26.1), and the presenter has to
         // know which pixels it may keep (§36). Both from one answer, so an application
         // cannot ask for half of the arrangement.
-        let layers = self.driver.layers(root);
+        let layers = self.driver.layers(key, root);
         if !layers.is_empty() {
             for id in &layers {
                 root.edit_widget(*id, |mut widget| widget.ctx.request_paint_only());
             }
-            presenter.cache_layers(layers);
+            shell.presenter.cache_layers(layers);
         }
 
         let (plan, _tree_update) = root.redraw();
@@ -536,17 +757,20 @@ impl ShellApp {
         // A scene the rasteriser cannot take is not a reason to close the window: the
         // frame is skipped, the window keeps what it had, and — unlike the silent
         // version this replaces (§33) — somebody is told.
-        match presenter.present(&plan, root.size(), window.scale_factor()) {
+        match shell.presenter.present(&plan, root.size(), shell.window.scale_factor()) {
             Ok(()) => {
-                if self.refusing {
-                    self.refusing = false;
-                    tracing::info!("the scene fits the rasteriser again");
+                if shell.refusing {
+                    shell.refusing = false;
+                    tracing::info!(window = key.0, "the scene fits the rasteriser again");
                 }
             },
             Err(error @ (PresentError::SceneTooLarge { .. } | PresentError::SceneTooDeep { .. })) => {
-                if !self.refusing {
-                    self.refusing = true;
-                    tracing::warn!("frame not drawn: {error}; the window keeps the last frame it had");
+                if !shell.refusing {
+                    shell.refusing = true;
+                    tracing::warn!(
+                        window = key.0,
+                        "frame not drawn: {error}; the window keeps the last frame it had"
+                    );
                 }
                 return Ok(());
             },
@@ -555,46 +779,97 @@ impl ShellApp {
 
         // Holes are reported rather than drawn: the host owns what goes in them, and
         // for an application without external content there are none (§4.3).
-        report_holes(presenter.holes());
+        report_holes(shell.presenter.holes());
 
-        window.set_cursor(root.cursor_icon());
+        shell.window.set_cursor(root.cursor_icon());
         Ok(())
     }
 
-    /// Acts on everything the render root asked for during the last call into it.
+    /// Acts on everything the render roots asked for during the last call into them.
+    ///
+    /// Every window's queue, not only the one an event arrived for: a root may be made
+    /// to ask for something by a `mutate_later` scheduled from another window, which is
+    /// exactly what carrying a model change into the other views does (§30).
     fn drain_signals(&mut self, event_loop: &ActiveEventLoop) {
-        let signals: Vec<_> = self.signals.borrow_mut().drain(..).collect();
-        for signal in signals {
-            match signal {
-                RenderRootSignal::Action(action, from) => self.driver.on_action(action, from),
-                RenderRootSignal::RequestRedraw | RenderRootSignal::RequestAnimFrame => {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                },
-                RenderRootSignal::SetCursor(cursor) => {
-                    if let Some(window) = &self.window {
-                        window.set_cursor(cursor);
-                    }
-                },
-                RenderRootSignal::SetTitle(title) => {
-                    if let Some(window) = &self.window {
-                        window.set_title(&title);
-                    }
-                },
-                RenderRootSignal::SetSize(size) => {
-                    if let Some(window) = &self.window {
-                        let _ = window.request_inner_size(size);
-                    }
-                },
-                RenderRootSignal::Exit => event_loop.exit(),
-                // Deliberately unhandled, and listed in the module docs: IME, the
-                // clipboard, accessibility and window-manager gestures are platform
-                // integrations of their own.
-                _ => {},
+        let keys: Vec<WindowKey> = self.windows.keys().copied().collect();
+        for key in keys {
+            let Some(shell) = self.windows.get_mut(&key) else {
+                continue;
+            };
+            let signals: Vec<_> = shell.signals.borrow_mut().drain(..).collect();
+            for signal in signals {
+                match signal {
+                    RenderRootSignal::Action(action, from) => {
+                        self.driver.on_action(&mut self.cx, key, action, from);
+                    },
+                    RenderRootSignal::RequestRedraw | RenderRootSignal::RequestAnimFrame => {
+                        if let Some(shell) = self.windows.get(&key) {
+                            shell.window.request_redraw();
+                        }
+                    },
+                    RenderRootSignal::SetCursor(cursor) => {
+                        if let Some(shell) = self.windows.get(&key) {
+                            shell.window.set_cursor(cursor);
+                        }
+                    },
+                    RenderRootSignal::SetTitle(title) => {
+                        if let Some(shell) = self.windows.get(&key) {
+                            shell.window.set_title(&title);
+                        }
+                    },
+                    RenderRootSignal::SetSize(size) => {
+                        if let Some(shell) = self.windows.get(&key) {
+                            let _ = shell.window.request_inner_size(size);
+                        }
+                    },
+                    // The application exiting, rather than one window closing: a window
+                    // goes through `ShellCtx::close_window` or its own close button.
+                    RenderRootSignal::Exit => event_loop.exit(),
+                    // Deliberately unhandled, and listed in the module docs: IME, the
+                    // clipboard, accessibility and window-manager gestures are platform
+                    // integrations of their own.
+                    _ => {},
+                }
             }
         }
+        self.apply_requests(event_loop);
     }
+}
+
+/// Chooses how a window's frames will reach the screen.
+///
+/// The GPU path when it was asked for and the machine can give it; the blit path
+/// otherwise. A machine with no usable device gets a warning and a working
+/// window, because "start without a GPU" is a requirement and not a courtesy.
+///
+/// A free function rather than a method, because every window answers it for itself:
+/// its own device, its own rasteriser, its own layer cache (decision 2).
+fn open_presenter(config: &WindowConfig, window: &Arc<Window>) -> Result<Box<dyn Presenter>, Error> {
+    let base = config.base_color;
+
+    #[cfg(feature = "vello")]
+    if config.backend.is_none_or(|backend| backend == Backend::Vello) {
+        match crate::gpu::SwapchainPresenter::new(window.clone(), window.inner_size(), base) {
+            Ok(presenter) => return Ok(Box::new(presenter)),
+            Err(error) => tracing::warn!("falling back to the blit path: {error}"),
+        }
+    }
+
+    // Whatever was asked for, the fallback has to be a rasteriser that does not
+    // need a device: arriving here after the GPU path failed usually means there
+    // is no usable device, and answering "no GPU" by asking for one again is how
+    // a promise of "starts without a GPU" turns into a window that never opens.
+    let backend = config
+        .backend
+        .filter(|backend| !backend.needs_device())
+        .or_else(|| {
+            crate::backend::COMPILED
+                .iter()
+                .copied()
+                .find(|backend| !backend.needs_device())
+        })
+        .unwrap_or(Backend::VelloCpu);
+    Ok(Box::new(BlitPresenter::new(backend, window.clone(), base)?))
 }
 
 /// Reports holes to whoever is watching. Filling them is the owner's business.
@@ -625,61 +900,77 @@ fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &Rgb
 
 impl ApplicationHandler for ShellApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() && self.failure.is_none() {
-            match self.start(event_loop) {
-                Ok(()) => self.drain_signals(event_loop),
-                Err(error) => {
-                    self.failure = Some(error);
-                    event_loop.exit();
-                },
-            }
-        }
+        // The first window is a request like any other, queued by `run`; anything the
+        // driver asked for while it was being started goes out in the same drain.
+        self.apply_requests(event_loop);
+        self.drain_signals(event_loop);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WinitWindowEvent) {
-        let Some(scale_factor) = self.window.as_ref().map(|window| window.scale_factor()) else {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WinitWindowEvent) {
+        let Some(key) = self.routes.get(&id).copied() else {
             return;
         };
-        let Some(root) = self.render_root.as_mut() else {
+        let Some(shell) = self.windows.get_mut(&key) else {
             return;
         };
+        let scale_factor = shell.window.scale_factor();
 
-        // Input first, through the same reducer `masonry_winit` uses (§26.3).
-        if let Some(translation) = self.reducer.reduce(scale_factor, &event) {
+        // Input first, through the same reducer `masonry_winit` uses (§26.3). One
+        // reducer per window: it accumulates pointer state, and two windows have two
+        // pointers as far as it is concerned.
+        if let Some(translation) = shell.reducer.reduce(scale_factor, &event) {
             match translation {
-                WindowEventTranslation::Keyboard(key) => {
-                    deliver_text(self.driver.as_mut(), root, TextEvent::Keyboard(key));
+                WindowEventTranslation::Keyboard(key_event) => {
+                    deliver_text(
+                        self.driver.as_mut(),
+                        &mut self.cx,
+                        key,
+                        &mut shell.root,
+                        TextEvent::Keyboard(key_event),
+                    );
                 },
                 WindowEventTranslation::Pointer(pointer) => {
-                    deliver_pointer(self.driver.as_mut(), root, pointer);
+                    deliver_pointer(self.driver.as_mut(), &mut self.cx, key, &mut shell.root, pointer);
                 },
             }
         }
 
         match event {
-            WinitWindowEvent::CloseRequested => event_loop.exit(),
+            // The window, not the process: the loop ends when the last window goes
+            // (`close`), which is the whole difference between one window and several.
+            WinitWindowEvent::CloseRequested => self.close(event_loop, key),
             WinitWindowEvent::Resized(size) => {
-                root.handle_window_event(WindowEvent::Resize(size));
-                if let Some(presenter) = self.presenter.as_mut() {
-                    presenter.resize(size);
-                }
+                shell.root.handle_window_event(WindowEvent::Resize(size));
+                shell.presenter.resize(size);
             },
             WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // The third multiplier of §9, and the only place it is applied: the
                 // tree keeps laying out in logical coordinates and the composition
                 // scales the drawing, so a display change costs a frame and not a
                 // relayout.
-                root.handle_window_event(WindowEvent::Rescale(scale_factor));
+                shell.root.handle_window_event(WindowEvent::Rescale(scale_factor));
             },
             WinitWindowEvent::Focused(focused) => {
-                deliver_text(self.driver.as_mut(), root, TextEvent::WindowFocusChange(focused));
+                deliver_text(
+                    self.driver.as_mut(),
+                    &mut self.cx,
+                    key,
+                    &mut shell.root,
+                    TextEvent::WindowFocusChange(focused),
+                );
             },
             WinitWindowEvent::RedrawRequested => {
-                if let Err(error) = self.redraw() {
-                    tracing::error!("{error}");
+                if let Err(error) = self.redraw(key) {
+                    tracing::error!(window = key.0, "{error}");
                 }
             },
             _ => {},
+        }
+
+        // The event is over and the tree has acted on it: an application that has to move
+        // something into another window says so now (see `ShellDriver::settled`).
+        if let Some(shell) = self.windows.get_mut(&key) {
+            self.driver.settled(&mut self.cx, key, &mut shell.root);
         }
 
         self.drain_signals(event_loop);
@@ -688,11 +979,12 @@ impl ApplicationHandler for ShellApp {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // An animation frame is a reason to draw the next one; anything else waits
         // for an event. This is what keeps an idle window idle — apart from an
-        // external hole, which by §26.1 has to keep painting to stay a hole.
-        if let (Some(root), Some(window)) = (self.render_root.as_ref(), self.window.as_ref())
-            && root.needs_anim()
-        {
-            window.request_redraw();
+        // external hole, which by §26.1 has to keep painting to stay a hole. Asked of
+        // each window separately, so one window animating does not wake the others.
+        for shell in self.windows.values() {
+            if shell.root.needs_anim() {
+                shell.window.request_redraw();
+            }
         }
     }
 }

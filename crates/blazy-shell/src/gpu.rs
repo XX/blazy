@@ -332,6 +332,24 @@ impl GpuFrames {
             return;
         }
 
+        // What this frame is copying is named before anything is stored, because
+        // storing evicts and the pixels of a kept layer are in the cache and nowhere
+        // else: dropping one to stay inside the ceiling empties its area, and the
+        // counters would still say the cache had reused it (§44.9).
+
+        self.cache.protect(kept.reuse.iter().map(|(id, _)| *id));
+
+        // The rectangles this frame claims, checked against the one promise the host
+        // cannot infer: a cached layer owns its pixels (§36). Overlapping layers copy
+        // over each other, and they add up to more than the window they tile.
+        let rects: Vec<_> = kept
+            .reuse
+            .iter()
+            .map(|(_, rect)| *rect)
+            .chain(kept.store.iter().map(|(_, _, _, rect)| *rect))
+            .collect();
+        self.cache.note_overlaps(&rects);
+
         // Textures first, because allocating one needs the cache mutably and copying
         // out of it needs it while the encoder is alive.
         for (index, id, transform, rect) in &kept.store {
@@ -346,8 +364,12 @@ impl GpuFrames {
             label: Some("blazy layer cache"),
         });
         for (id, rect) in &kept.reuse {
-            if let Some(texture) = self.cache.texture_of(*id) {
-                copy_rect(&mut encoder, texture, CORNER, &self.target, rect.origin(), *rect);
+            match self.cache.texture_of(*id) {
+                Some(texture) => copy_rect(&mut encoder, texture, CORNER, &self.target, rect.origin(), *rect),
+                // Unreachable while `protect` holds, and counted rather than ignored
+                // because this is exactly the silence §44.9 was found through: the area
+                // is empty this frame and every counter says the cache did its job.
+                None => self.cache.note_dropped(),
             }
         }
         for (_, id, _, rect) in &kept.store {
@@ -356,6 +378,7 @@ impl GpuFrames {
             }
         }
         self.queue.submit([encoder.finish()]);
+        self.cache.release();
     }
 
     /// Copies part of the frame out of the texture, as tightly packed RGBA8.
