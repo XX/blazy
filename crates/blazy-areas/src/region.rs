@@ -89,6 +89,85 @@ impl UiScale {
     }
 }
 
+/// "Hand the scale to your children, now" — a function a widget carries as a property.
+///
+/// Why a property and why a function, both measured (`issues/rewrite pass budget.md`):
+/// carrying a scale by [`UiScale`] alone costs one rewrite pass per level of nesting —
+/// each level has to be told, lay itself out, and tell the next through `mutate_later`,
+/// which runs in the *next* pass — and Masonry runs four passes per event. Two containers
+/// between a region's root and its controls already spill into the next frame, which is
+/// drawn half-scaled.
+///
+/// The way around it is to carry the whole subtree in the pass that has the `WidgetMut`.
+/// Nobody can walk another widget's children — `get_mut` wants the `WidgetPod`, and only
+/// the parent has it — but whoever holds a child's `WidgetMut` can read the child's
+/// properties, and a property can be a function. So a widget that can carry its children
+/// carries this, set to its own [`CarriesScale::carry_now`], and [`push_ui_scale`] calls
+/// it. A widget without one is carried the slow way, through its own layout, which is
+/// correct and costs a pass.
+#[derive(Clone, Copy)]
+pub struct ScaleCarrier(fn(&mut WidgetMut<'_, dyn Widget>, f64));
+
+impl ScaleCarrier {
+    /// The carrier of widgets of type `W`.
+    ///
+    /// Give it to the widget when it is made — `NewWidget::new(w).with_props(ScaleCarrier::of::<W>())`
+    /// — which is the only moment it can be given without a pass of its own.
+    pub fn of<W: CarriesScale>() -> Self {
+        Self(|widget, scale| {
+            if let Some(mut this) = widget.try_downcast::<W>() {
+                W::carry_now(&mut this, scale);
+            }
+        })
+    }
+}
+
+impl std::fmt::Debug for ScaleCarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScaleCarrier")
+    }
+}
+
+impl Property for ScaleCarrier {
+    fn static_default() -> &'static Self {
+        static DEFAULT: ScaleCarrier = ScaleCarrier(|_, _| {});
+        &DEFAULT
+    }
+}
+
+impl Default for ScaleCarrier {
+    fn default() -> Self {
+        *Self::static_default()
+    }
+}
+
+/// A widget that can hand an interface scale to its children in the pass it was given
+/// one, rather than through its next layout.
+///
+/// See [`ScaleCarrier`] for why that is the difference between a scale change that lands
+/// in one frame and one that does not.
+pub trait CarriesScale: Widget + masonry::core::FromDynWidget {
+    /// Applies `scale` to this widget's own state and to its children, now.
+    ///
+    /// For each child that is itself scaled, call [`push_ui_scale`] on its `WidgetMut`, so
+    /// that a carrier further down carries on. The widget's own layout must agree with
+    /// what this did — compare against what was carried, not against what was read — or
+    /// the two paths will fight over the same state (§46.3).
+    fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64);
+}
+
+/// Sets [`UiScale`] on `widget` and, if it carries a [`ScaleCarrier`], hands the scale
+/// on to its children in the same pass.
+///
+/// The one call a holder of a `WidgetMut` makes to scale a subtree. A subtree of
+/// carriers is scaled entirely in the pass the call is made in, whatever its depth; a
+/// widget without a carrier stops the walk there and carries on through its layout.
+pub fn push_ui_scale(widget: &mut WidgetMut<'_, dyn Widget>, scale: f64) {
+    widget.insert_prop(UiScale(scale));
+    let carrier = *widget.get_prop::<ScaleCarrier>();
+    (carrier.0)(widget, scale);
+}
+
 /// Cumulative counters, for spotting work that should not be happening.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -234,10 +313,9 @@ impl AreaContent {
 
     /// Sets the interface scale of one region.
     ///
-    /// Takes effect in two steps: this marks the region, the next mutate pass pushes
-    /// [`UiScale`] onto its root, and the root's `property_changed` asks for the
-    /// re-layout. The mutate pass runs before layout in the same rewrite loop, so a
-    /// scale change lands in the frame it was made.
+    /// Pushes [`UiScale`] onto the region's root in this pass, through [`push_ui_scale`],
+    /// so a root that carries a [`ScaleCarrier`] scales its whole subtree before the
+    /// layout that follows — in the frame the change was made, whatever its depth.
     pub fn set_ui_scale(this: &mut WidgetMut<'_, Self>, index: usize, scale: f64) {
         let scale = scale.clamp(0.1, 8.0);
         let Some(slot) = this.widget.slots.get_mut(index) else {
@@ -250,6 +328,11 @@ impl AreaContent {
         if !this.widget.pending.contains(&index) {
             this.widget.pending.push(index);
         }
+        // Pushed now rather than from the next layout: this is a `WidgetMut`, so the root
+        // can be reached in this pass, and waiting for layout to schedule a mutate costs
+        // one of the four passes an event has (`issues/rewrite pass budget.md`). The
+        // queue stays for the builder, whose widget is not in a tree yet.
+        Self::apply_pending(this);
         // A header's own height is a function of its scale, so the stack has to be
         // re-laid-out whatever the region's root decides to do about the property.
         this.ctx.request_layout();
@@ -264,7 +347,7 @@ impl AreaContent {
             this.widget.scale_pushes += 1;
 
             let mut root = this.ctx.get_mut(&mut this.widget.slots[index].pod);
-            root.insert_prop(UiScale(scale));
+            push_ui_scale(&mut root, scale);
         }
     }
 }

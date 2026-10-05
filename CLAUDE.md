@@ -457,6 +457,23 @@ measured** (its parent fixes its size), so a scale read in `measure` is read nev
 handing the value to some children by call and others by property gives one piece of state
 two owners — the caption put the text back on its next layout, every frame.
 
+**A scale change has four rewrite passes, and a level of nesting costs one (§48).** Masonry
+runs `REWRITE_PASSES_MAX = 4` passes an event and carries the rest into the next frame with
+a warning — the harness panics there instead, a window draws a frame half-scaled. Carrying
+by property costs a pass per container, because `mutate_later` runs in the *next* pass;
+measured, two containers between a region's root and its controls were the limit. Nobody
+can walk another widget's children (`get_mut` wants the parent's `WidgetPod`), but whoever
+holds a child's `WidgetMut` can read its properties, and a property can be a function:
+**`ScaleCarrier`** (in `blazy-areas`, beside `UiScale`) is "hand the scale to your children
+now", a type opts in through `CarriesScale`, and `push_ui_scale` inserts the value and calls
+the carrier — a subtree of carriers is scaled in one pass at any depth.
+`AreaContent::set_ui_scale` pushes in the pass it is called in, for the same reason. The
+carrier is given when the widget is made (`with_props(ScaleCarrier::of::<W>())`); a widget
+without one is carried through its own layout, which is correct and costs a pass — so a
+missing carrier is a frame late, not a bug anyone sees, and only the depth criterion
+notices. A carrier must record what it carried where the layout path records it, or the two
+paths become two owners again.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget

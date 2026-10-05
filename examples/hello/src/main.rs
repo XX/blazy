@@ -169,7 +169,9 @@ impl NodeSource for Nodes {
             .with(Background::Color(FILL))
             .with(BorderColor { color: OUTLINE })
             .with(BorderWidth { width: Length::px(1.0) })
-            .with(CornerRadius { radius: Length::px(6.0) })
+            .with(CornerRadius {
+                radius: Length::px(6.0),
+            })
             .with(Padding::all(Length::px(8.0)));
         NewWidget::new(Label::new(format!("node {index}")))
             .with_props(looks)

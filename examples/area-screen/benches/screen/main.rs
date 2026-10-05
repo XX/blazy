@@ -22,6 +22,7 @@ use self::bench::Options;
 
 mod bench;
 mod cache;
+mod depth;
 mod ops;
 mod windows;
 

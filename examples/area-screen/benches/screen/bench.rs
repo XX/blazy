@@ -587,6 +587,7 @@ pub fn run(opts: &Options) -> Outcome {
     let windows = crate::windows::window_table(opts, areas.min(4), nodes);
     let cross = crate::windows::cross_window(areas.min(4), nodes);
     let detach = crate::windows::detach_row(areas.min(4), nodes);
+    let depth = crate::depth::depth_table();
 
     let outcome = Outcome {
         nodes: areas,
@@ -595,6 +596,7 @@ pub fn run(opts: &Options) -> Outcome {
         criteria: {
             let mut criteria = crate::windows::criteria(&windows, &cross);
             criteria.extend(crate::windows::detach_criteria(&detach));
+            criteria.extend(crate::depth::depth_criteria(&depth));
             criteria.extend(evaluate(&Measured {
                 reports: &reports,
                 sweep: &sweep,
@@ -615,6 +617,7 @@ pub fn run(opts: &Options) -> Outcome {
             .chain(windows.iter().map(crate::windows::WindowRow::record))
             .chain(std::iter::once(cross.record()))
             .chain(std::iter::once(detach.record()))
+            .chain(std::iter::once(crate::depth::depth_record(&depth)))
             .collect(),
         sweep,
         zoom_sweep: Vec::new(),

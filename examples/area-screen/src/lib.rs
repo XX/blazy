@@ -286,7 +286,9 @@ pub fn area_header(area: usize) -> NewWidget<dyn Widget> {
         Color::from_rgb8(0x8a, 0x5a, 0x3c),
         Color::from_rgb8(0x44, 0x6b, 0x3c),
     ];
-    NewWidget::new(ScaledHeader::new(TINTS[area % TINTS.len()])).erased()
+    NewWidget::new(ScaledHeader::new(TINTS[area % TINTS.len()]))
+        .with_props(blazy::areas::ScaleCarrier::of::<ScaledHeader>())
+        .erased()
 }
 
 /// Takes an area out of a screen, ready to be built in another window — and cancels

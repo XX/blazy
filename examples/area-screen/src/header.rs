@@ -14,11 +14,11 @@
 
 use std::any::TypeId;
 
-use blazy::areas::UiScale;
+use blazy::areas::{CarriesScale, UiScale};
 use blazy::masonry::accesskit::{Node, Role};
 use blazy::masonry::core::{
     AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef, RegisterCtx,
-    UpdateCtx, Widget, WidgetPod,
+    UpdateCtx, Widget, WidgetMut, WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, Point, Rect, Size};
@@ -115,6 +115,23 @@ impl ScaledHeader {
     /// compares scales rather than pixels.
     fn content_width(scale: f64) -> f64 {
         CONTROLS as f64 * CONTROL * scale + (CONTROLS as f64 + 1.0) * GAP * scale
+    }
+}
+
+/// The header carries the scale to its bar in the pass it was given one, rather than
+/// through its next layout: one rewrite pass less, and a header with more containers in
+/// it would need every one of them (`issues/rewrite pass budget.md`).
+impl CarriesScale for ScaledHeader {
+    fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
+        // Recorded where the layout path records it, so the layout that follows finds it
+        // carried already — one owner for the state (§46.3).
+        this.widget.carried = Some(scale);
+        {
+            let mut bar = this.ctx.get_mut(&mut this.widget.bar);
+            bar.insert_prop(UiScale(scale));
+            Bar::carry_now(&mut bar, scale);
+        }
+        this.ctx.request_layout();
     }
 }
 

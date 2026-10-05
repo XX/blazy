@@ -2,7 +2,7 @@
 
 use std::any::TypeId;
 
-use blazy_areas::UiScale;
+use blazy_areas::{CarriesScale, UiScale};
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
     AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PropertiesRef, RegisterCtx, UpdateCtx, Widget,
@@ -93,6 +93,13 @@ impl Label {
     pub fn set_text(this: &mut WidgetMut<'_, Self>, text: impl Into<std::sync::Arc<str>>) {
         let mut inner = this.ctx.get_mut(&mut this.widget.inner);
         masonry::widgets::Label::set_text(&mut inner, text);
+    }
+}
+
+/// A caption is the end of a carry: its text is the one thing it has to scale.
+impl CarriesScale for Label {
+    fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
+        Self::set_scale(this, scale);
     }
 }
 

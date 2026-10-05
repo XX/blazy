@@ -2,11 +2,11 @@
 
 use std::any::TypeId;
 
-use blazy_areas::UiScale;
+use blazy_areas::{CarriesScale, UiScale, push_ui_scale};
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
     AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef, RegisterCtx,
-    UpdateCtx, Widget, WidgetId, WidgetPod,
+    UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, Point, Size};
@@ -107,39 +107,65 @@ impl Bar {
         for child in &mut self.children {
             let metrics = child.metrics;
             ctx.mutate_child_later(&mut child.pod, move |mut widget| {
-                // The property first, and onto *every* child: it is the general
-                // mechanism, it is what a widget of ours deeper down will read, and it is
-                // the value the child's own layout will compare against. Handing the
-                // scale by call to some children and by property to others is two owners
-                // for one piece of state — the caption's own layout then read the
-                // property it never got and put the text back (§46).
-                widget.insert_prop(UiScale(scale));
-                // And then, for a caption, the same scale *now* rather than through
-                // another rewrite pass: told by property alone it would have to be told,
-                // lay itself out and tell its own inner label, which is a pass per level
-                // — and four levels is where Masonry stops and calls it a loop.
-                if let Some(mut label) = widget.try_downcast::<crate::Label>() {
-                    crate::Label::set_scale(&mut label, scale);
-                } else if let Some(mut button) = widget.try_downcast::<masonry::widgets::Button>() {
-                    // One stock container is known by name here, and only one: a button
-                    // with a caption is the commonest control of a dense UI, and its
-                    // caption is a child it does not forward anything to. Reaching it is
-                    // exactly what an application should not have to write — the box
-                    // channel scales the button and leaves the words inside it at their
-                    // old size, which looks like a bug in the scale and is not (§46).
-                    let mut child = masonry::widgets::Button::child_mut(&mut button);
-                    // The property here too, and for the same reason as above: a caption
-                    // given the call but not the value compares its own layout against a
-                    // scale of 1 and puts the text back, one frame later, for ever.
-                    child.insert_prop(UiScale(scale));
-                    if let Some(mut label) = child.try_downcast::<crate::Label>() {
-                        crate::Label::set_scale(&mut label, scale);
-                    }
-                }
-                scale_box(&mut widget, metrics, scale);
+                scale_child(&mut widget, metrics, scale)
             });
         }
     }
+}
+
+/// The fast path: the whole row in the pass the scale arrived in (`ScaleCarrier`).
+///
+/// The same work the bar does from its layout, recorded in the same `applied`, so
+/// that the layout that follows finds nothing left to do — one owner for the state, two
+/// ways to reach it (§46.3).
+impl CarriesScale for Bar {
+    fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
+        if this.widget.applied == Some(scale) {
+            return;
+        }
+        this.widget.applied = Some(scale);
+        this.widget.counters.scalings += 1;
+        this.widget.counters.children_scaled += this.widget.children.len() as u64;
+        for index in 0..this.widget.children.len() {
+            let metrics = this.widget.children[index].metrics;
+            let mut child = this.ctx.get_mut(&mut this.widget.children[index].pod);
+            scale_child(&mut child, metrics, scale);
+        }
+        this.ctx.request_layout();
+    }
+}
+
+/// Hands `scale` to one control of a bar: the value, the caption, the box.
+fn scale_child(widget: &mut WidgetMut<'_, dyn Widget>, metrics: Metrics, scale: f64) {
+    // The property first, and onto *every* child: it is the general mechanism, it is
+    // what a widget of ours deeper down will read, and it is the value the child's own
+    // layout will compare against. Handing the scale by call to some children and by
+    // property to others is two owners for one piece of state — the caption's own layout
+    // then read the property it never got and put the text back (§46). Pushed rather than
+    // inserted, so a child that carries a scale of its own carries it on in this pass.
+    push_ui_scale(widget, scale);
+    // And then, for a caption, the same scale *now* rather than through another rewrite
+    // pass: told by property alone it would have to be told, lay itself out and tell its
+    // own inner label, which is a pass per level — and four is all an event has.
+    if let Some(mut label) = widget.try_downcast::<crate::Label>() {
+        crate::Label::set_scale(&mut label, scale);
+    } else if let Some(mut button) = widget.try_downcast::<masonry::widgets::Button>() {
+        // One stock container is known by name here, and only one: a button with a
+        // caption is the commonest control of a dense UI, and its caption is a child it
+        // does not forward anything to. Reaching it is exactly what an application should
+        // not have to write — the box channel scales the button and leaves the words
+        // inside it at their old size, which looks like a bug in the scale and is not
+        // (§46).
+        let mut child = masonry::widgets::Button::child_mut(&mut button);
+        // The property here too, and for the same reason as above: a caption given the
+        // call but not the value compares its own layout against a scale of 1 and puts
+        // the text back, one frame later, for ever.
+        push_ui_scale(&mut child, scale);
+        if let Some(mut label) = child.try_downcast::<crate::Label>() {
+            crate::Label::set_scale(&mut label, scale);
+        }
+    }
+    scale_box(widget, metrics, scale);
 }
 
 impl Widget for Bar {

@@ -178,3 +178,171 @@ fn the_scale_reaches_a_child_as_a_property() {
         "and it is there as a property, which is what a deeper widget would read"
     );
 }
+
+/// Depth: how a scale change travels through containers between a region's root and its
+/// controls (`issues/rewrite pass budget.md`).
+mod depth {
+    use std::sync::Arc;
+
+    use blazy_areas::{AreaContent, CarriesScale, ScaleCarrier, UiScale, push_ui_scale};
+    use masonry::accesskit::{Node, Role};
+    use masonry::app::{RenderRoot, RenderRootOptions, WindowSizePolicy};
+    use masonry::core::{
+        AccessCtx, ChildrenIds, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef, RegisterCtx,
+        UpdateCtx, Widget, WidgetMut, WidgetPod,
+    };
+    use masonry::dpi::PhysicalSize;
+    use masonry::imaging::Painter;
+    use masonry::kurbo::{Axis, Point, Size};
+    use masonry::layout::{LayoutSize, LenDef, LenReq, Length, SizeDef};
+    use masonry::theme::default_property_set;
+    use masonry::widgets::Button;
+
+    use crate::{Bar, Label, Metrics, carry_ui_scale};
+
+    /// A container with one child, carrying the scale both ways: in its layout (the
+    /// slow path, always) and in the pass it was given one (the fast path, when it
+    /// carries a [`ScaleCarrier`]).
+    struct Nest {
+        child: WidgetPod<dyn Widget>,
+        carried: Option<f64>,
+    }
+
+    impl CarriesScale for Nest {
+        fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
+            this.widget.carried = Some(scale);
+            {
+                let mut child = this.ctx.get_mut(&mut this.widget.child);
+                push_ui_scale(&mut child, scale);
+            }
+            this.ctx.request_layout();
+        }
+    }
+
+    impl Widget for Nest {
+        type Action = NoAction;
+
+        fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: std::any::TypeId) {
+            UiScale::prop_changed(ctx, property_type);
+        }
+
+        fn measure(
+            &mut self,
+            ctx: &mut MeasureCtx<'_>,
+            _props: &PropertiesRef<'_>,
+            axis: Axis,
+            len_req: LenReq,
+            cross_length: Option<Length>,
+        ) -> Length {
+            let auto = match len_req {
+                LenReq::MinContent => LenDef::MinContent,
+                LenReq::MaxContent => LenDef::MaxContent,
+                LenReq::FitContent(space) => LenDef::FitContent(space),
+            };
+            ctx.compute_length(&mut self.child, auto, LayoutSize::default(), axis, cross_length)
+        }
+
+        fn layout(&mut self, ctx: &mut LayoutCtx<'_>, props: &PropertiesRef<'_>, size: Size) {
+            let scale = props.get::<UiScale>(ctx.property_cache()).0;
+            carry_ui_scale(ctx, &mut self.child, &mut self.carried, scale);
+            let chosen = ctx.compute_size(&mut self.child, SizeDef::fixed(size), size.into());
+            ctx.run_layout(&mut self.child, chosen);
+            ctx.place_child(&mut self.child, Point::ORIGIN);
+        }
+
+        fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+
+        fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
+            ctx.register_child(&mut self.child);
+        }
+
+        fn children_ids(&self) -> ChildrenIds {
+            ChildrenIds::from_slice(&[self.child.id()])
+        }
+
+        fn accessibility_role(&self) -> Role {
+            Role::GenericContainer
+        }
+
+        fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+    }
+
+    /// Changes the header's scale to 2 through `depth` containers and reports whether
+    /// the event settled, and how many more frames the caption at the bottom needed.
+    ///
+    /// On a `RenderRoot` rather than a harness: past its four passes Masonry warns and
+    /// carries the rest into the next frame, which is what a window does, where the
+    /// harness panics instead.
+    fn scale_through(depth: usize, carriers: bool) -> (bool, usize) {
+        let label = NewWidget::new(Label::new("deep"));
+        let label_id = label.id();
+        let bar = NewWidget::new(Bar::new(Metrics::default()).with(label.erased(), Metrics::default()));
+        let mut header: NewWidget<dyn Widget> = if carriers {
+            bar.with_props(ScaleCarrier::of::<Bar>()).erased()
+        } else {
+            bar.erased()
+        };
+        for _ in 0..depth {
+            let nest = NewWidget::new(Nest {
+                child: header.to_pod(),
+                carried: None,
+            });
+            header = if carriers {
+                nest.with_props(ScaleCarrier::of::<Nest>()).erased()
+            } else {
+                nest.erased()
+            };
+        }
+        let content = AreaContent::header_and_main(
+            super::HEADER,
+            header,
+            NewWidget::new(Button::with_text("main")).erased(),
+        );
+        let mut root = RenderRoot::new(NewWidget::new(content).erased(), |_signal| {}, RenderRootOptions {
+            default_properties: Arc::new(default_property_set()),
+            use_system_fonts: false,
+            size_policy: WindowSizePolicy::User,
+            size: PhysicalSize::new(super::AREA.0, super::AREA.1),
+            scale_factor: 1.0,
+            test_font: None,
+        });
+        let _ = root.redraw();
+
+        let area = root.get_layer_root(0).id();
+        root.edit_widget(area, |mut widget| {
+            AreaContent::set_ui_scale(&mut widget.downcast::<AreaContent>(), 0, 2.0);
+        });
+        let settled = !root.needs_rewrite_passes();
+        let applied = |root: &RenderRoot| {
+            root.get_widget(label_id)
+                .and_then(|widget| widget.downcast::<Label>())
+                .map(|label| label.applied_scale())
+        };
+        let mut frames = 0;
+        while applied(&root) != Some(2.0) && frames < 10 {
+            let _ = root.redraw();
+            frames += 1;
+        }
+        (settled, frames)
+    }
+
+    /// Through carriers, a scale change lands in the event it was made in, at any depth.
+    #[test]
+    fn a_scale_change_lands_in_one_event_through_any_depth_of_carriers() {
+        for depth in 0..=8 {
+            assert_eq!(scale_through(depth, true), (true, 0), "{depth} containers deep");
+        }
+    }
+
+    /// Without them it is still correct, and late: Masonry runs four rewrite passes an
+    /// event, the slow path spends one per container, and the rest spills into a frame
+    /// drawn half-scaled.
+    ///
+    /// Pinned so that it fails loudly if upstream ever changes the budget — at which
+    /// point the carriers may be worth less than they are now.
+    #[test]
+    fn without_carriers_a_third_container_spills_into_the_next_frame() {
+        assert_eq!(scale_through(2, false), (true, 0));
+        assert_eq!(scale_through(3, false), (false, 1));
+    }
+}
