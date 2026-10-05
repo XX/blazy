@@ -17,7 +17,7 @@ use blazy::areas::{AreaContent, RegionKind, UiScale};
 use blazy::canvas::CanvasLayer;
 use blazy::masonry::core::{NewWidget, WidgetId};
 use blazy::masonry::dpi::PhysicalSize;
-use blazy::masonry::kurbo::{Point, Size, Vec2};
+use blazy::masonry::kurbo::{Point, Rect, Size, Vec2};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
 use blazy::masonry::theme::default_property_set;
@@ -49,7 +49,10 @@ const TINT: Color = Color::from_rgb8(0x6b, 0x4b, 0x8a);
 // --- MARK: ui_scale
 
 fn header_harness(scale: f64, size: (u32, u32)) -> TestHarness<AreaContent> {
-    let header = NewWidget::new(ScaledHeader::new(TINT)).erased();
+    // The caption alone, because the metric compares the same content at two scales and
+    // a bar lays out as many controls as fit: with buttons, the small image and the
+    // magnified one show different things and the comparison means nothing (§46).
+    let header = NewWidget::new(ScaledHeader::caption(TINT, "ui")).erased();
     let content = AreaContent::new(vec![(RegionKind::Main, 0.0, header)]).with_ui_scale(0, scale);
     TestHarness::create_with_size(
         default_property_set(),
@@ -177,6 +180,42 @@ fn screen_appearance() {
         TestHarnessParams::size_and_padding(PhysicalSize::new(240, 160), 0),
     );
     assert_render_snapshot!(harness, "screen_four_areas");
+}
+
+/// The shape the window actually builds: areas with the operator layer, a selected node
+/// and the status line, at a size where both are drawn.
+///
+/// `screen_four_areas` above is the geometry picture, and it is taken of a screen
+/// **without** operators, tiled small enough that a node fills an area. Three defects
+/// walked past it (§44.9) because nothing it contains could show them: with no operator
+/// layer there is no status line and no selection, and those are exactly the two things
+/// that were painted outside their area and over the neighbour. A snapshot of a scene
+/// the application does not build checks another product (§44.6); this one has both
+/// objects and the boundary they crossed.
+///
+/// Regenerate with `MASONRY_TEST_BLESS=1 cargo make test`.
+#[test]
+fn screen_with_operators_appearance() {
+    let (screen, _graph) = crate::ScreenSpec::new(2, 60).with_ops(true).build();
+    let mut harness = TestHarness::create_with(
+        default_property_set(),
+        NewWidget::new(screen),
+        // Larger than the default cap, because this picture is meant to have detail in
+        // it: the status line and the outline of a selected node are the objects under
+        // test, and they do not survive a thumbnail.
+        TestHarnessParams::size_and_padding(PhysicalSize::new(520, 260), 0)
+            .with_max_screenshot_size(32 * TestHarnessParams::KIBIBYTE),
+    );
+    let id = editor_id(&harness, 0);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(
+            &mut editor,
+            "node.select",
+            &blazy::ops::keymap::Props::new().with_int("index", 0),
+        );
+    });
+    assert_render_snapshot!(harness, "screen_with_operators");
 }
 
 /// The graph with its edges.
@@ -590,18 +629,21 @@ fn a_change_in_one_window_reaches_the_other_through_the_model() {
     assert_eq!(sync(&mut b, &graph), 0, "a window that is up to date pulls nothing");
 }
 
-/// The areas' layers tile the window rather than overlapping it.
+/// Every area's layer stays inside the area, and the areas tile the window.
 ///
 /// The promise §36 asks a caller for — a cached layer owns its rectangle — checked at the
 /// one place it can be: the rectangle a layer claims is the one the host works out by
-/// walking its scene, so anything an area paints outside its own box moves that
-/// rectangle onto its neighbour. Two things did: the outline of a selected node and the
-/// status line, neither of which is a child and neither of which anything clipped. The
-/// cost was not cosmetic — eight layers claiming 1.8 windows' worth of pixels put the
-/// cache over its ceiling, and the eviction blanked whichever area was copied that frame
-/// (§44.9).
+/// walking its scene, so anything an area paints outside its own box moves that rectangle
+/// onto its neighbour. Two things did: the outline of a selected node and the status
+/// line, neither of which is a child and neither of which anything clipped. The cost was
+/// not cosmetic — eight layers claiming 1.8 windows' worth of pixels put the cache over
+/// its ceiling, and the eviction blanked whichever area was copied that frame (§44.9).
+///
+/// Containment rather than only disjointness, because disjointness is the *consequence*:
+/// a screen of one area has nothing to overlap and would have passed while spilling over
+/// everything around it (§45).
 #[test]
-fn the_areas_layers_tile_the_window() {
+fn every_areas_layer_stays_inside_its_area() {
     use blazy::shell::layers::scene_bounds;
 
     let (screen, _graph) = crate::ScreenSpec::new(8, 200)
@@ -620,12 +662,21 @@ fn the_areas_layers_tile_the_window() {
             &blazy::ops::keymap::Props::new().with_int("index", 0),
         );
     });
+
     // What the host does on every frame, and without which there are no layers to
     // check: a layer lives exactly one paint, so an area that is clean is not painted
     // and stops being one (§26.1). This is `ShellDriver::layers` by hand.
     let areas: Vec<WidgetId> = harness.root_widget().area_ids();
+    let mut boxes: Vec<(WidgetId, Rect)> = Vec::new();
     for area in &areas {
-        harness.edit_widget_with_id(*area, |mut widget| widget.ctx.request_paint_only());
+        let rect = harness.edit_widget_with_id(*area, |mut widget| {
+            widget.ctx.request_paint_only();
+            widget
+                .ctx
+                .window_transform()
+                .transform_rect_bbox(widget.ctx.content_box())
+        });
+        boxes.push((*area, rect));
     }
     let (plan, _) = harness.redraw();
 
@@ -633,39 +684,42 @@ fn the_areas_layers_tile_the_window() {
     let rects: Vec<_> = plan
         .layers
         .iter()
-        .filter(|layer| areas.contains(&layer.widget_id))
         .filter_map(|layer| match &layer.kind {
-            blazy::masonry::app::VisualLayerKind::Scene(scene) => {
-                scene_bounds(scene, layer.transform, frame).map(|rect| (layer.widget_id, rect))
-            },
+            blazy::masonry::app::VisualLayerKind::Scene(scene) => boxes
+                .iter()
+                .find(|(id, _)| *id == layer.widget_id)
+                .and_then(|(id, area)| scene_bounds(scene, layer.transform, frame).map(|rect| (*id, *area, rect))),
             _ => None,
         })
         .collect();
     assert_eq!(rects.len(), areas.len(), "every area is a layer of its own");
 
-    for (i, (id, a)) in rects.iter().enumerate() {
-        for (other, b) in &rects[i + 1..] {
-            let overlap =
-                (a.x < b.x + b.width) && (b.x < a.x + a.width) && (a.y < b.y + b.height) && (b.y < a.y + a.height);
-            assert!(
-                !overlap,
-                "layers of {id:?} and {other:?} claim the same pixels: {a:?} and {b:?}"
-            );
-        }
+    for (id, area, drawn) in &rects {
+        // A whole pixel of slack on each side, because the layer's rectangle is rounded
+        // outwards to whole pixels and the area's is not.
+        let allowed = area.inflate(1.0, 1.0);
+        let drawn = Rect::new(
+            f64::from(drawn.x),
+            f64::from(drawn.y),
+            f64::from(drawn.x + drawn.width),
+            f64::from(drawn.y + drawn.height),
+        );
+        assert_eq!(
+            drawn.union(allowed),
+            allowed,
+            "{id:?} painted {drawn:?}, outside its area {area:?}"
+        );
     }
 
-    // And they add up to about the window, which is the arithmetic §37.2's ceiling rests
-    // on: a layer that claims more than its area would pass the test above only by
-    // luck.
-    let claimed: u64 = rects
-        .iter()
-        .map(|(_, r)| u64::from(r.width) * u64::from(r.height))
-        .sum();
-    let window = u64::from(frame.width) * u64::from(frame.height);
-    assert!(
-        claimed <= window,
-        "eight areas claimed {claimed} pixels of a {window}-pixel window"
-    );
+    // And nothing claims another's pixels — the consequence, kept because it is what the
+    // host counts at runtime (`overlaps`) and the two must agree.
+    for (i, (id, _, a)) in rects.iter().enumerate() {
+        for (other, _, b) in &rects[i + 1..] {
+            let overlap =
+                (a.x < b.x + b.width) && (b.x < a.x + a.width) && (a.y < b.y + b.height) && (b.y < a.y + a.height);
+            assert!(!overlap, "layers of {id:?} and {other:?} claim the same pixels");
+        }
+    }
 }
 
 /// A slider or a checkbox inside a node reaches the other window.

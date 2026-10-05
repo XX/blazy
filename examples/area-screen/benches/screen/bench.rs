@@ -37,7 +37,7 @@ pub(crate) const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
 ///
 /// Never repeats a value on consecutive steps: `set_ui_scale` ignores a scale equal
 /// to the current one, so a cycle with a repeat would quietly measure idle frames.
-const SCALES: [f64; 4] = [1.0, 1.25, 1.5, 1.25];
+pub(crate) const SCALES: [f64; 4] = [1.0, 1.25, 1.5, 1.25];
 
 /// How the benchmark was asked to run.
 pub struct Options {
@@ -71,6 +71,13 @@ struct Snapshot {
     /// Every scale change in these scenarios is made in area 0, so this is the
     /// leak counter: work that a change should not have been able to reach.
     other_area_region_resizes: u64,
+    /// Layout passes run on the region stacks of areas other than area 0.
+    ///
+    /// The other half of the leak counter above: a region can be laid out again at the
+    /// size it already had, and a resize counter never sees that. Only honest under the
+    /// `bench` profile — with debug assertions on, Masonry marks every child dirty so it
+    /// can check its parent visited them, and every area is laid out on every pass.
+    other_area_layouts: u64,
 }
 
 /// Result of one scenario.
@@ -115,6 +122,10 @@ impl Report {
         self.per_frame(self.after.other_area_region_resizes - self.before.other_area_region_resizes)
     }
 
+    fn other_area_layouts_per_frame(&self) -> f64 {
+        self.per_frame(self.after.other_area_layouts - self.before.other_area_layouts)
+    }
+
     fn child_layouts_per_frame(&self) -> f64 {
         self.per_frame(self.after.child_layouts - self.before.child_layouts)
     }
@@ -144,10 +155,13 @@ impl Report {
             child_layouts_per_frame: self.child_layouts_per_frame(),
             builds_per_frame: self.area_resizes_per_frame(),
             far_repaints_per_frame: self.region_resizes_per_frame(),
-            extra: vec![(
-                "other_area_region_resizes_per_frame",
-                self.other_area_region_resizes_per_frame(),
-            )],
+            extra: vec![
+                (
+                    "other_area_region_resizes_per_frame",
+                    self.other_area_region_resizes_per_frame(),
+                ),
+                ("other_area_layouts_per_frame", self.other_area_layouts_per_frame()),
+            ],
         }
     }
 }
@@ -159,15 +173,17 @@ fn snapshot(harness: &TestHarness<Screen>) -> Snapshot {
     let mut child_layouts = 0;
     let mut region_resizes = 0;
     let mut other_area_region_resizes = 0;
+    let mut other_area_layouts = 0;
     for (area, id) in area_ids(harness).into_iter().enumerate() {
         let stats = canvas_of(harness, area).stats();
         live += stats.materialised;
         child_layouts += stats.counters.child_layouts;
 
-        let resizes = content(harness, id).counters().resizes;
-        region_resizes += resizes;
+        let counters = content(harness, id).counters();
+        region_resizes += counters.resizes;
         if area != 0 {
-            other_area_region_resizes += resizes;
+            other_area_region_resizes += counters.resizes;
+            other_area_layouts += counters.layouts;
         }
     }
     Snapshot {
@@ -176,6 +192,7 @@ fn snapshot(harness: &TestHarness<Screen>) -> Snapshot {
         child_layouts,
         region_resizes,
         other_area_region_resizes,
+        other_area_layouts,
     }
 }
 
@@ -220,8 +237,25 @@ fn header_seen(harness: &TestHarness<Screen>, area: usize) -> f64 {
         .seen_scale()
 }
 
+/// The width each control of an area's header occupies, in order.
+///
+/// The content box rather than the border box: the box channel of §46 pushes padding
+/// onto every control, so a border box grows with the scale whether or not the control
+/// itself followed it. What is being measured here is whether the *control* moved.
+fn header_control_widths(harness: &TestHarness<Screen>, area: usize) -> Vec<f64> {
+    let id = region_id(harness, area, 0);
+    let header = harness.get_widget_with_id(id);
+    let bar = header.children()[0].ctx().widget_id();
+    harness
+        .get_widget_with_id(bar)
+        .children()
+        .iter()
+        .map(|child| child.ctx().content_box().width())
+        .collect()
+}
+
 /// Sets the interface scale of an area's header region.
-fn set_header_scale(harness: &mut TestHarness<Screen>, area: usize, scale: f64) {
+pub(crate) fn set_header_scale(harness: &mut TestHarness<Screen>, area: usize, scale: f64) {
     let id = area_ids(harness)[area];
     harness.edit_widget_with_id(id, |mut widget| {
         let mut content = widget.downcast::<AreaContent>();
@@ -487,6 +521,26 @@ pub fn run(opts: &Options) -> Outcome {
         scale_misses = missed.get();
     }
 
+    // --- Scenario 5b: do the *controls* follow the scale, or only the region?
+    //
+    // §22.1 said Masonry's widgets do not honour `UiScale`, and §46 found out why: they
+    // are never handed it. The scale reaches the region's root and stops there, so a
+    // header full of controls at the wrong size looks exactly like a header at the right
+    // one — no counter of regions can tell them apart. Counted from the failing side,
+    // like every other positive claim.
+    let unscaled_controls: u64 = {
+        let mut harness = new_harness(areas, nodes);
+        let before = header_control_widths(&harness, 0);
+        set_header_scale(&mut harness, 0, 2.0);
+        let _ = harness.redraw();
+        let after = header_control_widths(&harness, 0);
+        before
+            .iter()
+            .zip(&after)
+            .filter(|(before, after)| **after <= **before)
+            .count() as u64
+    };
+
     // --- Scenario 6: zoom the content of one region.
     //
     // §9's second rule, and the one that decides whether the two knobs stayed apart:
@@ -545,6 +599,7 @@ pub fn run(opts: &Options) -> Outcome {
                 reports: &reports,
                 sweep: &sweep,
                 scale_misses,
+                unscaled_controls,
                 regions,
                 overview_widgets,
                 overview_commands,
@@ -643,6 +698,8 @@ struct Measured<'a> {
     sweep: &'a [SweepRecord],
     /// `ui_scale` changes a region's layout never saw.
     scale_misses: u64,
+    /// Controls of a header whose own size did not follow the region's scale (§46).
+    unscaled_controls: u64,
     /// Idle milliseconds with one region per area and with two.
     regions: (f64, f64),
     /// Widgets and draw commands in the window at an overview zoom.
@@ -660,6 +717,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         reports,
         sweep,
         scale_misses,
+        unscaled_controls,
         regions,
         overview_widgets,
         overview_commands,
@@ -751,6 +809,20 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "changes not seen",
         });
 
+        // And one level down, which is where §46 found the gap: the region laying itself
+        // out at the new scale says nothing about the controls inside it. They follow
+        // only because something carries the scale to each of them — box metrics as
+        // properties, text as a call — and if that carrying stops, this is the number
+        // that moves and nothing else does.
+        criteria.push(Criterion {
+            name: "controls_follow_the_regions_scale",
+            claim: "every control of a header follows the region's interface scale",
+            kind: Kind::Counter,
+            measured: unscaled_controls as f64,
+            bound: 0.5,
+            unit: "controls that did not follow",
+        });
+
         // Containment upwards: a region resizing itself must not push the area around.
         criteria.push(Criterion {
             name: "ui_scale_change_does_not_resize_areas",
@@ -769,6 +841,20 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             measured: scale.other_area_region_resizes_per_frame(),
             bound: 0.05,
             unit: "foreign region resizes/frame",
+        });
+
+        // And the same containment counted in layout passes rather than in sizes: a
+        // region stack laid out again at the size it already had resizes nothing, so the
+        // criterion above cannot see a scale change that costs the window a layout
+        // instead of its region. Masonry lays out an ancestor of every dirty widget, so
+        // the screen itself runs; what must not run is any other area below it.
+        criteria.push(Criterion {
+            name: "ui_scale_change_lays_out_one_area",
+            claim: "changing ui_scale lays out the region stack of its own area only",
+            kind: Kind::Counter,
+            measured: scale.other_area_layouts_per_frame(),
+            bound: 0.05,
+            unit: "foreign area layouts/frame",
         });
     }
 
@@ -872,6 +958,22 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "areas unaccounted for",
         });
     }
+    if let Some(rescale) = cached_row("one area rescales") {
+        // The pixel side of the containment the layout criteria above check: a scale
+        // change in one area's header is a change of that area's pixels and of nobody
+        // else's. Counted in layers drawn, so a scale change that dirtied the window —
+        // through a layout of the screen it does cause, or a repaint it should not —
+        // shows here even where every region kept its size. The bound is one and not
+        // two: unlike a pan, nothing about a header reaches past its own area.
+        criteria.push(Criterion {
+            name: "a_scale_change_redraws_one_area",
+            claim: "changing the ui_scale of one area's header draws that area only",
+            kind: Kind::Counter,
+            measured: rescale.drawn,
+            bound: 1.5,
+            unit: "areas drawn/frame",
+        });
+    }
     if let Some(idle) = cached_row("nothing changes") {
         // Why the cache pays for itself (§36.3), as a counter: comparing scenes is
         // cheap, finding out where a layer sits walks its whole scene, and a layer that
@@ -930,6 +1032,20 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             measured: cache.iter().map(|row| row.dropped).fold(0.0, f64::max),
             bound: 1.0,
             unit: "kept layers with no pixels/frame",
+        });
+
+        // The gate the three defects of §44.9 slipped through: every counter here is a
+        // count of *work*, and none of them is shaped to see a defect that lives in the
+        // result of the work (§28.4 from the same side). So one criterion reads the
+        // frame itself — an idle window draws the same picture twice, or it is broken
+        // in a way no per-frame counter will report.
+        criteria.push(Criterion {
+            name: "an_idle_window_draws_the_same_picture_twice",
+            claim: "two frames in which nothing was touched show the same picture",
+            kind: Kind::Counter,
+            measured: cache.iter().map(|row| row.idle_blocks).max().unwrap_or(0) as f64,
+            bound: 1.0,
+            unit: "16x16 blocks whose content changed between two idle frames",
         });
 
         // The precondition §36 asks a caller for, in the only half a host can check:

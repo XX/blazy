@@ -75,6 +75,13 @@ pub struct LayerCounters {
     /// other, and they also add up to more pixels than the window, which is what put
     /// the cache over its ceiling (§44.9).
     pub overlaps: u64,
+    /// Times eviction could not bring the cache inside its ceiling.
+    ///
+    /// Reachable by design rather than by accident: the layers this frame is copying are
+    /// not evictable, because their pixels are in the cache and nowhere else (§44.9). So
+    /// the ceiling can yield for a frame — and when it does it says so, instead of
+    /// leaving a silent `return` where a promise used to be (§45).
+    pub over_ceiling: u64,
     /// Textures dropped to stay inside the ceiling.
     ///
     /// An eviction is not a fault — it costs the layer a redraw on the frame it comes
@@ -211,6 +218,7 @@ impl LayerCache {
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(id, _)| *id);
             let Some(id) = oldest else {
+                self.counters.over_ceiling += 1;
                 return;
             };
             self.entries.remove(&id);

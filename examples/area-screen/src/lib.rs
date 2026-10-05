@@ -331,6 +331,10 @@ pub fn sync_window(root: &mut RenderRoot, graph: &SharedGraph) -> usize {
             .and_then(|widget| widget.downcast::<AreaContent>())
             .and_then(|content| content.region_ids().last().copied())
         else {
+            // Loud, because a view that cannot be reached is a view that goes on showing
+            // the wrong graph, and skipping it costs nothing observable (§45).
+            debug_assert!(false, "area {area:?} holds no region to sync");
+            tracing::warn!(?area, "area holds no region to sync");
             continue;
         };
         root.edit_widget(editor_id, |mut widget| {
@@ -342,6 +346,14 @@ pub fn sync_window(root: &mut RenderRoot, graph: &SharedGraph) -> usize {
                 applied += sync_editor(&mut editor, graph);
             } else if let Some(mut canvas) = widget.try_downcast::<CanvasLayer>() {
                 applied += sync_canvas(&mut canvas, graph);
+            } else {
+                // The third shape nobody wrote. Silence here is precisely how §44.6
+                // happened: a `try_downcast` that misses has nothing to fail.
+                debug_assert!(
+                    false,
+                    "an area's main region shows the graph in a shape the pull does not know"
+                );
+                tracing::warn!(region = ?editor_id, "the pull does not know this region's shape");
             }
         });
     }

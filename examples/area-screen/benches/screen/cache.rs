@@ -16,7 +16,7 @@ use blazy::masonry::testing::TestHarness;
 use blazy::masonry::theme::default_property_set;
 use node_canvas::editor::NodeEditor;
 
-use crate::bench::{Options, PAN_STEP, VIEWPORT, pan_area, zoom_area};
+use crate::bench::{Options, PAN_STEP, SCALES, VIEWPORT, pan_area, set_header_scale, zoom_area};
 
 // --- MARK: the layer cache (§36)
 
@@ -54,6 +54,8 @@ pub(crate) struct CacheRow {
     /// it (§37.2).
     pub(crate) budget_kib: u64,
     pub(crate) evictions: f64,
+    /// Frames in which the ceiling had to yield because everything left was in use.
+    pub(crate) over_ceiling: f64,
     /// Per frame: layers the cache said it would copy and then had no pixels for.
     ///
     /// Zero by construction, and measured because it was not: an eviction could drop a
@@ -61,6 +63,23 @@ pub(crate) struct CacheRow {
     /// nothing at all. The area went empty for a frame while every other counter here
     /// said the cache was working (§44.9).
     pub(crate) dropped: f64,
+    /// Pixels that changed between two frames in which nothing was touched.
+    ///
+    /// Read off the frame rather than counted inside the cache, because every counter
+    /// the cache has was green while an area blinked: the layer that was dropped had
+    /// already raised `reused` (§44.9, §45). An idle window draws the same picture
+    /// twice or something is wrong that no per-frame counter is shaped to see.
+    pub(crate) idle_pixels: u64,
+    /// Blocks of the same two frames whose average colour moved enough to be content
+    /// rather than antialiasing.
+    ///
+    /// The criterion stands on this rather than on `idle_pixels`, because **the GPU does
+    /// not rasterise bit-identically across submissions**: with every layer copied and
+    /// nothing drawn, two consecutive frames still differed by one pixel in two runs out
+    /// of three (§45). A block mean moves by at most 2/255 when a pair of edge pixels
+    /// flips, and by tens when a region loses its content, so the line between noise and
+    /// structure is arithmetic rather than a tuned threshold.
+    pub(crate) idle_blocks: u64,
     /// Per frame: registered layers whose rectangle overlapped another's.
     ///
     /// The half of §36's precondition the host can check, and the one that failed: an
@@ -190,6 +209,52 @@ struct CacheCase {
     ops: bool,
 }
 
+/// Side of the block the two idle frames are compared in, in pixels.
+const BLOCK: usize = 16;
+
+/// How far a block's average channel may move before it is content and not antialiasing.
+///
+/// Derived rather than tuned. A block holds 256 pixels, so a pair of edge pixels flipping
+/// between two extremes moves its mean by 2 * 255 / 256 ≈ 2; a block that lost the
+/// content drawn in it moves by tens. Eight sits between the two, four times away from
+/// each (§45).
+const BLOCK_DELTA: u32 = 8;
+
+/// Blocks of two frames whose average colour differs by more than antialiasing.
+///
+/// Why not simply compare the frames: the GPU does not rasterise bit-identically across
+/// submissions, so exact equality is flaky by construction — measured at one pixel in two
+/// runs out of three, with every layer copied and nothing drawn at all.
+fn blocks_changed(first: &[u8], second: &[u8], width: usize) -> u64 {
+    if first.len() != second.len() || width == 0 {
+        return 0;
+    }
+    let height = first.len() / (width * 4);
+    let mut changed = 0;
+    for by in (0..height).step_by(BLOCK) {
+        for bx in (0..width).step_by(BLOCK) {
+            let (mut sums, mut count) = ([0i64; 4], 0i64);
+            for y in by..(by + BLOCK).min(height) {
+                for x in bx..(bx + BLOCK).min(width) {
+                    let at = (y * width + x) * 4;
+                    for channel in 0..4 {
+                        sums[channel] += i64::from(first[at + channel]) - i64::from(second[at + channel]);
+                    }
+                    count += 1;
+                }
+            }
+            if count > 0
+                && sums
+                    .iter()
+                    .any(|sum| sum.unsigned_abs() >= u64::from(BLOCK_DELTA) * count as u64)
+            {
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
 fn cache_case(
     gpu: &mut blazy::shell::gpu::GpuFrames,
     case: CacheCase,
@@ -274,6 +339,35 @@ fn cache_case(
     }
 
     let counters = gpu.layer_counters();
+
+    // Two more frames with nothing touched at all, compared pixel for pixel. After the
+    // gesture above, because that is the state the defect needed: a cache that has just
+    // had to store something is a cache that has just had to evict something.
+    let (idle_pixels, idle_blocks) = {
+        let frame = |gpu: &mut blazy::shell::gpu::GpuFrames, harness: &mut TestHarness<Screen>| {
+            if cached {
+                gpu.cache_layers(harness.root_widget().area_ids());
+            }
+            keep_layers(harness);
+            let (plan, _) = harness.redraw();
+            gpu.draw(&plan, logical, 1.0).ok()?;
+            gpu.wait();
+            Some(gpu.read_pixels())
+        };
+        let first = frame(gpu, &mut harness)?;
+        let second = frame(gpu, &mut harness)?;
+        (
+            first
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(second.as_chunks::<4>().0.iter())
+                .filter(|(a, b)| a != b)
+                .count() as u64,
+            blocks_changed(&first, &second, VIEWPORT.0 as usize),
+        )
+    };
+
     let frames = CACHE_FRAMES as f64;
     Some(CacheRow {
         what,
@@ -288,6 +382,9 @@ fn cache_case(
         kib: counters.bytes / 1024,
         budget_kib: budget / 1024,
         evictions: (counters.evictions - before.evictions) as f64 / frames,
+        idle_pixels,
+        idle_blocks,
+        over_ceiling: (counters.over_ceiling - before.over_ceiling) as f64 / frames,
         dropped: (counters.dropped - before.dropped) as f64 / frames,
         overlaps: (counters.overlaps - before.overlaps) as f64 / frames,
     })
@@ -314,6 +411,13 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
         rows.extend(cache_case(&mut gpu, case("nothing changes"), |_, _| {}));
         rows.extend(cache_case(&mut gpu, case("one area pans"), |h, _| {
             pan_area(h, 0, PAN_STEP);
+        }));
+        // A scale change in one area's header (§46): a layout change, unlike a pan, and
+        // one that runs the screen's own layout on the way — so the row that says whether
+        // a layout in one area reaches the pixels of the others. The scales never repeat
+        // on consecutive frames, so no frame of it is secretly idle.
+        rows.extend(cache_case(&mut gpu, case("one area rescales"), |h, i| {
+            set_header_scale(h, 0, SCALES[(i + 1) % SCALES.len()]);
         }));
         // In the quick set too: it is the row that keeps the two criteria above from
         // passing on a sweep where nothing ever changes (§20.9).
@@ -390,7 +494,7 @@ fn print_cache(rows: &[CacheRow]) {
         return;
     }
     println!(
-        "  {:<20} {:>5} {:>6} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8}",
+        "  {:<20} {:>5} {:>6} {:>8} {:>7} {:>7} {:>7} {:>8} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>7} {:>8}",
         "gesture",
         "cache",
         "layers",
@@ -398,8 +502,11 @@ fn print_cache(rows: &[CacheRow]) {
         "drawn/f",
         "walks/f",
         "evict/f",
+        "over c/f",
         "drop/f",
         "over/f",
+        "idle px",
+        "idle blk",
         "cmp ms",
         "walk ms",
         "gpu ms",
@@ -408,7 +515,7 @@ fn print_cache(rows: &[CacheRow]) {
     );
     for row in rows {
         println!(
-            "  {:<20} {:>5} {:>6} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.3} {:>7.3} {:>8.2} {:>7} {:>8}",
+            "  {:<20} {:>5} {:>6} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>8.2} {:>7.2} {:>7.2} {:>8} {:>8} {:>7.3} {:>7.3} {:>8.2} {:>7} {:>8}",
             row.what,
             if row.cached { "on" } else { "off" },
             row.layers,
@@ -416,8 +523,11 @@ fn print_cache(rows: &[CacheRow]) {
             row.drawn,
             row.walks,
             row.evictions,
+            row.over_ceiling,
             row.dropped,
             row.overlaps,
+            row.idle_pixels,
+            row.idle_blocks,
             row.compare_ms,
             row.walk_ms,
             row.gpu_ms,

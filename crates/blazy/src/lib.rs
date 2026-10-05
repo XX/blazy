@@ -45,6 +45,7 @@ pub use blazy_node_editor as node_editor;
 pub use blazy_ops as ops;
 pub use blazy_shape as shape;
 pub use blazy_shell as shell;
+pub use blazy_widgets as widgets;
 /// The Masonry this library is built against.
 ///
 /// Every public signature here speaks Masonry's types — `NewWidget`, `WidgetMut`,

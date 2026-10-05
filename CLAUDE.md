@@ -78,6 +78,7 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy-ops` | Operators, keymap as data, modal stack, undo journal. |
 | `crates/blazy-node-editor` | The node editor over the canvas: selection, box select, grab, pan, undo as operators, and the driver widget. |
 | `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
+| `crates/blazy-widgets` | Carries a region's interface scale into a subtree of stock Masonry widgets. |
 | `crates/blazy-shell` | The host: window, event loop, composition, choice of rasteriser. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
@@ -121,6 +122,19 @@ enormous margin. The full argument is in `crates/bench-utils/src/criteria.rs`.
 Consequences to respect when touching benchmarks:
 
 - A benchmark exits non-zero when a criterion fails, which is what makes CI a gate.
+- **A counter of work cannot see a defect that lives in the result of the work (§45).**
+  Three defects walked past 107 green criteria because an area evicted from the layer
+  cache raises `reused` exactly like an area that was copied. One criterion therefore
+  reads the frame itself: two frames in which nothing was touched must show the same
+  picture. It compares **16x16 block means, not bytes** — the GPU does not rasterise
+  bit-identically across submissions (measured: one pixel in two runs of three with
+  every layer copied), so exact equality is flaky by construction, and the threshold
+  between noise and content is arithmetic: a flipped pair of edge pixels moves a block
+  mean by 2/255, a region that lost its content by tens.
+- **A miss that can be normal has to be a number.** A `try_downcast` that finds nothing,
+  an `if let Some(texture)` that copies nothing, an eviction loop that returns with the
+  cache still over its ceiling — each of those was a defect or hid one, and each is now
+  a counter, a `debug_assert` or a warning (§44.9, §45).
 - An **empty criteria list is a failure**, not a pass. Otherwise the easiest way to
   turn CI green is to rename a scenario so `evaluate` stops finding it.
 - A `Criterion` is `measured < bound`. A positive claim ("this must happen") is
@@ -407,6 +421,21 @@ graph — 1.92 MB and 0.29 ms on 20 000 nodes — where a journal step costs wha
 touched: 40 bytes for a one-node drag. The graph is shared and the selection is not,
 deliberately: a selection in the model would repaint every area showing that graph,
 and one drawn inside its own area repaints one of eight (12.99 ms against 50.57).
+
+**A widget set was not needed; a way to hand a scale down was (§46).** Measured before
+designing anything: a stock Masonry widget resolves `Padding`, `CornerRadius`,
+`BorderWidth` and `Gap` from its own property stack before the theme, so pushing them from
+outside moves its geometry — a button's insets went 34x14 to 42x42 without the button
+knowing what a scale is. So `masonry_widgets_do_not_follow_ui_scale` is true only because
+nobody hands them the scale. What *cannot* be pushed is a font size: it is a parley style
+behind `WidgetMut<Label>`, so text needs a typed call. `blazy-widgets` is therefore the
+carrying and not a widget set: `scale_box` for the box, `Label` for the text,
+`carry_ui_scale` for every container between a region's root and its controls — forget one
+and the region lays itself out correctly while everything inside it stays at scale 1.
+Two things cost debugging and are written into the code: a region's root is **never
+measured** (its parent fixes its size), so a scale read in `measure` is read never; and
+handing the value to some children by call and others by property gives one piece of state
+two owners — the caption put the text back on its next layout, every frame.
 
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The

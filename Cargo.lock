@@ -290,6 +290,7 @@ dependencies = [
  "blazy-ops",
  "blazy-shape",
  "blazy-shell",
+ "blazy-widgets",
  "masonry",
 ]
 
@@ -347,6 +348,14 @@ dependencies = [
  "ui-events-winit",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "blazy-widgets"
+version = "0.1.0"
+dependencies = [
+ "blazy-areas",
+ "masonry",
 ]
 
 [[package]]

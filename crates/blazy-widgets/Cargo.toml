@@ -1,0 +1,19 @@
+[package]
+name = "blazy-widgets"
+description = "Carries a region's interface scale into a subtree of Masonry widgets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blazy-areas = { workspace = true }
+masonry = { workspace = true }
+
+[dev-dependencies]
+masonry = { workspace = true, features = ["testing"] }

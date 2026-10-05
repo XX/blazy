@@ -29,4 +29,5 @@ blazy-node-editor = { workspace = true }
 blazy-ops = { workspace = true }
 blazy-shape = { workspace = true }
 blazy-shell = { workspace = true }
+blazy-widgets = { workspace = true }
 masonry = { workspace = true }
