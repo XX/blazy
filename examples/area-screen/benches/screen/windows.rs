@@ -227,6 +227,24 @@ pub(crate) struct CrossRow {
     pub(crate) applied: usize,
     /// Nodes in the graph, so "applied" can be read against something.
     pub(crate) nodes: usize,
+    /// Links whose presence in an area of the other window disagrees with the model,
+    /// after its pull.
+    ///
+    /// Three links added and one of them removed in the first window, so both directions
+    /// are asked. The record the other window collects from used to have no links in it
+    /// at all, and a node-only criterion passed over that for as long as it existed.
+    pub(crate) links_adrift: usize,
+    /// Changes still owed after every window collected its share, plus views registered
+    /// for canvases no window holds — after a join, a detach and an edit.
+    ///
+    /// A view that left the tree used to stay registered and owed every later change, so
+    /// the windows were woken after every event from the first join on (§36). Measured
+    /// on the size of what is held rather than on work per frame, which is the only
+    /// place that defect lived (§28.4).
+    pub(crate) owed_after: usize,
+    /// Views the graph held at the end, and canvases the three windows hold.
+    pub(crate) views: usize,
+    pub(crate) canvases: usize,
 }
 
 /// Moves one node in one window and asks the other where it thinks that node is.
@@ -249,12 +267,95 @@ pub(crate) fn cross_window(areas: usize, nodes: usize) -> CrossRow {
     let _ = second.redraw();
     let adrift_after = usize::from(canvas_pos(&mut second, 0) != Some(truth));
 
+    // Links, both ways: three added in the first window, one of them removed again.
+    let added = [(0, 7), (1, 8), (2, 9)];
+    let first_editor = editor_id(&first, 0);
+    first.edit_widget_with_id(first_editor, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        for (from, to) in added {
+            let ends = Props::new().with_int("from", from).with_int("to", to);
+            NodeEditor::exec(&mut editor, "link.add", &ends);
+        }
+        let ends = Props::new().with_int("from", 1).with_int("to", 8);
+        NodeEditor::exec(&mut editor, "link.delete", &ends);
+    });
+    let _ = first.redraw();
+    let _ = sync(&mut second, &graph);
+    let _ = second.redraw();
+    let links_adrift = links_adrift(&mut second, &graph, &added);
+
+    // Views that leave: a join in the second window, a detach out of the first into a
+    // third, and then an edit, so that there is something for a departed view to be owed.
+    second.edit_root_widget(|mut screen| {
+        let tree = screen.widget.tree().clone();
+        if let Some((keep, gone)) = tree
+            .areas()
+            .find_map(|area| tree.joinable(area).map(|sibling| (area, sibling)))
+        {
+            Screen::join(&mut screen, keep, gone);
+        }
+    });
+    let _ = second.redraw();
+    let session = first.edit_root_widget(|mut screen| {
+        let last = screen.widget.area_ids().len().saturating_sub(1);
+        detach_area(&mut screen, last)
+    });
+    let _ = first.redraw();
+    let mut third = session.map(|session| {
+        let screen = ScreenSpec::new(1, nodes)
+            .with_ops(true)
+            .over_with(&graph, Some(session));
+        harness(screen)
+    });
+    let first_editor = editor_id(&first, 0);
+    first.edit_widget_with_id(first_editor, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 3));
+        NodeEditor::exec(&mut editor, "node.move", &Props::new().with_float("dx", 25.0));
+    });
+    let _ = first.redraw();
+    let mut canvases = 0;
+    for window in [Some(&mut first), Some(&mut second), third.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = sync(window, &graph);
+        let _ = window.redraw();
+        canvases += window.root_widget().area_ids().len();
+    }
+    let views = graph.borrow().views().len();
+    let owed_after = graph.borrow().views().owed() + views.abs_diff(canvases);
+
     CrossRow {
         adrift_before,
         adrift_after,
         applied,
         nodes,
+        links_adrift,
+        owed_after,
+        views,
+        canvases,
     }
+}
+
+/// Links whose presence in some area of a window disagrees with the model.
+fn links_adrift(harness: &mut TestHarness<Screen>, graph: &SharedGraph, links: &[(i64, i64)]) -> usize {
+    let mut adrift = 0;
+    for area in 0..harness.root_widget().area_ids().len() {
+        let id = editor_id(harness, area);
+        for &(from, to) in links {
+            let link = blazy::canvas::Link::new(from as usize, to as usize);
+            let truth = graph.borrow().links().contains(&link);
+            let shown = harness.edit_widget_with_id(id, |mut widget| {
+                let mut editor = widget.downcast::<NodeEditor>();
+                NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                    blazy::canvas::CanvasLayer::link_name(&mut canvas, link).is_some()
+                })
+            });
+            adrift += usize::from(shown != truth);
+        }
+    }
+    adrift
 }
 
 /// Where a window thinks node 0 is.
@@ -320,6 +421,10 @@ impl CrossRow {
                 ("nodes_adrift_before_the_pull", self.adrift_before as f64),
                 ("nodes_adrift_after_the_pull", self.adrift_after as f64),
                 ("changes_applied", self.applied as f64),
+                ("links_adrift_after_the_pull", self.links_adrift as f64),
+                ("owed_after_every_window_pulled", self.owed_after as f64),
+                ("views_held", self.views as f64),
+                ("canvases_in_windows", self.canvases as f64),
             ],
         }
     }
@@ -378,6 +483,28 @@ pub(crate) fn criteria(rows: &[WindowRow], cross: &CrossRow) -> Vec<Criterion> {
             measured: cross.applied as f64,
             bound: (cross.nodes / 4) as f64,
             unit: "changes applied for one moved node",
+        },
+        // Everything a view copies out of the model has to cross, and topology is part of
+        // it (§43): the record a window collects from had nodes and no links, so a link
+        // made in one window existed in the model and in that window only, for good.
+        Criterion {
+            name: "a_link_reaches_the_other_window",
+            claim: "a link made or removed in one window is made or removed in the other",
+            kind: Kind::Counter,
+            measured: cross.links_adrift as f64,
+            bound: 1.0,
+            unit: "links adrift after the pull, summed over the areas",
+        },
+        // A view that left the tree is owed nothing. Without it the windows never idle
+        // again after the first join: they are woken while anything is owed, and a view
+        // that no window holds can never collect what it is owed (§36, §28.4).
+        Criterion {
+            name: "a_departed_view_is_owed_nothing",
+            claim: "after a join, a detach and an edit, every window's pull leaves nothing owed",
+            kind: Kind::Counter,
+            measured: cross.owed_after as f64,
+            bound: 1.0,
+            unit: "changes owed plus views no window holds",
         },
     ]
 }

@@ -15,7 +15,9 @@ workspace = true
 # `window` is on by default, exactly as it is when depending on the shell directly;
 # `vello` is the one an application has to ask for.
 default = ["window"]
-window = ["blazy-shell/window"]
+# `window` also brings the assembly, which is owner mode by definition: it is a driver of
+# our own window loop (§14).
+window = ["blazy-shell/window", "dep:blazy-app"]
 vello = ["blazy-shell/vello"]
 # Masonry's `TestHarness`, for an application's own tests. Through the facade because the
 # harness has to come from the same Masonry as the widgets it drives, and the only way an
@@ -23,6 +25,7 @@ vello = ["blazy-shell/vello"]
 testing = ["masonry/testing"]
 
 [dependencies]
+blazy-app = { workspace = true, optional = true }
 blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
 blazy-node-editor = { workspace = true }

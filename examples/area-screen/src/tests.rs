@@ -22,6 +22,7 @@ use blazy::masonry::peniko::Color;
 use blazy::masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
 use blazy::masonry::theme::default_property_set;
 use blazy::masonry::ui_events::pointer::PointerButton;
+use blazy::node_editor::Change;
 use blazy::shell::Host;
 use image::RgbaImage;
 use node_canvas::build_canvas;
@@ -740,9 +741,14 @@ fn an_edit_inside_a_node_reaches_the_other_window() {
     let before = node_state(&mut b, 0, 0).expect("node 0 is on screen in both windows");
     let (value, checked) = (before.0 + 0.25, !before.1);
 
-    // Through the model, which is what a node widget does when its slider moves.
+    // What a node widget does when its slider moves: write the model, and record the
+    // change for the views that did not see it. The record is the node's rather than the
+    // model's because the node knows which view it is in — and a change owed to the view
+    // being dragged would rebuild the slider under the pointer, once per frame.
     graph.borrow_mut().set_value(0, value);
+    graph.borrow().views().note(Change::Contents { index: 0 });
     graph.borrow_mut().set_checked(0, checked);
+    graph.borrow().views().note(Change::Contents { index: 0 });
     let _ = a.redraw();
 
     assert_eq!(

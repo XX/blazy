@@ -31,14 +31,17 @@
 //!
 //! # Features
 //!
-//! * `window` (default) — owner mode: our own window and event loop. Turn it off for guest mode (§14) or a headless
-//!   host, and nothing below pulls in a window system.
+//! * `window` (default) — owner mode: our own window and event loop, and [`app`], the assembly of editors in areas and
+//!   windows that drives it. Turn it off for guest mode (§14) or a headless host, and nothing below pulls in a window
+//!   system.
 //! * `vello` — the GPU rasteriser, chosen at startup rather than at compile time (§26.2). Off by default, because it
 //!   needs a graphics device.
 //! * `testing` — Masonry's `TestHarness`, as `blazy::masonry::testing`, for an application's own tests.
 
 #![warn(missing_docs, unreachable_pub)]
 
+#[cfg(feature = "window")]
+pub use blazy_app as app;
 pub use blazy_areas as areas;
 pub use blazy_canvas as canvas;
 pub use blazy_node_editor as node_editor;

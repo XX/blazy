@@ -403,6 +403,33 @@ impl CanvasLayer {
         true
     }
 
+    /// Tells the canvas that what node `index` holds has changed in the model.
+    ///
+    /// The type-blind twin of [`update_child`](Self::update_child): the node's widget, if
+    /// it has one, is built again from the [`NodeSource`], which reads the model; a
+    /// far-field canvas re-records the scene the node is drawn in. For a caller that
+    /// knows the node's type, reaching into the widget is cheaper; this is for one that
+    /// does not — a window collecting a change another window made.
+    ///
+    /// Returns whether anything will be rebuilt or re-recorded. `false` is a node with no
+    /// widget and no far field, which reads the model when it is next built and needs
+    /// nothing now.
+    pub fn refresh_node(this: &mut WidgetMut<'_, Self>, index: usize) -> bool {
+        let refreshed = {
+            let mut content = this.ctx.get_mut(&mut this.widget.content);
+            let invalidate = content.widget.refresh_node(index);
+            let refreshed = !matches!(invalidate, Invalidate::Nothing);
+            invalidate.apply(&mut content.ctx);
+            refreshed
+        };
+        if refreshed {
+            // The cull runs in this widget's layout, and it is the cull that turns the
+            // mark into a rebuild.
+            this.ctx.request_layout();
+        }
+        refreshed
+    }
+
     /// The nodes that currently have a widget, as `(index, widget id)` pairs.
     ///
     /// Useful for tests and for apps that need to reach into a live node. The list

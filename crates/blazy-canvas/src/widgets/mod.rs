@@ -746,6 +746,39 @@ impl CanvasContent {
         // and the region check happen.
     }
 
+    /// Marks node `index`'s widget as stale, so the next cull builds it again from the
+    /// source, and re-records the far field if that is what draws the node.
+    ///
+    /// For a change to what a node *holds*: a widget reads the model once, when it is
+    /// built, so one that is on screen keeps the old value until something rebuilds it
+    /// (§44.9). Rebuilding rather than reaching into the widget is what lets a caller
+    /// that does not know the node's type — a window collecting a change another window
+    /// made — still show the truth.
+    ///
+    /// A mark rather than a rebuild on the spot, because two changes to one node arrive
+    /// together as often as not — a slider and a checkbox, collected in one pull — and the
+    /// second rebuild would have to remove a widget the first one has not even put in the
+    /// tree yet. The mark is the staleness the cull already checks after a change of
+    /// detail level, so the node is rebuilt once, in the mutate pass, like any other.
+    fn refresh_node(&mut self, index: usize) -> Invalidate {
+        if self.live_slot(index).is_none() {
+            return Invalidate::Nothing;
+        }
+        if self.far.active {
+            // The node is part of this widget's own scene, and what it holds may be what
+            // the scene draws — a tint is.
+            self.far.region = None;
+            return Invalidate::LayoutAndPaint;
+        }
+        if self.slots[index].pod.is_none() {
+            // No widget: the node reads the model when it is next built.
+            return Invalidate::Nothing;
+        }
+        self.slots[index].built = None;
+        self.detail_dirty = true;
+        Invalidate::Layout
+    }
+
     /// Records a new canvas-space position for a node.
     ///
     /// In far-field mode the node is part of this widget's own scene, so moving it

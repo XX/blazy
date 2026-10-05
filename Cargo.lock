@@ -284,6 +284,7 @@ dependencies = [
 name = "blazy"
 version = "0.1.0"
 dependencies = [
+ "blazy-app",
  "blazy-areas",
  "blazy-canvas",
  "blazy-node-editor",
@@ -292,6 +293,19 @@ dependencies = [
  "blazy-shell",
  "blazy-widgets",
  "masonry",
+]
+
+[[package]]
+name = "blazy-app"
+version = "0.1.0"
+dependencies = [
+ "blazy-areas",
+ "blazy-canvas",
+ "blazy-node-editor",
+ "blazy-ops",
+ "blazy-shell",
+ "masonry",
+ "tracing",
 ]
 
 [[package]]
@@ -317,6 +331,7 @@ dependencies = [
  "blazy-canvas",
  "blazy-ops",
  "masonry",
+ "tracing",
 ]
 
 [[package]]
@@ -1593,7 +1608,7 @@ dependencies = [
 [[package]]
 name = "linebender_include_doc_path"
 version = "0.1.0"
-source = "git+https://github.com/XX/xilem.git?rev=fc0391fc6312c37fc5d503a9bc7813a2132d01b6#fc0391fc6312c37fc5d503a9bc7813a2132d01b6"
+source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1653,7 +1668,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "masonry"
 version = "0.4.0"
-source = "git+https://github.com/XX/xilem.git?rev=fc0391fc6312c37fc5d503a9bc7813a2132d01b6#fc0391fc6312c37fc5d503a9bc7813a2132d01b6"
+source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
 dependencies = [
  "accesskit",
  "linebender_include_doc_path",
@@ -1668,7 +1683,7 @@ dependencies = [
 [[package]]
 name = "masonry_core"
 version = "0.4.0"
-source = "git+https://github.com/XX/xilem.git?rev=fc0391fc6312c37fc5d503a9bc7813a2132d01b6#fc0391fc6312c37fc5d503a9bc7813a2132d01b6"
+source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
 dependencies = [
  "accesskit",
  "anymap3",
@@ -1695,7 +1710,7 @@ dependencies = [
 [[package]]
 name = "masonry_testing"
 version = "0.4.0"
-source = "git+https://github.com/XX/xilem.git?rev=fc0391fc6312c37fc5d503a9bc7813a2132d01b6#fc0391fc6312c37fc5d503a9bc7813a2132d01b6"
+source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
 dependencies = [
  "accesskit_consumer",
  "image",
@@ -3321,7 +3336,7 @@ dependencies = [
 [[package]]
 name = "tree_arena"
 version = "0.2.0"
-source = "git+https://github.com/XX/xilem.git?rev=fc0391fc6312c37fc5d503a9bc7813a2132d01b6#fc0391fc6312c37fc5d503a9bc7813a2132d01b6"
+source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
 dependencies = [
  "hashbrown 0.17.1",
 ]

@@ -1,0 +1,26 @@
+[package]
+name = "blazy-app"
+description = "The assembly: node editors over one graph, in areas, in as many windows as the user opens."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blazy-areas = { workspace = true }
+blazy-canvas = { workspace = true }
+blazy-node-editor = { workspace = true }
+blazy-ops = { workspace = true }
+# Owner mode only: this crate is the application's driver of our own window loop, so it
+# asks for the window system the facade otherwise lets an application refuse (§14).
+blazy-shell = { workspace = true, features = ["window"] }
+masonry = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+masonry = { workspace = true, features = ["testing"] }

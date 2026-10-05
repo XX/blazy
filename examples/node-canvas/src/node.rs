@@ -29,6 +29,7 @@ use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, RoundedRect, Shape, Size
 use blazy::masonry::layout::{LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::widgets::{Checkbox, CheckboxToggled, Slider, SliderMoved};
+use blazy::node_editor::{Change, ViewToken};
 use blazy::shape::ShapeHit;
 
 use crate::model::SharedGraph;
@@ -163,8 +164,25 @@ impl GraphNode {
         ctx.mutate_self_later(|mut widget| Self::reload(&mut widget.downcast::<Self>()));
 
         let mut peers = Vec::new();
-        self.graph.borrow().other_views(self.canvas, &mut peers);
         let index = self.index;
+        {
+            let graph = self.graph.borrow();
+            let views = graph.views();
+            match self.canvas {
+                // Recorded for every view but this one, and that exclusion is load-bearing:
+                // this window collects what its views owe before it draws, and a change
+                // owed to *this* canvas would rebuild the node whose slider is being
+                // dragged — once per frame of the drag, out from under the pointer.
+                Some(canvas) => {
+                    views.note_except(canvas, Change::Contents { index });
+                    views.others(canvas, &mut peers);
+                },
+                None => {
+                    views.note(Change::Contents { index });
+                    peers.extend(views.ids());
+                },
+            }
+        }
         for peer in peers {
             // The mutate pass is where a widget outside this subtree may legally be
             // changed, and it runs before the next layout — so the other areas show the
@@ -187,8 +205,9 @@ impl GraphNode {
     /// widgets and the values are painted, so both copies have to be refreshed.
     ///
     /// Public because the push is not the only way in: a window that was not there when
-    /// the edit happened collects it from the model instead (`Change::Edited`), and the
-    /// widget it lands on is this one (§44.9).
+    /// the edit happened collects it from the graph's views instead (`Change::Contents`),
+    /// which rebuilds the node rather than reloading it — the pull does not know what a
+    /// node is (§44.9).
     pub fn reload(this: &mut blazy::masonry::core::WidgetMut<'_, Self>) {
         let state = this.widget.graph.borrow().node(this.widget.index);
         this.widget.value = state.value;
@@ -409,6 +428,13 @@ pub struct GraphSource {
     graph: SharedGraph,
     /// The canvas this source builds for, once it is in the tree.
     canvas: Option<WidgetId>,
+    /// This canvas's place among the graph's views, given up when the canvas is dropped.
+    ///
+    /// Held here because the source is what a canvas drops when it leaves the tree, and
+    /// that drop is the only notice anybody gets: Masonry has no removal event. A view
+    /// joined away or detached used to stay registered and owed every later change, so
+    /// the windows were woken after every event for good.
+    view: Option<ViewToken>,
     /// One shape for every node, because every node is the same size.
     ///
     /// Kept here rather than built per pick: the flattened cache inside it is what
@@ -430,6 +456,7 @@ impl GraphSource {
         Self {
             graph,
             canvas: None,
+            view: None,
             body: body_shape(crate::model::NODE_SIZE),
             far_min_radius_px: FAR_MIN_RADIUS_PX,
             far_batches: Vec::new(),
@@ -456,13 +483,27 @@ impl NodeSource for GraphSource {
     /// canvas over a shared graph is a view of it by the fact of existing.
     fn attached(&mut self, canvas: WidgetId) {
         self.canvas = Some(canvas);
-        self.graph.borrow_mut().register_view(canvas);
+        self.view = Some(self.graph.borrow().views().attach(canvas));
     }
 
     /// Records a drag in the model and names the other views that have to follow it.
+    ///
+    /// The canvas's own drag, which no editor sees — so the record the other windows
+    /// collect is written here, like the editor writes its own.
     fn moved(&mut self, index: usize, pos: Point, peers: &mut Vec<WidgetId>) {
         self.graph.borrow_mut().set_pos(index, pos);
-        self.graph.borrow().other_views(self.canvas, peers);
+        let graph = self.graph.borrow();
+        let views = graph.views();
+        match self.canvas {
+            Some(canvas) => {
+                views.note_except(canvas, Change::Moved { index, pos });
+                views.others(canvas, peers);
+            },
+            None => {
+                views.note(Change::Moved { index, pos });
+                peers.extend(views.ids());
+            },
+        }
     }
 
     fn paint_far(&mut self, nodes: &[(usize, Rect)], scale: f64, painter: &mut Painter<'_>) {

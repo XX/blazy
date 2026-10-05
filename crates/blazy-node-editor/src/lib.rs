@@ -35,6 +35,7 @@
 
 mod editor;
 pub mod ops;
+mod views;
 mod world;
 
 #[cfg(test)]
@@ -44,10 +45,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub use blazy_canvas::Link;
-use masonry::core::WidgetId;
 use masonry::kurbo::{Point, Rect};
 
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SessionHandle};
+pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};
 pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, journal};
 
 /// What a node editor needs from the graph behind it.
@@ -67,18 +68,19 @@ pub trait NodeGraph: 'static {
     /// Moves node `index` so that its top-left corner is at `pos`.
     fn set_node_pos(&mut self, index: usize, pos: Point);
 
-    /// Pushes into `out` every canvas showing this graph except `this`.
+    /// The canvases showing this graph, and what each of them has not been told yet.
     ///
-    /// The canvases a moved node has to reach in the same frame (§30). Required rather
-    /// than defaulted to "none", because "none" is the answer that compiles, passes
-    /// every test with one view, and splits two views of one graph apart on the first
-    /// drag — which is exactly how §30 was found. A graph shown in one canvas only
-    /// answers with nothing, deliberately.
+    /// Where the other views of a moved node are found in the same frame (§30), and where
+    /// the views of *other windows* collect what they missed (§44.3). Required rather than
+    /// defaulted to an empty registry, because "no views" is the answer that compiles,
+    /// passes every test with one view, and splits two views of one graph apart on the
+    /// first drag — which is exactly how §30 was found.
     ///
-    /// A canvas learns its own id through
-    /// [`NodeSource::attached`](blazy_canvas::NodeSource::attached), which is the natural
-    /// place to record it.
-    fn other_views(&self, this: WidgetId, out: &mut Vec<WidgetId>);
+    /// The graph keeps one [`Views`] and hands out a [`ViewToken`] from it in
+    /// [`NodeSource::attached`](blazy_canvas::NodeSource::attached); the editor records
+    /// what its operators change. What the application changes past the operators, it
+    /// records with [`Views::note`].
+    fn views(&self) -> &Views;
 
     /// Adds a node at `rect` and hands back the name it got.
     ///

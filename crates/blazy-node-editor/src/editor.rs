@@ -51,7 +51,7 @@ use masonry::ui_events::pointer::{PointerScrollEvent, PointerType, PointerUpdate
 use masonry::{TextAlign, TextAlignOptions};
 
 use crate::ops::CANVAS_SCOPE;
-use crate::{Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
+use crate::{Change, Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
 
 /// What a view of a graph holds that the graph does not.
 ///
@@ -382,7 +382,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             // other views of the graph are not following it (§30).
             return;
         }
-        let peers = peers_of(&session.borrow(), this.widget.canvas.id());
+        let peers = fan_out(&session.borrow(), this.widget.canvas.id(), &changes);
         for peer in peers {
             let (positions, edits) = (changes.positions.clone(), changes.edits.clone());
             this.ctx
@@ -437,20 +437,34 @@ impl<G: NodeGraph> EditorSession<G> {
 /// carries both of for.
 fn apply_edits(canvas: &mut WidgetMut<'_, CanvasLayer>, edits: &[Edit]) {
     for &edit in edits {
-        match edit {
-            Edit::NodeAdded { index, rect } => CanvasLayer::insert_node(canvas, index, rect.origin(), rect.size()),
-            Edit::NodeRemoved { index } => {
-                CanvasLayer::remove_node(canvas, index);
-            },
-            Edit::LinkAdded(link) => {
+        apply_edit(canvas, edit);
+    }
+}
+
+/// Applies one structural edit, so that applying it twice changes nothing.
+///
+/// Twice is the normal case rather than a hazard: inside a window the push delivers an
+/// edit to the graph's other views in the same frame, and the pull that carries it across
+/// windows delivers it to them again (`Views`). A node inserted again under its own name
+/// replaces itself and a removal of something absent is nothing — but a link is named by
+/// the canvas, so inserting one twice would file it twice, and that is what the lookup
+/// here is for.
+pub(crate) fn apply_edit(canvas: &mut WidgetMut<'_, CanvasLayer>, edit: Edit) {
+    match edit {
+        Edit::NodeAdded { index, rect } => CanvasLayer::insert_node(canvas, index, rect.origin(), rect.size()),
+        Edit::NodeRemoved { index } => {
+            CanvasLayer::remove_node(canvas, index);
+        },
+        Edit::LinkAdded(link) => {
+            if CanvasLayer::link_name(canvas, link).is_none() {
                 CanvasLayer::insert_link(canvas, link);
-            },
-            Edit::LinkRemoved(link) => {
-                if let Some(name) = CanvasLayer::link_name(canvas, link) {
-                    CanvasLayer::remove_link(canvas, name);
-                }
-            },
-        }
+            }
+        },
+        Edit::LinkRemoved(link) => {
+            if let Some(name) = CanvasLayer::link_name(canvas, link) {
+                CanvasLayer::remove_link(canvas, name);
+            }
+        },
     }
 }
 
@@ -484,10 +498,26 @@ fn positions_of<G: NodeGraph>(world: &EditorWorld<G>, mut moved: Vec<usize>) -> 
         .collect()
 }
 
-/// The other canvases showing the same graph (§30).
-fn peers_of<G: NodeGraph>(session: &EditorSession<G>, own_canvas: WidgetId) -> Vec<WidgetId> {
+/// Hands what the operators changed to every other view of the graph, and names the
+/// ones in reach.
+///
+/// Two deliveries in one place, so that neither can know something the other does not:
+/// every change goes into the graph's [`Views`](crate::Views) for the views of other
+/// windows to collect, and the ids come back for the caller to push to in this frame
+/// (§30). They used to be two lists kept by two owners — the push here, the record in the
+/// application's model — and the record had no links in it, so a link made in one
+/// window never reached another (`issues/application assembly.md`).
+fn fan_out<G: NodeGraph>(session: &EditorSession<G>, own_canvas: WidgetId, changes: &Changes) -> Vec<WidgetId> {
+    let graph = session.world.graph.borrow();
+    let views = graph.views();
+    for &edit in &changes.edits {
+        views.note_except(own_canvas, Change::Structure(edit));
+    }
+    for &(index, pos) in &changes.positions {
+        views.note_except(own_canvas, Change::Moved { index, pos });
+    }
     let mut peers = Vec::new();
-    session.world.graph.borrow().other_views(own_canvas, &mut peers);
+    views.others(own_canvas, &mut peers);
     peers
 }
 
@@ -662,7 +692,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             // other views of the graph are not following it (§30).
             return;
         }
-        let peers = peers_of(&session.borrow(), self.canvas.id());
+        let peers = fan_out(&session.borrow(), self.canvas.id(), &changes);
         for peer in peers {
             let (positions, edits) = (changes.positions.clone(), changes.edits.clone());
             ctx.mutate_later(peer, move |widget| apply_moves(widget, positions, edits));

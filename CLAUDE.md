@@ -80,10 +80,11 @@ fewer numbers, and a fast inner loop.
 | `crates/blazy-shape` | Shape-accurate hit testing, for widgets and for bare curves. |
 | `crates/blazy-widgets` | Carries a region's interface scale into a subtree of stock Masonry widgets. |
 | `crates/blazy-shell` | The host: window, event loop, composition, choice of rasteriser. |
+| `crates/blazy-app` | The assembly: node editors over one graph, in areas and windows — the `ShellDriver` an application hands to the loop. |
 | `crates/bench-utils` | Criteria, verdict, JSON report, and render metrics. |
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
-| `examples/hello` | The smallest application: two areas, two canvases, one dependency. |
+| `examples/hello` | The smallest application: a node editor over its own graph, in areas and windows, one dependency. |
 
 Each experiment is a **library plus a thin binary plus a bench target**, not one binary
 (`examples/hello` measures nothing and is a binary alone).
@@ -388,15 +389,34 @@ dropped silently for any other, so the model records what each view still owes a
 window pulls its share in `ShellDriver::frame`. Waking the other windows belongs in
 `ShellDriver::settled`, after the event: both seats are offered an event *before* the tree
 acts on it, so a wake-up decided there is one gesture late — which is how a change made
-with the mouse failed to cross while one made with a key did (§44.3). And the pull has to
-know **every shape the application builds**: the tests and the benchmarks built areas with
-the operator layer, the window built them without, and a pull that looked only for a
-`NodeEditor` applied nothing at all there — silently, since a `try_downcast` that misses
-has nothing to fail. A test whose scene is not the shape the application builds is testing
-another product. And **everything a node widget copies out of the model** has to be
-recorded, not only its geometry: a slider and a checkbox are read once, when the node is
-built, so recording positions alone left two windows disagreeing about a checkbox for
-good (§44.9).
+with the mouse failed to cross while one made with a key did (§44.3). And **everything a
+node widget copies out of the model** has to be recorded, not only its geometry: a slider
+and a checkbox are read once, when the node is built, so recording positions alone left two
+windows disagreeing about a checkbox for good (§44.9). And a test whose scene is not the
+shape the application builds is testing another product: the tests built areas with the
+operator layer and the window built them without (§44.6).
+
+**What a view is owed is the library's to record, not the application's (§47).** The
+example kept that record in its model and the editor pushed changes from its own list —
+two lists, two owners — and the record had no links in it, so a link made in one window
+never reached another. It also never forgot a view: a canvas joined away stayed owed every
+later change, and since windows are woken while anything is owed, no window idled again
+after the first join. Now `blazy_node_editor::Views` is the registry, the editor's
+`fan_out` writes the same list it pushes, and a canvas's `ViewToken` lives in its
+`NodeSource` so that **the drop is the unregistration** — Masonry has no widget-removed
+event (`remove_child` carries a TODO there), but it does drop the widget. Three things
+follow and are easy to undo: the application records only what it changes *past* the
+operators (`Change::Contents`), and records it **except for its own view**, or the pull
+rebuilds the node whose slider is being dragged on every frame of the drag; every change
+is applied twice inside a window (push, then pull), so applying one has to be idempotent —
+a canvas names its own links, so `apply_edit` looks a link up by its ends before filing
+it; and the pull asks the registry which views are in this window's tree, so it does not
+know or care what wraps a canvas — the pull that looked for a `NodeEditor` applied nothing
+to a bare canvas, silently (§44.6). `blazy_app::EditorApp` is that driver for an
+application: the graph and "what fills an area" in, the windows, layers, pull, wake-ups,
+detach and screen keys out. Screen keys are offered events before the tree, so a default
+binding holds a modifier the editor's keymap does not use — plain `X` for a split made
+`node.delete` unreachable — and a test holds that.
 
 **A node's name is a hole in an array, never an index that shifts (§43).** A removed
 node leaves its slot behind, dead, and the next insertion takes the name back — the free
@@ -464,12 +484,14 @@ device request cost less than a second pinned crate. The GPU path sits on the pu
 `imaging_vello`, `imaging_wgpu` and `wgpu` instead, and `wgpu` is pinned to the version
 `imaging_wgpu` selects, because the texture types have to come from one crate version.
 
-Strategy towards upstream is **contribute, not fork** (§17), with one recorded
-exception: the pin points at our fork `XX/xilem`, which is upstream `b81d8d7` plus a
-single commit — a return flag on `Layer::capture_pointer_event`, so a layer root can
-keep an event from the tree (§17 item 4, §39.1). It exists so the request went upstream
-with working code and numbers attached; the pin goes back to upstream once it is
-answered. Nothing else here patches Masonry, and nothing should be added to the fork.
+Strategy towards upstream is **contribute, not fork** (§17), and the pin points at our
+fork all the same: branch `dev` of `XX/xilem`, which is upstream `271a27a` plus our own
+commits. So far there is one — a return flag on `Layer::capture_pointer_event`, so a layer
+root can keep an event from the tree (§17 item 4, §39.1). A change Masonry needs goes into
+that fork, as a commit of its own that could be sent upstream; it is the user's to make,
+so when work here needs one, **say so and stop** rather than working around Masonry or
+patching it from this repository. The pin is a commit, not the branch: moving it is a step
+of its own, judged by CI.
 
 ## Because it is a library, not an application
 
@@ -505,7 +527,7 @@ both are already argued in §15.1 and §18:
   copies of a number drift, and the copy in the code is the one nobody re-measures —
   §40.4 found the price of a draw command restated in the code as three different pairs
   of numbers.
-- **The seven published crates carry `#![warn(missing_docs, unreachable_pub)]`**, so a new
+- **The eight published crates carry `#![warn(missing_docs, unreachable_pub)]`**, so a new
   public item needs a doc comment. That is also what catches a doc comment orphaned by a
   reordering: four of them had come adrift and were documenting the wrong function.
 - **Counter and error types are `#[non_exhaustive]`; configuration types are not.** A

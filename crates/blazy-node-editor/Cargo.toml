@@ -15,6 +15,7 @@ workspace = true
 blazy-canvas = { workspace = true }
 blazy-ops = { workspace = true }
 masonry = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 masonry = { workspace = true, features = ["testing"] }

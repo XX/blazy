@@ -11,14 +11,14 @@ use blazy_canvas::CanvasLayer;
 use blazy_ops::OpResult;
 use blazy_ops::keymap::Props;
 use blazy_ops::undo::Step;
-use masonry::core::{NewWidget, WidgetId};
+use masonry::core::NewWidget;
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Point, Rect, Size};
 use masonry::testing::TestHarness;
 use masonry::theme::default_property_set;
 use masonry::widgets::Label;
 
-use crate::{EditorWorld, Link, MoveRecord, NodeEditor, NodeGraph, SharedGraph};
+use crate::{EditorWorld, Link, MoveRecord, NodeEditor, NodeGraph, SharedGraph, Views};
 
 /// The smallest graph the seam allows: rectangles in a row, its links, and the views
 /// showing it.
@@ -30,7 +30,7 @@ struct Row {
     rects: Vec<Option<Rect>>,
     free: Vec<usize>,
     links: Vec<Link>,
-    views: Vec<WidgetId>,
+    views: Views,
 }
 
 impl NodeGraph for Row {
@@ -48,8 +48,8 @@ impl NodeGraph for Row {
         }
     }
 
-    fn other_views(&self, this: WidgetId, out: &mut Vec<WidgetId>) {
-        out.extend(self.views.iter().copied().filter(|&id| id != this));
+    fn views(&self) -> &Views {
+        &self.views
     }
 
     fn insert_node(&mut self, rect: Rect) -> usize {
@@ -423,4 +423,63 @@ fn editor_harness(graph: &SharedGraph<Row>, session: &crate::SessionHandle<Row>)
     );
     let _ = harness.redraw();
     harness
+}
+
+/// A view is forgotten when its token goes, and with it everything it was owed.
+///
+/// The token's drop is the only notice a graph gets that a canvas left the tree: Masonry
+/// has no removal event. Before it existed a view joined away stayed owed every later
+/// change, and the windows were woken after every event for good.
+#[test]
+fn a_view_is_forgotten_with_its_token() {
+    let views = Views::new();
+    let canvas = NewWidget::new(Label::new("")).to_pod().id();
+    let other = NewWidget::new(Label::new("")).to_pod().id();
+    let token = views.attach(canvas);
+    let _kept = views.attach(other);
+
+    views.note_except(other, crate::Change::Contents { index: 0 });
+    assert_eq!(views.owed(), 1, "owed to the view that did not make it");
+    assert!(views.has_pending());
+
+    drop(token);
+    assert_eq!(views.len(), 1);
+    assert_eq!(views.owed(), 0, "and what it was owed goes with it");
+    assert!(!views.has_pending());
+    assert_eq!(views.counters().detached, 1);
+}
+
+/// Collecting a link twice files it once.
+///
+/// Twice is the normal case: inside a window the push delivers an edit to the other views
+/// in the same frame, and the pull delivers it again. A node re-inserted under its own
+/// name replaces itself, but a canvas names its links itself, so a second insertion would
+/// file the same link under a second name.
+#[test]
+fn a_link_collected_twice_is_filed_once() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = editor_harness(&graph, &session);
+    let canvas = harness.root_widget().canvas_id();
+    let views = graph.borrow().views().clone();
+    let _token = views.attach(canvas);
+    let link = Link::new(0, 2);
+    views.note(crate::Change::Structure(crate::Edit::LinkAdded(link)));
+    views.note(crate::Change::Structure(crate::Edit::LinkAdded(link)));
+
+    let applied = harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| crate::sync_canvas(&mut canvas, &views))
+    });
+    assert_eq!(applied, 2);
+    let names = harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            let first = CanvasLayer::link_name(&mut canvas, link);
+            if let Some(name) = first {
+                CanvasLayer::remove_link(&mut canvas, name);
+            }
+            (first, CanvasLayer::link_name(&mut canvas, link))
+        })
+    });
+    assert!(names.0.is_some(), "the link is there");
+    assert_eq!(names.1, None, "once: removing it once leaves none");
 }
