@@ -642,6 +642,45 @@ pub(crate) fn push_link(path: &mut BezPath, start: Point, end: Point) {
     path.curve_to(curve.p1, curve.p2, curve.p3);
 }
 
+/// Appends a link as a thin filled ribbon along its curve, `half` canvas units to either
+/// side, flattened into `pieces` straight pieces.
+///
+/// Along the curve rather than its chord, and that was measured (§53): a link to a node
+/// below loops out to the right and back, and its chord runs diagonally *under* the two
+/// nodes it joins, so a chord ribbon showed 66 blocks of the picture where the curve shows
+/// 888. One piece is the chord, which is what a link a pixel or two long needs.
+///
+/// Wound the same way whatever the link's direction — out along the left offset, back
+/// along the right — so a batch filled with the non-zero rule never cancels where two
+/// ribbons cross.
+pub(crate) fn push_link_ribbon(path: &mut BezPath, start: Point, end: Point, half: f64, pieces: usize) {
+    use masonry::kurbo::{ParamCurve, ParamCurveDeriv};
+    let curve = link_curve(start, end);
+    let tangent = curve.deriv();
+    let pieces = pieces.max(1);
+    let offset = |t: f64| {
+        let d = tangent.eval(t).to_vec2();
+        let length = d.hypot();
+        if length <= f64::EPSILON {
+            let chord = end - start;
+            let l = chord.hypot().max(f64::EPSILON);
+            return masonry::kurbo::Vec2::new(-chord.y, chord.x) * (half / l);
+        }
+        masonry::kurbo::Vec2::new(-d.y, d.x) * (half / length)
+    };
+    let at = |i: usize| i as f64 / pieces as f64;
+    path.move_to(curve.eval(0.0) + offset(0.0));
+    for i in 1..=pieces {
+        let t = at(i);
+        path.line_to(curve.eval(t) + offset(t));
+    }
+    for i in (0..=pieces).rev() {
+        let t = at(i);
+        path.line_to(curve.eval(t) - offset(t));
+    }
+    path.close_path();
+}
+
 /// How the canvas strokes its links.
 ///
 /// Style rather than mechanism, like [`DetailThresholds`](crate::DetailThresholds): how a link should look
@@ -679,6 +718,22 @@ pub struct LinkStyle {
     /// of the zoom range and 32 px at the top, which would make a link unpickable
     /// exactly where it is thinnest (`rnd/architecture.md` §25.2).
     pub slop: f64,
+    /// In the far field, draw each link as a thin filled ribbon along its curve rather
+    /// than as a stroked curve.
+    ///
+    /// On the CPU rasteriser a stroked segment costs about seven times a filled one
+    /// (§35.2), and a visible stroke far more: a one-pixel stroke made an overview of
+    /// 5000 nodes cost 81 ms against 7 for the ribbon (§53). On the GPU path the ribbon
+    /// costs 10–50% more than the stroke, which is the price of the default; an
+    /// application that only ever draws on the GPU can turn this off.
+    pub far_fill: bool,
+    /// In the far field, the narrowest a link is drawn on screen, in pixels; zero draws
+    /// it at [`width`](Self::width) canvas units whatever that comes to.
+    ///
+    /// Two canvas units at an overview zoom of 0.02 are 0.04 px: a line at four percent
+    /// coverage, which no block of the frame shows (§53). A floor in pixels is what makes
+    /// the graph's structure visible where the overview exists to show it.
+    pub far_min_width_px: f64,
 }
 
 impl Default for LinkStyle {
@@ -689,6 +744,10 @@ impl Default for LinkStyle {
             width: 2.0,
             min_screen_length: 2.0,
             slop: blazy_shape::DEFAULT_SLOP,
+            // On by default, both: measured, an overview drawn the old way spends most of a
+            // CPU frame on links nobody can see (§53).
+            far_fill: true,
+            far_min_width_px: 0.5,
         }
     }
 }

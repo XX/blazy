@@ -21,7 +21,7 @@ use masonry::layout::{LenReq, Length};
 
 use crate::detail::{CanvasDetail, Detail, DetailBudget};
 use crate::index::SpatialIndex;
-use crate::links::{Link, LinkLayer, LinkStyle, PortLayout, PortSide, link_curve, push_link};
+use crate::links::{Link, LinkLayer, LinkStyle, PortLayout, PortSide, link_curve, push_link, push_link_ribbon};
 use crate::source::NodeSource;
 use crate::stats::{CanvasHit, CanvasStats};
 
@@ -116,6 +116,11 @@ const ZOOM_EPSILON: f64 = 1e-9;
 /// that takes the wheel over (`view.zoom`) has to zoom at the same speed, or rebinding
 /// the wheel changes how it feels.
 pub const WHEEL_ZOOM_RATE: f64 = 0.0015;
+/// Screen pixels of a far-field link's reach per straight piece of its ribbon (§53).
+const FAR_RIBBON_PIECE_PX: f64 = 8.0;
+/// The least a link's handles reach, in canvas units — what `link_curve` gives a short
+/// link, and what makes a link to the node below loop out and back.
+const FAR_RIBBON_HANDLE: f64 = 24.0;
 /// How close to a port the pointer has to be to pick it, in screen pixels.
 const PORT_SLOP_PX: f64 = 7.0;
 /// A wheel notch, in pixels, matching what `Portal` assumes.
@@ -1258,7 +1263,6 @@ impl Widget for CanvasContent {
         // show what is wired to what.
         if !self.links.is_empty() {
             self.link_repaints += 1;
-            let stroke = Stroke::new(self.link_style.width);
             let hovered = self.hovered.and_then(CanvasHit::link);
 
             // One path per style, and one command per path. The curves keep apart
@@ -1271,6 +1275,19 @@ impl Widget for CanvasContent {
             let mut hot = std::mem::take(&mut self.scratch_hot_links);
             plain.truncate(0);
             hot.truncate(0);
+            // The far-field forms (§53): links filled rather than stroked, and never
+            // thinner on screen than a floor. Only where nodes have no widgets — closer in a
+            // link is a curve someone looks at.
+            let far = self.far.active;
+            let fill = far && self.link_style.far_fill;
+            let floor = if far && self.scale > f64::EPSILON {
+                self.link_style.far_min_width_px / self.scale
+            } else {
+                0.0
+            };
+            let width = self.link_style.width.max(floor);
+            let stroke = Stroke::new(width);
+            let mut filled = BezPath::new();
             for &edge in self.links.recorded() {
                 let Some(link) = self.links.edge(edge) else {
                     continue;
@@ -1287,7 +1304,18 @@ impl Widget for CanvasContent {
                     &mut plain
                 };
                 let (start, end) = self.ports.ends(link, from, to);
-                push_link(path, start, end);
+                if fill && hovered != Some(edge as usize) {
+                    // A piece per eight pixels of the curve's reach on screen, so a link
+                    // a pixel or two long is its chord and a loop keeps its shape.
+                    let reach = (end - start).hypot() + 2.0 * FAR_RIBBON_HANDLE;
+                    let pieces = ((reach * self.scale / FAR_RIBBON_PIECE_PX).ceil() as usize).clamp(1, 8);
+                    push_link_ribbon(&mut filled, start, end, width / 2.0, pieces);
+                } else {
+                    push_link(path, start, end);
+                }
+            }
+            if !filled.is_empty() {
+                painter.fill(&filled, self.link_style.color).draw();
             }
             if !plain.is_empty() {
                 painter.stroke(&plain, &stroke, self.link_style.color).draw();

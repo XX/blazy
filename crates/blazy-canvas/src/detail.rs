@@ -47,8 +47,8 @@ pub struct DetailThresholds {
 impl Default for DetailThresholds {
     fn default() -> Self {
         Self {
-            full: 0.2,
-            simplified: 0.05,
+            full: 0.1,
+            simplified: 0.02,
         }
     }
 }

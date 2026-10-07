@@ -531,6 +531,19 @@ port used to be handed to whatever the pointer had reached by then — the view,
 panned. The editor's own harness never moved the hover with the button down; the window
 did, and the regression test lives in `hello`.
 
+**A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
+units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
+frame showed any, while drawing them cost three quarters of a CPU frame. The far field now
+draws each link as a filled ribbon along its curve, at least a pixel wide
+(`LinkStyle::far_fill`, `far_min_width_px`, both on by default): 2-3x cheaper on the CPU path
+and the graph's structure is finally on screen. Three traps measured on the way: a visible
+*stroke* is ruinous on the CPU rasteriser (81 ms for 5000 nodes); a ribbon along the *chord*
+loses every link that loops back to the node below (its chord runs under both nodes); and
+the block measure under-counts a one-pixel line (it moves a block by ~7/255 against a
+threshold of 8) — it answers "is the structure visible at all", not "how many links". Any
+far-field lever is judged against the frame with no links, never against the old picture:
+the old picture showed none either.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget

@@ -1114,6 +1114,14 @@ fn zoom_pick_sweep(opts: &Options) -> (usize, usize) {
     (changes, samples)
 }
 
+/// Blocks of an overview frame that have to show links for the overview to show them.
+///
+/// Measured at 374 and 926 on the two graphs at zoom 0.02, and 306 and 157 at zoom 0.10,
+/// where the old way showed none; a hundred is well clear of both. The block measure
+/// under-counts a one-pixel line — it moves a block's mean by about 7/255 against a
+/// threshold of 8 — so this is a floor on structure being visible, not a count of links.
+const OVERVIEW_LINK_BLOCKS: u64 = 100;
+
 /// The Phase 0 pass criteria, evaluated against the numbers just measured.
 ///
 /// Bounds are set well clear of the measured values (§20.5), because a criterion is
@@ -1514,9 +1522,11 @@ fn evaluate(
     //
     // Draw commands are the cheap half (§32.2), and the criterion above bounds them.
     // What the rasteriser is charged for is path segments, and what the far field puts
-    // in a frame is four per node plus two per link — the corner rounding, which is the
-    // other four per node, is dropped while it is sub-pixel (§35.2). Counted as the
-    // excess over that model, so it fails from the side that costs a frame: restore the
+    // in a frame is four per node plus four per link — the corner rounding, which is the
+    // other four per node, is dropped while it is sub-pixel (§35.2), and a link at an
+    // overview zoom is a ribbon of one piece, four *filled* segments, where it used to
+    // be two stroked ones that cost the CPU rasteriser more (§53). Counted as the excess
+    // over that model, so it fails from the side that costs a frame: restore the
     // rounding at an overview zoom and it is twenty thousand segments over.
     let far_excess = far
         .iter()
@@ -1524,17 +1534,40 @@ fn evaluate(
         .map(|row| {
             row.segments
                 .saturating_sub(4 * row.recorded_nodes as u64)
-                .saturating_sub(2 * row.recorded_links as u64)
+                .saturating_sub(4 * row.recorded_links as u64)
         })
         .max();
     if let Some(excess) = far_excess {
         criteria.push(Criterion {
             name: "a_far_field_node_costs_four_segments",
-            claim: "the far field draws four segments a node and two a link",
+            claim: "the far field draws four segments a node and four a link",
             kind: Kind::Counter,
             measured: excess as f64,
             bound: 64.0,
             unit: "segments beyond the model",
+        });
+    }
+
+    // And what the far field is *for*: an overview shows the graph's structure. Drawn
+    // the old way — two canvas units, stroked — a link at zoom 0.02 is 0.04 px wide and
+    // no block of the frame shows it, while it cost three quarters of a CPU frame (§53).
+    // Counted on the frame against the same graph with no links, from the failing side.
+    let hidden_overviews = far
+        .iter()
+        .filter(|row| row.what == "plain nodes")
+        .filter(|row| {
+            row.blocks_with_links
+                .is_some_and(|blocks| blocks < OVERVIEW_LINK_BLOCKS)
+        })
+        .count();
+    if far.iter().any(|row| row.blocks_with_links.is_some()) {
+        criteria.push(Criterion {
+            name: "an_overview_shows_its_links",
+            claim: "the default far field shows the graph's links, not only its nodes",
+            kind: Kind::Counter,
+            measured: hidden_overviews as f64,
+            bound: 0.5,
+            unit: "far-field tables whose default frame shows no links",
         });
     }
 

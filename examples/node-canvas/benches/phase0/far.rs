@@ -46,11 +46,20 @@ impl Rasterisers {
     fn open(timed: bool) -> Self {
         Self {
             timed,
-            host: timed.then(|| blazy::shell::Host::any().ok()).flatten(),
+            // Opened in the quick set too: what a lever does to the picture is decided
+            // on a CPU frame, and that is a counter, not a time (§53).
+            host: blazy::shell::Host::any().ok(),
             gpu: timed
                 .then(|| blazy::shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)).ok())
                 .flatten(),
         }
+    }
+
+    /// One CPU frame of the plan, for comparing what levers do to the picture.
+    fn picture(&mut self, plan: &blazy::masonry::app::VisualLayerPlan) -> Option<Vec<u8>> {
+        let host = self.host.as_mut()?;
+        let size = blazy::masonry::kurbo::Size::new(f64::from(VIEWPORT.0), f64::from(VIEWPORT.1));
+        host.render(plan, size).ok().map(|frame| frame.image.data)
     }
 
     /// Rasterises the plan on the blit path and returns milliseconds per frame.
@@ -109,6 +118,15 @@ pub(crate) struct FarRow {
     /// The other half, on the blit path, and on the GPU path where there is a device.
     pub(crate) cpu_ms: f64,
     pub(crate) gpu_ms: f64,
+    /// 16x16 blocks of the frame that differ from the frame with no links at all by more
+    /// than antialiasing (§45): how much of the graph's structure the picture shows.
+    ///
+    /// The fidelity measure §53 needed and did not have. Measuring a lever against the
+    /// stroked picture said every lever changed nothing — because the stroked picture
+    /// shows no links either.
+    pub(crate) blocks_with_links: Option<u64>,
+    /// The CPU frame, for that comparison.
+    picture: Option<Vec<u8>>,
 }
 
 /// Path segments in the frame the canvas would hand the rasteriser.
@@ -163,6 +181,7 @@ fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
     let composed = blazy::shell::Composition::new(&plan, 1.0).scene;
     let encoded = blazy::shell::encode::encoded(&composed, frame);
 
+    let picture = paths.picture(&plan);
     let (mut cpu_ms, mut gpu_ms) = (0.0, 0.0);
     if paths.timed {
         cpu_ms = paths.blit_ms(&plan);
@@ -183,6 +202,8 @@ fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
         plan_ms: report.mean_ms(),
         cpu_ms,
         gpu_ms,
+        blocks_with_links: None,
+        picture,
     }
 }
 
@@ -232,7 +253,70 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
         far_case(row("overscan 0.00", with(0.0), None), &mut paths),
         far_case(row("links >= 4 px", links_at(4.0), None), &mut paths),
         far_case(row("links >= 8 px", links_at(8.0), None), &mut paths),
+        // The levers of §53: what a link costs drawn as fill rather than stroke, and how
+        // many of them share their pixels with another.
+        // §53: how a far-field link is drawn. The default is a filled ribbon at least a
+        // pixel wide; these are the alternatives it was chosen over.
+        far_case(
+            row(
+                "stroked, as was",
+                node_canvas::FarTuning {
+                    fill_links: false,
+                    link_min_px: 0.0,
+                    ..default
+                },
+                None,
+            ),
+            &mut paths,
+        ),
+        far_case(
+            row(
+                "stroked, 1 px",
+                node_canvas::FarTuning {
+                    fill_links: false,
+                    ..default
+                },
+                None,
+            ),
+            &mut paths,
+        ),
+        far_case(
+            row(
+                "filled, no floor",
+                node_canvas::FarTuning {
+                    link_min_px: 0.0,
+                    ..default
+                },
+                None,
+            ),
+            &mut paths,
+        ),
+        far_case(
+            row(
+                "filled, 0.5 px",
+                node_canvas::FarTuning {
+                    link_min_px: 0.5,
+                    ..default
+                },
+                None,
+            ),
+            &mut paths,
+        ),
     ];
+    let mut rows = rows;
+    // Every row against the same graph with no links: how many blocks of the frame show
+    // any of them.
+    let bare = rows
+        .iter()
+        .find(|row| row.what == "plain, no links")
+        .and_then(|row| row.picture.clone());
+    if let Some(bare) = bare {
+        for row in &mut rows {
+            if let Some(picture) = &row.picture {
+                row.blocks_with_links = Some(bench_utils::render::blocks_changed(&bare, picture, VIEWPORT.0 as usize));
+            }
+        }
+    }
     print_far(&rows);
     rows
 }
@@ -261,6 +345,10 @@ impl FarRow {
                 ("link_reselects_per_frame", self.link_reselects),
                 ("cpu_raster_ms", self.cpu_ms),
                 ("gpu_raster_ms", self.gpu_ms),
+                (
+                    "blocks_showing_links",
+                    self.blocks_with_links.map_or(-1.0, |b| b as f64),
+                ),
             ],
         }
     }
@@ -271,6 +359,7 @@ fn print_far(rows: &[FarRow]) {
         "  {:<16} {:>8} {:>8} {:>8} {:>9} {:>10} {:>10} {:>9} {:>9} {:>9}",
         "what", "nodes", "links", "hidden", "segments", "records/f", "resel/f", "plan ms", "cpu ms", "gpu ms"
     );
+    println!("  {:<16} {:>12}", "", "link blocks");
     for row in rows {
         println!(
             "  {:<16} {:>8} {:>8} {:>8} {:>9} {:>10.2} {:>10.2} {:>9.3} {:>9.2} {:>9.2}",
@@ -284,6 +373,11 @@ fn print_far(rows: &[FarRow]) {
             row.plan_ms,
             row.cpu_ms,
             row.gpu_ms,
+        );
+        println!(
+            "  {:<16} {:>12}",
+            "",
+            row.blocks_with_links.map_or_else(|| "-".to_owned(), |b| b.to_string())
         );
     }
 }

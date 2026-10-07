@@ -8,6 +8,7 @@
 use std::time::{Duration, Instant};
 
 use area_screen::{Screen, ScreenSpec};
+use bench_utils::render::blocks_changed;
 use blazy::areas::AreaScreen;
 use blazy::canvas::CanvasLayer;
 use blazy::masonry::core::NewWidget;
@@ -207,52 +208,6 @@ struct CacheCase {
     budget: Option<u64>,
     /// Whether the areas carry the operator layer.
     ops: bool,
-}
-
-/// Side of the block the two idle frames are compared in, in pixels.
-const BLOCK: usize = 16;
-
-/// How far a block's average channel may move before it is content and not antialiasing.
-///
-/// Derived rather than tuned. A block holds 256 pixels, so a pair of edge pixels flipping
-/// between two extremes moves its mean by 2 * 255 / 256 ≈ 2; a block that lost the
-/// content drawn in it moves by tens. Eight sits between the two, four times away from
-/// each (§45).
-const BLOCK_DELTA: u32 = 8;
-
-/// Blocks of two frames whose average colour differs by more than antialiasing.
-///
-/// Why not simply compare the frames: the GPU does not rasterise bit-identically across
-/// submissions, so exact equality is flaky by construction — measured at one pixel in two
-/// runs out of three, with every layer copied and nothing drawn at all.
-fn blocks_changed(first: &[u8], second: &[u8], width: usize) -> u64 {
-    if first.len() != second.len() || width == 0 {
-        return 0;
-    }
-    let height = first.len() / (width * 4);
-    let mut changed = 0;
-    for by in (0..height).step_by(BLOCK) {
-        for bx in (0..width).step_by(BLOCK) {
-            let (mut sums, mut count) = ([0i64; 4], 0i64);
-            for y in by..(by + BLOCK).min(height) {
-                for x in bx..(bx + BLOCK).min(width) {
-                    let at = (y * width + x) * 4;
-                    for channel in 0..4 {
-                        sums[channel] += i64::from(first[at + channel]) - i64::from(second[at + channel]);
-                    }
-                    count += 1;
-                }
-            }
-            if count > 0
-                && sums
-                    .iter()
-                    .any(|sum| sum.unsigned_abs() >= u64::from(BLOCK_DELTA) * count as u64)
-            {
-                changed += 1;
-            }
-        }
-    }
-    changed
 }
 
 fn cache_case(

@@ -149,6 +149,8 @@ impl CanvasSpec {
             .with_ports(crate::node::PORTS)
             .with_link_style(blazy::canvas::LinkStyle {
                 min_screen_length: self.far.min_link_px,
+                far_fill: self.far.fill_links,
+                far_min_width_px: self.far.link_min_px,
                 ..blazy::canvas::LinkStyle::default()
             })
     }
@@ -194,6 +196,10 @@ pub struct FarTuning {
     pub min_radius_px: f64,
     /// `LinkStyle::min_screen_length`: how long a link must be on screen to be drawn.
     pub min_link_px: f64,
+    /// `LinkStyle::far_fill`: links filled rather than stroked in the far field (§53).
+    pub fill_links: bool,
+    /// `LinkStyle::far_min_width_px`: the narrowest a far-field link is on screen (§53).
+    pub link_min_px: f64,
 }
 
 impl Default for FarTuning {
@@ -202,6 +208,8 @@ impl Default for FarTuning {
             overscan: CanvasLayer::DEFAULT_FAR_OVERSCAN,
             min_radius_px: crate::node::FAR_MIN_RADIUS_PX,
             min_link_px: blazy::canvas::LinkStyle::default().min_screen_length,
+            fill_links: blazy::canvas::LinkStyle::default().far_fill,
+            link_min_px: blazy::canvas::LinkStyle::default().far_min_width_px,
         }
     }
 }
