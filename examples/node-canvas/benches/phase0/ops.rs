@@ -102,6 +102,8 @@ pub(crate) struct OpsRow {
     /// class remembered by the canvas and never reaching the widget counts exactly like
     /// one that did. Only the click row looks; the others leave it at zero.
     pub(crate) misstyled: usize,
+    /// Links the graph gained, per gesture. Only the link-drag row adds any.
+    pub(crate) links_added: f64,
     /// Operators still running when the gesture ended. Zero, or the gesture hung.
     pub(crate) left_running: usize,
     /// Milliseconds per gesture, including a redraw per event.
@@ -244,6 +246,7 @@ fn row(
         invoked: per(ops.invoked - start.ops.invoked),
         class_changes: per(stats.counters.class_changes - start.class_changes),
         misstyled: 0,
+        links_added: 0.0,
         left_running: harness.root_widget().modal_depth(),
         ms: ms / repeats as f64,
     }
@@ -374,6 +377,51 @@ fn drag_row(count: usize, repeats: usize) -> OpsRow {
     }
     let ms = clock.elapsed().as_secs_f64() * 1000.0;
     row("drag (LMB)", "tree", &mut harness, start, repeats, MOVES + 2, 0, ms)
+}
+
+/// Drags a link out of one node's output into another node's second input (§52).
+///
+/// A different pair of on-screen nodes each time, into the input no generated link uses, so
+/// that every gesture really adds a link: a repeat would be a duplicate the graph refuses,
+/// and a row of refusals measures the refusal.
+fn link_drag_row(count: usize, repeats: usize) -> OpsRow {
+    let (mut harness, graph) = ops_harness(count);
+    let live = harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
+    });
+    let port = |harness: &mut TestHarness<NodeEditor>, index: usize, side, number| {
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                let pos = CanvasLayer::child_pos(&mut canvas, index).expect("the node exists");
+                let at = node_canvas::node::PORTS.position(
+                    blazy::masonry::kurbo::Rect::from_origin_size(pos, NODE_SIZE),
+                    side,
+                    number,
+                );
+                canvas.widget.view() * at
+            })
+        })
+    };
+    let links_before = graph.borrow().link_count();
+    let start = before(&mut harness);
+    let clock = Instant::now();
+    for k in 0..repeats {
+        let (from, to) = (live[k].0, live[k + live.len() / 2].0);
+        let out = port(&mut harness, from, blazy::canvas::PortSide::Output, 0);
+        let input = port(&mut harness, to, blazy::canvas::PortSide::Input, 1);
+        harness.mouse_move(out);
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        for step in 1..=MOVES {
+            harness.mouse_move(out + (input - out) * (step as f64 / MOVES as f64));
+            let _ = harness.redraw();
+        }
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+    }
+    let ms = clock.elapsed().as_secs_f64() * 1000.0;
+    let mut drag = row("link drag", "tree", &mut harness, start, repeats, MOVES + 2, 0, ms);
+    drag.links_added = (graph.borrow().link_count() - links_before) as f64 / repeats as f64;
+    drag
 }
 
 /// Panning with the left button, which is an operator like everything else.
@@ -557,6 +605,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
         invoked: per(counters.invoked),
         class_changes: (stats.counters.class_changes - start.class_changes) as f64 / repeats as f64,
         misstyled: 0,
+        links_added: 0.0,
         left_running: runtime.modal_depth(),
         ms: ms / repeats as f64,
     }
@@ -676,6 +725,7 @@ pub(crate) fn ops_table(opts: &Options, count: usize) -> Vec<OpsRow> {
     let rows = vec![
         click_row(count, repeats),
         drag_row(count, repeats),
+        link_drag_row(count, repeats),
         canvas_drag_row(count, repeats),
         box_row(count, repeats),
         grab_row("grab (key G)", count, repeats, false),

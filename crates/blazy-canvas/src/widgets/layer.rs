@@ -83,6 +83,7 @@ pub struct CanvasLayer {
     /// Links handed to [`CanvasLayer::with_links`] before the canvas was in a tree.
     pending_links: Option<Vec<Link>>,
     link_style: LinkStyle,
+    ports: PortLayout,
 }
 
 impl CanvasLayer {
@@ -138,6 +139,7 @@ impl CanvasLayer {
             zoom_limits: (0.02, 8.0),
             pending_links: None,
             link_style: LinkStyle::default(),
+            ports: PortLayout::default(),
         }
     }
 
@@ -171,6 +173,18 @@ impl CanvasLayer {
     /// The default of [`Self::with_far_overscan`]: a quarter of the viewport on each
     /// side, measured down from a half in §35.2.
     pub const DEFAULT_FAR_OVERSCAN: f64 = FAR_OVERSCAN;
+
+    /// Where the ports are on a node, and whether they are drawn.
+    #[must_use]
+    pub fn with_ports(mut self, ports: PortLayout) -> Self {
+        self.ports = ports;
+        self
+    }
+
+    /// The port layout this canvas uses.
+    pub fn ports(&self) -> PortLayout {
+        self.ports
+    }
 
     /// Restyles the links.
     pub fn with_link_style(mut self, style: LinkStyle) -> Self {
@@ -601,6 +615,21 @@ impl CanvasLayer {
         hit
     }
 
+    /// What is under a point given in this widget's coordinates, from the parent's raw
+    /// context.
+    ///
+    /// The pick an operator layer needs while it holds the pointer: the canvas below sees
+    /// no events then, so it publishes no hover, and a driver holding an `EventCtx` cannot
+    /// reach a child to ask (§38.3). The raw context can. Counted like any other pick.
+    pub fn hit_test_raw(&mut self, pos: Point, window: Affine, ctx: &mut RawCtx<'_>) -> Option<CanvasHit> {
+        let canvas_pos = self.view.inverse() * pos;
+        let scale = self.hit_scale(window);
+        let (content, _) = ctx.get_raw_mut(&mut self.content);
+        let hit = content.hit(canvas_pos, scale);
+        publish_hit_stats(&self.stats, content);
+        hit
+    }
+
     /// The canvas-space position of a node, or `None` for a name nothing holds.
     ///
     /// A removed node answers `None` from the moment it is removed, not from the moment
@@ -755,6 +784,14 @@ impl Widget for CanvasLayer {
                 // cannot hit-test a child, and this costs the pick the drag decision
                 // needed anyway.
                 let hit = self.hover(pos, ctx);
+                // Where the node a port belongs to is, for the drag below to grab it by.
+                let port_node = match hit {
+                    Some(CanvasHit::Port { index, .. }) => {
+                        let (content, _) = ctx.get_raw(&mut self.content);
+                        content.live_rect_of(index).map(|rect| (index, rect.origin()))
+                    },
+                    _ => None,
+                };
                 self.drag = match e.button {
                     // Left button drags a node if there is one under the pointer,
                     // and pans otherwise — unless the application has taken the
@@ -763,6 +800,16 @@ impl Widget for CanvasLayer {
                         Some(CanvasHit::Node { index, pos: child_pos }) => Drag::Node {
                             index,
                             grab: canvas_pos - child_pos,
+                        },
+                        // A port is part of its node here: dragging a link out of one is
+                        // an operator's (`link.drag`), and without operators a press on a
+                        // node's edge moves the node, as it always did.
+                        Some(CanvasHit::Port { .. }) => match port_node {
+                            Some((index, origin)) => Drag::Node {
+                                index,
+                                grab: canvas_pos - origin,
+                            },
+                            None => Drag::Pan { last: pos },
                         },
                         // A link is pickable but not draggable by the canvas:
                         // selection and rewiring are operators (§11). A press on a
@@ -895,6 +942,7 @@ impl Widget for CanvasLayer {
                 content.links.invalidate();
             }
             content.link_style = self.link_style;
+            content.ports = self.ports;
             content.far_overscan = self.far_overscan;
             content.links.set_slack(region_slack(self.far_overscan));
             content.controls_on_hover = self.controls_on_hover;
@@ -955,6 +1003,7 @@ impl Widget for CanvasLayer {
                 link_reselects: content.links.refreshes(),
                 hit_queries: content.hit_queries,
                 hit_node_tests: content.hit_node_tests,
+                hit_port_tests: content.hit_port_tests,
                 hit_curve_tests: content.hit_curve_tests,
                 hit_curve_scans: content.hit_curve_scans,
             },

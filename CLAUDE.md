@@ -515,6 +515,22 @@ editor that opened the menu holds the keys meanwhile. Two harness limits to reme
 `mouse_move_to` checks visibility in the base layer only, and the harness — not the host —
 is what handled layers all along.
 
+**A port is the canvas's rule, not a call per curve (§52).** A `Link` names its ports by
+number; where a port *is* comes from `PortLayout` (the default — middle of the edge — is the
+curve every link had before ports), because curves are built in bulk, thousands at a time
+and in the far field with no widget anywhere. The application says only *how many* ports a
+node has (`NodeSource::ports`, default one in and one out), and is asked only at a pick.
+Ports pick before nodes and only on nodes with widgets — in the far field a few screen
+pixels are hundreds of canvas units. While an operator holds the pointer the canvas sees no
+events and publishes no hover, so `link.drag` asks the driver to pick per move
+(`track_hover`); doing that for every operator is not just slower — it moved the hover off
+the port before the held press resolved, and the drag went to `node.move`. For the same
+reason, **while a press is held the hover is the press's**: the gesture is decided on the
+first move past the threshold but is about where the press was, and a fast pull out of a
+port used to be handed to whatever the pointer had reached by then — the view, which
+panned. The editor's own harness never moved the hover with the button down; the window
+did, and the regression test lives in `hello`.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget

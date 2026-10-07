@@ -30,7 +30,7 @@ use std::fmt::Write as _;
 use std::mem;
 use std::rc::Rc;
 
-use blazy_canvas::{CanvasLayer, CanvasStats, wheel_pixels};
+use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, wheel_pixels};
 use blazy_ops::event::{Device, OpEvent, Sample};
 use blazy_ops::keymap::{Props, Scope};
 use blazy_ops::runtime::{OpRuntime, Seat};
@@ -199,6 +199,8 @@ pub struct NodeEditor<G: NodeGraph> {
     shown: BTreeSet<usize>,
     /// The menu this editor opened and has not seen closed, by its layer's root.
     menu: Option<WidgetId>,
+    /// What the pointer was over when the press now held was made.
+    press_hover: Option<CanvasHit>,
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
@@ -240,6 +242,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             hud_layout: None,
             shown: BTreeSet::new(),
             menu: None,
+            press_hover: None,
         }
     }
 
@@ -745,12 +748,41 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// about the world is filled in first: where the pointer is, in canvas
     /// coordinates, and what the canvas last found under it.
     fn dispatch(&mut self, ctx: &mut EventCtx<'_>, event: &OpEvent, sample: Sample, seat: Seat) -> bool {
-        let (view, hover) = {
+        let (view, mut hover) = {
             let (canvas, _) = ctx.get_raw(&mut self.canvas);
             (canvas.view(), canvas.stats().hovered)
         };
+        // An operator holding the pointer that needs to know what is under it — a link
+        // being dragged to a port — gets a pick of its own: the canvas below sees no events
+        // while the operator holds them, so its own hover is the one from the press.
+        let tracking = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.borrow().world.track_hover);
+        if tracking && let Some(pos) = event.pos() {
+            let window = ctx.window_transform();
+            let (canvas, mut raw) = ctx.get_raw_mut(&mut self.canvas);
+            hover = canvas.hit_test_raw(pos, window, &mut raw);
+        }
         self.view = view;
         let is_press = matches!(event, OpEvent::Press { .. });
+
+        // A held press is decided — click or drag — on the first move past the threshold,
+        // and what it is decided *about* is where it was pressed: `OpEvent::Drag` carries
+        // the press's position for exactly that reason (§39.3). So while the press is held,
+        // what the pointer is over is what it was over at the press. Taking it from the
+        // move instead handed every fast drag that left its target before the threshold —
+        // out of a port, off the edge of a node — to whatever was under the pointer by
+        // then, usually the view (§52).
+        if is_press {
+            self.press_hover = hover;
+        } else if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.borrow().runtime.is_holding())
+        {
+            hover = self.press_hover;
+        }
 
         // Into canvas coordinates before the runtime sees it, because that is the space
         // this application's operators think in — and the space a `Drag` has to carry its
@@ -917,6 +949,12 @@ impl<G: NodeGraph> NodeEditor<G> {
         let session = session.borrow();
         let viewport = ctx.content_box();
         let graph = session.world.graph.borrow();
+        // A link being dragged out of a port: the curve it will be, in the colour of the
+        // selection, over everything else the editor draws.
+        if let Some((start, end)) = session.world.link_preview {
+            let curve = self.view * blazy_canvas::link_curve(start, end);
+            painter.stroke(curve, &Stroke::new(2.0), self.style.selection).draw();
+        }
         // Nodes with widgets wear the class and can look selected by themselves; the far
         // field has no widgets and nothing to wear it on.
         let outline = match self.style.outline {

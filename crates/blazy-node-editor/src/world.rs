@@ -92,6 +92,15 @@ pub struct EditorWorld<G: NodeGraph> {
     /// Left here rather than opened by the operator, for the reason everything here is:
     /// an operator never touches a widget, and a menu on screen is one (§38.3).
     pub menu: Option<crate::Menu>,
+    /// A link being dragged out of a port: from its output end to its input end, in canvas
+    /// coordinates, for the driver to draw over the canvas.
+    pub link_preview: Option<(Point, Point)>,
+    /// Whether the running operator needs to know what is under the pointer on every move.
+    ///
+    /// While an operator holds the pointer the canvas below sees no events and publishes no
+    /// hover; the driver picks for it instead — and only while this asks, so a node drag,
+    /// which needs no hover, does not pay a pick per move.
+    pub track_hover: bool,
     /// Set when something changed that only affects pixels.
     pub dirty: bool,
     /// Changes to the shape of the graph the views have not been told about yet.
@@ -130,6 +139,8 @@ impl<G: NodeGraph> EditorWorld<G> {
             pan: Vec2::ZERO,
             zoom: Vec::new(),
             menu: None,
+            link_preview: None,
+            track_hover: false,
             dirty: false,
             edits: Vec::new(),
             new_node_size: DEFAULT_NODE_SIZE,

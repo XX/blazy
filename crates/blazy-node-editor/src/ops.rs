@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use blazy_canvas::CanvasHit;
+use blazy_canvas::{CanvasHit, PortSide};
 use blazy_ops::event::{OpEvent, Pattern};
 use blazy_ops::keymap::{Binding, Keymap, Props};
 use blazy_ops::runtime::{OpCtx, OpRuntime};
@@ -608,7 +608,15 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for DeleteNodeOp {
 fn ends<G: NodeGraph>(cx: &OpCtx<'_, EditorWorld<G>>) -> Option<Link> {
     let (from, to) = (cx.props().int("from", -1), cx.props().int("to", -1));
     if from >= 0 && to >= 0 {
-        return Some(Link::new(from as usize, to as usize));
+        // Ports as well, when a script names them; output 0 and input 0 when it does not,
+        // which is what a link between two whole nodes always meant.
+        let port = |name| u16::try_from(cx.props().int(name, 0)).unwrap_or(0);
+        return Some(Link::between(
+            from as usize,
+            port("from_port"),
+            to as usize,
+            port("to_port"),
+        ));
     }
     let mut selected = cx.world().selection.iter().copied();
     match (selected.next(), selected.next(), selected.next()) {
@@ -650,6 +658,130 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddLinkOp {
         cx.push_undo(Box::new(LinkStep { link, added: true }));
         OpResult::Finished
     }
+}
+
+/// Drags a link out of a port and drops it on another node's port.
+///
+/// Modal, started by a drag that began on a port (bound ahead of `node.move`, whose poll
+/// would otherwise take the press, since a port is part of its node). While it runs it
+/// asks the driver to pick on every move (`EditorWorld::track_hover`) — the pointer is the
+/// operator's, the canvas below sees no events and publishes no hover — and leaves the
+/// curve to draw in `EditorWorld::link_preview`. On release over a port of the other side
+/// of another node, the link goes into the graph through the same path `link.add` takes,
+/// undo step included; anywhere else nothing happens. `Escape` or the other button
+/// cancels.
+#[derive(Default)]
+pub struct LinkDragOp {
+    /// The port the drag started from: node, side, number, and where it is.
+    start: Option<(usize, PortSide, u16, Point)>,
+}
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
+    fn name(&self) -> &'static str {
+        "link.drag"
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        matches!(cx.world().hover, Some(CanvasHit::Port { .. }))
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let Some(CanvasHit::Port { index, side, port, pos }) = cx.world().hover else {
+            return OpResult::Cancelled;
+        };
+        self.start = Some((index, side, port, pos));
+        let pointer = cx.world().pointer;
+        let world = cx.world_mut();
+        world.track_hover = true;
+        world.link_preview = Some(preview(side, pos, pointer));
+        world.dirty = true;
+        OpResult::Running
+    }
+
+    fn modal(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let Some((node, side, port, at)) = self.start else {
+            return OpResult::Cancelled;
+        };
+        let event = cx.event().cloned();
+        match event {
+            Some(OpEvent::Move { .. }) => {
+                let pointer = cx.world().pointer;
+                // To the port under the pointer if it would take the link, so the curve
+                // shows where it will land; to the pointer otherwise.
+                let end = match cx.world().hover {
+                    Some(CanvasHit::Port {
+                        index,
+                        side: other,
+                        pos,
+                        ..
+                    }) if index != node && other != side => pos,
+                    _ => pointer,
+                };
+                let world = cx.world_mut();
+                world.link_preview = Some(preview(side, at, end));
+                world.dirty = true;
+                OpResult::Running
+            },
+            Some(OpEvent::Release {
+                button: PointerButton::Primary,
+                ..
+            }) => {
+                let target = cx.world().hover;
+                end_drag(cx);
+                let Some(CanvasHit::Port {
+                    index,
+                    side: other,
+                    port: other_port,
+                    ..
+                }) = target
+                else {
+                    return OpResult::Cancelled;
+                };
+                if index == node || other == side {
+                    return OpResult::Cancelled;
+                }
+                // Out of an output, into an input, whichever end the drag started from.
+                let link = match side {
+                    PortSide::Output => Link::between(node, port, index, other_port),
+                    PortSide::Input => Link::between(index, other_port, node, port),
+                };
+                if !cx.world_mut().add_link(link) {
+                    return OpResult::Cancelled;
+                }
+                cx.push_undo(Box::new(LinkStep { link, added: true }));
+                OpResult::Finished
+            },
+            Some(OpEvent::Key {
+                key: Key::Named(NamedKey::Escape),
+                down: true,
+                ..
+            })
+            | Some(OpEvent::Press {
+                button: PointerButton::Secondary,
+                ..
+            }) => {
+                end_drag(cx);
+                OpResult::Cancelled
+            },
+            _ => OpResult::Running,
+        }
+    }
+}
+
+/// The preview of a link being dragged, from its output end to its input end.
+fn preview(side: PortSide, port: Point, other: Point) -> (Point, Point) {
+    match side {
+        PortSide::Output => (port, other),
+        PortSide::Input => (other, port),
+    }
+}
+
+/// Takes the drag's traces out of the world, whatever the drag ended in.
+fn end_drag<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>) {
+    let world = cx.world_mut();
+    world.track_hover = false;
+    world.link_preview = None;
+    world.dirty = true;
 }
 
 /// Deletes the link under the pointer, or the one a binding names.
@@ -744,8 +876,10 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for RedoOp {
 pub fn default_keymap() -> Keymap {
     Keymap::new()
         .with(CANVAS_CONTEXT, vec![
-            // Left drag: the node under the pointer, or the view. Two rows, and the
-            // polls tell them apart.
+            // Left drag: a link out of the port under the pointer, the node under the
+            // pointer, or the view. Three rows, and the polls tell them apart — the port
+            // first, because a port is part of its node and `node.move` would take it.
+            Binding::new(Pattern::drag(PointerButton::Primary), "link.drag"),
             Binding::new(Pattern::drag(PointerButton::Primary), "node.move"),
             Binding::new(Pattern::drag(PointerButton::Primary), "view.pan"),
             // Left click: the node under the pointer, or nothing at all — the sentence
@@ -839,6 +973,7 @@ pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
     runtime.register(MoveOp::default());
     runtime.register(PanOp::default());
     runtime.register(ZoomOp);
+    runtime.register(LinkDragOp::default());
     runtime.register(crate::MenuOp::new(NODE_MENU, node_menu()));
     runtime.register(AddNodeOp);
     runtime.register(DeleteNodeOp);

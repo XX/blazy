@@ -78,7 +78,7 @@ mod stats;
 mod widgets;
 
 pub use crate::detail::{CanvasDetail, DEFAULT_WIDGET_BUDGET, Detail, DetailBudget, DetailThresholds};
-pub use crate::links::{Link, LinkStyle};
+pub use crate::links::{Link, LinkStyle, PortLayout, PortSide, Ports, link_curve};
 pub use crate::source::NodeSource;
 pub use crate::stats::{CanvasCounters, CanvasHit, CanvasStats};
 pub use crate::widgets::{CanvasContent, CanvasLayer, WHEEL_ZOOM_RATE, wheel_pixels};

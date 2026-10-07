@@ -3,7 +3,7 @@
 use masonry::kurbo::Point;
 
 use crate::detail::Detail;
-use crate::links::Link;
+use crate::links::{Link, PortSide};
 
 /// What the canvas found under a point.
 ///
@@ -19,6 +19,17 @@ pub enum CanvasHit {
         /// Canvas-space position of the node's top-left corner.
         pos: Point,
     },
+    /// A port of a node, which is where a link is dragged out of or into.
+    Port {
+        /// The node the port is on.
+        index: usize,
+        /// Which side of the node.
+        side: PortSide,
+        /// Its number on that side.
+        port: u16,
+        /// Where it is, in canvas coordinates.
+        pos: Point,
+    },
     /// A link, by its index in the edge list.
     Link {
         /// Index into the edge list given to [`CanvasLayer::with_links`](crate::CanvasLayer::with_links).
@@ -29,10 +40,14 @@ pub enum CanvasHit {
 }
 
 impl CanvasHit {
-    /// The node index, if this is a node.
+    /// The node index, if this is a node or one of its ports.
+    ///
+    /// A port is part of its node for everything that is not about ports: a click on one
+    /// selects the node. What tells a port apart is the binding order — the link drag is
+    /// bound before the node drag, and its poll is the one that asks for a port.
     pub fn node(self) -> Option<usize> {
         match self {
-            Self::Node { index, .. } => Some(index),
+            Self::Node { index, .. } | Self::Port { index, .. } => Some(index),
             Self::Link { .. } => None,
         }
     }
@@ -41,7 +56,15 @@ impl CanvasHit {
     pub fn link(self) -> Option<usize> {
         match self {
             Self::Link { edge, .. } => Some(edge),
-            Self::Node { .. } => None,
+            Self::Node { .. } | Self::Port { .. } => None,
+        }
+    }
+
+    /// The port, if this is one: its node, side and number.
+    pub fn port(self) -> Option<(usize, PortSide, u16)> {
+        match self {
+            Self::Port { index, side, port, .. } => Some((index, side, port)),
+            Self::Node { .. } | Self::Link { .. } => None,
         }
     }
 }
@@ -198,6 +221,12 @@ pub struct CanvasCounters {
     /// by node *density* and not by the size of the graph — which is the difference
     /// between a pointer that stays cheap on a million nodes and one that does not.
     pub hit_node_tests: u64,
+    /// Ports measured against the pointer, summed over every pick.
+    ///
+    /// Bounded by the nodes near the pointer and the ports each has, never by the graph:
+    /// a pick that asked every node how many ports it has would be a pick that cost the
+    /// graph.
+    pub hit_port_tests: u64,
     /// Link curves whose geometry a pick actually rebuilt and measured, summed.
     ///
     /// The expensive half, and the one that must not follow the zoom: a curve counted

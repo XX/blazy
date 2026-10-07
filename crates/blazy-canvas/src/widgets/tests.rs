@@ -169,7 +169,14 @@ fn a_node_wins_over_a_link_running_under_it() {
 
     assert!(
         blazy_shape::near_segment(
-            crate::links::link_curve(node_rect(0.0, 0.0), node_rect(400.0, 0.0)).into(),
+            {
+                let (start, end) = crate::links::PortLayout::default().ends(
+                    Link::new(0, 1),
+                    node_rect(0.0, 0.0),
+                    node_rect(400.0, 0.0),
+                );
+                crate::links::link_curve(start, end).into()
+            },
             on_both,
             4.0
         ),
@@ -442,7 +449,8 @@ impl Widget for Curves {
         if self.batched {
             let mut path = BezPath::new();
             for &(from, to) in &self.links {
-                push_link(&mut path, from, to);
+                let (start, end) = crate::links::PortLayout::default().ends(Link::new(0, 1), from, to);
+                push_link(&mut path, start, end);
             }
             if !path.is_empty() {
                 painter.stroke(&path, &stroke, colour).draw();
@@ -450,7 +458,8 @@ impl Widget for Curves {
         } else {
             for &(from, to) in &self.links {
                 let mut path = BezPath::new();
-                push_link(&mut path, from, to);
+                let (start, end) = crate::links::PortLayout::default().ends(Link::new(0, 1), from, to);
+                push_link(&mut path, start, end);
                 painter.stroke(&path, &stroke, colour).draw();
             }
         }

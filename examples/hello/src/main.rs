@@ -16,7 +16,8 @@
 //! cargo run -p hello -- my.keymap     # with keymap overrides
 //! ```
 //!
-//! Drag a node to move it, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
+//! Drag a node to move it, drag out of a port (the dots on a node's edges) into another
+//! node's port to link them, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
 //! delete, `F` to link the two selected nodes, `Ctrl+Z` to undo. `Alt+X` / `Alt+Y` split
 //! the area under the pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another
 //! window over the same graph and `Alt+D` moves the area into one of its own.
@@ -29,7 +30,7 @@ use std::rc::Rc;
 
 use blazy::app::EditorApp;
 use blazy::areas::SplitTree;
-use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource};
+use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::core::{DefaultProperties, NewWidget, PropertySet, PropertyStack, Selector, Widget, WidgetId};
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{BezPath, Point, Rect, Shape, Size};
@@ -49,6 +50,16 @@ const NODES: usize = 12;
 const COLS: usize = 4;
 /// Every node's size.
 const NODE: Size = Size::new(140.0, 60.0);
+/// Inputs and outputs every node has.
+const PORTS_IN: u16 = 2;
+const PORTS_OUT: u16 = 1;
+/// Where they are on a node: in two rows down its edges, drawn as dots.
+const PORT_LAYOUT: PortLayout = PortLayout {
+    first: Some(20.0),
+    step: 20.0,
+    dot_radius: 4.0,
+    dot_color: Color::from_rgb8(0x9a, 0x9a, 0xa8),
+};
 
 /// The graph: where each node is, which nodes are linked, and who is looking.
 ///
@@ -133,11 +144,9 @@ impl NodeGraph for Graph {
 
     fn insert_link(&mut self, link: Link) -> bool {
         let live = |end: u32| self.nodes.get(end as usize).is_some_and(Option::is_some);
-        let known = self
-            .links
-            .iter()
-            .any(|l| (l.from, l.to) == (link.from, link.to) || (l.from, l.to) == (link.to, link.from));
-        if link.from == link.to || !live(link.from) || !live(link.to) || known {
+        let known = self.links.iter().any(|&l| l == link || l == link.reversed());
+        let ports = link.from_port < PORTS_OUT && link.to_port < PORTS_IN;
+        if link.from == link.to || !live(link.from) || !live(link.to) || known || !ports {
             return false;
         }
         self.links.push(link);
@@ -145,8 +154,7 @@ impl NodeGraph for Graph {
     }
 
     fn remove_link(&mut self, link: Link) {
-        self.links
-            .retain(|l| (l.from, l.to) != (link.from, link.to) && (l.from, l.to) != (link.to, link.from));
+        self.links.retain(|&l| l != link && l != link.reversed());
     }
 }
 
@@ -183,6 +191,14 @@ impl NodeSource for Nodes {
         }
         if !path.is_empty() {
             painter.fill(&path, FILL).draw();
+        }
+    }
+
+    /// Two inputs and an output: what a link can be dragged out of and into.
+    fn ports(&mut self, _index: usize) -> Ports {
+        Ports {
+            inputs: PORTS_IN,
+            outputs: PORTS_OUT,
         }
     }
 
@@ -230,7 +246,9 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
             move |index: usize| graph.borrow().node_rect_of(index)
         };
         let nodes = Nodes { graph, view: None };
-        let canvas = CanvasLayer::new(names, geometry, nodes).with_links(links);
+        let canvas = CanvasLayer::new(names, geometry, nodes)
+            .with_links(links)
+            .with_ports(PORT_LAYOUT);
         // The nodes look selected by themselves, so the editor outlines only the far
         // field, where there is no node widget to wear the class.
         let style = OverlayStyle {
@@ -323,5 +341,36 @@ mod tests {
             })
         });
         assert!(in_other, "the other area shows the link in the same frame (§30)");
+    }
+
+    /// A quick pull out of a port, whose first move is already past the port, is a link.
+    ///
+    /// The gesture is decided on the first move past the drag threshold and is about where
+    /// the press was. Deciding it on what the pointer was over by then handed a fast drag
+    /// out of a port to the view, which panned — seen on a render of this window, and
+    /// invisible to the editor's own tests, whose single-widget harness did not move the
+    /// hover while the button was down (§52). Here, in the shape the window builds.
+    #[test]
+    fn a_fast_pull_out_of_a_port_links_rather_than_pans() {
+        use blazy::masonry::kurbo::Point;
+        use blazy::masonry::ui_events::pointer::PointerButton;
+
+        let graph = Graph::grid();
+        let screen = app(&graph).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
+        let _ = harness.redraw();
+        // Node 0 is at (40, 40), 140 by 60: its output is at (180, 60). Node 1 is at
+        // (220, 40): its second input is at (220, 80).
+        harness.mouse_move(Point::new(180.0, 60.0));
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_move(Point::new(190.0, 90.0));
+        harness.mouse_move(Point::new(220.0, 80.0));
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+        assert!(
+            graph.borrow().links.contains(&Link::between(0, 0, 1, 1)),
+            "the pull made a link, from node 0's output to node 1's second input"
+        );
     }
 }

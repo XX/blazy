@@ -17,7 +17,7 @@
 
 use std::any::TypeId;
 
-use blazy::canvas::{CanvasDetail, CanvasLayer, Detail, NodeSource};
+use blazy::canvas::{CanvasDetail, CanvasLayer, Detail, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx,
@@ -493,6 +493,15 @@ impl GraphSource {
     }
 }
 
+/// Where a node's ports are: in line with its controls, an input beside each and the
+/// output beside the first.
+pub const PORTS: PortLayout = PortLayout {
+    first: Some(HEADER_HEIGHT + PADDING + 10.0),
+    step: 20.0 + PADDING,
+    dot_radius: 4.0,
+    dot_color: Color::from_rgb8(0x9a, 0x9a, 0xa8),
+};
+
 impl NodeSource for GraphSource {
     fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
         GraphNode::build(&self.graph, self.canvas, index, detail)
@@ -525,6 +534,13 @@ impl NodeSource for GraphSource {
                 views.note(Change::Moved { index, pos });
                 peers.extend(views.ids());
             },
+        }
+    }
+
+    fn ports(&mut self, _index: usize) -> Ports {
+        Ports {
+            inputs: crate::model::INPUTS,
+            outputs: crate::model::OUTPUTS,
         }
     }
 

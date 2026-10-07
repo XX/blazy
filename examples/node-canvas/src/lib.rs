@@ -146,6 +146,7 @@ impl CanvasSpec {
             // model's (§43): two views over one graph must not hold two copies of it.
             .with_links(self.links.unwrap_or_else(|| graph.borrow().links().to_vec()))
             .with_far_overscan(self.far.overscan)
+            .with_ports(crate::node::PORTS)
             .with_link_style(blazy::canvas::LinkStyle {
                 min_screen_length: self.far.min_link_px,
                 ..blazy::canvas::LinkStyle::default()

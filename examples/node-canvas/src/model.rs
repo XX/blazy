@@ -16,6 +16,11 @@ use blazy::node_editor::{Link, NodeGraph, Views};
 /// Node footprint in canvas units.
 pub const NODE_SIZE: Size = Size::new(160.0, 96.0);
 
+/// Inputs every node has: one for the slider, one for the checkbox.
+pub const INPUTS: u16 = 2;
+/// Outputs every node has.
+pub const OUTPUTS: u16 = 1;
+
 /// Spacing between nodes in the generated grid.
 pub const GRID_STEP: f64 = 220.0;
 /// Nodes per row in the generated grid.
@@ -350,6 +355,10 @@ impl NodeGraph for GraphModel {
         if link.from == link.to || !live(link.from) || !live(link.to) {
             return false;
         }
+        // Every node has the same ports: one output, and an input per control.
+        if link.from_port >= OUTPUTS || link.to_port >= INPUTS {
+            return false;
+        }
         if self.link_named(link).is_some() {
             return false;
         }
@@ -366,7 +375,7 @@ impl NodeGraph for GraphModel {
 
 /// Two links are the same link whichever way round they are written.
 fn same_link(a: Link, b: Link) -> bool {
-    (a.from, a.to) == (b.from, b.to) || (a.from, a.to) == (b.to, b.from)
+    a == b || a == b.reversed()
 }
 
 /// Shared handle to the graph.

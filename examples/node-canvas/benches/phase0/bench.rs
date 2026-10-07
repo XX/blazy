@@ -1072,8 +1072,12 @@ fn zoom_pick_sweep(opts: &Options) -> (usize, usize) {
 
     // Put the middle of the only link under the centre of the viewport, so that
     // zooming about the centre leaves it exactly where it is.
+    // Where the curve runs is where its ends are, and they are the ports (§52): the
+    // middle of the curve is the middle of its ends, since the handles are symmetric.
     let (from, to) = (node_rect(&mut harness, 0), node_rect(&mut harness, 1));
-    let midpoint = Point::new((from.x1 + to.x0) / 2.0, (from.center().y + to.center().y) / 2.0);
+    let start = node_canvas::node::PORTS.position(from, blazy::canvas::PortSide::Output, 0);
+    let end = node_canvas::node::PORTS.position(to, blazy::canvas::PortSide::Input, 0);
+    let midpoint = start.midpoint(end);
     harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
             CanvasLayer::pan(&mut canvas, VIEWPORT_CENTRE - midpoint);
@@ -1634,6 +1638,40 @@ fn evaluate(
             measured: (crate::ops::NOTCHES as f64 - by_keymap.invoked).max(0.0),
             bound: 0.5,
             unit: "notches that ran no operator/gesture",
+        });
+    }
+
+    if let (Some(link), Some(drag)) = (gesture("link drag", "tree"), gesture("drag (LMB)", "tree")) {
+        // Dragging a link out of a port adds the link, and costs what adding a link costs:
+        // the curve that follows the pointer is the editor's overlay, not the canvas's, so
+        // the frames of the drag lay out nothing and the one that adds it re-chooses the
+        // recorded set once (§43).
+        criteria.push(Criterion {
+            name: "a_link_drag_lays_out_only_its_link",
+            claim: "dragging a link lays out no more than the one structural edit at its end",
+            kind: Kind::Counter,
+            measured: link.content_layouts,
+            bound: 1.5,
+            unit: "layout passes/gesture",
+        });
+        // From the failing side: a drag that ended over a port and added nothing.
+        criteria.push(Criterion {
+            name: "every_link_drag_adds_its_link",
+            claim: "a drag from an output to an input adds the link",
+            kind: Kind::Counter,
+            measured: (1.0 - link.links_added).max(0.0),
+            bound: 0.5,
+            unit: "gestures that added no link",
+        });
+        // The pick per move is the link drag's, asked for while it runs; a node drag does not
+        // need to know what is under the pointer and must not pay for it.
+        criteria.push(Criterion {
+            name: "a_node_drag_does_not_pick_per_move",
+            claim: "dragging a node picks on the press, not on every move",
+            kind: Kind::Counter,
+            measured: drag.picks,
+            bound: 3.0,
+            unit: "picks/gesture",
         });
     }
 

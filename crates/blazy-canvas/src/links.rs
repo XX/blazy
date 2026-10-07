@@ -49,22 +49,135 @@ use std::collections::HashMap;
 use masonry::kurbo::{BezPath, CubicBez, Point, Rect};
 use masonry::peniko::Color;
 
-/// A connection between two nodes, by index into the canvas's node array.
+/// A connection from an output of one node to an input of another.
+///
+/// Nodes by index into the canvas's node array, ports by their number on that side of the
+/// node. [`Link::new`] connects port 0 to port 0, which is what a graph that knows nothing
+/// about ports means — and with the default [`PortLayout`] it is drawn exactly as a link
+/// was before ports existed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
     /// The node the curve leaves, by index.
     pub from: u32,
     /// The node the curve arrives at, by index.
     pub to: u32,
+    /// The output of `from` the curve leaves.
+    pub from_port: u16,
+    /// The input of `to` the curve arrives at.
+    pub to_port: u16,
 }
 
 impl Link {
-    /// An edge between two nodes, by index into the canvas's node array.
+    /// An edge between two nodes, from output 0 to input 0.
     pub fn new(from: usize, to: usize) -> Self {
+        Self::between(from, 0, to, 0)
+    }
+
+    /// An edge from output `from_port` of `from` to input `to_port` of `to`.
+    pub fn between(from: usize, from_port: u16, to: usize, to_port: u16) -> Self {
         Self {
             from: from as u32,
             to: to as u32,
+            from_port,
+            to_port,
         }
+    }
+
+    /// The same edge, written the other way round.
+    ///
+    /// A canvas names an edge whichever way it is written (`link_name`), because a graph
+    /// that does not care about direction writes it either way; the ports go with their
+    /// nodes.
+    #[must_use]
+    pub fn reversed(self) -> Self {
+        Self {
+            from: self.to,
+            to: self.from,
+            from_port: self.to_port,
+            to_port: self.from_port,
+        }
+    }
+}
+
+/// Which side of a node a port is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "a port is an input or an output, and that is all"
+)]
+pub enum PortSide {
+    /// On the left edge, where links arrive.
+    Input,
+    /// On the right edge, where links leave.
+    Output,
+}
+
+/// How many ports a node has on each side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::exhaustive_structs, reason = "configuration, constructed by the application")]
+pub struct Ports {
+    /// Ports on the left edge.
+    pub inputs: u16,
+    /// Ports on the right edge.
+    pub outputs: u16,
+}
+
+/// Where a node's ports are, as a rule rather than as a question to the application.
+///
+/// A rule because of where ports are needed: every link's curve ends at two of them, and
+/// the canvas builds curves in bulk — thousands for the recorded set, in the far field
+/// with no widget anywhere (§24, §31). A callback per endpoint would put the application
+/// in the middle of that. What the application does say is *how many* ports a node has
+/// (`NodeSource::ports`), and only when the pointer is near one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "configuration, constructed with ..Default::default()"
+)]
+pub struct PortLayout {
+    /// How far below the node's top edge the first port is, in canvas units; `None` puts
+    /// every port at the middle of the edge, which is where a link ended before ports.
+    pub first: Option<f64>,
+    /// The distance between one port and the next, in canvas units.
+    pub step: f64,
+    /// The radius of the dot drawn at each port of a node that has a widget, in canvas
+    /// units; zero draws none. Nodes without widgets — the far field — have no dots.
+    pub dot_radius: f64,
+    /// The colour of the dots.
+    pub dot_color: Color,
+}
+
+impl Default for PortLayout {
+    fn default() -> Self {
+        Self {
+            first: None,
+            step: 0.0,
+            dot_radius: 0.0,
+            dot_color: Color::from_rgb8(0x9a, 0x9a, 0xa8),
+        }
+    }
+}
+
+impl PortLayout {
+    /// Where port `port` on `side` of a node occupying `rect` is, in canvas coordinates.
+    pub fn position(&self, rect: Rect, side: PortSide, port: u16) -> Point {
+        let x = match side {
+            PortSide::Input => rect.x0,
+            PortSide::Output => rect.x1,
+        };
+        let y = match self.first {
+            None => rect.center().y,
+            Some(first) => rect.y0 + first + f64::from(port) * self.step,
+        };
+        Point::new(x, y)
+    }
+
+    /// Where `link` leaves `from` and arrives at `to`.
+    pub(crate) fn ends(&self, link: Link, from: Rect, to: Rect) -> (Point, Point) {
+        (
+            self.position(from, PortSide::Output, link.from_port),
+            self.position(to, PortSide::Input, link.to_port),
+        )
     }
 }
 
@@ -255,7 +368,7 @@ impl LinkLayer {
     pub(crate) fn name_of(&self, link: Link) -> Option<u32> {
         self.incident(link.from as usize).find(|&name| {
             let edge = self.edges[name as usize].expect("incident lists only name live edges");
-            edge == link || (edge.from == link.to && edge.to == link.from)
+            edge == link || edge == link.reversed()
         })
     }
 
@@ -493,20 +606,18 @@ fn pack(edges: &[Option<Link>], node_count: usize) -> (Vec<u32>, Vec<u32>) {
     (offsets, incident)
 }
 
-/// The curve for one link, from the right edge of `from` to the left edge of `to`.
+/// The curve of a link from `start` to `end`.
 ///
-/// A cubic with horizontal handles, which is what every node editor draws and what
-/// makes two links between the same pair of columns distinguishable. Ports are the
-/// midpoints of the facing edges: real ports are a node's business, and the canvas
-/// does not know how many a node has.
+/// A cubic with horizontal handles, which is what every node editor draws and what makes
+/// two links between the same pair of columns distinguishable. From two points rather
+/// than two nodes, so that the curve a link is drawn with and the one an editor previews
+/// while a link is being dragged out of a port are the same curve.
 ///
-/// The curve, not the path, is what both callers actually want: painting strokes it
-/// and hit testing measures the distance to it. One function so that the two can
-/// never disagree about where a link is — a pointer that picks a curve the eye does
+/// The curve, not the path, is what both of the canvas's callers actually want: painting
+/// strokes it and hit testing measures the distance to it. One function so that the two
+/// can never disagree about where a link is — a pointer that picks a curve the eye does
 /// not see there is worse than one that misses.
-pub(crate) fn link_curve(from: Rect, to: Rect) -> CubicBez {
-    let start = Point::new(from.x1, from.center().y);
-    let end = Point::new(to.x0, to.center().y);
+pub fn link_curve(start: Point, end: Point) -> CubicBez {
     // Handles scale with the gap so a short link does not loop and a long one does
     // not go slack.
     let reach = ((end.x - start.x).abs() * 0.5).max(24.0);
@@ -525,8 +636,8 @@ pub(crate) fn link_curve(from: Rect, to: Rect) -> CubicBez {
 /// instead of a continuation of the previous link: stroking finishes the subpath on
 /// every `MoveTo` and caps it, so the two links never grow a segment joining them.
 /// That is the only reason one command can carry thousands of unrelated curves.
-pub(crate) fn push_link(path: &mut BezPath, from: Rect, to: Rect) {
-    let curve = link_curve(from, to);
+pub(crate) fn push_link(path: &mut BezPath, start: Point, end: Point) {
+    let curve = link_curve(start, end);
     path.move_to(curve.p0);
     path.curve_to(curve.p1, curve.p2, curve.p3);
 }
@@ -587,6 +698,12 @@ mod tests {
     use masonry::kurbo::Size;
 
     use super::*;
+
+    /// A link between two node rectangles, ending where the default layout puts ports.
+    fn push_between(path: &mut BezPath, from: Rect, to: Rect) {
+        let (start, end) = PortLayout::default().ends(Link::new(0, 1), from, to);
+        push_link(path, start, end);
+    }
 
     fn rect(x: f64, y: f64) -> Rect {
         Rect::from_origin_size(Point::new(x, y), Size::new(100.0, 50.0))
@@ -740,7 +857,7 @@ mod tests {
     #[test]
     fn the_curve_starts_and_ends_on_the_facing_edges() {
         let mut path = BezPath::new();
-        push_link(&mut path, rect(0.0, 0.0), rect(300.0, 100.0));
+        push_between(&mut path, rect(0.0, 0.0), rect(300.0, 100.0));
         let start = path.elements()[0];
         assert!(
             matches!(start, masonry::kurbo::PathEl::MoveTo(p) if p == Point::new(100.0, 25.0)),
@@ -753,8 +870,8 @@ mod tests {
     #[test]
     fn a_batch_starts_a_new_subpath_per_link() {
         let mut path = BezPath::new();
-        push_link(&mut path, rect(0.0, 0.0), rect(300.0, 0.0));
-        push_link(&mut path, rect(0.0, 900.0), rect(300.0, 900.0));
+        push_between(&mut path, rect(0.0, 0.0), rect(300.0, 0.0));
+        push_between(&mut path, rect(0.0, 900.0), rect(300.0, 900.0));
 
         let moves = path
             .elements()

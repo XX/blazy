@@ -5,6 +5,7 @@ use masonry::imaging::Painter;
 use masonry::kurbo::{Point, Rect};
 
 use crate::detail::Detail;
+use crate::links::Ports;
 
 /// Builds the widget for a node when it scrolls into view.
 ///
@@ -84,6 +85,18 @@ pub trait NodeSource: 'static {
     /// the short-link rule makes and for the same reason (§31.4).
     fn paint_far(&mut self, nodes: &[(usize, Rect)], scale: f64, painter: &mut Painter<'_>) {
         let _ = (nodes, scale, painter);
+    }
+
+    /// How many ports node `index` has on each side.
+    ///
+    /// Asked only when the pointer is near the node — to pick a port — and for the dots of
+    /// nodes that have widgets, never per link: where a port *is* is the canvas's rule
+    /// (`PortLayout`), and a link names its ports by number. The default is one input and
+    /// one output, which is what a link meant before ports and what makes a link draggable
+    /// out of any node of an application that never heard of ports.
+    fn ports(&mut self, index: usize) -> Ports {
+        let _ = index;
+        Ports { inputs: 1, outputs: 1 }
     }
 
     /// Whether the canvas-space `point` is inside node `index`, whose rectangle is

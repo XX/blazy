@@ -21,7 +21,7 @@ use masonry::layout::{LenReq, Length};
 
 use crate::detail::{CanvasDetail, Detail, DetailBudget};
 use crate::index::SpatialIndex;
-use crate::links::{Link, LinkLayer, LinkStyle, link_curve, push_link};
+use crate::links::{Link, LinkLayer, LinkStyle, PortLayout, PortSide, link_curve, push_link};
 use crate::source::NodeSource;
 use crate::stats::{CanvasHit, CanvasStats};
 
@@ -116,6 +116,8 @@ const ZOOM_EPSILON: f64 = 1e-9;
 /// that takes the wheel over (`view.zoom`) has to zoom at the same speed, or rebinding
 /// the wheel changes how it feels.
 pub const WHEEL_ZOOM_RATE: f64 = 0.0015;
+/// How close to a port the pointer has to be to pick it, in screen pixels.
+const PORT_SLOP_PX: f64 = 7.0;
 /// A wheel notch, in pixels, matching what `Portal` assumes.
 const WHEEL_LINE_PX: f64 = 120.0;
 
@@ -254,12 +256,13 @@ fn diff_sorted(
 /// One place, because the box is used for three different decisions — whether a link is
 /// too short to draw, whether the pointer can be near it, and nothing else may disagree
 /// with either.
-fn link_bounds(from: &Slot, to: &Slot) -> Rect {
-    link_curve(
+fn link_bounds(link: Link, from: &Slot, to: &Slot, ports: &PortLayout) -> Rect {
+    let (start, end) = ports.ends(
+        link,
         Rect::from_origin_size(from.pos, from.size),
         Rect::from_origin_size(to.pos, to.size),
-    )
-    .bounding_box()
+    );
+    link_curve(start, end).bounding_box()
 }
 
 /// Whether `outer` fully contains `inner`.
@@ -331,6 +334,8 @@ pub struct CanvasContent {
     links: LinkLayer,
     /// How links are stroked.
     link_style: LinkStyle,
+    /// Where the ends of a link are on a node.
+    pub(crate) ports: PortLayout,
     /// How far past the viewport the far field and the link set are recorded, pushed
     /// down by the parent.
     far_overscan: f64,
@@ -409,6 +414,7 @@ pub struct CanvasContent {
     composes: u64,
     builds: u64,
     class_changes: u64,
+    hit_port_tests: u64,
     /// Nodes inserted or removed.
     node_edits: u64,
     /// Links inserted or removed.
@@ -445,6 +451,7 @@ impl CanvasContent {
             far: FarField::default(),
             links: LinkLayer::default(),
             link_style: LinkStyle::default(),
+            ports: PortLayout::default(),
             far_overscan: FAR_OVERSCAN,
             active: None,
             hovered: None,
@@ -469,6 +476,7 @@ impl CanvasContent {
             composes: 0,
             builds: 0,
             class_changes: 0,
+            hit_port_tests: 0,
             fresh: Vec::new(),
             node_edits: 0,
             link_edits: 0,
@@ -598,7 +606,66 @@ impl CanvasContent {
     /// either of them, so the canvas has to answer for both.
     fn hit(&mut self, canvas_pos: Point, scale: f64) -> Option<CanvasHit> {
         self.hit_queries += 1;
-        self.hit_node(canvas_pos).or_else(|| self.hit_link(canvas_pos, scale))
+        // Ports before nodes: a port sits on a node's edge, half inside it, and a press
+        // there means "drag a link out of it", not "drag the node".
+        self.hit_port(canvas_pos, scale)
+            .or_else(|| self.hit_node(canvas_pos))
+            .or_else(|| self.hit_link(canvas_pos, scale))
+    }
+
+    /// The port under a point, or `None`.
+    ///
+    /// The nodes near the point come from the grid, as for a node; only those are asked
+    /// how many ports they have (`NodeSource::ports`), so the application is called a
+    /// handful of times per pick, never per link. The tolerance is in screen pixels, for
+    /// the reason the link's is (§25.2), and never smaller than the dot that is drawn.
+    fn hit_port(&mut self, canvas_pos: Point, scale: f64) -> Option<CanvasHit> {
+        // Not in the far field: a node there is a few pixels across, its ports are not
+        // drawn, and a tolerance of a few screen pixels is hundreds of canvas units — a
+        // pick would find a port nobody can see on a node nobody can grab.
+        if self.far.active {
+            return None;
+        }
+        let slop = if scale > f64::EPSILON {
+            PORT_SLOP_PX / scale
+        } else {
+            0.0
+        };
+        let radius = slop.max(self.ports.dot_radius);
+        let mut candidates = std::mem::take(&mut self.scratch_candidates);
+        self.index.candidates(
+            Rect::from_points(canvas_pos, canvas_pos).inflate(radius, radius),
+            &mut candidates,
+        );
+        let mut found = None;
+        'nodes: for &index in candidates.iter().rev() {
+            let Some(rect) = self.live_rect_of(index) else {
+                continue;
+            };
+            // Only a node with a widget has ports to grab — the ones whose dots are drawn.
+            // A node without one is a shape in the canvas's own scene, too small to aim at.
+            if self.slots[index].pod.is_none() || !rect.inflate(radius, radius).contains(canvas_pos) {
+                continue;
+            }
+            let ports = self.source.ports(index);
+            for (side, count) in [(PortSide::Output, ports.outputs), (PortSide::Input, ports.inputs)] {
+                for port in 0..count {
+                    self.hit_port_tests += 1;
+                    let at = self.ports.position(rect, side, port);
+                    if at.distance(canvas_pos) <= radius {
+                        found = Some(CanvasHit::Port {
+                            index,
+                            side,
+                            port,
+                            pos: at,
+                        });
+                        break 'nodes;
+                    }
+                }
+            }
+        }
+        self.scratch_candidates = candidates;
+        found
     }
 
     /// The topmost node under a point, or `None`.
@@ -682,7 +749,8 @@ impl CanvasContent {
                 continue;
             };
             examined += 1;
-            let curve = link_curve(from, to);
+            let (start, end) = self.ports.ends(link, from, to);
+            let curve = link_curve(start, end);
             if near_segment(curve.into(), canvas_pos, radius) {
                 found = Some(CanvasHit::Link {
                     edge: edge as usize,
@@ -886,9 +954,10 @@ impl CanvasContent {
         slot.pos = pos;
         self.index.moved(index, pos);
         let slots = &self.slots;
+        let ports = &self.ports;
         self.links.node_moved(index, |link| {
             match (slots.get(link.from as usize), slots.get(link.to as usize)) {
-                (Some(from), Some(to)) if from.alive && to.alive => link_bounds(from, to),
+                (Some(from), Some(to)) if from.alive && to.alive => link_bounds(link, from, to, ports),
                 _ => Rect::ZERO,
             }
         });
@@ -1049,6 +1118,7 @@ impl CanvasContent {
             0.0
         };
         let slots = &self.slots;
+        let ports = &self.ports;
         self.links.measure_recorded(|link| {
             let (Some(from), Some(to)) = (
                 slots.get(link.from as usize).filter(|s| s.alive),
@@ -1059,7 +1129,7 @@ impl CanvasContent {
                 // box it gets rejects it from every pick, which is the same answer.
                 return Some(Rect::ZERO);
             };
-            let bounds = link_bounds(from, to);
+            let bounds = link_bounds(link, from, to, ports);
             // The diagonal of the box the curve occupies, not the chord: a link that
             // bows away and comes back is visible even when its endpoints nearly
             // coincide. It is also the conservative choice — never smaller than either
@@ -1153,6 +1223,35 @@ impl Widget for CanvasContent {
         self.composes += 1;
     }
 
+    /// The dots of the ports of every node that has a widget, over the nodes.
+    ///
+    /// Over rather than under, because a port sits on its node's edge and half of it is
+    /// inside the node. Only for nodes with widgets: in the far field a node is a few
+    /// pixels and a dot on it is noise. Off unless the application sizes the dots
+    /// (`PortLayout::dot_radius`), so an application that draws its own ports, or has none,
+    /// pays nothing.
+    fn post_paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        if self.ports.dot_radius <= 0.0 || self.far.active {
+            return;
+        }
+        let mut dots = BezPath::new();
+        for &index in &self.live {
+            let Some(rect) = self.live_rect_of(index) else {
+                continue;
+            };
+            let ports = self.source.ports(index);
+            for (side, count) in [(PortSide::Input, ports.inputs), (PortSide::Output, ports.outputs)] {
+                for port in 0..count {
+                    let at = self.ports.position(rect, side, port);
+                    dots.extend(masonry::kurbo::Circle::new(at, self.ports.dot_radius).path_elements(0.1));
+                }
+            }
+        }
+        if !dots.is_empty() {
+            painter.fill(&dots, self.ports.dot_color).draw();
+        }
+    }
+
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
         // Links go under the nodes, at every detail level: they are the graph's
         // structure, and a graph too small to show a node's controls still has to
@@ -1187,7 +1286,8 @@ impl Widget for CanvasContent {
                 } else {
                     &mut plain
                 };
-                push_link(path, from, to);
+                let (start, end) = self.ports.ends(link, from, to);
+                push_link(path, start, end);
             }
             if !plain.is_empty() {
                 painter.stroke(&plain, &stroke, self.link_style.color).draw();
@@ -1256,6 +1356,7 @@ fn publish_hit_stats(stats: &Cell<CanvasStats>, content: &CanvasContent) {
     current.hovered = content.hovered;
     current.counters.hit_queries = content.hit_queries;
     current.counters.hit_node_tests = content.hit_node_tests;
+    current.counters.hit_port_tests = content.hit_port_tests;
     current.counters.hit_curve_tests = content.hit_curve_tests;
     current.counters.hit_curve_scans = content.hit_curve_scans;
     stats.set(current);

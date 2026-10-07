@@ -108,7 +108,7 @@ impl NodeGraph for Row {
 
 /// Two links are the same link whichever way round they are written.
 fn same_link(a: Link, b: Link) -> bool {
-    (a.from, a.to) == (b.from, b.to) || (a.from, a.to) == (b.to, b.from)
+    a == b || a == b.reversed()
 }
 
 const SIZE: Size = Size::new(100.0, 60.0);
@@ -885,4 +885,107 @@ fn a_menu_opened_by_the_edge_stays_inside_the_window() {
     assert!(origin.x >= 0.0 && origin.y >= 0.0, "{origin:?}");
     assert!(origin.x + size.width <= 800.0 + 1e-9, "{origin:?} {size:?}");
     assert!(origin.y + size.height <= 400.0 + 1e-9, "{origin:?} {size:?}");
+}
+
+mod link_drag {
+    use masonry::core::TextEvent;
+    use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
+    use masonry::kurbo::Point;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use super::*;
+
+    /// Drags from `from` to `to` with the primary button, in steps.
+    fn drag(harness: &mut TestHarness<NodeEditor<Row>>, from: Point, to: Point) {
+        harness.mouse_move(from);
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        for step in 1..=8 {
+            harness.mouse_move(from + (to - from) * (f64::from(step) / 8.0));
+        }
+        let _ = harness.redraw();
+    }
+
+    fn release(harness: &mut TestHarness<NodeEditor<Row>>) {
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+    }
+
+    fn links(graph: &SharedGraph<Row>) -> Vec<Link> {
+        graph.borrow().links.clone()
+    }
+
+    /// Out of node 0's output, into node 1's input: a link, which undo takes back.
+    #[test]
+    fn a_link_dragged_from_an_output_to_an_input_is_added_and_undone() {
+        let graph = row(3);
+        let session = crate::EditorSession::new(&graph).share();
+        let mut harness = editor_harness(&graph, &session);
+        drag(&mut harness, Point::new(100.0, 30.0), Point::new(150.0, 30.0));
+        assert!(
+            session.borrow().world.link_preview.is_some(),
+            "the curve follows the pointer"
+        );
+        release(&mut harness);
+        assert_eq!(links(&graph), [Link::between(0, 0, 1, 0)]);
+        assert!(
+            session.borrow().world.link_preview.is_none(),
+            "and goes when the drag ends"
+        );
+        assert!(!session.borrow().world.track_hover, "and so does the pick per move");
+        let in_canvas = harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::link_name(&mut canvas, Link::between(0, 0, 1, 0)).is_some()
+            })
+        });
+        assert!(in_canvas, "the canvas shows it");
+
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::exec(&mut editor, "ed.undo", &Props::new());
+        });
+        assert!(links(&graph).is_empty(), "undo takes it back");
+    }
+
+    /// Dragged backwards, from an input to an output, it is the same link.
+    #[test]
+    fn a_link_dragged_from_an_input_runs_out_of_the_output_anyway() {
+        let graph = row(3);
+        let session = crate::EditorSession::new(&graph).share();
+        let mut harness = editor_harness(&graph, &session);
+        drag(&mut harness, Point::new(150.0, 30.0), Point::new(100.0, 30.0));
+        release(&mut harness);
+        assert_eq!(links(&graph), [Link::between(0, 0, 1, 0)]);
+    }
+
+    /// Dropped on nothing, it is nothing.
+    #[test]
+    fn a_link_dropped_on_empty_canvas_adds_nothing() {
+        let graph = row(3);
+        let session = crate::EditorSession::new(&graph).share();
+        let mut harness = editor_harness(&graph, &session);
+        drag(&mut harness, Point::new(100.0, 30.0), Point::new(125.0, 200.0));
+        release(&mut harness);
+        assert!(links(&graph).is_empty());
+        assert_eq!(session.borrow().runtime.history().depth(), 0, "and leaves no step");
+    }
+
+    /// Escape in the middle of a drag cancels it.
+    #[test]
+    fn escape_cancels_a_link_drag() {
+        let graph = row(3);
+        let session = crate::EditorSession::new(&graph).share();
+        let mut harness = editor_harness(&graph, &session);
+        let editor = harness.root_widget().ctx().widget_id();
+        harness.set_focus_fallback(Some(editor));
+        drag(&mut harness, Point::new(100.0, 30.0), Point::new(150.0, 30.0));
+        harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: Key::Named(NamedKey::Escape),
+            code: Code::Unidentified,
+            modifiers: Modifiers::empty(),
+            ..KeyboardEvent::default()
+        }));
+        assert!(session.borrow().world.link_preview.is_none());
+        release(&mut harness);
+        assert!(links(&graph).is_empty(), "the release after a cancel adds nothing");
+    }
 }
