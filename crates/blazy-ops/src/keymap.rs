@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 
 use crate::event::{Device, OpEvent, Pattern};
+pub use crate::keyfile::KeymapError;
 
 /// A name in a keymap: an operator's, a context's or a property's.
 ///
@@ -106,6 +107,23 @@ impl Props {
         }
     }
 
+    /// Sets `name` to `value`, replacing what it was.
+    ///
+    /// The in-place twin of the `with_*` builders, for a reader that does not know the
+    /// value's kind until it has read it. A name set twice keeps the last value, as a
+    /// file that says it twice means.
+    pub fn set(&mut self, name: Name, value: Value) {
+        match self.0.iter_mut().find(|(key, _)| *key == name) {
+            Some((_, slot)) => *slot = value,
+            None => self.0.push((name, value)),
+        }
+    }
+
+    /// Every property, in the order it was set.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
+        self.0.iter().map(|(name, value)| (name.as_ref(), *value))
+    }
+
     /// Whether any property is set.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -117,7 +135,7 @@ impl Props {
 }
 
 /// One entry of a keymap.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Binding {
     /// The event this binding fires on.
     pub pattern: Pattern,
@@ -146,7 +164,7 @@ impl Binding {
 }
 
 /// The bindings that apply in one context.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Section {
     /// The context this section belongs to, e.g. `"canvas"`.
     pub context: Name,
@@ -211,7 +229,7 @@ impl Thresholds {
 }
 
 /// A whole keymap.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Keymap {
     sections: Vec<Section>,
     thresholds: Thresholds,
@@ -284,6 +302,43 @@ impl Keymap {
                 .filter(move |section| section.context == context)
                 .flat_map(|section| section.bindings.iter())
         })
+    }
+
+    /// Every context's bindings, in the order the contexts were first added.
+    pub fn sections(&self) -> &[Section] {
+        &self.sections
+    }
+
+    /// Takes out the first binding of `op` on `pattern` in `context`, and says whether
+    /// there was one.
+    pub fn remove(&mut self, context: &str, pattern: &Pattern, op: &str) -> bool {
+        let Some(section) = self.sections.iter_mut().find(|section| section.context == context) else {
+            return false;
+        };
+        match section
+            .bindings
+            .iter()
+            .position(|binding| binding.pattern == *pattern && binding.op == op)
+        {
+            Some(at) => {
+                section.bindings.remove(at);
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// Puts `bindings` ahead of what `context` already holds, in their own order.
+    ///
+    /// What an override is: tried before the binding it overrides.
+    pub fn prepend(&mut self, context: impl Into<Name>, bindings: Vec<Binding>) {
+        let context = context.into();
+        match self.sections.iter_mut().find(|section| section.context == context) {
+            Some(section) => {
+                section.bindings.splice(0..0, bindings);
+            },
+            None => self.sections.push(Section { context, bindings }),
+        }
     }
 
     /// The bindings in a context, for a menu or a "what is bound to this" report.

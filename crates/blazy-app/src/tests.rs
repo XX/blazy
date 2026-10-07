@@ -366,3 +366,133 @@ fn a_bound_key_names_its_action_and_an_unbound_one_nothing() {
         "plain X is the editor's"
     );
 }
+
+/// Keys go to the editor of the area under the pointer.
+///
+/// Masonry hands a key to the focus fallback and nobody else; a window that names none
+/// has editors that never hear a key — which is what the window this crate replaced was,
+/// and nothing failed, because nothing that was not sent can fail.
+#[test]
+fn keys_go_to_the_area_under_the_pointer() {
+    use masonry::core::{PointerEvent, PointerInfo, PointerState, PointerType, PointerUpdate, TextEvent};
+    use masonry::dpi::PhysicalPosition;
+
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+
+    let zoom = |root: &mut RenderRoot, area: usize| {
+        edit_editor(root, area, |editor| {
+            NodeEditor::with_canvas(editor, |canvas| canvas.widget.zoom())
+        })
+    };
+    let before = (zoom(&mut root, 0), zoom(&mut root, 1));
+
+    // Over the right-hand area, the way the shell delivers a move — then `settled`.
+    let _ = root.handle_pointer_event(PointerEvent::Move(PointerUpdate {
+        pointer: PointerInfo {
+            pointer_id: None,
+            persistent_device_id: None,
+            pointer_type: PointerType::Mouse,
+        },
+        current: PointerState {
+            position: PhysicalPosition::new(900.0, 400.0),
+            ..Default::default()
+        },
+        coalesced: vec![],
+        predicted: vec![],
+    }));
+    app.settled(&mut cx, key, &mut root);
+    let _ = root.handle_text_event(TextEvent::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: Key::Character("-".into()),
+        code: Code::Unidentified,
+        modifiers: Modifiers::empty(),
+        ..KeyboardEvent::default()
+    }));
+    let _ = root.redraw();
+
+    assert_eq!(
+        zoom(&mut root, 0),
+        before.0,
+        "the area the pointer is not over heard nothing"
+    );
+    assert!(zoom(&mut root, 1) < before.1, "the one it is over zoomed out");
+    assert!(app.counters().key_targets >= 1);
+}
+
+/// One file rebinds an editor operator and a screen action, and both take.
+#[test]
+fn one_file_overrides_the_editor_and_the_screen() {
+    let overrides = "blazy-keymap 1\n\
+        context screen\n\
+        unbind alt+key:x screen.split_horizontal\n\
+        bind ctrl+alt+key:h screen.split_horizontal\n\
+        context canvas\n\
+        unbind key:x node.delete\n\
+        bind key:d node.delete\n";
+    let path = std::env::temp_dir().join(format!("blazy-app-overrides-{}.keymap", std::process::id()));
+    std::fs::write(&path, overrides).unwrap();
+
+    let graph = Grid::new(8);
+    let app = app(&graph).with_keymap_overrides(&path).expect("the overrides read");
+    let _ = std::fs::remove_file(&path);
+
+    let key = |name: &str, mods: Modifiers| {
+        masonry::core::TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: Key::Character(name.into()),
+            code: Code::Unidentified,
+            modifiers: mods,
+            ..KeyboardEvent::default()
+        })
+    };
+    assert_eq!(
+        app.keys.action_for(&key("h", Modifiers::CONTROL | Modifiers::ALT)),
+        Some(ScreenAction::SplitHorizontal)
+    );
+    assert_eq!(
+        app.keys.action_for(&key("x", Modifiers::ALT)),
+        None,
+        "the old binding is gone"
+    );
+
+    // And the editors of this application run with the same file in force.
+    let screen = app.screen(SplitTree::balanced(1));
+    let session = screen.payload(0).expect("an area carries a session").clone();
+    let keymap = session.borrow().runtime.keymap().clone();
+    let event = OpEvent::Key {
+        key: Key::Character("d".into()),
+        mods: Modifiers::empty(),
+        down: true,
+    };
+    let ops: Vec<String> = keymap
+        .matches(Scope(&CANVAS_SCOPE), &event)
+        .map(|binding| binding.op.to_string())
+        .collect();
+    assert_eq!(ops, ["node.delete"]);
+}
+
+/// A bad overrides file leaves the application as it was and says which line.
+#[test]
+fn a_bad_overrides_file_names_its_line() {
+    let path = std::env::temp_dir().join(format!("blazy-app-bad-{}.keymap", std::process::id()));
+    std::fs::write(&path, "blazy-keymap 1\ncontext screen\nbind alt+key:q screen.quit\n").unwrap();
+    let graph = Grid::new(8);
+    let error = app(&graph).with_keymap_overrides(&path).err();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        matches!(error, Some(crate::KeymapLoadError::Screen(ref unknown)) if unknown.0 == "screen.quit"),
+        "{error:?}"
+    );
+}
+
+/// The application's whole default keymap — editor and screen — survives its own file.
+#[test]
+fn the_default_keymap_reads_back_from_its_file() {
+    let keymap = crate::default_keymap();
+    assert_eq!(blazy_ops::keymap::Keymap::parse(&keymap.write()), Ok(keymap));
+}

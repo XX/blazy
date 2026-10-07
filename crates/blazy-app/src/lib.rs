@@ -47,6 +47,7 @@ use std::rc::Rc;
 
 use blazy_areas::{AreaId, AreaScreen, SplitTree, Workspace};
 use blazy_node_editor::{EditorSession, NodeGraph, SessionHandle, SharedGraph, sync_root};
+use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
 use blazy_shell::window::{Error, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use masonry::app::RenderRoot;
@@ -55,7 +56,40 @@ use masonry::dpi::LogicalSize;
 use masonry::kurbo::Axis;
 use masonry::peniko::Color;
 
-pub use crate::keys::{ScreenAction, ScreenKeys};
+pub use crate::keys::{SCREEN_CONTEXT, ScreenAction, ScreenKeys, UnknownScreenAction};
+
+/// The keymap an application starts from: the editor's bindings and the screen's.
+///
+/// One keymap, so one file overrides both — a user who rebinds `node.delete` and the
+/// split in the same breath writes one file, and [`Keymap::write`] of this is that file's
+/// starting point.
+pub fn default_keymap() -> Keymap {
+    blazy_node_editor::ops::default_keymap().with(SCREEN_CONTEXT, ScreenKeys::default().bindings())
+}
+
+/// Why a keymap could not be put in force.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum KeymapLoadError {
+    /// The file could not be read.
+    Io(std::io::Error),
+    /// It could be read, and it is not a keymap, or a line of it is wrong.
+    Keymap(KeymapError),
+    /// Its screen section names an action there is none of.
+    Screen(UnknownScreenAction),
+}
+
+impl std::fmt::Display for KeymapLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Keymap(error) => write!(f, "{error}"),
+            Self::Screen(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for KeymapLoadError {}
 
 /// A screen of node editors: areas that carry the session their editor shows.
 ///
@@ -83,6 +117,11 @@ pub struct AppCounters {
     /// Zero after an event that changed nothing, and that is the claim §36 rests on: a
     /// window that is woken for no reason is a window that never idles.
     pub wakes: u64,
+    /// Times a window's keys were pointed at another editor.
+    ///
+    /// One per crossing from one area into another, not one per event: the target is
+    /// read on every event, and set only when it changed.
+    pub key_targets: u64,
 }
 
 /// Node editors over one graph, in areas, in windows: the [`ShellDriver`] an application
@@ -108,6 +147,8 @@ pub struct EditorApp<G: NodeGraph> {
     remaining: usize,
     /// Every window this application has.
     windows: Vec<WindowKey>,
+    /// The editor each window last sent its keys to.
+    focus: Vec<(WindowKey, WidgetId)>,
     counters: AppCounters,
 }
 
@@ -139,6 +180,7 @@ impl<G: NodeGraph> EditorApp<G> {
             base_color: defaults.base_color,
             remaining: 0,
             windows: Vec::new(),
+            focus: Vec::new(),
             counters: AppCounters::default(),
         }
     }
@@ -158,6 +200,37 @@ impl<G: NodeGraph> EditorApp<G> {
     pub fn with_keys(mut self, keys: ScreenKeys) -> Self {
         self.keys = keys;
         self
+    }
+
+    /// The same application, with `keymap` in force for the editors and the screen.
+    ///
+    /// Each area's session gets a runtime with this keymap, and the screen's bindings
+    /// come from its [`SCREEN_CONTEXT`] section. Replaces [`with_sessions`](Self::with_sessions).
+    ///
+    /// # Errors
+    ///
+    /// When the screen section names an action there is none of.
+    pub fn with_keymap(mut self, keymap: Keymap) -> Result<Self, UnknownScreenAction> {
+        self.keys = ScreenKeys::from_keymap(&keymap)?;
+        self.session = Rc::new(move |graph| {
+            EditorSession::with_runtime(graph, blazy_node_editor::ops::runtime_with(keymap.clone())).share()
+        });
+        Ok(self)
+    }
+
+    /// The same application, with a user's overrides file laid over [`default_keymap`].
+    ///
+    /// All or nothing: a file with one bad line leaves the defaults in force and says
+    /// which line.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read, is not a keymap, or names a binding or an action
+    /// there is none of.
+    pub fn with_keymap_overrides(self, path: impl AsRef<std::path::Path>) -> Result<Self, KeymapLoadError> {
+        let text = std::fs::read_to_string(path).map_err(KeymapLoadError::Io)?;
+        let keymap = default_keymap().patched(&text).map_err(KeymapLoadError::Keymap)?;
+        self.with_keymap(keymap).map_err(KeymapLoadError::Screen)
     }
 
     /// The same application, writing and reading its workspace at `path`.
@@ -259,6 +332,40 @@ impl<G: NodeGraph> EditorApp<G> {
         let applied = sync_root(root, &views);
         self.counters.pulled += applied as u64;
         applied
+    }
+
+    /// Points `window`'s keys at the editor of the area under the pointer, or of the
+    /// first area when the pointer is over none.
+    ///
+    /// Masonry hands a key to the focused widget or to the window's focus fallback and to
+    /// nobody else (§38.3); a window of several editors that names none has editors that
+    /// never hear `G`, `X` or `Ctrl+Z` — which is what the window this crate replaced did.
+    /// The area under the pointer is Blender's answer and the one an area can give: the
+    /// screen publishes it, and the area's session knows its editor.
+    ///
+    /// Read through a `WidgetRef`, not a `WidgetMut`: this runs after every event, and an
+    /// edit would cost the window a battery of rewrite passes each time (§38.2).
+    pub fn route_keys(&mut self, window: WindowKey, root: &mut RenderRoot) {
+        let target = {
+            let screen = root.get_layer_root(0);
+            let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
+                return;
+            };
+            let area = screen.hovered_area().or_else(|| screen.tree().areas().next());
+            area.and_then(|area| screen.payload(area))
+                .and_then(|session| session.borrow().editor)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        match self.focus.iter_mut().find(|(key, _)| *key == window) {
+            Some((_, current)) if *current == target => return,
+            Some((_, current)) => *current = target,
+            None => self.focus.push((window, target)),
+        }
+        if root.set_focus_fallback(Some(target)) {
+            self.counters.key_targets += 1;
+        }
     }
 
     /// Does what `action` asks, in the window `root` belongs to.
@@ -398,9 +505,10 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
     ///
     /// Each new window comes back here, so the count walks down to zero through the same
     /// path a key takes, rather than through a loop of its own.
-    fn started(&mut self, cx: &mut ShellCtx, window: WindowKey, _root: &mut RenderRoot) {
+    fn started(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
         self.windows.push(window);
         self.counters.windows_opened += 1;
+        self.route_keys(window, root);
         if self.remaining > 0 {
             self.remaining -= 1;
             self.open_window(cx, None);
@@ -416,12 +524,16 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         self.pull(root);
     }
 
-    /// Wakes the windows whose views are owed something.
+    /// Points the keys at the area under the pointer, and wakes the windows whose views are
+    /// owed something.
     ///
     /// After the event rather than in a seat: a seat is offered the event before the
     /// tree acts on it, so a change made with the mouse would be noticed one gesture
     /// late (§44.3).
-    fn settled(&mut self, cx: &mut ShellCtx, _window: WindowKey, _root: &mut RenderRoot) {
+    fn settled(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
+        // The keys follow the pointer from area to area, decided after the event like
+        // everything else here: the event is what moved the pointer.
+        self.route_keys(window, root);
         for window in self.windows_to_wake() {
             self.counters.wakes += 1;
             cx.request_redraw(window);
@@ -432,7 +544,11 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         if !self.layers {
             return Vec::new();
         }
-        with_screen::<G, _>(root, |screen| screen.widget.area_ids())
+        // Read-only: this is asked every frame, and an edit costs a rewrite battery.
+        root.get_layer_root(0)
+            .downcast::<EditorScreen<G>>()
+            .map(|screen| screen.area_ids())
+            .unwrap_or_default()
     }
 
     /// The screen's operations, from the seat in front of the tree.

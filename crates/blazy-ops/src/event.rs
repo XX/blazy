@@ -93,6 +93,21 @@ pub enum OpEvent {
         /// The modifiers held at the time.
         mods: Modifiers,
     },
+    /// The wheel or a trackpad scrolled.
+    ///
+    /// `dy` is in **logical pixels**, positive towards the user (the wheel rolled back, a
+    /// page scrolled down), whatever unit the platform reported: a line or a page is
+    /// converted by the driver, which is the one that knows how big a line and a page are
+    /// (`blazy_canvas::wheel_pixels`). An operator that zooms decides how many pixels are
+    /// worth how much zoom; the event only says how far.
+    Scroll {
+        /// Where the pointer was, in the driver's own space.
+        pos: Point,
+        /// How far, in logical pixels, positive towards the user.
+        dy: f64,
+        /// The modifiers held at the time.
+        mods: Modifiers,
+    },
     /// A key went down or came up.
     Key {
         /// The key itself.
@@ -146,6 +161,7 @@ impl OpEvent {
             Self::Press { pos, .. }
             | Self::Release { pos, .. }
             | Self::Move { pos, .. }
+            | Self::Scroll { pos, .. }
             | Self::Click { pos, .. }
             | Self::Drag { pos, .. } => Some(*pos),
             Self::Key { .. } => None,
@@ -165,6 +181,7 @@ impl OpEvent {
             Self::Press { button, mods, .. } => Self::Press { button, pos: at, mods },
             Self::Release { button, mods, .. } => Self::Release { button, pos: at, mods },
             Self::Move { mods, .. } => Self::Move { pos: at, mods },
+            Self::Scroll { dy, mods, .. } => Self::Scroll { pos: at, dy, mods },
             Self::Click {
                 button,
                 screen,
@@ -196,6 +213,7 @@ impl OpEvent {
             Self::Press { mods, .. }
             | Self::Release { mods, .. }
             | Self::Move { mods, .. }
+            | Self::Scroll { mods, .. }
             | Self::Key { mods, .. }
             | Self::Click { mods, .. }
             | Self::Drag { mods, .. } => *mods,
@@ -223,6 +241,12 @@ pub enum Trigger {
     Click(PointerButton),
     /// A press of `button` that travelled past the drag threshold.
     Drag(PointerButton),
+    /// The wheel, or a trackpad's scroll, in either direction.
+    ///
+    /// One trigger for both directions, because what the direction means is the
+    /// operator's — a zoom reads `dy` and goes in or out — and two bindings for one
+    /// gesture would be two places to rebind it.
+    Scroll,
     /// The second click of a double click, within the keymap's window.
     ///
     /// A separate trigger rather than a count property, because a binding on it must be
@@ -289,6 +313,11 @@ impl Pattern {
         Self::new(Trigger::Key(Key::Character(name.into())))
     }
 
+    /// The wheel, in either direction.
+    pub fn scroll() -> Self {
+        Self::new(Trigger::Scroll)
+    }
+
     /// A named key going down, e.g. `Pattern::named(NamedKey::Escape)`.
     pub fn named(key: masonry::core::keyboard::NamedKey) -> Self {
         Self::new(Trigger::Key(Key::Named(key)))
@@ -325,6 +354,7 @@ impl Pattern {
             (Trigger::Click(want), OpEvent::Click { button, .. }) => want == button,
             (Trigger::DoubleClick(want), OpEvent::Click { button, count, .. }) => want == button && *count >= 2,
             (Trigger::Drag(want), OpEvent::Drag { button, .. }) => want == button,
+            (Trigger::Scroll, OpEvent::Scroll { .. }) => true,
             _ => false,
         }
     }

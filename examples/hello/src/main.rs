@@ -13,6 +13,7 @@
 //!
 //! ```text
 //! cargo run -p hello
+//! cargo run -p hello -- my.keymap     # with keymap overrides
 //! ```
 //!
 //! Drag a node to move it, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
@@ -227,7 +228,17 @@ fn main() -> Result<(), Error> {
     let config = WindowConfig::default()
         .with_title("blazy - hello")
         .with_size(1000.0, 600.0);
-    app(&Graph::grid()).run(config, SplitTree::balanced(2))
+    let app = app(&Graph::grid());
+    // A path, if given, is a file of keymap overrides (`blazy::app::default_keymap()`
+    // written out is where one starts).
+    let app = match std::env::args_os().nth(1) {
+        Some(path) => app.with_keymap_overrides(&path).unwrap_or_else(|error| {
+            eprintln!("{}: {error}", std::path::Path::new(&path).display());
+            std::process::exit(2);
+        }),
+        None => app,
+    };
+    app.run(config, SplitTree::balanced(2))
 }
 
 #[cfg(test)]

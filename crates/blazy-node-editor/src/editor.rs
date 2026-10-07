@@ -30,7 +30,7 @@ use std::fmt::Write as _;
 use std::mem;
 use std::rc::Rc;
 
-use blazy_canvas::{CanvasLayer, CanvasStats};
+use blazy_canvas::{CanvasLayer, CanvasStats, wheel_pixels};
 use blazy_ops::event::{Device, OpEvent, Sample};
 use blazy_ops::keymap::{Props, Scope};
 use blazy_ops::runtime::{OpRuntime, Seat};
@@ -39,8 +39,8 @@ use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::keyboard::KeyState;
 use masonry::core::{
     AccessCtx, BrushIndex, ChildrenIds, EventCtx, Handled, Layer, LayoutCtx, MeasureCtx, NoAction, PaintCtx,
-    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Widget, WidgetId, WidgetMut,
-    WidgetPod, render_text,
+    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Update, UpdateCtx, Widget,
+    WidgetId, WidgetMut, WidgetPod, render_text,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
@@ -74,6 +74,14 @@ pub struct EditorSession<G: NodeGraph> {
     /// The canvas owns the view while it exists (§22 keeps it out of layout, so nothing
     /// else may drive it); this is the copy that outlives it.
     pub view: Affine,
+    /// The editor widget showing this session, once it is in a tree.
+    ///
+    /// For a driver that has to send it keys: Masonry hands a key to the focused widget
+    /// or to the window's focus fallback and to nobody else (§38.3), so in a window of
+    /// several areas the driver points the fallback at the editor under the pointer —
+    /// and an area knows its session, not its widgets. Recorded by the editor itself when
+    /// it is added, and overwritten by the next one when the area is rebuilt elsewhere.
+    pub editor: Option<WidgetId>,
 }
 
 impl<G: NodeGraph> EditorSession<G> {
@@ -88,6 +96,7 @@ impl<G: NodeGraph> EditorSession<G> {
             world: EditorWorld::new(graph),
             runtime,
             view: Affine::IDENTITY,
+            editor: None,
         }
     }
 
@@ -233,7 +242,12 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// is handed the session's view, so the new widget opens where the old one was
     /// looking.
     pub fn with_session(canvas: CanvasLayer, session: SessionHandle<G>) -> Self {
-        let canvas = canvas.with_builtin_gestures(false).with_view(session.borrow().view);
+        // The wheel too: `view.zoom` is bound on it, and the canvas below would answer
+        // first and mark it handled.
+        let canvas = canvas
+            .with_builtin_gestures(false)
+            .with_wheel_zoom(false)
+            .with_view(session.borrow().view);
         Self {
             session: Some(session),
             ..Self::new(canvas)
@@ -376,6 +390,9 @@ impl<G: NodeGraph> NodeEditor<G> {
             if changes.pan != Vec2::ZERO {
                 CanvasLayer::pan(&mut canvas, changes.pan);
             }
+            for &(origin, factor) in &changes.zoom {
+                CanvasLayer::zoom_around(&mut canvas, origin, factor);
+            }
         }
         if changes.positions.is_empty() && changes.edits.is_empty() {
             // A pan is this view's business alone: the view is not model state, so the
@@ -405,6 +422,7 @@ struct Changes {
     /// was added in the same step has to arrive after it.
     edits: Vec<Edit>,
     pan: Vec2,
+    zoom: Vec<(Point, f64)>,
     dirty: bool,
 }
 
@@ -412,7 +430,7 @@ impl Changes {
     /// Whether anything has to reach the canvas. A repaint is not "something": it is
     /// asked for before this is consulted.
     fn is_empty(&self) -> bool {
-        self.positions.is_empty() && self.edits.is_empty() && self.pan == Vec2::ZERO
+        self.positions.is_empty() && self.edits.is_empty() && self.pan == Vec2::ZERO && self.zoom.is_empty()
     }
 }
 
@@ -424,6 +442,7 @@ impl<G: NodeGraph> EditorSession<G> {
             positions: positions_of(&self.world, moved),
             edits: mem::take(&mut self.world.edits),
             pan: mem::replace(&mut self.world.pan, Vec2::ZERO),
+            zoom: mem::take(&mut self.world.zoom),
             dirty: mem::take(&mut self.world.dirty),
         }
     }
@@ -679,6 +698,9 @@ impl<G: NodeGraph> NodeEditor<G> {
             if changes.pan != Vec2::ZERO {
                 canvas.pan_raw(changes.pan, &mut raw);
             }
+            for &(origin, factor) in &changes.zoom {
+                canvas.zoom_raw(origin, factor, &mut raw);
+            }
         }
         // Structure goes through the mutate pass even for this canvas, because adding a
         // node may add a child and removing one may drop a child, and that is the only
@@ -786,8 +808,8 @@ impl<G: NodeGraph> NodeEditor<G> {
 
 /// Converts a Masonry pointer event into the one the keymap matches.
 ///
-/// Returns `None` for the events an operator layer has no use for — enter, leave,
-/// gestures, and the scroll the canvas owns.
+/// Returns `None` for the events an operator layer has no use for — enter, leave and
+/// gestures. The scroll is `view.zoom`'s since the wheel became a binding.
 fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sample)> {
     let (op_event, state, info) = match event {
         PointerEvent::Down(e) => (
@@ -816,11 +838,20 @@ fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sam
             current,
             pointer,
         ),
-        PointerEvent::Scroll(PointerScrollEvent { .. })
-        | PointerEvent::Enter(_)
-        | PointerEvent::Leave(_)
-        | PointerEvent::Cancel(_)
-        | PointerEvent::Gesture(_) => return None,
+        PointerEvent::Scroll(PointerScrollEvent {
+            delta, state, pointer, ..
+        }) => (
+            OpEvent::Scroll {
+                pos: ctx.local_position(state.position),
+                dy: wheel_pixels(*delta, ctx.scale_factor(), ctx.content_box().size()),
+                mods: state.modifiers,
+            },
+            state,
+            pointer,
+        ),
+        PointerEvent::Enter(_) | PointerEvent::Leave(_) | PointerEvent::Cancel(_) | PointerEvent::Gesture(_) => {
+            return None;
+        },
     };
     // The threshold is measured in screen pixels and the timestamp comes from the
     // platform, so a drag means the same distance at every zoom and a double click can
@@ -928,6 +959,13 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                 }
             },
             _ => {},
+        }
+    }
+
+    /// Tells the session which widget shows it, so a driver can send this one keys.
+    fn update(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
+        if let (Update::WidgetAdded, Some(session)) = (event, self.session.as_ref()) {
+            session.borrow_mut().editor = Some(ctx.widget_id());
         }
     }
 

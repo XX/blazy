@@ -77,6 +77,7 @@
 #![warn(missing_docs, unreachable_pub)]
 
 pub mod event;
+mod keyfile;
 pub mod keymap;
 pub mod runtime;
 pub mod undo;

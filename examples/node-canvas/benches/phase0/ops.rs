@@ -87,6 +87,12 @@ pub(crate) struct OpsRow {
     pub(crate) unpolled: f64,
     /// Operators cancelled, per gesture.
     pub(crate) cancels: f64,
+    /// Operators run from the interface, per gesture.
+    ///
+    /// What says a gesture reached the keymap at all: the wheel used to be the canvas's
+    /// own, and a zoom row whose operator never ran would cost exactly what the canvas's
+    /// zoom costs — and pass any comparison with it.
+    pub(crate) invoked: f64,
     /// Operators still running when the gesture ended. Zero, or the gesture hung.
     pub(crate) left_running: usize,
     /// Milliseconds per gesture, including a redraw per event.
@@ -224,6 +230,7 @@ fn row(
         refused: per(ops.refused - start.ops.refused),
         unpolled: (ops.unpolled - start.ops.unpolled) as f64,
         cancels: per(ops.modal_cancels - start.ops.modal_cancels),
+        invoked: per(ops.invoked - start.ops.invoked),
         left_running: harness.root_widget().modal_depth(),
         ms: ms / repeats as f64,
     }
@@ -512,6 +519,7 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
         refused: per(counters.refused),
         unpolled: counters.unpolled as f64,
         cancels: per(counters.modal_cancels),
+        invoked: per(counters.invoked),
         left_running: runtime.modal_depth(),
         ms: ms / repeats as f64,
     }
@@ -580,6 +588,50 @@ fn pan_row(count: usize, repeats: usize) -> OpsRow {
     row("pan (middle)", "canvas", &mut harness, start, repeats, MOVES + 2, 0, ms)
 }
 
+/// Wheel notches in one zoom gesture.
+pub(crate) const NOTCHES: usize = 6;
+
+/// Zooms in by a few wheel notches, through the keymap or through the canvas's own wheel.
+///
+/// The pair §38.7 left open: the wheel was the canvas's, and `view.zoom` took it over
+/// (`issues/keymap file and zoom operator.md`). The claim is that it costs nothing for
+/// having moved — the same passes, no node laid out — and the operator row has to show
+/// its operator actually ran, or it is the canvas row twice.
+fn zoom_row(count: usize, repeats: usize, through_keymap: bool) -> OpsRow {
+    let (mut harness, _graph) = if through_keymap {
+        ops_harness(count)
+    } else {
+        plain_harness(count, true)
+    };
+    let at = empty_point(&mut harness);
+    harness.mouse_move(at);
+    let _ = harness.redraw();
+    let start = before(&mut harness);
+    let mut ms = 0.0;
+    for _ in 0..repeats {
+        let clock = Instant::now();
+        for _ in 0..NOTCHES {
+            harness.mouse_wheel(Vec2::new(0.0, -120.0));
+            let _ = harness.redraw();
+        }
+        ms += clock.elapsed().as_secs_f64() * 1000.0;
+        // Back to where it was, outside the clock, so every repeat zooms over the same
+        // part of the graph.
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::set_view(&mut canvas, blazy::masonry::kurbo::Affine::IDENTITY);
+            });
+        });
+        let _ = harness.redraw();
+    }
+    let (gesture, seat) = if through_keymap {
+        ("zoom (wheel)", "tree")
+    } else {
+        ("zoom (wheel)", "canvas")
+    };
+    row(gesture, seat, &mut harness, start, repeats, NOTCHES, 0, ms)
+}
+
 /// The gesture table.
 pub(crate) fn ops_table(opts: &Options, count: usize) -> Vec<OpsRow> {
     let repeats = if opts.quick { QUICK_REPEATS } else { REPEATS };
@@ -593,6 +645,8 @@ pub(crate) fn ops_table(opts: &Options, count: usize) -> Vec<OpsRow> {
         grab_row("grab, cancelled", count, repeats, true),
         pan_op_row(count, repeats),
         pan_row(count, repeats),
+        zoom_row(count, repeats, true),
+        zoom_row(count, repeats, false),
         host_seat_row(count, repeats),
     ];
     print_ops(&rows);

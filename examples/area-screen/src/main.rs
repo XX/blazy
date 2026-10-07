@@ -36,6 +36,9 @@
 //! | `Ctrl+S` | write the workspace to `--workspace` |
 //! | `Ctrl+O` | read it back |
 //!
+//! Every one of them, and every key of the editor, can be rebound with `--keymap FILE`;
+//! `--write-keymap FILE` writes the defaults as a starting point.
+//!
 //! Every area carries the operator layer, so the graph itself is edited here the way it
 //! is in the node-canvas window — left-drag a node to move it, `G`, `X`, `F`, `Shift+A`,
 //! `Ctrl+Z` (§38.3).
@@ -107,10 +110,25 @@ struct Args {
     /// rasterisation. Turning it off is how the difference is seen by eye.
     #[arg(long)]
     no_layer_cache: bool,
+
+    /// A file of keymap overrides, laid over the defaults (`bind` and `unbind` lines).
+    ///
+    /// One file for the editors and the screen: its `canvas` and `window` contexts are
+    /// the editor's, its `screen` context the splits, joins and windows above.
+    #[arg(long, value_name = "PATH")]
+    keymap: Option<PathBuf>,
+
+    /// Write the default keymap to PATH and exit: the starting point for `--keymap`.
+    #[arg(long, value_name = "PATH")]
+    write_keymap: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
+    if let Some(path) = &args.write_keymap {
+        std::fs::write(path, blazy::app::default_keymap().write()).expect("the keymap could not be written");
+        return;
+    }
     let backend = args.backend.as_deref().map(|name| {
         Backend::from_name(name).unwrap_or_else(|| {
             let names: Vec<_> = COMPILED.iter().map(|backend| backend.name()).collect();
@@ -140,8 +158,20 @@ fn main() {
         .with_backend(backend);
 
     let building = graph.clone();
-    EditorApp::new(&graph, move |area, session| spec.area(&building, area, session))
-        .with_workspace(args.workspace)
+    let app = EditorApp::new(&graph, move |area, session| spec.area(&building, area, session));
+    // A bad overrides file is reported and the defaults stay, rather than a window that
+    // refuses to open over a typo.
+    let app = match &args.keymap {
+        Some(path) => match app.with_keymap_overrides(path) {
+            Ok(app) => app,
+            Err(error) => {
+                eprintln!("{}: {error}; the default keymap is in force", path.display());
+                std::process::exit(2);
+            },
+        },
+        None => app,
+    };
+    app.with_workspace(args.workspace)
         .with_layer_cache(layers)
         .with_windows(args.windows)
         .run(config, SplitTree::balanced(areas))

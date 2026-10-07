@@ -81,6 +81,12 @@ pub struct EditorWorld<G: NodeGraph> {
     /// The view is not model state and not the operator's to touch, so it leaves here
     /// the same way a moved node does — as something for the driver to carry in.
     pub pan: Vec2,
+    /// View zooms the driver has not applied yet: the point to zoom about, in the
+    /// driver's own (screen) units, and the factor.
+    ///
+    /// The zoom twin of [`pan`](Self::pan), and kept as a list rather than a product
+    /// because two zooms about two points are not one zoom about either.
+    pub zoom: Vec<(Point, f64)>,
     /// Set when something changed that only affects pixels.
     pub dirty: bool,
     /// Changes to the shape of the graph the views have not been told about yet.
@@ -117,6 +123,7 @@ impl<G: NodeGraph> EditorWorld<G> {
             band: None,
             moved: Vec::new(),
             pan: Vec2::ZERO,
+            zoom: Vec::new(),
             dirty: false,
             edits: Vec::new(),
             new_node_size: DEFAULT_NODE_SIZE,

@@ -1,6 +1,7 @@
 //! What the screen does on a key, as data.
 
 use blazy_ops::event::{OpEvent, Pattern};
+use blazy_ops::keymap::{Binding, Keymap};
 use masonry::core::TextEvent;
 use masonry::core::keyboard::{KeyState, Modifiers};
 
@@ -29,6 +30,56 @@ pub enum ScreenAction {
     /// Reads the workspace file back.
     LoadWorkspace,
 }
+
+/// The keymap context the screen's bindings live in.
+pub const SCREEN_CONTEXT: &str = "screen";
+
+impl ScreenAction {
+    /// Every action, in the order the defaults bind them.
+    pub const ALL: [Self; 9] = [
+        Self::SplitHorizontal,
+        Self::SplitVertical,
+        Self::Join,
+        Self::Swap,
+        Self::ToggleMaximize,
+        Self::NewWindow,
+        Self::Detach,
+        Self::SaveWorkspace,
+        Self::LoadWorkspace,
+    ];
+
+    /// The name a keymap file binds this action by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SplitHorizontal => "screen.split_horizontal",
+            Self::SplitVertical => "screen.split_vertical",
+            Self::Join => "screen.join",
+            Self::Swap => "screen.swap",
+            Self::ToggleMaximize => "screen.maximize",
+            Self::NewWindow => "screen.new_window",
+            Self::Detach => "screen.detach",
+            Self::SaveWorkspace => "screen.save_workspace",
+            Self::LoadWorkspace => "screen.load_workspace",
+        }
+    }
+
+    /// The action a keymap file names, if it names one.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+}
+
+/// A screen binding names an action this build does not have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownScreenAction(pub String);
+
+impl std::fmt::Display for UnknownScreenAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no screen action is called {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownScreenAction {}
 
 /// Which keys do what to the screen.
 ///
@@ -80,6 +131,37 @@ impl ScreenKeys {
     pub fn with(mut self, pattern: Pattern, action: ScreenAction) -> Self {
         self.bindings.insert(0, (pattern, action));
         self
+    }
+
+    /// The screen's bindings as a keymap section, for a file.
+    pub fn bindings(&self) -> Vec<Binding> {
+        self.bindings
+            .iter()
+            .map(|(pattern, action)| Binding::new(pattern.clone(), action.name()))
+            .collect()
+    }
+
+    /// The screen's bindings as `keymap`'s [`SCREEN_CONTEXT`] section says them; none if
+    /// it has no such section.
+    ///
+    /// # Errors
+    ///
+    /// When a binding names an action this build does not have. Refused rather than
+    /// skipped: a binding that does nothing is the miss that looks like success (§45).
+    pub fn from_keymap(keymap: &Keymap) -> Result<Self, UnknownScreenAction> {
+        let Some(section) = keymap.section(SCREEN_CONTEXT) else {
+            return Ok(Self::none());
+        };
+        let bindings = section
+            .bindings
+            .iter()
+            .map(|binding| {
+                ScreenAction::from_name(&binding.op)
+                    .map(|action| (binding.pattern.clone(), action))
+                    .ok_or_else(|| UnknownScreenAction(binding.op.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { bindings })
     }
 
     /// What `event` asks the screen to do, if anything.

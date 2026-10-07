@@ -1587,6 +1587,33 @@ fn evaluate(
         });
     }
 
+    if let (Some(by_keymap), Some(by_canvas)) = (gesture("zoom (wheel)", "tree"), gesture("zoom (wheel)", "canvas")) {
+        // The wheel moved from the canvas into the keymap, and the claim is that the move
+        // cost nothing: the same layout passes and the same node layouts as the canvas's
+        // own zoom. Against the canvas, not against zero — a zoom in materialises nodes
+        // and lays them out whoever drives it (18 a gesture on this graph, measured on
+        // both rows), and a bound of zero was a claim about zooming, not about the keymap.
+        criteria.push(Criterion {
+            name: "zoom_through_the_keymap_costs_what_the_canvas_zoom_cost",
+            claim: "a wheel zoom through view.zoom lays out no more than the canvas's own",
+            kind: Kind::Counter,
+            measured: (by_keymap.content_layouts - by_canvas.content_layouts).max(0.0)
+                + (by_keymap.child_layouts - by_canvas.child_layouts).max(0.0),
+            bound: 0.5,
+            unit: "extra layout passes and node layouts/gesture",
+        });
+        // And from the failing side, the vacuity guard the comparison needs: an operator
+        // that never ran costs exactly what the canvas costs, because the canvas did it.
+        criteria.push(Criterion {
+            name: "every_wheel_notch_runs_view_zoom",
+            claim: "each notch of the wheel over an editor runs view.zoom",
+            kind: Kind::Counter,
+            measured: (crate::ops::NOTCHES as f64 - by_keymap.invoked).max(0.0),
+            bound: 0.5,
+            unit: "notches that ran no operator/gesture",
+        });
+    }
+
     if let Some(band) = gesture("box select", "tree") {
         // The claim modality is worth anything for: while the operator runs, the
         // events are the operator's. It holds because the driver takes Masonry's

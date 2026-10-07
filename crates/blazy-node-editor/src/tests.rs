@@ -483,3 +483,103 @@ fn a_link_collected_twice_is_filed_once() {
     assert!(names.0.is_some(), "the link is there");
     assert_eq!(names.1, None, "once: removing it once leaves none");
 }
+
+/// The wheel zooms through the keymap exactly as the canvas zoomed on its own.
+///
+/// `view.zoom` took the wheel over from the canvas; rebinding nothing must change nothing
+/// about how it feels — the same notch, the same point, the same view.
+#[test]
+fn the_wheel_zooms_through_the_keymap_as_the_canvas_did() {
+    let graph = row(3);
+    let at = Point::new(220.0, 140.0);
+    let notch = masonry::kurbo::Vec2::new(0.0, -120.0);
+
+    // The canvas alone, with its own wheel.
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let mut bare = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(CanvasLayer::new(3, geometry, source)),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = bare.redraw();
+    bare.mouse_move(at);
+    bare.mouse_wheel(notch);
+    let by_canvas = bare.root_widget().view();
+
+    // The editor, whose canvas has given the wheel up to the keymap.
+    let session = crate::EditorSession::new(&graph).share();
+    let mut editor = editor_harness(&graph, &session);
+    editor.mouse_move(at);
+    editor.mouse_wheel(notch);
+    let by_operator =
+        editor.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.view()));
+
+    assert_ne!(by_canvas, masonry::kurbo::Affine::IDENTITY, "the notch zoomed at all");
+    assert_eq!(
+        by_operator, by_canvas,
+        "the same notch at the same point gives the same view"
+    );
+    assert_eq!(
+        session.borrow().runtime.history().depth(),
+        0,
+        "a view change is not an undo step"
+    );
+}
+
+/// A key and a script zoom by the factor they are given, about the point they name.
+#[test]
+fn a_key_and_a_script_zoom_by_their_factor() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = editor_harness(&graph, &session);
+    let zoom = |harness: &mut TestHarness<NodeEditor<Row>>| {
+        harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.zoom()))
+    };
+    let before = zoom(&mut harness);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(
+            &mut editor,
+            "view.zoom",
+            &Props::new()
+                .with_float("factor", 2.0)
+                .with_float("x", 0.0)
+                .with_float("y", 0.0),
+        );
+    });
+    let _ = harness.redraw();
+    assert!((zoom(&mut harness) / before - 2.0).abs() < 1e-9);
+
+    // Keys reach the focus fallback and nobody else (§38.3); a host names the editor.
+    let editor = harness.root_widget().ctx().widget_id();
+    harness.set_focus_fallback(Some(editor));
+    harness.process_text_event(masonry::core::TextEvent::Keyboard(
+        masonry::core::keyboard::KeyboardEvent {
+            state: masonry::core::keyboard::KeyState::Down,
+            key: masonry::core::keyboard::Key::Character("-".into()),
+            code: masonry::core::keyboard::Code::Unidentified,
+            modifiers: masonry::core::keyboard::Modifiers::empty(),
+            ..Default::default()
+        },
+    ));
+    let _ = harness.redraw();
+    let expected = 2.0 / crate::ops::ZoomOp::STEP;
+    assert!(
+        (zoom(&mut harness) / before - expected).abs() < 1e-9,
+        "`-` zooms out by one step — if the editor hears the key at all"
+    );
+}
+
+/// The editor's default keymap survives its own file.
+#[test]
+fn the_default_keymap_reads_back_from_its_file() {
+    let keymap = crate::ops::default_keymap();
+    let text = keymap.write();
+    assert_eq!(blazy_ops::keymap::Keymap::parse(&text), Ok(keymap), "{text}");
+}

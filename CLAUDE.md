@@ -474,6 +474,20 @@ missing carrier is a frame late, not a bug anyone sees, and only the depth crite
 notices. A carrier must record what it carried where the layout path records it, or the two
 paths become two owners again.
 
+**The keymap is a file, and one format serves two uses (§49).** `Keymap::patched` lays a
+file over a keymap: `unbind` takes a binding out, `bind` goes in *ahead* of what the context
+holds. Over an empty keymap that is the whole keymap (`Keymap::parse`); over the defaults it
+is a user's overrides, tried first. An `unbind` that finds nothing is an error — it is how an
+overrides file goes stale — and a file with one bad line changes nothing. Screen keys live in
+the same file (context `screen`). The wheel is `view.zoom`'s now: `with_session` takes it from
+the canvas with `with_wheel_zoom(false)`, and both share `wheel_pixels`/`WHEEL_ZOOM_RATE`, so
+rebinding nothing changes nothing. **Keys reach only the focused widget or the window's focus
+fallback (§38.3)**, and a window of several editors that names none has editors that hear
+nothing — every test named one itself, the window did not, and `G`/`X`/`Ctrl+Z` did nothing
+there from §44 to §49. `EditorApp::route_keys` points the fallback at the editor of the area
+under the pointer after every event, reading through a `WidgetRef` (an edit would cost a
+rewrite battery per event); the editor records its own id in its session for that.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget

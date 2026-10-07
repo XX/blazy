@@ -14,6 +14,7 @@ use masonry::core::{
     AccessCtx, AllowRawMut, ChildrenIds, ComposeCtx, LayoutCtx, MeasureCtx, MutateCtx, NoAction, PaintCtx,
     PropertiesRef, RawCtx, RegisterCtx, Widget, WidgetMut, WidgetPod,
 };
+use masonry::dpi::{LogicalPosition, PhysicalPosition};
 use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, BezPath, Point, Rect, Shape, Size, Stroke};
 use masonry::layout::{LenReq, Length};
@@ -100,10 +101,33 @@ pub(crate) const FAR_OVERSCAN: f64 = 0.25;
 
 /// Zoom changes smaller than this are treated as no change at all.
 const ZOOM_EPSILON: f64 = 1e-9;
-/// How fast a wheel notch zooms, as an exponent on the scroll distance in pixels.
-const WHEEL_ZOOM_RATE: f64 = 0.0015;
+/// How fast the wheel zooms: the zoom factor is `exp(-dy * WHEEL_ZOOM_RATE)` for a scroll
+/// of `dy` logical pixels.
+///
+/// Public because the canvas is not the only one zooming on the wheel: an operator layer
+/// that takes the wheel over (`view.zoom`) has to zoom at the same speed, or rebinding
+/// the wheel changes how it feels.
+pub const WHEEL_ZOOM_RATE: f64 = 0.0015;
 /// A wheel notch, in pixels, matching what `Portal` assumes.
 const WHEEL_LINE_PX: f64 = 120.0;
+
+/// How far a scroll went, in logical pixels, positive towards the user.
+///
+/// A wheel reports lines, a trackpad pixels, some devices pages; this is the one place
+/// they are made comparable, the way `Portal` does it, so the canvas's own wheel and an
+/// operator bound to it agree about what one notch is.
+pub fn wheel_pixels(delta: masonry::ui_events::ScrollDelta, scale_factor: f64, viewport: Size) -> f64 {
+    let line_px = PhysicalPosition {
+        x: WHEEL_LINE_PX * scale_factor,
+        y: WHEEL_LINE_PX * scale_factor,
+    };
+    let page_px = PhysicalPosition {
+        x: viewport.width * scale_factor,
+        y: viewport.height * scale_factor,
+    };
+    let LogicalPosition { y, .. } = delta.to_pixel_delta(line_px, page_px).to_logical::<f64>(scale_factor);
+    y
+}
 
 /// What a state change asks Masonry to redo.
 ///

@@ -474,6 +474,62 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for PanOp {
     }
 }
 
+/// Zooms the view about the pointer.
+///
+/// What the canvas used to do on the wheel by itself, past the keymap — so the wheel
+/// could be neither rebound nor scripted (`issues/keymap file and zoom operator.md`). From
+/// the wheel the factor follows the scroll, at the canvas's own rate
+/// ([`WHEEL_ZOOM_RATE`](blazy_canvas::WHEEL_ZOOM_RATE)), so rebinding nothing changes
+/// nothing about how it feels; from a key or a script it is the `factor` property.
+///
+/// Like `view.pan` it changes the view and not the model, so it writes no undo step and
+/// the other views of the graph do not follow it (§30).
+#[derive(Default)]
+pub struct ZoomOp;
+
+impl ZoomOp {
+    /// The factor a key binding zooms by when it does not say.
+    pub const STEP: f64 = 1.25;
+}
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for ZoomOp {
+    fn name(&self) -> &'static str {
+        "view.zoom"
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let factor = match cx.event() {
+            // Rolled towards the user is out, as the canvas has always had it.
+            Some(OpEvent::Scroll { dy, .. }) => {
+                let rate = cx.props().float("rate", blazy_canvas::WHEEL_ZOOM_RATE);
+                (-dy * rate).exp()
+            },
+            _ => cx.props().float("factor", Self::STEP),
+        };
+        // About the pointer, in screen units: the canvas point under it stays under it.
+        let origin = cx.world().pointer_screen;
+        zoom(cx, origin, factor)
+    }
+
+    /// From a script: `factor`, about `x`/`y` in the driver's own units, or about the
+    /// pointer when they are not given.
+    fn exec(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let pointer = cx.world().pointer_screen;
+        let origin = Point::new(cx.props().float("x", pointer.x), cx.props().float("y", pointer.y));
+        let factor = cx.props().float("factor", Self::STEP);
+        zoom(cx, origin, factor)
+    }
+}
+
+/// Leaves a zoom for the driver, unless it would do nothing.
+fn zoom<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, origin: Point, factor: f64) -> OpResult {
+    if !factor.is_finite() || factor <= 0.0 || factor == 1.0 {
+        return OpResult::Cancelled;
+    }
+    cx.world_mut().zoom.push((origin, factor));
+    OpResult::Finished
+}
+
 /// Adds a node where the pointer is, and selects it.
 ///
 /// The size is [`EditorWorld::new_node_size`] unless the binding says otherwise, and the
@@ -725,6 +781,12 @@ pub fn default_keymap() -> Keymap {
             Binding::new(Pattern::key("x"), "link.delete"),
             Binding::new(Pattern::key("x"), "node.delete"),
             Binding::new(Pattern::key("f"), "link.add"),
+            // The view. The wheel used to be the canvas's own and nobody's to rebind; `=`
+            // and `-` are the keys of a laptop with no numpad, where Blender's own are.
+            Binding::new(Pattern::scroll(), "view.zoom"),
+            Binding::new(Pattern::key("="), "view.zoom").with_props(Props::new().with_float("factor", ZoomOp::STEP)),
+            Binding::new(Pattern::key("-"), "view.zoom")
+                .with_props(Props::new().with_float("factor", 1.0 / ZoomOp::STEP)),
         ])
         .with("window", vec![
             Binding::new(Pattern::key("z").with_mods(Modifiers::CONTROL), "ed.undo"),
@@ -740,11 +802,18 @@ pub fn default_keymap() -> Keymap {
 /// A starting point rather than the only arrangement: a runtime with more operators, or
 /// a keymap read from a file, goes to [`NodeEditor::with_runtime`](crate::NodeEditor::with_runtime).
 pub fn runtime<G: NodeGraph>() -> OpRuntime<EditorWorld<G>> {
-    let mut runtime = OpRuntime::new(default_keymap());
+    runtime_with(default_keymap())
+}
+
+/// The same operators, with `keymap` in force — one read from a file, or the defaults
+/// with a user's overrides laid over them (`Keymap::patched`).
+pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
+    let mut runtime = OpRuntime::new(keymap);
     runtime.register(SelectOp);
     runtime.register(BoxSelectOp::default());
     runtime.register(MoveOp::default());
     runtime.register(PanOp::default());
+    runtime.register(ZoomOp);
     runtime.register(AddNodeOp);
     runtime.register(DeleteNodeOp);
     runtime.register(AddLinkOp);

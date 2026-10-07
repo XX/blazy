@@ -8,7 +8,6 @@ use masonry::core::{
     AccessCtx, AllowRawMut, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NoAction, PaintCtx, PointerEvent,
     PropertiesMut, PropertiesRef, RawCtx, RegisterCtx, Widget, WidgetId, WidgetMut, WidgetPod,
 };
-use masonry::dpi::{LogicalPosition, PhysicalPosition};
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Vec2};
 use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
@@ -69,6 +68,8 @@ pub struct CanvasLayer {
     controls_on_hover: bool,
     /// Whether the canvas acts on the primary button itself.
     builtin_gestures: bool,
+    /// Whether the wheel zooms the view here, or is left to an operator layer above.
+    wheel_zoom: bool,
     /// Where the detail levels switch over for readability.
     thresholds: DetailThresholds,
     /// What the tree may cost, in widgets.
@@ -128,6 +129,7 @@ impl CanvasLayer {
             drag: Drag::None,
             controls_on_hover: false,
             builtin_gestures: true,
+            wheel_zoom: true,
             thresholds: DetailThresholds::default(),
             budget: DetailBudget::default(),
             attached: false,
@@ -208,6 +210,18 @@ impl CanvasLayer {
     /// (§25.4).
     pub fn with_builtin_gestures(mut self, enabled: bool) -> Self {
         self.builtin_gestures = enabled;
+        self
+    }
+
+    /// Whether the canvas zooms on the wheel itself. On by default.
+    ///
+    /// The same seam as [`with_builtin_gestures`](Self::with_builtin_gestures), for the
+    /// wheel: an operator layer that binds the wheel (`view.zoom`) has to hear it, and the
+    /// canvas sits below it and would answer first. Off, the scroll is left unhandled and
+    /// bubbles up.
+    #[must_use]
+    pub fn with_wheel_zoom(mut self, enabled: bool) -> Self {
+        self.wheel_zoom = enabled;
         self
     }
 
@@ -365,6 +379,22 @@ impl CanvasLayer {
     /// too, and the driver holding an `EventCtx` is the one that has to carry it in.
     /// Only the canvas is dirtied — child positions are in canvas coordinates, so a
     /// view change moves nobody (§22).
+    /// Zooms the view about `origin` from the parent's raw context.
+    ///
+    /// The zoom twin of [`pan_raw`](Self::pan_raw), for the same caller: an operator
+    /// layer that has taken the wheel owns zooming too, and carries it in while it holds
+    /// an `EventCtx`. Only the canvas is dirtied, as for a pan (§22).
+    pub fn zoom_raw(&mut self, origin: Point, factor: f64, ctx: &mut RawCtx<'_>) {
+        if let Some(view) = self.zoomed_view(origin, factor)
+            && self.store_view(view)
+        {
+            ctx.request_layout();
+        }
+    }
+
+    /// Pans the view from the parent's raw context.
+    ///
+    /// See [`zoom_raw`](Self::zoom_raw), which is the same seam for the zoom.
     pub fn pan_raw(&mut self, delta: Vec2, ctx: &mut RawCtx<'_>) {
         let view = Affine::translate(delta) * self.view;
         if self.store_view(view) {
@@ -749,21 +779,10 @@ impl Widget for CanvasLayer {
                     ctx.set_handled();
                 }
             },
-            PointerEvent::Scroll(PointerScrollEvent { delta, state, .. }) if !ctx.is_handled() => {
+            PointerEvent::Scroll(PointerScrollEvent { delta, state, .. }) if self.wheel_zoom && !ctx.is_handled() => {
                 // Wheel notches are converted the same way `Portal` does it, so the
                 // zoom speed matches the platform's idea of a scroll step.
-                let scale_factor = ctx.scale_factor();
-                let line_px = PhysicalPosition {
-                    x: WHEEL_LINE_PX * scale_factor,
-                    y: WHEEL_LINE_PX * scale_factor,
-                };
-                let viewport = self.viewport;
-                let page_px = PhysicalPosition {
-                    x: viewport.width * scale_factor,
-                    y: viewport.height * scale_factor,
-                };
-                let delta_px = delta.to_pixel_delta(line_px, page_px);
-                let LogicalPosition { y, .. } = delta_px.to_logical::<f64>(scale_factor);
+                let y = wheel_pixels(*delta, ctx.scale_factor(), self.viewport);
                 if y == 0.0 {
                     return;
                 }

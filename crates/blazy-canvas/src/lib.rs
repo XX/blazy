@@ -81,5 +81,5 @@ pub use crate::detail::{CanvasDetail, DEFAULT_WIDGET_BUDGET, Detail, DetailBudge
 pub use crate::links::{Link, LinkStyle};
 pub use crate::source::NodeSource;
 pub use crate::stats::{CanvasCounters, CanvasHit, CanvasStats};
-pub use crate::widgets::{CanvasContent, CanvasLayer};
+pub use crate::widgets::{CanvasContent, CanvasLayer, WHEEL_ZOOM_RATE, wheel_pixels};
 pub(crate) use crate::widgets::{FAR_OVERSCAN, region_covers, region_slack};
