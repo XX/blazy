@@ -13,8 +13,8 @@ use blazy::canvas::CanvasLayer;
 use blazy::masonry::core::NewWidget;
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
 use node_canvas::editor::NodeEditor;
+use node_canvas::property_set;
 
 use crate::bench::{Options, PAN_STEP, SCALES, VIEWPORT, pan_area, set_header_scale, zoom_area};
 
@@ -103,7 +103,7 @@ fn keep_layers(harness: &mut TestHarness<Screen>) {
 fn layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = ScreenSpec::new(areas, nodes).with_isolated_layers(true).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -130,7 +130,7 @@ fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
         .with_ops(true)
         .build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );

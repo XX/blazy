@@ -18,15 +18,14 @@ use blazy::masonry::core::{NewWidget, TextEvent};
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Point, Vec2};
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
 use blazy::masonry::ui_events::pointer::PointerButton;
 use blazy::ops::event::{Device, Sample};
 use blazy::ops::keymap::{Props, Scope};
 use blazy::ops::runtime::Seat;
-use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::{NODE_SIZE, SharedGraph};
 use node_canvas::ops::{CANVAS_SCOPE, EditorWorld, UndoMode};
+use node_canvas::{CanvasSpec, property_set};
 
 use crate::bench::{Options, ScenarioRecord, VIEWPORT, stats};
 
@@ -93,6 +92,16 @@ pub(crate) struct OpsRow {
     /// own, and a zoom row whose operator never ran would cost exactly what the canvas's
     /// zoom costs — and pass any comparison with it.
     pub(crate) invoked: f64,
+    /// Classes put on or taken off nodes, per gesture (§38.7): what a view's selection
+    /// costs its nodes.
+    pub(crate) class_changes: f64,
+    /// Nodes on screen whose look disagrees with the selection, after the row: selected
+    /// and not styled so, or styled so and not selected.
+    ///
+    /// The other half of [`class_changes`](Self::class_changes), from the failing side: a
+    /// class remembered by the canvas and never reaching the widget counts exactly like
+    /// one that did. Only the click row looks; the others leave it at zero.
+    pub(crate) misstyled: usize,
     /// Operators still running when the gesture ended. Zero, or the gesture hung.
     pub(crate) left_running: usize,
     /// Milliseconds per gesture, including a redraw per event.
@@ -117,7 +126,7 @@ pub(crate) struct UndoRow {
 pub(crate) fn ops_harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
     let (canvas, graph) = CanvasSpec::new(count).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(node_canvas::editor::with_ops(canvas, &graph)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -131,7 +140,7 @@ pub(crate) fn ops_harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph
 fn plain_harness(count: usize, builtin_gestures: bool) -> (TestHarness<NodeEditor>, SharedGraph) {
     let (canvas, graph) = CanvasSpec::new(count).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(node_canvas::editor::new(canvas.with_builtin_gestures(builtin_gestures))),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -186,6 +195,7 @@ fn press_key(harness: &mut TestHarness<NodeEditor>, key: Key, mods: Modifiers) {
 /// Counters read from the canvas and from the operator layer, before and after.
 struct Before {
     child_layouts: u64,
+    class_changes: u64,
     content_layouts: u64,
     picks: u64,
     ops: blazy::ops::OpCounters,
@@ -195,6 +205,7 @@ fn before(harness: &mut TestHarness<NodeEditor>) -> Before {
     let stats = stats(harness);
     Before {
         child_layouts: stats.counters.child_layouts,
+        class_changes: stats.counters.class_changes,
         content_layouts: stats.counters.content_layouts,
         picks: stats.counters.hit_queries,
         ops: harness.root_widget().op_counters(),
@@ -231,6 +242,8 @@ fn row(
         unpolled: (ops.unpolled - start.ops.unpolled) as f64,
         cancels: per(ops.modal_cancels - start.ops.modal_cancels),
         invoked: per(ops.invoked - start.ops.invoked),
+        class_changes: per(stats.counters.class_changes - start.class_changes),
+        misstyled: 0,
         left_running: harness.root_widget().modal_depth(),
         ms: ms / repeats as f64,
     }
@@ -258,7 +271,29 @@ fn click_row(count: usize, repeats: usize) -> OpsRow {
         let _ = harness.redraw();
     }
     let ms = clock.elapsed().as_secs_f64() * 1000.0;
-    row("click select", "tree", &mut harness, start, repeats, 3, 0, ms)
+    let mut click = row("click select", "tree", &mut harness, start, repeats, 3, 0, ms);
+    click.misstyled = misstyled(&mut harness);
+    click
+}
+
+/// Nodes on screen that look selected and are not, or are and do not.
+///
+/// "Looks" is the colour the node's widget resolves its outline to, through the class and
+/// the property stack — the whole path, not the canvas's record of the class.
+fn misstyled(harness: &mut TestHarness<NodeEditor>) -> usize {
+    let selection = harness.root_widget().selection();
+    let live = harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
+    });
+    live.into_iter()
+        .filter(|&(index, id)| {
+            let outline = harness
+                .get_widget_with_id(id)
+                .get_prop::<blazy::masonry::properties::BorderColor>()
+                .color;
+            (outline.components[3] > 0.0) != selection.contains(&index)
+        })
+        .count()
 }
 
 /// A rubber band started by a press: the case pointer capture covers.
@@ -520,6 +555,8 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
         unpolled: counters.unpolled as f64,
         cancels: per(counters.modal_cancels),
         invoked: per(counters.invoked),
+        class_changes: (stats.counters.class_changes - start.class_changes) as f64 / repeats as f64,
+        misstyled: 0,
         left_running: runtime.modal_depth(),
         ms: ms / repeats as f64,
     }

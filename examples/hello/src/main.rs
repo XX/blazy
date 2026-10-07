@@ -30,14 +30,17 @@ use std::rc::Rc;
 use blazy::app::EditorApp;
 use blazy::areas::SplitTree;
 use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource};
-use blazy::masonry::core::{NewWidget, PropertySet, Widget, WidgetId};
+use blazy::masonry::core::{DefaultProperties, NewWidget, PropertySet, PropertyStack, Selector, Widget, WidgetId};
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{BezPath, Point, Rect, Shape, Size};
 use blazy::masonry::layout::Length;
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
-use blazy::masonry::widgets::Label;
-use blazy::node_editor::{NodeEditor, NodeGraph, SharedGraph, ViewToken, Views};
+use blazy::masonry::theme::default_property_set;
+use blazy::masonry::widgets::{Label, SizedBox};
+use blazy::node_editor::{
+    NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
+};
 use blazy::shell::window::{Error, WindowConfig};
 
 /// Nodes the graph starts with.
@@ -161,22 +164,14 @@ struct Nodes {
 /// A node's fill, and its outline.
 const FILL: Color = Color::from_rgb8(0x2c, 0x2c, 0x34);
 const OUTLINE: Color = Color::from_rgb8(0x50, 0x50, 0x5c);
+/// The outline of a selected node.
+const PICKED: Color = Color::from_rgb8(0xff, 0xa5, 0x2c);
 
 impl NodeSource for Nodes {
-    /// A caption in a box. The box is properties, not a widget of ours: Masonry paints a
-    /// background, a border and a corner for every widget that carries them.
+    /// A caption in a box. The box is a stock `SizedBox` and everything it looks like —
+    /// selected or not — is in [`properties`]: the node does not know what a selection is.
     fn build(&mut self, index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
-        let looks = PropertySet::new()
-            .with(Background::Color(FILL))
-            .with(BorderColor { color: OUTLINE })
-            .with(BorderWidth { width: Length::px(1.0) })
-            .with(CornerRadius {
-                radius: Length::px(6.0),
-            })
-            .with(Padding::all(Length::px(8.0)));
-        NewWidget::new(Label::new(format!("node {index}")))
-            .with_props(looks)
-            .erased()
+        NewWidget::new(SizedBox::new(NewWidget::new(Label::new(format!("node {index}"))))).erased()
     }
 
     /// The nodes too small to deserve widgets, all in one fill (§31): without this an
@@ -196,6 +191,33 @@ impl NodeSource for Nodes {
     }
 }
 
+/// The theme, plus what a node looks like — and what it looks like selected.
+///
+/// The node is a `SizedBox` because the theme has no style of its own for one: a
+/// property stack replaces the theme's for its type, and a `Label` would lose every
+/// label's. The box is in the stack rather than on each node because a property put on
+/// the widget itself beats the stack, and the outline could then never change colour.
+fn properties() -> DefaultProperties {
+    let mut properties = default_property_set();
+    let mut stack = PropertyStack::new();
+    stack.push_layer(
+        Selector::new(),
+        PropertySet::new()
+            .with(Background::Color(FILL))
+            .with(BorderColor { color: OUTLINE })
+            .with(BorderWidth { width: Length::px(1.0) })
+            .with(CornerRadius {
+                radius: Length::px(6.0),
+            })
+            .with(Padding::all(Length::px(8.0))),
+    );
+    // Selected is a class the editor puts on the node; a colour is all it changes, so
+    // a click repaints the node and lays nothing out.
+    stack.push_layer(Selector::classes(&[SELECTED]), BorderColor { color: PICKED });
+    properties.insert_stack::<SizedBox>(stack);
+    properties
+}
+
 /// The application: what fills an area is an editor over the graph.
 fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
     let graph_of_areas = graph.clone();
@@ -209,7 +231,13 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
         };
         let nodes = Nodes { graph, view: None };
         let canvas = CanvasLayer::new(names, geometry, nodes).with_links(links);
-        NewWidget::new(NodeEditor::with_session(canvas, session.clone())).erased()
+        // The nodes look selected by themselves, so the editor outlines only the far
+        // field, where there is no node widget to wear the class.
+        let style = OverlayStyle {
+            outline: SelectionOutline::FarField,
+            ..OverlayStyle::default()
+        };
+        NewWidget::new(NodeEditor::with_session(canvas, session.clone()).with_style(style)).erased()
     })
 }
 
@@ -238,14 +266,13 @@ fn main() -> Result<(), Error> {
         }),
         None => app,
     };
-    app.run(config, SplitTree::balanced(2))
+    app.with_properties(properties()).run(config, SplitTree::balanced(2))
 }
 
 #[cfg(test)]
 mod tests {
     use blazy::masonry::dpi::PhysicalSize;
     use blazy::masonry::testing::TestHarness;
-    use blazy::masonry::theme::default_property_set;
     use blazy::ops::keymap::Props;
 
     use super::*;
@@ -257,11 +284,8 @@ mod tests {
     fn the_screen_builds_and_an_edit_in_one_area_reaches_the_other() {
         let graph = Graph::grid();
         let screen = app(&graph).screen(SplitTree::balanced(2));
-        let mut harness = TestHarness::create_with_size(
-            default_property_set(),
-            NewWidget::new(screen),
-            PhysicalSize::new(1000, 600),
-        );
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
         let _ = harness.redraw();
 
         let areas = harness.root_widget().area_ids();

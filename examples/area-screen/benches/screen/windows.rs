@@ -15,13 +15,13 @@ use blazy::masonry::core::{NewWidget, WidgetId};
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Point, Vec2};
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
 use blazy::node_editor::ops::CANVAS_SCOPE;
 use blazy::ops::event::OpEvent;
 use blazy::ops::keymap::{Props, Scope};
 use blazy::ops::runtime::Seat;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::SharedGraph;
+use node_canvas::property_set;
 
 use crate::bench::{Options, VIEWPORT};
 
@@ -46,7 +46,7 @@ fn window(areas: usize, nodes: usize, graph: Option<&SharedGraph>) -> (TestHarne
         None => spec.build(),
     };
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -651,7 +651,7 @@ fn canvas_pos_of(harness: &mut TestHarness<Screen>, area: usize, index: usize) -
 /// A harness over a screen built elsewhere.
 fn harness(screen: Screen) -> TestHarness<Screen> {
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );

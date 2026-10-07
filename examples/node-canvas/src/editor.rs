@@ -7,7 +7,7 @@
 //! checks while dragging a node around — and because the tests read it back.
 
 use blazy::canvas::CanvasLayer;
-use blazy::node_editor::SessionHandle;
+use blazy::node_editor::{OverlayStyle, SelectionOutline, SessionHandle};
 
 use crate::model::{GraphModel, SharedGraph};
 
@@ -18,14 +18,28 @@ pub type NodeEditor = blazy::node_editor::NodeEditor<GraphModel>;
 pub const HUD_CAPTION: &str = "left-drag a node or the view - right-click selects, right-drag boxes - \
      G moves, B boxes, Shift+A adds, X deletes, F links, Ctrl+Z undoes";
 
+/// The editor's colours, with the outline of a selected node left to the node.
+///
+/// This example's nodes style themselves (`GraphNode` wears the `selected` class, and
+/// [`crate::property_set`] says what that looks like), so the editor outlines only the far
+/// field, where there are no widgets to wear anything.
+fn style() -> OverlayStyle {
+    OverlayStyle {
+        outline: SelectionOutline::FarField,
+        ..OverlayStyle::default()
+    }
+}
+
 /// An editor with the canvas's own gestures and the statistics overlay.
 pub fn new(canvas: CanvasLayer) -> NodeEditor {
-    NodeEditor::new(canvas).with_hud(HUD_CAPTION)
+    NodeEditor::new(canvas).with_hud(HUD_CAPTION).with_style(style())
 }
 
 /// An editor with the operator layer and the statistics overlay.
 pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph) -> NodeEditor {
-    NodeEditor::with_ops(canvas, graph).with_hud(HUD_CAPTION)
+    NodeEditor::with_ops(canvas, graph)
+        .with_hud(HUD_CAPTION)
+        .with_style(style())
 }
 
 /// The same, over a session that already exists.
@@ -33,5 +47,7 @@ pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph) -> NodeEditor {
 /// What an area rebuilt in another window is made of: a new widget showing the state the
 /// old one showed (the detach task, decision 1).
 pub fn with_session(canvas: CanvasLayer, session: SessionHandle<GraphModel>) -> NodeEditor {
-    NodeEditor::with_session(canvas, session).with_hud(HUD_CAPTION)
+    NodeEditor::with_session(canvas, session)
+        .with_hud(HUD_CAPTION)
+        .with_style(style())
 }

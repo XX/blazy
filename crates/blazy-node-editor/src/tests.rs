@@ -583,3 +583,166 @@ fn the_default_keymap_reads_back_from_its_file() {
     let text = keymap.write();
     assert_eq!(blazy_ops::keymap::Keymap::parse(&text), Ok(keymap), "{text}");
 }
+
+/// The colour a selected node's border takes, by the style below.
+const PICKED: masonry::peniko::Color = masonry::peniko::Color::from_rgb8(0xff, 0xa5, 0x2c);
+
+/// Properties where a label that wears [`SELECTED`](crate::SELECTED) has a coloured border.
+///
+/// The whole of what an application writes for its nodes to look selected: one layer of
+/// its node type's property stack. Labels stand in for nodes here; an application styles
+/// a type of its own, because this replaces the theme's stack for the type.
+fn styled_properties() -> masonry::core::DefaultProperties {
+    use masonry::core::{PropertyStack, Selector};
+    use masonry::properties::BorderColor;
+    let mut properties = default_property_set();
+    let mut stack = PropertyStack::new();
+    stack.push_layer(Selector::classes(&[crate::SELECTED]), BorderColor { color: PICKED });
+    properties.insert_stack::<Label>(stack);
+    properties
+}
+
+/// A harness over a fresh canvas and an existing session, with the selection styled.
+fn styled_harness(graph: &SharedGraph<Row>, session: &crate::SessionHandle<Row>) -> TestHarness<NodeEditor<Row>> {
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let canvas = CanvasLayer::new(3, geometry, source);
+    let mut harness = TestHarness::create_with_size(
+        styled_properties(),
+        NewWidget::new(NodeEditor::with_session(canvas, session.clone())),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = harness.redraw();
+    harness
+}
+
+/// The border colour each node's widget resolves to, by name.
+fn borders(harness: &mut TestHarness<NodeEditor<Row>>) -> Vec<(usize, masonry::peniko::Color)> {
+    let live = harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
+    });
+    live.into_iter()
+        .map(|(index, id)| {
+            let color = harness
+                .get_widget_with_id(id)
+                .get_prop::<masonry::properties::BorderColor>()
+                .color;
+            (index, color)
+        })
+        .collect()
+}
+
+/// A selected node looks selected by its own style, and only the selected one does.
+///
+/// §38.7's customer: the node never hears of a selection — it wears a class, and its
+/// type's property stack says what that class looks like.
+#[test]
+fn a_selected_node_looks_selected_by_its_own_style() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = styled_harness(&graph, &session);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 1));
+    });
+    let _ = harness.redraw();
+
+    let borders = borders(&mut harness);
+    assert_eq!(borders.len(), 3, "all three nodes are on screen");
+    for (index, color) in borders {
+        assert_eq!(color == PICKED, index == 1, "node {index}");
+    }
+}
+
+/// A click changes the class of the nodes it changed, and no others.
+#[test]
+fn a_click_changes_the_class_of_two_nodes() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = styled_harness(&graph, &session);
+    let changes = |harness: &mut TestHarness<NodeEditor<Row>>| {
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats().counters.class_changes)
+        })
+    };
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 0));
+    });
+    let _ = harness.redraw();
+    let before = changes(&mut harness);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 2));
+    });
+    let _ = harness.redraw();
+    assert_eq!(
+        changes(&mut harness) - before,
+        2,
+        "one node lost the class, one gained it"
+    );
+}
+
+/// A node built over a selection that already exists wears it from the start.
+///
+/// The case the class has to be remembered for: a widget rebuilt in another window — the
+/// nodes are new, the session is not.
+#[test]
+fn a_node_built_after_the_selection_wears_it() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    {
+        let mut first = styled_harness(&graph, &session);
+        first.edit_root_widget(|mut editor| {
+            NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 2));
+        });
+        let _ = first.redraw();
+    }
+    let mut second = styled_harness(&graph, &session);
+    let _ = second.redraw();
+    let picked: Vec<usize> = borders(&mut second)
+        .into_iter()
+        .filter(|(_, color)| *color == PICKED)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(picked, [2]);
+}
+
+/// A selected node that scrolls out of view and back comes back wearing the class.
+///
+/// Virtualisation drops the widget the moment the node leaves (§20.2); the class lives on
+/// in the canvas's slot, and the next widget is built wearing it. Nothing tells the node
+/// again — that is the point.
+#[test]
+fn a_selected_node_scrolled_back_into_view_still_looks_selected() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = styled_harness(&graph, &session);
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 0));
+    });
+    let _ = harness.redraw();
+    let pan = |harness: &mut TestHarness<NodeEditor<Row>>, dx: f64| {
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::pan(&mut canvas, masonry::kurbo::Vec2::new(dx, 0.0));
+            });
+        });
+        let _ = harness.redraw();
+    };
+    pan(&mut harness, -5000.0);
+    assert!(
+        borders(&mut harness).is_empty(),
+        "every node left the view, and with it its widget"
+    );
+    pan(&mut harness, 5000.0);
+    let picked: Vec<usize> = borders(&mut harness)
+        .into_iter()
+        .filter(|(_, color)| *color == PICKED)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(picked, [0]);
+}

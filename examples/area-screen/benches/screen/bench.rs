@@ -19,7 +19,7 @@ use blazy::masonry::core::{NewWidget, WidgetId, WindowEvent};
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Axis, Point, Vec2};
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
+use node_canvas::property_set;
 
 /// Viewport used for all scenarios. A working screen, not a demo window.
 pub(crate) const VIEWPORT: (u32, u32) = (1400, 900);
@@ -266,7 +266,7 @@ pub(crate) fn set_header_scale(harness: &mut TestHarness<Screen>, area: usize, s
 fn new_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -280,7 +280,7 @@ fn new_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
 fn headerless_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = ScreenSpec::new(areas, nodes).without_header().build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );

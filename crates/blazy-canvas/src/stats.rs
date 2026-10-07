@@ -121,6 +121,12 @@ pub struct CanvasCounters {
     /// If this climbs steeply while panning slowly, the overscan is too tight and
     /// nodes are thrashing in and out.
     pub builds: u64,
+    /// Classes put on or taken off nodes (`CanvasLayer::set_node_class`).
+    ///
+    /// The cost of a view's state reaching its nodes, counted per node that changed: a
+    /// selection that touched every selected node on each click would be a selection that
+    /// cost the selection, and this is where it shows.
+    pub class_changes: u64,
     /// Nodes inserted into or removed from the canvas (§43).
     pub node_edits: u64,
     /// Links inserted into or removed from the canvas.

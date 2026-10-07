@@ -13,14 +13,13 @@ use blazy::masonry::core::{NewWidget, TextEvent};
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Point, Vec2};
 use blazy::masonry::testing::{TestHarness, TestHarnessParams};
-use blazy::masonry::theme::default_property_set;
 use blazy::masonry::ui_events::pointer::PointerButton;
 use blazy::ops::OpResult;
 use blazy::ops::keymap::Props;
 
-use crate::CanvasSpec;
 use crate::editor::NodeEditor;
 use crate::model::{NODE_SIZE, NodeState, SharedGraph};
+use crate::{CanvasSpec, property_set};
 
 /// A harness whose editor drives operators, with the keymap listening for keys.
 ///
@@ -30,7 +29,7 @@ use crate::model::{NODE_SIZE, NodeState, SharedGraph};
 fn ops_harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
     let (canvas, graph) = CanvasSpec::new(count).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(crate::editor::with_ops(canvas, &graph)),
         PhysicalSize::new(1100, 750),
     );
@@ -239,7 +238,7 @@ fn a_band_starts_where_the_press_was_on_a_panned_view() {
 fn a_pan_on_a_scaled_display_moves_by_what_the_pointer_did() {
     let (canvas, graph) = CanvasSpec::new(500).build();
     let mut harness = TestHarness::create_with(
-        default_property_set(),
+        property_set(),
         NewWidget::new(crate::editor::with_ops(canvas, &graph)),
         {
             let mut params = TestHarnessParams::default();

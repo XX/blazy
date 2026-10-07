@@ -111,6 +111,7 @@ impl CanvasLayer {
                     size,
                     pod: None,
                     built: None,
+                    classes: Vec::new(),
                 },
                 None => EMPTY_SLOT,
             })
@@ -431,6 +432,38 @@ impl CanvasLayer {
         };
         f(content.ctx.get_mut(pod));
         true
+    }
+
+    /// Puts `class` on node `index`'s widget, or takes it off — now if the node has a
+    /// widget, and on every widget it is built with from now on.
+    ///
+    /// What lets a node *look* like what a view knows about it — selected, active,
+    /// erroneous — without the node knowing why: Masonry resolves a widget's properties
+    /// against the property stack of its type, and a [`Selector`](masonry::core::Selector)
+    /// matches classes the way the theme's matches `hovered`. The view's state stays in the
+    /// view; the node's style stays in data (`DefaultProperties::insert_stack`).
+    ///
+    /// Returns whether anything changed. A node that does not exist wears nothing.
+    pub fn set_node_class(this: &mut WidgetMut<'_, Self>, index: usize, class: &'static str, on: bool) -> bool {
+        let mut content = this.ctx.get_mut(&mut this.widget.content);
+        let changed = CanvasContent::set_node_class(&mut content, index, class, on);
+        // Published here rather than by the next layout, because a class change is
+        // designed not to cause one: the counter would otherwise wait for an unrelated
+        // frame, and a criterion reading it after a click would read the click before.
+        let mut stats = this.widget.stats.get();
+        stats.counters.class_changes = content.widget.class_changes;
+        this.widget.stats.set(stats);
+        changed
+    }
+
+    /// Whether node `index` wears `class`, as the canvas remembers it.
+    pub fn node_has_class(this: &mut WidgetMut<'_, Self>, index: usize, class: &str) -> bool {
+        let content = this.ctx.get_mut(&mut this.widget.content);
+        content
+            .widget
+            .slots
+            .get(index)
+            .is_some_and(|slot| slot.alive && slot.classes.contains(&class))
     }
 
     /// Tells the canvas that what node `index` holds has changed in the model.
@@ -909,6 +942,7 @@ impl Widget for CanvasLayer {
                 child_layouts: content.child_layouts,
                 composes: content.composes,
                 builds: content.builds,
+                class_changes: content.class_changes,
                 node_edits: content.node_edits,
                 link_edits: content.link_edits,
                 link_compactions: content.links.edit_counters().0,

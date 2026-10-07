@@ -15,11 +15,10 @@
 use blazy::canvas::{DEFAULT_WIDGET_BUDGET, DetailBudget};
 use blazy::masonry::app::RenderRoot;
 use blazy::masonry::core::NewWidget;
-use blazy::masonry::theme::default_property_set;
 use blazy::shell::window::{ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use blazy::shell::{Backend, COMPILED};
 use clap::Parser;
-use node_canvas::{DEFAULT_NODES, build_canvas};
+use node_canvas::{DEFAULT_NODES, build_canvas, property_set};
 
 #[derive(Parser)]
 #[command(
@@ -73,13 +72,7 @@ fn main() {
     // need to act on them — that they arrive at all is claim 3 holding. What the
     // driver is here for is the other half of the keymap: the keys no focused widget
     // claimed have to reach the editor, and only the host can say so.
-    run(
-        config,
-        NewWidget::new(editor).erased(),
-        default_property_set(),
-        KeymapFocus,
-    )
-    .unwrap();
+    run(config, NewWidget::new(editor).erased(), property_set(), KeymapFocus).unwrap();
 }
 
 /// Makes the application's root widget the focus fallback, so the keymap hears keys.

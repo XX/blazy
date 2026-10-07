@@ -39,6 +39,26 @@ use blazy::canvas::{CanvasLayer, Link};
 use crate::model::{GraphModel, NODE_SIZE, SharedGraph, share};
 use crate::node::GraphSource;
 
+/// The theme, plus what a selected node looks like.
+///
+/// The one place this example's style for a selected node is written: a layer of
+/// `GraphNode`'s property stack, matched by the `selected` class the editor puts on the
+/// nodes of its own selection (§38.7). Everything that builds a scene of this example —
+/// the windows, the tests, the benchmarks — builds it with this, so that what they
+/// measure is what the window shows (§44.6).
+pub fn property_set() -> blazy::masonry::core::DefaultProperties {
+    use blazy::masonry::core::{PropertyStack, Selector};
+    use blazy::masonry::peniko::Color;
+    use blazy::masonry::properties::BorderColor;
+    let mut properties = blazy::masonry::theme::default_property_set();
+    let mut stack = PropertyStack::new();
+    stack.push_layer(Selector::classes(&[blazy::node_editor::SELECTED]), BorderColor {
+        color: Color::from_rgb8(0xff, 0xa5, 0x2c),
+    });
+    properties.insert_stack::<crate::node::GraphNode>(stack);
+    properties
+}
+
 /// Default graph size. The figure comes straight from the Phase 0 brief.
 pub const DEFAULT_NODES: usize = 5000;
 

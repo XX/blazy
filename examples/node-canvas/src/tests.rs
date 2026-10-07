@@ -9,13 +9,12 @@ use blazy::masonry::core::{NewWidget, WidgetId, WidgetRef};
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Point, Vec2};
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
 use blazy::masonry::ui_events::pointer::PointerButton;
 
-use crate::CanvasSpec;
 use crate::editor::NodeEditor;
 use crate::model::{NODE_SIZE, SharedGraph};
 use crate::node::GraphNode;
+use crate::{CanvasSpec, property_set};
 
 fn harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
     harness_with(count, false)
@@ -24,7 +23,7 @@ fn harness(count: usize) -> (TestHarness<NodeEditor>, SharedGraph) {
 fn harness_with(count: usize, controls_on_hover: bool) -> (TestHarness<NodeEditor>, SharedGraph) {
     let (canvas, graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(crate::editor::new(canvas)),
         PhysicalSize::new(1100, 750),
     );
@@ -655,7 +654,7 @@ fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEdito
     let graph = crate::model::share(crate::model::GraphModel::generated(count));
     let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(crate::editor::new(canvas)),
         PhysicalSize::new(1100, 750),
     );

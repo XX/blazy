@@ -488,6 +488,21 @@ there from §44 to §49. `EditorApp::route_keys` points the fallback at the edit
 under the pointer after every event, reading through a `WidgetRef` (an edit would cost a
 rewrite battery per event); the editor records its own id in its session for that.
 
+**A node looks selected by wearing a class, and its style is data (§50).** The editor
+puts `SELECTED` on the nodes of its own session's selection (per view, by difference), the
+canvas remembers a node's classes in its slot and builds every widget wearing them (the
+widget comes and goes, §20.2), and the application's look for the class is a layer of its
+node type's property stack (`DefaultProperties::insert_stack`). Three things bite: the
+stack *replaces* a type's stack, and the theme has one for `Label`, `Button` and other stock
+types — style your own node type or a `SizedBox`; a property put on the widget itself beats
+the stack, so whatever a class changes must live in the stack; and Masonry answers a change
+of `BorderColor`/`Background` with a *pre*-paint only — a node that draws its own outline in
+`paint` must request a repaint in `property_changed`, or it never shows the selection (the
+snapshot caught it after the editor's own outline was turned off). A class change on a node
+built in the same mutate pass goes through `mutate_later`: the widget is not in the tree
+until the pass after, and `get_mut` panics. `SelectionOutline::Always` stays the default so
+an application that styles nothing does not lose its selection.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget

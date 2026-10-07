@@ -105,6 +105,7 @@ fn content_at_scale(rects: &[Rect], edges: Vec<Link>, visible: Rect, scale: f64)
             size: r.size(),
             pod: None,
             built: None,
+            classes: Vec::new(),
         })
         .collect();
     let mut content = CanvasContent::new(slots, Box::new(RoundedSource::new(size)));

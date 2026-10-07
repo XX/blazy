@@ -10,9 +10,8 @@ use std::time::Instant;
 use blazy::masonry::core::NewWidget;
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
-use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
+use node_canvas::{CanvasSpec, property_set};
 
 use crate::bench::{Options, PAN_STEP, ScenarioRecord, VIEWPORT, look_at, measure, node_rect, pan_step, stats};
 
@@ -145,7 +144,7 @@ fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
     } = case;
     let (canvas, _graph) = CanvasSpec::new(count).with_links(links).with_far(tuning).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );

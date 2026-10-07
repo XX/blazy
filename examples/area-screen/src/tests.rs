@@ -20,15 +20,14 @@ use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Point, Rect, Size, Vec2};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::testing::{TestHarness, TestHarnessParams, assert_render_snapshot};
-use blazy::masonry::theme::default_property_set;
 use blazy::masonry::ui_events::pointer::PointerButton;
 use blazy::node_editor::Change;
 use blazy::shell::Host;
 use image::RgbaImage;
-use node_canvas::build_canvas;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::SharedGraph;
 use node_canvas::node::GraphNode;
+use node_canvas::{build_canvas, property_set};
 
 use crate::header::ScaledHeader;
 use crate::{Screen, build_screen};
@@ -56,7 +55,7 @@ fn header_harness(scale: f64, size: (u32, u32)) -> TestHarness<AreaContent> {
     let header = NewWidget::new(ScaledHeader::caption(TINT, "ui")).erased();
     let content = AreaContent::new(vec![(RegionKind::Main, 0.0, header)]).with_ui_scale(0, scale);
     TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(content),
         PhysicalSize::new(size.0, size.1),
     )
@@ -83,7 +82,7 @@ fn ui_scale_magnifies_without_blurring() {
 fn canvas_harness(zoom: f64, size: (u32, u32)) -> TestHarness<CanvasLayer> {
     let (canvas, _graph) = build_canvas(400);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(canvas),
         PhysicalSize::new(size.0, size.1),
     );
@@ -176,7 +175,7 @@ fn assert_redrawn_not_repeated(small: &RgbaImage, big: &RgbaImage) {
 fn screen_appearance() {
     let (screen, _graph) = build_screen(4, 200, None);
     let mut harness = TestHarness::create_with(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         TestHarnessParams::size_and_padding(PhysicalSize::new(240, 160), 0),
     );
@@ -199,7 +198,7 @@ fn screen_appearance() {
 fn screen_with_operators_appearance() {
     let (screen, _graph) = crate::ScreenSpec::new(2, 60).with_ops(true).build();
     let mut harness = TestHarness::create_with(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         // Larger than the default cap, because this picture is meant to have detail in
         // it: the status line and the outline of a selected node are the objects under
@@ -228,7 +227,7 @@ fn screen_with_operators_appearance() {
 fn canvas_with_links_appearance() {
     let (canvas, _graph) = build_canvas(400);
     let mut harness = TestHarness::create_with(
-        default_property_set(),
+        property_set(),
         NewWidget::new(canvas),
         TestHarnessParams::size_and_padding(PhysicalSize::new(260, 180), 0),
     );
@@ -267,11 +266,8 @@ fn the_snapshot_scales_are_the_ones_that_were_set() {
 /// A screen of `areas` areas over one shared graph.
 fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<Screen>, SharedGraph) {
     let (screen, graph) = build_screen(areas, nodes, None);
-    let mut harness = TestHarness::create_with_size(
-        default_property_set(),
-        NewWidget::new(screen),
-        PhysicalSize::new(1400, 900),
-    );
+    let mut harness =
+        TestHarness::create_with_size(property_set(), NewWidget::new(screen), PhysicalSize::new(1400, 900));
     let _ = harness.redraw();
     (harness, graph)
 }
@@ -416,22 +412,16 @@ fn a_control_edit_in_one_area_reaches_the_others() {
 /// A screen whose areas carry the operator layer, over one shared graph.
 fn ops_screen(areas: usize, nodes: usize) -> (TestHarness<Screen>, SharedGraph) {
     let (screen, graph) = crate::ScreenSpec::new(areas, nodes).with_ops(true).build();
-    let mut harness = TestHarness::create_with_size(
-        default_property_set(),
-        NewWidget::new(screen),
-        PhysicalSize::new(1400, 900),
-    );
+    let mut harness =
+        TestHarness::create_with_size(property_set(), NewWidget::new(screen), PhysicalSize::new(1400, 900));
     let _ = harness.redraw();
     (harness, graph)
 }
 
 /// A harness over a screen that was built elsewhere: the second window of a test.
 fn harness_of(screen: Screen) -> TestHarness<Screen> {
-    let mut harness = TestHarness::create_with_size(
-        default_property_set(),
-        NewWidget::new(screen),
-        PhysicalSize::new(1400, 900),
-    );
+    let mut harness =
+        TestHarness::create_with_size(property_set(), NewWidget::new(screen), PhysicalSize::new(1400, 900));
     let _ = harness.redraw();
     harness
 }
@@ -962,11 +952,8 @@ fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
         .with_budget(Some(64))
         .with_isolated_layers(true)
         .build();
-    let mut harness = TestHarness::create_with_size(
-        default_property_set(),
-        NewWidget::new(screen),
-        PhysicalSize::new(1400, 900),
-    );
+    let mut harness =
+        TestHarness::create_with_size(property_set(), NewWidget::new(screen), PhysicalSize::new(1400, 900));
     let (plan, _) = harness.redraw();
     let first = plan.layers.len();
 
@@ -1014,7 +1001,7 @@ fn a_kept_layer_is_the_same_picture() {
         .with_budget(Some(64))
         .with_isolated_layers(true)
         .build();
-    let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
+    let mut harness = TestHarness::create_with_size(property_set(), NewWidget::new(screen), size);
     let ids = harness.root_widget().area_ids();
 
     let logical = Size::new(f64::from(size.width), f64::from(size.height));
@@ -1088,7 +1075,7 @@ fn a_changed_layer_is_drawn_again() {
         .with_budget(Some(64))
         .with_isolated_layers(true)
         .build();
-    let mut harness = TestHarness::create_with_size(default_property_set(), NewWidget::new(screen), size);
+    let mut harness = TestHarness::create_with_size(property_set(), NewWidget::new(screen), size);
     let ids = harness.root_widget().area_ids();
     gpu.cache_layers(ids.clone());
     let logical = Size::new(f64::from(size.width), f64::from(size.height));

@@ -19,7 +19,7 @@ use blazy::masonry::core::NewWidget;
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Axis, Size};
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
+use node_canvas::property_set;
 
 use crate::bench::{Options, VIEWPORT};
 
@@ -46,7 +46,7 @@ pub(crate) struct OpsRow {
 fn harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = build_screen(areas, nodes, None);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(screen),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );

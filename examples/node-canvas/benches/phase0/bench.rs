@@ -20,10 +20,9 @@ use blazy::masonry::core::NewWidget;
 use blazy::masonry::dpi::PhysicalSize;
 use blazy::masonry::kurbo::{Affine, Point, Vec2};
 use blazy::masonry::testing::TestHarness;
-use blazy::masonry::theme::default_property_set;
-use node_canvas::CanvasSpec;
 use node_canvas::editor::NodeEditor;
 use node_canvas::model::{GRID_STEP, GraphModel, NODE_SIZE, share};
+use node_canvas::{CanvasSpec, property_set};
 
 /// Viewport used for all scenarios.
 pub(crate) const VIEWPORT: (u32, u32) = (1100, 750);
@@ -308,7 +307,7 @@ fn linked_harness(count: usize, links: usize) -> TestHarness<NodeEditor> {
     edges.truncate(links);
     let (canvas, _graph) = CanvasSpec::new(count).with_links(edges).build();
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -320,7 +319,7 @@ fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEd
     let (canvas, _graph) = CanvasSpec::new(count).with_controls_on_hover(controls_on_hover).build();
     let editor = node_canvas::editor::new(canvas);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(editor),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -340,7 +339,7 @@ fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
     let graph = share(GraphModel::generated_with_step(count, GRID_STEP / times.sqrt()));
     let canvas = CanvasSpec::new(count).over(&graph);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -353,7 +352,7 @@ fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEdito
     let graph = share(GraphModel::generated(count));
     let canvas = CanvasSpec::new(count).over(&graph).with_budget(budget);
     let mut harness = TestHarness::create_with_size(
-        default_property_set(),
+        property_set(),
         NewWidget::new(node_canvas::editor::new(canvas)),
         PhysicalSize::new(VIEWPORT.0, VIEWPORT.1),
     );
@@ -1571,6 +1570,30 @@ fn evaluate(
             measured: click.content_layouts,
             bound: 0.5,
             unit: "layout passes/gesture",
+        });
+    }
+
+    if let Some(click) = gesture("click select", "tree") {
+        // A node knows it is selected by wearing a class (§38.7), and a click changes the
+        // class of the nodes whose selection it changed — one going, one coming — not of
+        // every selected node, and not of the canvas.
+        criteria.push(Criterion {
+            name: "a_click_restyles_the_nodes_it_changed",
+            claim: "a click changes the class of at most the two nodes it (de)selected",
+            kind: Kind::Counter,
+            measured: click.class_changes,
+            bound: 2.5,
+            unit: "class changes/click",
+        });
+        // And from the failing side: the class reached the widget and the widget's style
+        // answered — counted on the resolved colour, not on the canvas's record.
+        criteria.push(Criterion {
+            name: "a_selected_node_looks_selected",
+            claim: "every node on screen looks selected exactly when it is",
+            kind: Kind::Counter,
+            measured: click.misstyled as f64,
+            bound: 0.5,
+            unit: "nodes whose look disagrees with the selection",
         });
     }
 

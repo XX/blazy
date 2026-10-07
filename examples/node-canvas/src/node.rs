@@ -28,6 +28,7 @@ use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, RoundedRect, Shape, Size, Stroke};
 use blazy::masonry::layout::{LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
+use blazy::masonry::properties::BorderColor;
 use blazy::masonry::widgets::{Checkbox, CheckboxToggled, Slider, SliderMoved};
 use blazy::node_editor::{Change, ViewToken};
 use blazy::shape::ShapeHit;
@@ -300,6 +301,20 @@ impl Widget for GraphNode {
         );
         painter.fill(RoundedRect::from_rect(header, RADIUS), self.tint).draw();
 
+        // Selected or not is not this widget's to know: it wears a class, and the style
+        // for that class — `crate::property_set` — says what colour its outline is (§38.7).
+        // Transparent, which is the default, means no outline at all.
+        let outline = props.get::<BorderColor>(ctx.property_cache()).color;
+        if outline.components[3] > 0.0 {
+            painter
+                .stroke(
+                    body.rect().inset(-1.0).to_rounded_rect(RADIUS + 1.0),
+                    &Stroke::new(2.0),
+                    outline,
+                )
+                .draw();
+        }
+
         // Without control widgets the node still has to show its state. The stand-in
         // sits where the real controls would, because it is swapped for them the
         // moment the pointer arrives: a mismatch here would read as the UI jumping
@@ -383,6 +398,13 @@ impl Widget for GraphNode {
 
     fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
         CanvasDetail::prop_changed(ctx, property_type);
+        // The outline is drawn by `paint`, not by the box Masonry paints for a widget, and
+        // Masonry answers a change of `BorderColor` with a *pre*-paint — the box — and
+        // nothing more. Without asking, a node that became selected kept its old paint,
+        // and the window showed no selection at all once the editor stopped outlining it.
+        if property_type == TypeId::of::<BorderColor>() {
+            ctx.request_paint_only();
+        }
     }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {

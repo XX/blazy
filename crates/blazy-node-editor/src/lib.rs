@@ -47,9 +47,16 @@ use std::rc::Rc;
 pub use blazy_canvas::Link;
 use masonry::kurbo::{Point, Rect};
 
-pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SessionHandle};
+pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
 pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};
 pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, journal};
+
+/// The class a selected node wears (`CanvasLayer::set_node_class`).
+///
+/// What an application's style is written against: a layer of the node type's property
+/// stack with `Selector::classes(&[SELECTED])` is how a node looks selected without
+/// knowing what a selection is (§38.7). Per view, like the selection itself.
+pub const SELECTED: &str = "selected";
 
 /// What a node editor needs from the graph behind it.
 ///

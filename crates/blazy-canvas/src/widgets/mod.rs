@@ -72,6 +72,14 @@ struct Slot {
     /// handed to it as [`CanvasDetail`] so it can scale how much effort its painted
     /// stand-in deserves. A change in either makes the widget stale.
     built: Option<(Detail, Detail)>,
+    /// Classes the node's widget wears, kept here because the widget comes and goes.
+    ///
+    /// A node is virtualised (§20.2): most of the time it has no widget, and a class put
+    /// on the widget alone would be gone the next time it scrolled out and back. So the
+    /// slot remembers, and the widget is built wearing them. `&'static str` because a
+    /// class is a name the application's style is written against — code, like an
+    /// operator's name — and a node wears one or two.
+    classes: Vec<&'static str>,
 }
 
 /// How far past the viewport nodes stay materialised, as a fraction of the viewport.
@@ -150,6 +158,7 @@ const EMPTY_SLOT: Slot = Slot {
     size: Size::ZERO,
     pod: None,
     built: None,
+    classes: Vec::new(),
 };
 
 /// The subset of a Masonry context this crate needs to invalidate a widget.
@@ -362,6 +371,14 @@ pub struct CanvasContent {
     /// Indices that should have a widget, computed by the last cull and applied in
     /// the next mutate pass.
     pending: Option<Vec<usize>>,
+    /// Nodes whose widget was built in the mutate pass that is running, and is not in
+    /// the tree until the pass after it registers them.
+    ///
+    /// A widget that is not in the tree cannot be reached through `get_mut` — Masonry
+    /// panics, "child not found" — and a class change can arrive in the same pass that
+    /// built it (an editor rebuilt in another window builds its nodes and tells them
+    /// what is selected at once). Cleared by the layout that follows registration.
+    fresh: Vec<usize>,
     /// The canvas-space region nodes are kept live in: the viewport **plus the
     /// overscan margin**, pushed down by the parent.
     ///
@@ -391,6 +408,7 @@ pub struct CanvasContent {
     child_layouts: u64,
     composes: u64,
     builds: u64,
+    class_changes: u64,
     /// Nodes inserted or removed.
     node_edits: u64,
     /// Links inserted or removed.
@@ -450,6 +468,8 @@ impl CanvasContent {
             child_layouts: 0,
             composes: 0,
             builds: 0,
+            class_changes: 0,
+            fresh: Vec::new(),
             node_edits: 0,
             link_edits: 0,
             level_switches: 0,
@@ -501,6 +521,8 @@ impl CanvasContent {
             size,
             pod: None,
             built: None,
+            // A name handed out again is a new node, and wears nothing of the old one's.
+            classes: Vec::new(),
         };
         self.index.insert(index, Rect::from_origin_size(pos, size));
         self.node_edits += 1;
@@ -751,8 +773,12 @@ impl CanvasContent {
 
         for &index in &added {
             let (detail, global) = this.widget.build_spec(index);
-            let widget = this.widget.source.build(index, detail).with_props(CanvasDetail(global));
+            let mut widget = this.widget.source.build(index, detail).with_props(CanvasDetail(global));
+            for class in &this.widget.slots[index].classes {
+                widget = widget.with_class(class);
+            }
             this.widget.slots[index].pod = Some(widget.to_pod());
+            this.widget.fresh.push(index);
             this.widget.slots[index].built = Some((detail, global));
             this.widget.builds += 1;
         }
@@ -768,6 +794,48 @@ impl CanvasContent {
         }
         // The far-field repaint is requested by the parent, which is where culling
         // and the region check happen.
+    }
+
+    /// Puts `class` on node `index`, or takes it off, and says whether that changed
+    /// anything.
+    ///
+    /// The slot remembers it for the widgets to come; a widget that exists wears it now.
+    /// A class change is resolved by Masonry against the property stack of the widget's
+    /// type, and only the properties whose value moved are told — so a style that changes
+    /// a colour costs a repaint of the node, and nothing else.
+    fn set_node_class(this: &mut WidgetMut<'_, Self>, index: usize, class: &'static str, on: bool) -> bool {
+        let Some(slot) = this.widget.slots.get_mut(index).filter(|slot| slot.alive) else {
+            return false;
+        };
+        let wears = slot.classes.contains(&class);
+        if wears == on {
+            return false;
+        }
+        if on {
+            slot.classes.push(class);
+        } else {
+            slot.classes.retain(|&worn| worn != class);
+        }
+        this.widget.class_changes += 1;
+        let fresh = this.widget.fresh.contains(&index);
+        if let Some(pod) = this.widget.slots[index].pod.as_mut() {
+            let apply = move |mut widget: WidgetMut<'_, dyn Widget>| {
+                if on {
+                    widget.ctx.add_class(class);
+                } else {
+                    widget.ctx.remove_class(class);
+                }
+            };
+            if fresh {
+                // Built in this pass and not in the tree yet: the next mutate pass can
+                // reach it. It was built wearing the slot's classes as they were then.
+                let id = pod.id();
+                this.ctx.mutate_later(id, apply);
+            } else {
+                apply(this.ctx.get_mut(pod));
+            }
+        }
+        true
     }
 
     /// Marks node `index`'s widget as stale, so the next cull builds it again from the
@@ -1058,6 +1126,8 @@ impl Widget for CanvasContent {
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {
         self.layouts += 1;
+        // Whatever was built before this layout is in the tree by now.
+        self.fresh.clear();
 
         // Children are laid out in canvas coordinates at their natural size; the
         // zoom lives entirely in this widget's transform. That separation is the

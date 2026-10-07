@@ -51,7 +51,7 @@ use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
 use blazy_shell::window::{Error, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use masonry::app::RenderRoot;
-use masonry::core::{Handled, NewWidget, TextEvent, Widget, WidgetId, WidgetMut};
+use masonry::core::{DefaultProperties, Handled, NewWidget, TextEvent, Widget, WidgetId, WidgetMut};
 use masonry::dpi::LogicalSize;
 use masonry::kurbo::Axis;
 use masonry::peniko::Color;
@@ -145,6 +145,9 @@ pub struct EditorApp<G: NodeGraph> {
     base_color: Color,
     /// Windows still to open at startup.
     remaining: usize,
+    /// The properties every widget falls back on: the theme, and the application's
+    /// styles — what a selected node looks like among them (§50).
+    properties: Option<DefaultProperties>,
     /// Every window this application has.
     windows: Vec<WindowKey>,
     /// The editor each window last sent its keys to.
@@ -179,6 +182,7 @@ impl<G: NodeGraph> EditorApp<G> {
             backend: defaults.backend,
             base_color: defaults.base_color,
             remaining: 0,
+            properties: None,
             windows: Vec::new(),
             focus: Vec::new(),
             counters: AppCounters::default(),
@@ -231,6 +235,16 @@ impl<G: NodeGraph> EditorApp<G> {
         let text = std::fs::read_to_string(path).map_err(KeymapLoadError::Io)?;
         let keymap = default_keymap().patched(&text).map_err(KeymapLoadError::Keymap)?;
         self.with_keymap(keymap).map_err(KeymapLoadError::Screen)
+    }
+
+    /// The same application, with `properties` in place of the theme's defaults.
+    ///
+    /// Where an application's style goes — the theme, plus a property stack for its node
+    /// type saying what a node wearing [`SELECTED`](blazy_node_editor::SELECTED) looks like.
+    #[must_use]
+    pub fn with_properties(mut self, properties: DefaultProperties) -> Self {
+        self.properties = Some(properties);
+        self
     }
 
     /// The same application, writing and reading its workspace at `path`.
@@ -299,12 +313,11 @@ impl<G: NodeGraph> EditorApp<G> {
         self.backend = config.backend;
         self.base_color = config.base_color;
         let screen = self.screen(tree);
-        run(
-            config,
-            NewWidget::new(screen).erased(),
-            masonry::theme::default_property_set(),
-            self,
-        )
+        let properties = self
+            .properties
+            .take()
+            .unwrap_or_else(masonry::theme::default_property_set);
+        run(config, NewWidget::new(screen).erased(), properties, self)
     }
 
     /// The windows that have to draw to catch up with a change, after an event.

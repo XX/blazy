@@ -171,7 +171,8 @@ fn main() {
         },
         None => app,
     };
-    app.with_workspace(args.workspace)
+    app.with_properties(node_canvas::property_set())
+        .with_workspace(args.workspace)
         .with_layer_cache(layers)
         .with_windows(args.windows)
         .run(config, SplitTree::balanced(areas))
@@ -188,12 +189,12 @@ mod tests {
     use blazy::masonry::core::{NewWidget, WidgetId};
     use blazy::masonry::dpi::PhysicalSize;
     use blazy::masonry::kurbo::Point;
-    use blazy::masonry::theme::default_property_set;
     use blazy::node_editor::Change;
     use blazy::ops::keymap::Props;
     use blazy::shell::window::{ShellCtx, ShellDriver};
     use node_canvas::editor::NodeEditor;
     use node_canvas::model::SharedGraph;
+    use node_canvas::property_set;
 
     use super::*;
 
@@ -295,7 +296,7 @@ mod tests {
     fn root_of(app: &EditorApp<GraphModel>) -> RenderRoot {
         let screen = app.screen(SplitTree::balanced(2));
         let mut root = RenderRoot::new(NewWidget::new(screen).erased(), |_signal| {}, RenderRootOptions {
-            default_properties: Arc::new(default_property_set()),
+            default_properties: Arc::new(property_set()),
             use_system_fonts: false,
             size_policy: WindowSizePolicy::User,
             size: PhysicalSize::new(1400, 900),

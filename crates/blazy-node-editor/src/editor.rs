@@ -126,6 +126,26 @@ pub struct OverlayStyle {
     pub selection: Color,
     /// The inside of the rubber band.
     pub band_fill: Color,
+    /// Where the editor outlines selected nodes itself.
+    pub outline: SelectionOutline,
+}
+
+/// Where the editor draws its own outline round a selected node.
+///
+/// Every selected node wears the [`SELECTED`](crate::SELECTED) class whatever this says,
+/// so an application that styles it (`DefaultProperties::insert_stack` with
+/// `Selector::classes(&["selected"])`) can have the node look selected by itself. The
+/// outline is for what such a style cannot reach.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "configuration, matched by the caller")]
+pub enum SelectionOutline {
+    /// Round every selected node on screen. The default, because an application that
+    /// styles nothing would otherwise have a selection nobody can see.
+    #[default]
+    Always,
+    /// Only where nodes have no widgets — the far field (§20.6), where a node is a shape
+    /// in the canvas's own scene and wears no class.
+    FarField,
 }
 
 impl Default for OverlayStyle {
@@ -133,6 +153,7 @@ impl Default for OverlayStyle {
         Self {
             background: Color::from_rgb8(0x1c, 0x1c, 0x20),
             selection: Color::from_rgb8(0xff, 0xa5, 0x2c),
+            outline: SelectionOutline::Always,
             band_fill: Color::from_rgba8(0xff, 0xa5, 0x2c, 0x20),
         }
     }
@@ -169,6 +190,12 @@ pub struct NodeEditor<G: NodeGraph> {
     /// so it must not happen per frame. It is redone only when [`Self::hud`] actually
     /// changes, which during a steady pan is almost never.
     hud_layout: Option<Layout<BrushIndex>>,
+    /// The nodes this editor's canvas has been told are selected.
+    ///
+    /// What the [`SELECTED`](crate::SELECTED) class was last set from, so that a change of
+    /// selection touches the nodes that changed and no others — a box select of a
+    /// thousand nodes and one more click should cost one class, not a thousand.
+    shown: BTreeSet<usize>,
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
@@ -208,6 +235,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             hud: String::new(),
             hud_next: String::new(),
             hud_layout: None,
+            shown: BTreeSet::new(),
         }
     }
 
@@ -364,6 +392,40 @@ impl<G: NodeGraph> NodeEditor<G> {
         }
     }
 
+    /// Brings the [`SELECTED`](crate::SELECTED) class on this editor's nodes in line with
+    /// the session's selection, touching only the nodes whose selection changed.
+    ///
+    /// Only this editor's canvas: a selection is the view's, not the graph's (§38.4), so
+    /// the other views of the graph do not follow it.
+    fn sync_selection(this: &mut WidgetMut<'_, Self>) {
+        let Some(session) = this.widget.session.clone() else {
+            return;
+        };
+        let selection = session.borrow().world.selection.clone();
+        if selection == this.widget.shown {
+            return;
+        }
+        let gone: Vec<usize> = this.widget.shown.difference(&selection).copied().collect();
+        let came: Vec<usize> = selection.difference(&this.widget.shown).copied().collect();
+        {
+            let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
+            for index in gone {
+                CanvasLayer::set_node_class(&mut canvas, index, crate::SELECTED, false);
+            }
+            for index in came {
+                CanvasLayer::set_node_class(&mut canvas, index, crate::SELECTED, true);
+            }
+        }
+        this.widget.shown = selection;
+    }
+
+    /// Whether the session's selection is one this editor's nodes have not been told about.
+    fn selection_stale(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.borrow().world.selection != self.shown)
+    }
+
     /// Applies what the operators changed, from a `WidgetMut`.
     ///
     /// The twin of [`flush`](Self::flush), and what the two share — draining the world,
@@ -378,6 +440,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         if changes.dirty {
             this.ctx.request_post_paint();
         }
+        Self::sync_selection(this);
         if changes.is_empty() {
             return;
         }
@@ -687,6 +750,11 @@ impl<G: NodeGraph> NodeEditor<G> {
         if changes.dirty {
             ctx.request_post_paint();
         }
+        // Classes are changed from the mutate pass: it is where a child's `WidgetMut` is to
+        // be had, and a selection is a click, not a frame of a drag.
+        if self.selection_stale() {
+            ctx.mutate_self_later(|mut widget| Self::sync_selection(&mut widget.downcast::<Self>()));
+        }
         if changes.is_empty() {
             return;
         }
@@ -786,7 +854,13 @@ impl<G: NodeGraph> NodeEditor<G> {
         let session = session.borrow();
         let viewport = ctx.content_box();
         let graph = session.world.graph.borrow();
-        for &index in &session.world.selection {
+        // Nodes with widgets wear the class and can look selected by themselves; the far
+        // field has no widgets and nothing to wear it on.
+        let outline = match self.style.outline {
+            SelectionOutline::Always => true,
+            SelectionOutline::FarField => self.stats.detail == Some(blazy_canvas::Detail::Box),
+        };
+        for &index in session.world.selection.iter().filter(|_| outline) {
             if index >= graph.node_count() {
                 continue;
             }
@@ -1008,6 +1082,12 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
             session.borrow_mut().view = self.view;
         }
         self.stats = stats;
+        // A widget built over a session that already has a selection — an area rebuilt in
+        // another window, a script that selected from outside — has nodes that have not
+        // been told yet. Once, in the next mutate pass; never again while nothing changes.
+        if self.selection_stale() {
+            ctx.mutate_self_later(|mut widget| Self::sync_selection(&mut widget.downcast::<Self>()));
+        }
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
