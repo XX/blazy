@@ -341,6 +341,28 @@ impl Keymap {
         }
     }
 
+    /// The binding of `op` with exactly `props` that a menu shows beside the entry as its
+    /// shortcut: a key if there is one, the first binding otherwise.
+    ///
+    /// A key first, because a shortcut is something to remember for next time, and "Drag
+    /// Secondary" beside *Box select* teaches less than `B` does.
+    pub fn binding_for(&self, op: &str, props: &Props) -> Option<&Binding> {
+        let mut bindings = self
+            .sections
+            .iter()
+            .flat_map(|section| section.bindings.iter())
+            .filter(|binding| binding.op == op && binding.props == *props);
+        let first = bindings.next()?;
+        if matches!(first.pattern.trigger, crate::event::Trigger::Key(_)) {
+            return Some(first);
+        }
+        Some(
+            bindings
+                .find(|binding| matches!(binding.pattern.trigger, crate::event::Trigger::Key(_)))
+                .unwrap_or(first),
+        )
+    }
+
     /// The bindings in a context, for a menu or a "what is bound to this" report.
     pub fn section(&self, context: &str) -> Option<&Section> {
         self.sections.iter().find(|section| section.context == context)

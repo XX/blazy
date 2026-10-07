@@ -320,6 +320,56 @@ fn write_pattern(pattern: &Pattern) -> String {
     out
 }
 
+impl Pattern {
+    /// The pattern as a person reads it: `Shift+A`, `Ctrl+Z`, `Drag Middle`, `Wheel`.
+    ///
+    /// For a menu entry's shortcut and a "what is bound" report — not for a file, which is
+    /// what [`Keymap::write`] is for: this one loses the difference between a key going
+    /// down and coming up, and does not read back.
+    pub fn label(&self) -> String {
+        let mut out = String::new();
+        for (name, modifier) in [
+            ("Ctrl", Modifiers::CONTROL),
+            ("Shift", Modifiers::SHIFT),
+            ("Alt", Modifiers::ALT),
+            ("Meta", Modifiers::META),
+        ] {
+            if self.mods.contains(modifier) {
+                out.push_str(name);
+                out.push('+');
+            }
+        }
+        let button = |button: PointerButton| {
+            let name = BUTTONS
+                .iter()
+                .find(|(_, b)| *b == button)
+                .map_or("?", |(name, _)| *name);
+            let mut chars = name.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                .unwrap_or_default()
+        };
+        let key = |key: &Key| match key {
+            Key::Character(text) if text == " " => "Space".to_owned(),
+            Key::Character(text) => text.to_uppercase(),
+            Key::Named(named) => named.to_string(),
+        };
+        match &self.trigger {
+            Trigger::Press(b) => write!(out, "Press {}", button(*b)),
+            Trigger::Release(b) => write!(out, "Release {}", button(*b)),
+            Trigger::Click(b) => write!(out, "Click {}", button(*b)),
+            Trigger::Drag(b) => write!(out, "Drag {}", button(*b)),
+            Trigger::DoubleClick(b) => write!(out, "Double-click {}", button(*b)),
+            Trigger::Key(k) => write!(out, "{}", key(k)),
+            Trigger::KeyUp(k) => write!(out, "{} (up)", key(k)),
+            Trigger::Scroll => write!(out, "Wheel"),
+        }
+        .ok();
+        out
+    }
+}
+
 /// A key as the W3C names it, with whitespace written as a code point so a line can still
 /// be split on it.
 fn parse_key(word: &str) -> Result<Key, &'static str> {
@@ -482,5 +532,27 @@ mod tests {
     fn comments_and_blank_lines_are_skipped() {
         let text = "blazy-keymap 1\n\n# mine\ncontext canvas\n  bind key:g node.move  \n";
         assert_eq!(Keymap::parse(text).map(|k| k.len()), Ok(1));
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use masonry::core::keyboard::Modifiers;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use crate::event::Pattern;
+
+    #[test]
+    fn a_pattern_reads_the_way_a_menu_shows_it() {
+        assert_eq!(Pattern::key("a").with_mods(Modifiers::SHIFT).label(), "Shift+A");
+        assert_eq!(
+            Pattern::key("z")
+                .with_mods(Modifiers::CONTROL | Modifiers::SHIFT)
+                .label(),
+            "Ctrl+Shift+Z"
+        );
+        assert_eq!(Pattern::key(" ").with_mods(Modifiers::CONTROL).label(), "Ctrl+Space");
+        assert_eq!(Pattern::drag(PointerButton::Auxiliary).label(), "Drag Middle");
+        assert_eq!(Pattern::scroll().label(), "Wheel");
     }
 }

@@ -702,3 +702,60 @@ fn an_error_hands_on_its_cause() {
     );
     assert!(shell.to_string().contains("no device"), "{shell}");
 }
+
+/// Popups: a layer a widget asks for reaches the window.
+#[cfg(feature = "window")]
+mod layers_in_the_window {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, WindowSizePolicy};
+    use masonry::core::{LayerType, NewWidget};
+    use masonry::kurbo::Point;
+    use masonry::layers::Tooltip;
+    use masonry::widgets::Label;
+
+    use super::*;
+    use crate::window::apply_layer_signal;
+
+    /// A layer is put in and taken out by the host, from the signal the widget sent.
+    ///
+    /// The loop used to drop these signals, and with them every popup — a menu, a tooltip,
+    /// a selector's list — while the harness, which handles them itself, said all was well.
+    #[test]
+    fn a_layer_a_widget_asks_for_reaches_the_window() {
+        let signals = Rc::new(RefCell::new(Vec::new()));
+        let sink = signals.clone();
+        let mut root = RenderRoot::new(
+            NewWidget::new(Label::new("base")).erased(),
+            move |signal| sink.borrow_mut().push(signal),
+            RenderRootOptions {
+                default_properties: Arc::new(default_property_set()),
+                use_system_fonts: false,
+                size_policy: WindowSizePolicy::User,
+                size: PhysicalSize::new(200, 100),
+                scale_factor: 1.0,
+                test_font: None,
+            },
+        );
+        let _ = root.redraw();
+
+        // What `EventCtx::create_layer` sends.
+        let popup = NewWidget::new(Tooltip::new(NewWidget::new(Label::new("tip"))));
+        let id = popup.id();
+        let unhandled = apply_layer_signal(
+            &mut root,
+            RenderRootSignal::NewLayer(LayerType::Other, popup.erased(), Point::new(20.0, 20.0)),
+        );
+        assert!(unhandled.is_none(), "a layer signal is the host's to handle");
+        let _ = root.redraw();
+        assert!(root.get_widget(id).is_some(), "the popup is in the window");
+
+        let _ = apply_layer_signal(&mut root, RenderRootSignal::RemoveLayer(id));
+        let _ = root.redraw();
+        assert!(root.get_widget(id).is_none(), "and out of it again");
+
+        // Anything else comes back for the loop to handle.
+        assert!(apply_layer_signal(&mut root, RenderRootSignal::RequestRedraw).is_some());
+    }
+}

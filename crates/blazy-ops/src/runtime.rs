@@ -600,6 +600,26 @@ impl<W> OpRuntime<W> {
         }
     }
 
+    /// Whether operator `name` would run now, with `props` — `None` if there is no such
+    /// operator.
+    ///
+    /// What a menu asks to show an entry as available or not: the same poll, in the same
+    /// context, that a key and a script are refused by (§38), so an entry the menu offers
+    /// is one that runs. Counted as a poll, and as nothing else.
+    pub fn poll(&mut self, world: &mut W, name: &str, props: &Props) -> Option<bool> {
+        let at = self.index_of(name)?;
+        let op = self.ops[at].as_ref()?;
+        let cx = OpCtx {
+            world,
+            event: None,
+            props,
+            scope: &[],
+            undo: &mut self.undo,
+        };
+        self.counters.polled += 1;
+        Some(op.poll(&cx))
+    }
+
     /// Cancels every running operator, innermost first.
     ///
     /// What a window losing focus, or a driver being torn down, has to do: a modal

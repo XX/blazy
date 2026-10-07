@@ -787,6 +787,8 @@ pub fn default_keymap() -> Keymap {
             Binding::new(Pattern::key("="), "view.zoom").with_props(Props::new().with_float("factor", ZoomOp::STEP)),
             Binding::new(Pattern::key("-"), "view.zoom")
                 .with_props(Props::new().with_float("factor", 1.0 / ZoomOp::STEP)),
+            // The editor's menu, under the pointer — Blender's old `W`.
+            Binding::new(Pattern::key("w"), NODE_MENU),
         ])
         .with("window", vec![
             Binding::new(Pattern::key("z").with_mods(Modifiers::CONTROL), "ed.undo"),
@@ -795,6 +797,29 @@ pub fn default_keymap() -> Keymap {
                 "ed.redo",
             ),
         ])
+}
+
+/// The operator that opens [`node_menu`].
+pub const NODE_MENU: &str = "menu.node";
+
+/// The editor's menu: what can be done to the graph and the view from where the pointer is.
+///
+/// Every entry is an operator the keymap also binds, with the properties it binds it with,
+/// so the menu shows each one's shortcut — and teaches it.
+pub fn node_menu() -> crate::Menu {
+    crate::Menu::new("Node")
+        .with("Add node", "node.add", Props::new())
+        .with("Delete", "node.delete", Props::new())
+        .with("Link selected", "link.add", Props::new())
+        .with("Box select", "node.box_select", Props::new())
+        .with("Zoom in", "view.zoom", Props::new().with_float("factor", ZoomOp::STEP))
+        .with(
+            "Zoom out",
+            "view.zoom",
+            Props::new().with_float("factor", 1.0 / ZoomOp::STEP),
+        )
+        .with("Undo", "ed.undo", Props::new())
+        .with("Redo", "ed.redo", Props::new())
 }
 
 /// A runtime with these operators registered and [`default_keymap`] in force.
@@ -814,6 +839,7 @@ pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
     runtime.register(MoveOp::default());
     runtime.register(PanOp::default());
     runtime.register(ZoomOp);
+    runtime.register(crate::MenuOp::new(NODE_MENU, node_menu()));
     runtime.register(AddNodeOp);
     runtime.register(DeleteNodeOp);
     runtime.register(AddLinkOp);

@@ -977,6 +977,31 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "areas drawn/frame",
         });
     }
+    if let (Some(menu), Some(idle)) = (cached_row("a menu is open"), cached_row("nothing changes")) {
+        // A menu is its own layer above the areas, and the areas under it are unchanged:
+        // an open menu costs the menu, not the window (§36). Summed over the row rather
+        // than averaged, because the frame that opens the menu is the one a menu painted
+        // into its area would show up in, and an average over eight frames hides one.
+        criteria.push(Criterion {
+            name: "an_open_menu_redraws_no_area",
+            claim: "opening a menu over an area, and keeping it open, draws no area",
+            kind: Kind::Counter,
+            measured: menu.drawn * crate::cache::CACHE_FRAMES as f64,
+            bound: 0.5,
+            unit: "areas drawn over the row",
+        });
+        // And the menu is there at all: a row in which it never opened would agree with
+        // the claim above for nothing. One layer more than an idle screen has.
+        criteria.push(Criterion {
+            name: "the_menu_row_has_a_menu",
+            claim: "the menu row's plan carries the menu's layer",
+            kind: Kind::Counter,
+            measured: f64::from(u8::from(menu.layers <= idle.layers)),
+            bound: 1.0,
+            unit: "menu rows with no menu",
+        });
+    }
+
     if let Some(idle) = cached_row("nothing changes") {
         // Why the cache pays for itself (§36.3), as a counter: comparing scenes is
         // cheap, finding out where a layer sits walks its whole scene, and a layer that

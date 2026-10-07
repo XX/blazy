@@ -746,3 +746,143 @@ fn a_selected_node_scrolled_back_into_view_still_looks_selected() {
         .collect();
     assert_eq!(picked, [0]);
 }
+
+mod menus {
+    use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
+    use masonry::core::{TextEvent, WidgetId};
+    use masonry::kurbo::Point;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use super::*;
+    use crate::MenuLayer;
+
+    fn key(harness: &mut TestHarness<NodeEditor<Row>>, key: Key) {
+        harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key,
+            code: Code::Unidentified,
+            modifiers: Modifiers::empty(),
+            ..KeyboardEvent::default()
+        }));
+        let _ = harness.redraw();
+    }
+
+    /// An editor with the keys, the pointer over empty canvas, and its menu open.
+    fn opened() -> (TestHarness<NodeEditor<Row>>, SharedGraph<Row>, WidgetId) {
+        let graph = row(3);
+        let session = crate::EditorSession::new(&graph).share();
+        let mut harness = editor_harness(&graph, &session);
+        let editor = harness.root_widget().ctx().widget_id();
+        harness.set_focus_fallback(Some(editor));
+        harness.mouse_move(Point::new(500.0, 300.0));
+        key(&mut harness, Key::Character("w".into()));
+        let menu = harness.root_widget().open_menu().expect("W opens the menu");
+        assert!(harness.try_get_widget(menu).is_some(), "and it is in the window");
+        (harness, graph, menu)
+    }
+
+    /// The button of the entry that runs `op`.
+    fn entry(harness: &TestHarness<NodeEditor<Row>>, menu: WidgetId, op: &str) -> WidgetId {
+        let layer = harness.get_widget_with_id(menu);
+        let layer = layer.downcast::<MenuLayer<Row>>().expect("the layer is a menu");
+        layer
+            .entries()
+            .find(|(_, name)| *name == op)
+            .map(|(id, _)| id)
+            .expect("the entry is there")
+    }
+
+    /// Choosing an entry runs its operator the way a key does, and closes the menu.
+    #[test]
+    fn an_entry_runs_its_operator_and_closes_the_menu() {
+        let (mut harness, graph, menu) = opened();
+        let add = entry(&harness, menu, "node.add");
+        // Unchecked: the harness looks for a widget under the pointer in the base layer
+        // only, and a menu is a layer of its own.
+        harness.mouse_move_to_unchecked(add);
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+        assert_eq!(graph.borrow().node_count(), 4, "a node was added");
+        assert!(harness.try_get_widget(menu).is_none(), "and the menu is gone");
+        assert_eq!(harness.root_widget().open_menu(), None);
+    }
+
+    /// An entry whose operator would be refused is shown refused.
+    #[test]
+    fn an_entry_that_would_be_refused_is_disabled() {
+        let (harness, _graph, menu) = opened();
+        // Nothing is selected, so there is nothing to link.
+        let link = entry(&harness, menu, "link.add");
+        assert!(harness.get_widget_with_id(link).ctx().is_disabled());
+        let add = entry(&harness, menu, "node.add");
+        assert!(!harness.get_widget_with_id(add).ctx().is_disabled());
+    }
+
+    /// A click outside closes the menu and does nothing else.
+    #[test]
+    fn a_click_outside_closes_the_menu_and_nothing_else() {
+        let (mut harness, graph, menu) = opened();
+        let clicks = harness.root_widget().op_counters().clicks;
+        harness.mouse_move(Point::new(5.0, 5.0));
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+        assert!(harness.try_get_widget(menu).is_none(), "the menu is gone");
+        assert_eq!(harness.root_widget().open_menu(), None, "and the editor knows");
+        assert_eq!(graph.borrow().node_count(), 3);
+        assert_eq!(
+            harness.root_widget().op_counters().clicks,
+            clicks,
+            "the click never reached the keymap"
+        );
+    }
+
+    /// Escape closes it, and the keys are the menu's while it is open.
+    #[test]
+    fn escape_closes_the_menu_and_keys_do_not_leak_past_it() {
+        let (mut harness, graph, menu) = opened();
+        // `Shift+A` would add a node; with the menu open it does not.
+        harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: Key::Character("a".into()),
+            code: Code::Unidentified,
+            modifiers: Modifiers::SHIFT,
+            ..KeyboardEvent::default()
+        }));
+        let _ = harness.redraw();
+        assert_eq!(graph.borrow().node_count(), 3, "the keymap did not hear it");
+        key(&mut harness, Key::Named(NamedKey::Escape));
+        assert!(harness.try_get_widget(menu).is_none());
+        assert_eq!(harness.root_widget().open_menu(), None);
+    }
+}
+
+/// A menu opened near the bottom-right corner is moved inside the window.
+#[test]
+fn a_menu_opened_by_the_edge_stays_inside_the_window() {
+    use masonry::core::TextEvent;
+    use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers};
+    use masonry::kurbo::Point;
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = editor_harness(&graph, &session);
+    let editor = harness.root_widget().ctx().widget_id();
+    harness.set_focus_fallback(Some(editor));
+    harness.mouse_move(Point::new(790.0, 390.0));
+    harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: Key::Character("w".into()),
+        code: Code::Unidentified,
+        modifiers: Modifiers::empty(),
+        ..KeyboardEvent::default()
+    }));
+    let _ = harness.redraw();
+    let menu = harness.root_widget().open_menu().expect("the menu opened");
+    let widget = harness.get_widget_with_id(menu);
+    let origin = widget.ctx().to_window(Point::ORIGIN);
+    let size = widget.ctx().border_box().size();
+    assert!(origin.x >= 0.0 && origin.y >= 0.0, "{origin:?}");
+    assert!(origin.x + size.width <= 800.0 + 1e-9, "{origin:?} {size:?}");
+    assert!(origin.y + size.height <= 400.0 + 1e-9, "{origin:?} {size:?}");
+}

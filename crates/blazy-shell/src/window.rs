@@ -48,7 +48,8 @@
 //! custom title bar, resize handles, the system menu. Masonry emits signals for all
 //! of them and this loop ignores those signals rather than pretending: each is a
 //! platform integration of its own, and none is on the critical path for the
-//! question this crate exists to answer.
+//! question this crate exists to answer. Layers are not among them: a popup is a layer,
+//! and [`apply_layer_signal`] puts it in the window.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -375,6 +376,25 @@ pub trait ShellDriver {
         let _ = (cx, window, root, event);
         Handled::No
     }
+}
+
+/// Does what a layer signal asks of `root`, or hands the signal back if it is not one.
+///
+/// A popup in Masonry — a menu, a tooltip, a selector's list — is a layer, and a layer is
+/// not created by the widget that wants it: the widget emits
+/// [`RenderRootSignal::NewLayer`] and the host puts the root into the window's stack. This
+/// loop used to drop those signals with IME and the clipboard, so no popup ever appeared in
+/// a blazy window — and no test noticed, because the test harness handles them itself
+/// (`issues/menus.md`). A free function over the root, so an embedder running its own loop
+/// does the same, and a test can check it without a window.
+pub fn apply_layer_signal(root: &mut RenderRoot, signal: RenderRootSignal) -> Option<RenderRootSignal> {
+    match signal {
+        RenderRootSignal::NewLayer(_kind, widget, position) => root.add_layer(widget, position),
+        RenderRootSignal::RemoveLayer(id) => root.remove_layer(id),
+        RenderRootSignal::RepositionLayer(id, position) => root.reposition_layer(id, position),
+        other => return Some(other),
+    }
+    None
 }
 
 /// Offers one pointer event to the host seat, and then to the tree unless it was taken.
@@ -825,6 +845,14 @@ impl ShellApp {
                     // The application exiting, rather than one window closing: a window
                     // goes through `ShellCtx::close_window` or its own close button.
                     RenderRootSignal::Exit => event_loop.exit(),
+                    signal @ (RenderRootSignal::NewLayer(..)
+                    | RenderRootSignal::RemoveLayer(_)
+                    | RenderRootSignal::RepositionLayer(..)) => {
+                        if let Some(shell) = self.windows.get_mut(&key) {
+                            let _ = apply_layer_signal(&mut shell.root, signal);
+                            shell.window.request_redraw();
+                        }
+                    },
                     // Deliberately unhandled, and listed in the module docs: IME, the
                     // clipboard, accessibility and window-manager gestures are platform
                     // integrations of their own.

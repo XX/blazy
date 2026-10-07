@@ -38,9 +38,9 @@ use blazy_ops::{OpCounters, OpResult};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::keyboard::KeyState;
 use masonry::core::{
-    AccessCtx, BrushIndex, ChildrenIds, EventCtx, Handled, Layer, LayoutCtx, MeasureCtx, NoAction, PaintCtx,
-    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Update, UpdateCtx, Widget,
-    WidgetId, WidgetMut, WidgetPod, render_text,
+    AccessCtx, BrushIndex, ChildrenIds, EventCtx, Handled, Layer, LayerType, LayoutCtx, MeasureCtx, NewWidget,
+    NoAction, PaintCtx, PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Update,
+    UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod, render_text,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
@@ -50,6 +50,7 @@ use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerScrollEvent, PointerType, PointerUpdate};
 use masonry::{TextAlign, TextAlignOptions};
 
+use crate::menu::MenuLayer;
 use crate::ops::CANVAS_SCOPE;
 use crate::{Change, Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
 
@@ -196,6 +197,8 @@ pub struct NodeEditor<G: NodeGraph> {
     /// selection touches the nodes that changed and no others — a box select of a
     /// thousand nodes and one more click should cost one class, not a thousand.
     shown: BTreeSet<usize>,
+    /// The menu this editor opened and has not seen closed, by its layer's root.
+    menu: Option<WidgetId>,
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
@@ -236,6 +239,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             hud_next: String::new(),
             hud_layout: None,
             shown: BTreeSet::new(),
+            menu: None,
         }
     }
 
@@ -385,6 +389,16 @@ impl<G: NodeGraph> NodeEditor<G> {
         result
     }
 
+    /// The menu this editor has open, by its layer's root, if any.
+    pub fn open_menu(&self) -> Option<WidgetId> {
+        self.menu
+    }
+
+    /// Hears that its menu closed. Called by the menu.
+    pub(crate) fn menu_closed(this: &mut WidgetMut<'_, Self>) {
+        this.widget.menu = None;
+    }
+
     /// Sets how a finished move becomes an undo step. See [`EditorWorld::record_move`].
     pub fn set_move_recorder(this: &mut WidgetMut<'_, Self>, recorder: MoveRecorder<G>) {
         if let Some(session) = this.widget.session.as_ref() {
@@ -419,6 +433,42 @@ impl<G: NodeGraph> NodeEditor<G> {
         this.widget.shown = selection;
     }
 
+    /// The menu an operator asked for, made into the layer that shows it — `None` when
+    /// nothing asked.
+    ///
+    /// Each entry is polled now, through the runtime a key goes through, so the menu shows
+    /// as available exactly what would run; and each is labelled with the binding that runs
+    /// the same operator with the same properties, if there is one.
+    fn take_menu(
+        &self,
+        target: WidgetId,
+        to_window: impl FnOnce(Point) -> Point,
+    ) -> Option<(NewWidget<MenuLayer<G>>, Point)> {
+        let session = self.session.as_ref()?;
+        let session = &mut *session.borrow_mut();
+        let menu = session.world.menu.take()?;
+        let entries = menu
+            .items
+            .iter()
+            .map(|item| crate::menu::Entry {
+                label: item.label.clone(),
+                op: item.op.clone(),
+                props: item.props.clone(),
+                enabled: session
+                    .runtime
+                    .poll(&mut session.world, &item.op, &item.props)
+                    .unwrap_or(false),
+                shortcut: session
+                    .runtime
+                    .keymap()
+                    .binding_for(&item.op, &item.props)
+                    .map(|binding| binding.pattern.label()),
+            })
+            .collect();
+        let at = to_window(session.world.pointer_screen);
+        Some((NewWidget::new(MenuLayer::new(&menu.title, entries, target, at)), at))
+    }
+
     /// Whether the session's selection is one this editor's nodes have not been told about.
     fn selection_stale(&self) -> bool {
         self.session
@@ -439,6 +489,12 @@ impl<G: NodeGraph> NodeEditor<G> {
         let changes = session.borrow_mut().take_changes();
         if changes.dirty {
             this.ctx.request_post_paint();
+        }
+        let editor = this.ctx.widget_id();
+        let origin = this.ctx.to_window(Point::ORIGIN);
+        if let Some((menu, at)) = this.widget.take_menu(editor, |p| p + origin.to_vec2()) {
+            this.widget.menu = Some(menu.id());
+            this.ctx.create_layer(LayerType::Other, menu, at);
         }
         Self::sync_selection(this);
         if changes.is_empty() {
@@ -750,6 +806,13 @@ impl<G: NodeGraph> NodeEditor<G> {
         if changes.dirty {
             ctx.request_post_paint();
         }
+        // A menu goes on screen as a layer above the window, at the pointer; the host puts
+        // it there (`blazy_shell::window::apply_layer_signal`).
+        let origin = ctx.to_window(Point::ORIGIN);
+        if let Some((menu, at)) = self.take_menu(ctx.widget_id(), |p| p + origin.to_vec2()) {
+            self.menu = Some(menu.id());
+            ctx.create_layer(LayerType::Other, menu, at);
+        }
         // Classes are changed from the mutate pass: it is where a child's `WidgetMut` is to
         // be had, and a selection is a click, not a frame of a drag.
         if self.selection_stale() {
@@ -1014,6 +1077,17 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                     session.runtime.cancel_all(&mut session.world);
                 }
                 self.flush(ctx);
+            },
+            // While its menu is open the keys are the menu's, and the menu cannot take
+            // them itself: `Escape` closes it, and nothing else reaches the keymap.
+            TextEvent::Keyboard(key) if !ctx.is_handled() && self.menu.is_some() => {
+                if key.state == KeyState::Down
+                    && key.key == masonry::core::keyboard::Key::Named(masonry::core::keyboard::NamedKey::Escape)
+                    && let Some(menu) = self.menu.take()
+                {
+                    ctx.remove_layer(menu);
+                }
+                ctx.set_handled();
             },
             TextEvent::Keyboard(key) if !ctx.is_handled() => {
                 let op_event = OpEvent::Key {

@@ -503,6 +503,18 @@ built in the same mutate pass goes through `mutate_later`: the widget is not in 
 until the pass after, and `get_mut` panics. `SelectionOutline::Always` stays the default so
 an application that styles nothing does not lose its selection.
 
+**A popup is a layer, and the host is what makes one (§51).** A widget asks with
+`create_layer`, which only emits `RenderRootSignal::NewLayer`; the host has to put the root
+in the window's stack. `blazy-shell` dropped those signals, so no popup — ours or Masonry's
+own tooltips and selector lists — ever appeared in a blazy window, and every test passed
+because the harness handles them itself. `apply_layer_signal` is the host's half now. Menus
+are data (`Menu`), opened by an operator (`MenuOp`, since binding properties carry no
+strings), and an entry runs through `NodeEditor::exec` — the script path, same poll, same
+history. A layer cannot take focus as it is added (`request_focus` is an event's), so the
+editor that opened the menu holds the keys meanwhile. Two harness limits to remember:
+`mouse_move_to` checks visibility in the base layer only, and the harness — not the host —
+is what handled layers all along.
+
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The
 working mechanism is `WidgetMut::insert_prop` → `Widget::property_changed` → the widget

@@ -21,7 +21,7 @@ use crate::bench::{Options, PAN_STEP, SCALES, VIEWPORT, pan_area, set_header_sca
 // --- MARK: the layer cache (§36)
 
 /// Frames each cache scenario is timed over. Few: each one is a whole GPU frame.
-const CACHE_FRAMES: usize = 8;
+pub(crate) const CACHE_FRAMES: usize = 8;
 
 /// What one gesture costs a screen of areas, with and without kept layers.
 pub(crate) struct CacheRow {
@@ -441,6 +441,26 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
             // few hundred pixels wide and a node further along the row lands in the
             // area next door, where it would select something and prove nothing.
             |h, i| click_node(h, 0, if i % 2 == 0 { 3 } else { 5 }),
+        ));
+        // A menu is a layer of its own above the window (`issues/menus.md`), and an area
+        // under it is still the area it was: its pixels can be kept. Opened once, on the
+        // first frame, through the operator a key would run; every frame after that is a
+        // window with a menu open and nothing else happening.
+        rows.extend(cache_case(
+            &mut gpu,
+            CacheCase {
+                ops: true,
+                ..case("a menu is open")
+            },
+            |h, i| {
+                if i == 0 {
+                    let id = main_region(h, 0);
+                    h.edit_widget_with_id(id, |mut widget| {
+                        let mut editor = widget.downcast::<NodeEditor>();
+                        NodeEditor::exec(&mut editor, "menu.node", &blazy::ops::keymap::Props::new());
+                    });
+                }
+            },
         ));
         // The set of layers *is* the set of areas, so an operation that changes the areas
         // changes what the cache holds — §41.2 asks whether it survives that. The join

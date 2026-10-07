@@ -34,6 +34,7 @@
 #![warn(missing_docs, unreachable_pub)]
 
 mod editor;
+mod menu;
 pub mod ops;
 mod views;
 mod world;
@@ -48,6 +49,7 @@ pub use blazy_canvas::Link;
 use masonry::kurbo::{Point, Rect};
 
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
+pub use crate::menu::{Menu, MenuItem, MenuLayer, MenuOp};
 pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};
 pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, journal};
 

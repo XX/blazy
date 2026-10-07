@@ -87,6 +87,11 @@ pub struct EditorWorld<G: NodeGraph> {
     /// The zoom twin of [`pan`](Self::pan), and kept as a list rather than a product
     /// because two zooms about two points are not one zoom about either.
     pub zoom: Vec<(Point, f64)>,
+    /// A menu an operator asked to open, for the driver to put on screen at the pointer.
+    ///
+    /// Left here rather than opened by the operator, for the reason everything here is:
+    /// an operator never touches a widget, and a menu on screen is one (§38.3).
+    pub menu: Option<crate::Menu>,
     /// Set when something changed that only affects pixels.
     pub dirty: bool,
     /// Changes to the shape of the graph the views have not been told about yet.
@@ -124,6 +129,7 @@ impl<G: NodeGraph> EditorWorld<G> {
             moved: Vec::new(),
             pan: Vec2::ZERO,
             zoom: Vec::new(),
+            menu: None,
             dirty: false,
             edits: Vec::new(),
             new_node_size: DEFAULT_NODE_SIZE,
