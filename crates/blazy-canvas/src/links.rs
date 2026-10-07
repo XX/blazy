@@ -733,6 +733,10 @@ pub struct LinkStyle {
     /// Two canvas units at an overview zoom of 0.02 are 0.04 px: a line at four percent
     /// coverage, which no block of the frame shows (§53). A floor in pixels is what makes
     /// the graph's structure visible where the overview exists to show it.
+    ///
+    /// The default is half a pixel, not one: a full pixel per link turns a dense overview
+    /// into a grey mat over the nodes, and half a pixel still puts every link on screen
+    /// at about half the link colour's contrast (§53.6).
     pub far_min_width_px: f64,
 }
 

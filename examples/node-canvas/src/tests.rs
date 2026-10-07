@@ -361,12 +361,20 @@ fn detail_rebuild_preserves_state() {
 
     // Crossing into Simplified drops the controls; coming back rebuilds them, and the
     // rebuilt widget has to pick up what the model holds now.
-    zoom_out(&mut harness, 0.2);
+    // 0.08: between the default thresholds of 0.1 and 0.02 (§53.6).
+    zoom_out(&mut harness, 0.08);
     assert!(
         live(&mut harness).iter().any(|(i, _)| *i == target),
         "the node should still be materialised at simplified detail"
     );
-    zoom_out(&mut harness, 5.0);
+    // Otherwise the zoom never crossed a threshold and nothing below tests a rebuild —
+    // which is how this test went on failing for the wrong reason when they moved.
+    let id = live_id(&mut harness, target).expect("node is live");
+    assert!(
+        node_ref(&harness, id).checkbox_id().is_none(),
+        "simplified drops the controls"
+    );
+    zoom_out(&mut harness, 12.5);
 
     let id = live_id(&mut harness, target).expect("node should be live again");
     let node = node_ref(&harness, id);

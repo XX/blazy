@@ -118,12 +118,13 @@ pub(crate) struct FarRow {
     /// The other half, on the blit path, and on the GPU path where there is a device.
     pub(crate) cpu_ms: f64,
     pub(crate) gpu_ms: f64,
-    /// 16x16 blocks of the frame that differ from the frame with no links at all by more
-    /// than antialiasing (§45): how much of the graph's structure the picture shows.
+    /// 16x16 blocks of the frame holding a pixel visibly different from the frame with no
+    /// links at all: how much of the graph's structure the picture shows.
     ///
     /// The fidelity measure §53 needed and did not have. Measuring a lever against the
     /// stroked picture said every lever changed nothing — because the stroked picture
-    /// shows no links either.
+    /// shows no links either. Pixels and not the block mean of §45: the default link is
+    /// half a pixel wide and moves a block's mean by less than antialiasing does (§53.6).
     pub(crate) blocks_with_links: Option<u64>,
     /// The CPU frame, for that comparison.
     picture: Option<Vec<u8>>,
@@ -253,10 +254,8 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
         far_case(row("overscan 0.00", with(0.0), None), &mut paths),
         far_case(row("links >= 4 px", links_at(4.0), None), &mut paths),
         far_case(row("links >= 8 px", links_at(8.0), None), &mut paths),
-        // The levers of §53: what a link costs drawn as fill rather than stroke, and how
-        // many of them share their pixels with another.
-        // §53: how a far-field link is drawn. The default is a filled ribbon at least a
-        // pixel wide; these are the alternatives it was chosen over.
+        // §53: how a far-field link is drawn. The default is a filled ribbon at least half
+        // a pixel wide; these are the alternatives it was chosen over.
         far_case(
             row(
                 "stroked, as was",
@@ -274,6 +273,7 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
                 "stroked, 1 px",
                 node_canvas::FarTuning {
                     fill_links: false,
+                    link_min_px: 1.0,
                     ..default
                 },
                 None,
@@ -293,9 +293,9 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
         ),
         far_case(
             row(
-                "filled, 0.5 px",
+                "filled, 1 px",
                 node_canvas::FarTuning {
-                    link_min_px: 0.5,
+                    link_min_px: 1.0,
                     ..default
                 },
                 None,
@@ -313,7 +313,7 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
     if let Some(bare) = bare {
         for row in &mut rows {
             if let Some(picture) = &row.picture {
-                row.blocks_with_links = Some(bench_utils::render::blocks_changed(&bare, picture, VIEWPORT.0 as usize));
+                row.blocks_with_links = Some(bench_utils::render::blocks_touched(&bare, picture, VIEWPORT.0 as usize));
             }
         }
     }

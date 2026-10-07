@@ -152,6 +152,44 @@ pub fn blocks_changed(first: &[u8], second: &[u8], width: usize) -> u64 {
     changed
 }
 
+/// How far one pixel's channel may move before the change is something an eye sees.
+///
+/// Derived from the far field it is used on (§53.6): a link half a pixel wide moves the
+/// pixels it crosses by about half its contrast against the background, some fifty
+/// levels; the link of two canvas units at zoom 0.02 moves them by four. Sixteen sits
+/// between the two, three times from each.
+pub const PIXEL_DELTA: u8 = 16;
+
+/// Blocks of two frames holding at least one pixel that moved by [`PIXEL_DELTA`].
+///
+/// The question [`blocks_changed`] cannot answer: whether a thin line reached the screen
+/// at all. A line half a pixel wide is plainly visible and still moves its block's mean by
+/// about three levels, under [`BLOCK_DELTA`]. Asking pixel by pixel is safe only where the
+/// two frames come from one deterministic rasteriser — two CPU frames, not two GPU
+/// submissions — which is why this does not replace the block mean in the idle-frame
+/// criterion of §45.
+pub fn blocks_touched(first: &[u8], second: &[u8], width: usize) -> u64 {
+    if first.len() != second.len() || width == 0 {
+        return 0;
+    }
+    let height = first.len() / (width * 4);
+    let mut touched = 0;
+    for by in (0..height).step_by(BLOCK) {
+        for bx in (0..width).step_by(BLOCK) {
+            let hit = (by..(by + BLOCK).min(height)).any(|y| {
+                (bx..(bx + BLOCK).min(width)).any(|x| {
+                    let at = (y * width + x) * 4;
+                    (0..4).any(|c| first[at + c].abs_diff(second[at + c]) >= PIXEL_DELTA)
+                })
+            });
+            if hit {
+                touched += 1;
+            }
+        }
+    }
+    touched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +248,25 @@ mod tests {
             0.0,
             "which is what differing_fraction is for"
         );
+    }
+
+    /// A line too thin for the block mean is still a line, and a faint one is not.
+    #[test]
+    fn a_half_pixel_line_touches_blocks_the_mean_does_not_see() {
+        let (width, height) = (32usize, 16usize);
+        let bare = vec![30u8; width * height * 4];
+        let with_line = |level: u8| {
+            let mut frame = bare.clone();
+            for y in 0..height {
+                let at = (y * width + 3) * 4;
+                frame[at..at + 3].fill(level);
+            }
+            frame
+        };
+        let half = with_line(30 + 54);
+        assert_eq!(blocks_changed(&bare, &half, width), 0, "under the block mean");
+        assert_eq!(blocks_touched(&bare, &half, width), 1);
+        assert_eq!(blocks_touched(&bare, &with_line(30 + 4), width), 0, "too faint to see");
     }
 
     #[test]

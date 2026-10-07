@@ -534,15 +534,20 @@ did, and the regression test lives in `hello`.
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now
-draws each link as a filled ribbon along its curve, at least a pixel wide
+draws each link as a filled ribbon along its curve, at least half a pixel wide
 (`LinkStyle::far_fill`, `far_min_width_px`, both on by default): 2-3x cheaper on the CPU path
-and the graph's structure is finally on screen. Three traps measured on the way: a visible
-*stroke* is ruinous on the CPU rasteriser (81 ms for 5000 nodes); a ribbon along the *chord*
-loses every link that loops back to the node below (its chord runs under both nodes); and
-the block measure under-counts a one-pixel line (it moves a block by ~7/255 against a
-threshold of 8) — it answers "is the structure visible at all", not "how many links". Any
-far-field lever is judged against the frame with no links, never against the old picture:
-the old picture showed none either.
+and the graph's structure is finally on screen. Half a pixel and not one, and detail
+thresholds of 0.1/0.02 rather than 0.2/0.05, are decisions taken **by eye** (§53.6): a full
+pixel buries a dense overview under grey, and the higher thresholds dropped controls while
+they still read well — the widget budget, not the threshold, is what keeps the tree
+affordable. Three traps measured on the way: a visible *stroke* is ruinous on the CPU
+rasteriser (81 ms for 5000 nodes); a ribbon along the *chord* loses every link that loops
+back to the node below (its chord runs under both nodes); and the block mean of §45 cannot
+see a thin line at all — half a pixel moves a block by ~3/255 against a threshold of 8 — so
+the far table counts blocks holding a *visibly changed pixel* (`blocks_touched`), which is
+safe only because both frames come from one deterministic CPU rasteriser. It answers "is the
+structure visible at all", not "how many links". Any far-field lever is judged against the
+frame with no links, never against the old picture: the old picture showed none either.
 
 **Masonry has no inherited properties (§22.1).** A `PropertyStack` hangs off the
 widget itself and `Selector` matches classes and state flags, never ancestry. The

@@ -49,8 +49,10 @@ fn contains_rect_is_inclusive() {
 #[test]
 fn detail_thresholds_are_ordered() {
     let thresholds = DetailThresholds::default();
+    assert!(thresholds.full > thresholds.simplified);
     assert_eq!(thresholds.for_scale(1.0), Detail::Full);
-    assert_eq!(thresholds.for_scale(0.2), Detail::Simplified);
+    assert_eq!(thresholds.for_scale(thresholds.full), Detail::Simplified);
+    assert_eq!(thresholds.for_scale(thresholds.simplified), Detail::Box);
     assert_eq!(thresholds.for_scale(0.01), Detail::Box);
 }
 

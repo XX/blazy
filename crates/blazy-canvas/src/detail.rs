@@ -45,6 +45,10 @@ pub struct DetailThresholds {
 }
 
 impl Default for DetailThresholds {
+    /// 0.1 and 0.02, lowered from 0.2 and 0.05 by eye (§53.6): the higher pair dropped a
+    /// node's controls and then its widget at zooms where it still read well. Cost is not
+    /// this rule's business — [`DetailBudget`] keeps the tree affordable whatever these
+    /// say, and the stricter of the two wins.
     fn default() -> Self {
         Self {
             full: 0.1,
