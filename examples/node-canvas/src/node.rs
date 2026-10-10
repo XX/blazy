@@ -407,6 +407,13 @@ impl Widget for GraphNode {
         }
     }
 
+    /// The port dots, drawn by the node so that they sit at its level among the nodes: a
+    /// node raised over this one covers them, and a corner it leaves unpainted shows them
+    /// (§50.8). After the controls, which reach close to the edge the dots sit on.
+    fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        PORTS.paint_ports(painter, ctx.border_box(), NODE_PORTS);
+    }
+
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
         if let Some(controls) = self.controls.as_mut() {
             ctx.register_child(&mut controls.slider);
@@ -502,6 +509,12 @@ pub const PORTS: PortLayout = PortLayout {
     dot_color: Color::from_rgb8(0x9a, 0x9a, 0xa8),
 };
 
+/// How many ports every node has: the canvas asks the source, the node draws them.
+const NODE_PORTS: Ports = Ports {
+    inputs: crate::model::INPUTS,
+    outputs: crate::model::OUTPUTS,
+};
+
 impl NodeSource for GraphSource {
     fn build(&mut self, index: usize, detail: Detail) -> NewWidget<dyn Widget> {
         GraphNode::build(&self.graph, self.canvas, index, detail)
@@ -538,10 +551,7 @@ impl NodeSource for GraphSource {
     }
 
     fn ports(&mut self, _index: usize) -> Ports {
-        Ports {
-            inputs: crate::model::INPUTS,
-            outputs: crate::model::OUTPUTS,
-        }
+        NODE_PORTS
     }
 
     fn paint_far(&mut self, nodes: &[(usize, Rect)], scale: f64, painter: &mut Painter<'_>) {

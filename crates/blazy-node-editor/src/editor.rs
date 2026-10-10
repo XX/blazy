@@ -319,7 +319,7 @@ impl<G: NodeGraph> NodeEditor<G> {
     pub fn selection(&self) -> BTreeSet<usize> {
         self.session
             .as_ref()
-            .map(|session| session.borrow().world.selection.clone())
+            .map(|session| session.borrow().world.selection())
             .unwrap_or_default()
     }
 
@@ -418,7 +418,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         let Some(session) = this.widget.session.clone() else {
             return;
         };
-        let selection = session.borrow().world.selection.clone();
+        let selection = session.borrow().world.selection();
         if selection == this.widget.shown {
             return;
         }
@@ -429,11 +429,17 @@ impl<G: NodeGraph> NodeEditor<G> {
             for index in gone {
                 CanvasLayer::set_node_class(&mut canvas, index, crate::SELECTED, false);
             }
+            // The nodes that came are raised as well, once, by the graph's registry and not
+            // here: every editor over the graph runs this, and a raise per editor would
+            // reorder the nodes once per view (§50.8).
             for index in came {
                 CanvasLayer::set_node_class(&mut canvas, index, crate::SELECTED, true);
             }
         }
         this.widget.shown = selection;
+        // The outline is this editor's own paint (`SelectionOutline`), and a selection made
+        // in another area changed nothing this editor was asked to repaint for.
+        this.ctx.request_post_paint();
     }
 
     /// The menu an operator asked for, made into the layer that shows it — `None` when
@@ -476,7 +482,7 @@ impl<G: NodeGraph> NodeEditor<G> {
     fn selection_stale(&self) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|session| session.borrow().world.selection != self.shown)
+            .is_some_and(|session| session.borrow().world.selection() != self.shown)
     }
 
     /// Applies what the operators changed, from a `WidgetMut`.
@@ -516,16 +522,20 @@ impl<G: NodeGraph> NodeEditor<G> {
                 CanvasLayer::zoom_around(&mut canvas, origin, factor);
             }
         }
-        if changes.positions.is_empty() && changes.edits.is_empty() {
-            // A pan is this view's business alone: the view is not model state, so the
-            // other views of the graph are not following it (§30).
+        if !changes.concerns_the_graph() {
             return;
         }
-        let peers = fan_out(&session.borrow(), this.widget.canvas.id(), &changes);
+        let (peers, announced) = fan_out(&session.borrow(), this.widget.canvas.id(), &changes);
+        if !announced.is_empty() {
+            let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
+            for &change in &announced {
+                crate::views::apply(&mut canvas, change);
+            }
+        }
         for peer in peers {
-            let (positions, edits) = (changes.positions.clone(), changes.edits.clone());
+            let (positions, edits, announced) = (changes.positions.clone(), changes.edits.clone(), announced.clone());
             this.ctx
-                .mutate_later(peer, move |widget| apply_moves(widget, positions, edits));
+                .mutate_later(peer, move |widget| apply_to_peer(widget, positions, edits, announced));
         }
     }
 }
@@ -546,13 +556,26 @@ struct Changes {
     pan: Vec2,
     zoom: Vec<(Point, f64)>,
     dirty: bool,
+    /// The nodes that came into the selection, when it changed at all.
+    selected: Option<Vec<usize>>,
 }
 
 impl Changes {
     /// Whether anything has to reach the canvas. A repaint is not "something": it is
     /// asked for before this is consulted.
     fn is_empty(&self) -> bool {
-        self.positions.is_empty() && self.edits.is_empty() && self.pan == Vec2::ZERO && self.zoom.is_empty()
+        self.positions.is_empty()
+            && self.edits.is_empty()
+            && self.pan == Vec2::ZERO
+            && self.zoom.is_empty()
+            && self.selected.is_none()
+    }
+
+    /// Whether the other views of the graph have anything to hear. A pan or a zoom is this
+    /// view's business alone: the view is not model state, so the other views of the graph
+    /// are not following it (§30).
+    fn concerns_the_graph(&self) -> bool {
+        !self.positions.is_empty() || !self.edits.is_empty() || self.selected.is_some()
     }
 }
 
@@ -560,7 +583,12 @@ impl<G: NodeGraph> EditorSession<G> {
     /// Takes what the operators changed, leaving the world clean.
     fn take_changes(&mut self) -> Changes {
         let moved = mem::take(&mut self.world.moved);
+        let selected = self.world.selection_before.take().and_then(|before| {
+            let now = self.world.selection();
+            (now != before).then(|| now.difference(&before).copied().collect())
+        });
         Changes {
+            selected,
             positions: positions_of(&self.world, moved),
             edits: mem::take(&mut self.world.edits),
             pan: mem::replace(&mut self.world.pan, Vec2::ZERO),
@@ -621,6 +649,25 @@ fn apply_moves(mut widget: WidgetMut<'_, dyn Widget>, positions: Vec<(usize, Poi
     }
 }
 
+/// What a view of the graph in this window is pushed: the moves and edits, then what the
+/// selection changed (`Views::announce_selection`). The registry has all of it too, for the
+/// views of other windows; this one will collect it again, harmlessly.
+fn apply_to_peer(
+    mut widget: WidgetMut<'_, dyn Widget>,
+    positions: Vec<(usize, Point)>,
+    edits: Vec<Edit>,
+    announced: Vec<Change>,
+) {
+    let mut canvas = widget.downcast::<CanvasLayer>();
+    apply_edits(&mut canvas, &edits);
+    for (index, pos) in positions {
+        CanvasLayer::move_child(&mut canvas, index, pos);
+    }
+    for change in announced {
+        crate::views::apply(&mut canvas, change);
+    }
+}
+
 /// The current position of every node in `moved`, deduplicated.
 ///
 /// Deduplicated here rather than as it is filled: a drag pushes the same index on
@@ -648,7 +695,11 @@ fn positions_of<G: NodeGraph>(world: &EditorWorld<G>, mut moved: Vec<usize>) -> 
 /// (§30). They used to be two lists kept by two owners — the push here, the record in the
 /// application's model — and the record had no links in it, so a link made in one
 /// window never reached another (`issues/application assembly.md`).
-fn fan_out<G: NodeGraph>(session: &EditorSession<G>, own_canvas: WidgetId, changes: &Changes) -> Vec<WidgetId> {
+fn fan_out<G: NodeGraph>(
+    session: &EditorSession<G>,
+    own_canvas: WidgetId,
+    changes: &Changes,
+) -> (Vec<WidgetId>, Vec<Change>) {
     let graph = session.world.graph.borrow();
     let views = graph.views();
     for &edit in &changes.edits {
@@ -657,9 +708,16 @@ fn fan_out<G: NodeGraph>(session: &EditorSession<G>, own_canvas: WidgetId, chang
     for &(index, pos) in &changes.positions {
         views.note_except(own_canvas, Change::Moved { index, pos });
     }
+    // After the edits, so that a node added and selected in one gesture exists by the time
+    // it is raised; for every view, this one included.
+    let announced = changes
+        .selected
+        .as_deref()
+        .map(|came| views.announce_selection(came))
+        .unwrap_or_default();
     let mut peers = Vec::new();
     views.others(own_canvas, &mut peers);
-    peers
+    (peers, announced)
 }
 
 /// Formats the HUD into `out`, reusing its allocation.
@@ -872,15 +930,21 @@ impl<G: NodeGraph> NodeEditor<G> {
             let edits = changes.edits.clone();
             ctx.mutate_later(self.canvas.id(), move |widget| apply_moves(widget, Vec::new(), edits));
         }
-        if changes.positions.is_empty() && changes.edits.is_empty() {
-            // A pan is this view's business alone: the view is not model state, so the
-            // other views of the graph are not following it (§30).
+        if !changes.concerns_the_graph() {
             return;
         }
-        let peers = fan_out(&session.borrow(), self.canvas.id(), &changes);
+        let (peers, announced) = fan_out(&session.borrow(), self.canvas.id(), &changes);
+        if !announced.is_empty() {
+            // After the edits queued above, in the same pass: a node selected as it is added
+            // has to be there before it is raised.
+            let announced = announced.clone();
+            ctx.mutate_later(self.canvas.id(), move |widget| {
+                apply_to_peer(widget, Vec::new(), Vec::new(), announced);
+            });
+        }
         for peer in peers {
-            let (positions, edits) = (changes.positions.clone(), changes.edits.clone());
-            ctx.mutate_later(peer, move |widget| apply_moves(widget, positions, edits));
+            let (positions, edits, announced) = (changes.positions.clone(), changes.edits.clone(), announced.clone());
+            ctx.mutate_later(peer, move |widget| apply_to_peer(widget, positions, edits, announced));
         }
     }
 
@@ -961,7 +1025,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             SelectionOutline::Always => true,
             SelectionOutline::FarField => self.stats.detail == Some(blazy_canvas::Detail::Box),
         };
-        for &index in session.world.selection.iter().filter(|_| outline) {
+        for &index in session.world.selection().iter().filter(|_| outline) {
             if index >= graph.node_count() {
                 continue;
             }

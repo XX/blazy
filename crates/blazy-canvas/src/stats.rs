@@ -150,6 +150,8 @@ pub struct CanvasCounters {
     /// selection that touched every selected node on each click would be a selection that
     /// cost the selection, and this is where it shows.
     pub class_changes: u64,
+    /// Nodes raised to the top of the stacking order (`CanvasLayer::raise_node`).
+    pub raises: u64,
     /// Nodes inserted into or removed from the canvas (§43).
     pub node_edits: u64,
     /// Links inserted into or removed from the canvas.

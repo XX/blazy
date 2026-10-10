@@ -113,6 +113,7 @@ impl CanvasLayer {
                     pod: None,
                     built: None,
                     classes: Vec::new(),
+                    raised: 0,
                 },
                 None => EMPTY_SLOT,
             })
@@ -468,6 +469,72 @@ impl CanvasLayer {
         stats.counters.class_changes = content.widget.class_changes;
         this.widget.stats.set(stats);
         changed
+    }
+
+    /// Puts node `index` above every other node of this canvas — drawn over them, and
+    /// picked first where they overlap — and says whether its place changed.
+    ///
+    /// For a canvas that is the only view of its graph. The order belongs to the graph:
+    /// several canvases over one graph stack its nodes alike only if they take their stamps
+    /// from one counter, which is [`stack_node`](Self::stack_node).
+    ///
+    /// It is remembered by name, so the node comes back on top when it scrolls out and in
+    /// again; a name a removal frees and an insertion takes back starts at the bottom, like
+    /// any new node. Raising costs a repaint of the one node and no layout.
+    pub fn raise_node(this: &mut WidgetMut<'_, Self>, index: usize) -> bool {
+        Self::restack_with(this, index, |content| content.raise_node(index))
+    }
+
+    /// Gives node `index` the stacking stamp `stamp`: nodes stack by `(stamp, name)`, and
+    /// a node no one raised has stamp zero. Says whether the node's place changed.
+    ///
+    /// What a graph shown in several canvases uses: the stamps come from the graph, so a
+    /// node raised in one view is raised in all of them, and a view made later can be
+    /// handed the order as it stands. Setting the same stamp again changes nothing.
+    pub fn stack_node(this: &mut WidgetMut<'_, Self>, index: usize, stamp: u64) -> bool {
+        Self::restack_with(this, index, |content| content.stack_node(index, stamp))
+    }
+
+    fn restack_with(
+        this: &mut WidgetMut<'_, Self>,
+        index: usize,
+        change: impl FnOnce(&mut CanvasContent) -> bool,
+    ) -> bool {
+        let mut content = this.ctx.get_mut(&mut this.widget.content);
+        if !change(content.widget) {
+            return false;
+        }
+        // The new order reaches the screen with the next paint pass, and nothing about the
+        // pass asks for one: the node's own scene is unchanged. Asking it to repaint is the
+        // cheapest way to get a frame — the content's own repaint would redraw every link.
+        // The port dots go with it: each node draws its own (§50.8).
+        let fresh = content.widget.fresh.contains(&index);
+        if let Some(pod) = content.widget.slots[index].pod.as_mut() {
+            if fresh {
+                let id = pod.id();
+                content
+                    .ctx
+                    .mutate_later(id, |mut widget| widget.ctx.request_paint_only());
+            } else {
+                content.ctx.get_mut(pod).ctx.request_paint_only();
+            }
+        }
+        let mut stats = this.widget.stats.get();
+        stats.counters.raises = content.widget.raises;
+        this.widget.stats.set(stats);
+        true
+    }
+
+    /// Node `index`'s stacking stamp, as this canvas remembers it: nodes stack by
+    /// `(stamp, name)`, and zero is a node no one raised.
+    pub fn node_stacking(this: &mut WidgetMut<'_, Self>, index: usize) -> u64 {
+        let content = this.ctx.get_mut(&mut this.widget.content);
+        content
+            .widget
+            .slots
+            .get(index)
+            .filter(|slot| slot.alive)
+            .map_or(0, |slot| slot.raised)
     }
 
     /// Whether node `index` wears `class`, as the canvas remembers it.
@@ -991,6 +1058,7 @@ impl Widget for CanvasLayer {
                 composes: content.composes,
                 builds: content.builds,
                 class_changes: content.class_changes,
+                raises: content.raises,
                 node_edits: content.node_edits,
                 link_edits: content.link_edits,
                 link_compactions: content.links.edit_counters().0,

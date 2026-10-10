@@ -108,6 +108,7 @@ fn content_at_scale(rects: &[Rect], edges: Vec<Link>, visible: Rect, scale: f64)
             pod: None,
             built: None,
             classes: Vec::new(),
+            raised: 0,
         })
         .collect();
     let mut content = CanvasContent::new(slots, Box::new(RoundedSource::new(size)));
@@ -685,4 +686,48 @@ fn the_adjacency_survives_its_own_compaction() {
     canvas.live_rect = all;
     canvas.refresh_links();
     assert_eq!(canvas.links.recorded().len(), 199);
+}
+
+// --- MARK: STACKING
+
+/// A raised node stays on top when the set of widgets is rebuilt around it, and is picked
+/// first where it overlaps another; a name handed out again starts at the bottom.
+#[test]
+fn a_raised_node_stays_on_top_until_its_name_is_reused() {
+    let size = Size::new(100.0, 60.0);
+    let rects: Vec<Rect> = [0.0, 50.0, 300.0]
+        .iter()
+        .map(|&x| Rect::from_origin_size(Point::new(x, 0.0), size))
+        .collect();
+    let mut canvas = content(&rects, Vec::new(), Rect::new(0.0, 0.0, 800.0, 600.0));
+    let overlap = Point::new(75.0, 30.0);
+    assert_eq!(
+        node_at(&mut canvas, overlap.x, overlap.y),
+        Some(1),
+        "by name, 1 is above 0"
+    );
+
+    canvas.live = vec![0, 1, 2];
+    canvas.restack();
+    assert!(canvas.raise_node(0));
+    assert!(!canvas.raise_node(0), "the node on top is not raised again");
+    assert_eq!(canvas.order, [1, 2, 0]);
+    assert_eq!(node_at(&mut canvas, overlap.x, overlap.y), Some(0));
+
+    // The set changes — a node scrolls out and in — and the order is rebuilt from names.
+    canvas.live = vec![0, 2];
+    canvas.restack();
+    canvas.live = vec![0, 1, 2];
+    canvas.restack();
+    assert_eq!(canvas.order, [1, 2, 0], "the stacking is the node's, not the widget's");
+
+    let _ = canvas.remove_node(0);
+    let _ = canvas.insert_node(0, rects[0].origin(), size);
+    canvas.restack();
+    assert_eq!(
+        canvas.order,
+        [0, 1, 2],
+        "a new node under an old name starts at the bottom"
+    );
+    assert_eq!(node_at(&mut canvas, overlap.x, overlap.y), Some(1));
 }

@@ -46,7 +46,8 @@
 
 use std::collections::HashMap;
 
-use masonry::kurbo::{BezPath, CubicBez, Point, Rect};
+use masonry::imaging::Painter;
+use masonry::kurbo::{BezPath, Circle, CubicBez, Point, Rect, Shape};
 use masonry::peniko::Color;
 
 /// A connection from an output of one node to an input of another.
@@ -140,8 +141,10 @@ pub struct PortLayout {
     pub first: Option<f64>,
     /// The distance between one port and the next, in canvas units.
     pub step: f64,
-    /// The radius of the dot drawn at each port of a node that has a widget, in canvas
-    /// units; zero draws none. Nodes without widgets — the far field — have no dots.
+    /// The radius of the dot at each port, in canvas units, and the least distance at
+    /// which a port is picked. The node draws the dots, not the canvas
+    /// ([`paint_ports`](Self::paint_ports)); nodes without widgets — the far field — have
+    /// none, and are not picked by their ports either.
     pub dot_radius: f64,
     /// The colour of the dots.
     pub dot_color: Color,
@@ -170,6 +173,31 @@ impl PortLayout {
             Some(first) => rect.y0 + first + f64::from(port) * self.step,
         };
         Point::new(x, y)
+    }
+
+    /// Draws the dots of a node's `ports`, for a node widget to call from its `post_paint`
+    /// with `ctx.border_box()` — the box the canvas gave it, in the coordinates the
+    /// painter is in.
+    ///
+    /// The node draws them rather than the canvas because a dot belongs at its node's
+    /// level in the stacking order: drawn by the canvas over every node, a dot showed
+    /// through the node raised over it, and clipping it by that node's box hid it under
+    /// the corner the node leaves unpainted (§50.8). From the post-paint, so a control
+    /// reaching the node's edge does not cover half of it. Nothing with
+    /// `dot_radius` at zero.
+    pub fn paint_ports(&self, painter: &mut Painter<'_>, rect: Rect, ports: Ports) {
+        if self.dot_radius <= 0.0 {
+            return;
+        }
+        let mut dots = BezPath::new();
+        for (side, count) in [(PortSide::Input, ports.inputs), (PortSide::Output, ports.outputs)] {
+            for port in 0..count {
+                dots.extend(Circle::new(self.position(rect, side, port), self.dot_radius).path_elements(0.1));
+            }
+        }
+        if !dots.is_empty() {
+            painter.fill(&dots, self.dot_color).draw();
+        }
     }
 
     /// Where `link` leaves `from` and arrives at `to`.

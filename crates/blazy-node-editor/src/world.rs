@@ -49,11 +49,11 @@ pub enum Edit {
 pub struct EditorWorld<G: NodeGraph> {
     /// The graph. The source of truth, shared with every view of it (§30).
     pub graph: SharedGraph<G>,
-    /// Selected nodes, by index.
+    /// The selection as it was before the first change the driver has not announced yet.
     ///
-    /// A `BTreeSet` so that iteration order is the graph's order rather than a hash
-    /// seed's: a test comparing two runs would otherwise compare their orderings.
-    pub selection: BTreeSet<usize>,
+    /// The selection itself is the graph's ([`Views::selection`](crate::Views::selection)):
+    /// this is what lets the driver tell the views which nodes came into it.
+    pub(crate) selection_before: Option<BTreeSet<usize>>,
     /// What the pointer is over, as the canvas last picked it.
     ///
     /// The context an operator polls against, and the reason a press picks as well as
@@ -130,7 +130,7 @@ impl<G: NodeGraph> EditorWorld<G> {
     pub fn new(graph: &SharedGraph<G>) -> Self {
         Self {
             graph: graph.clone(),
-            selection: BTreeSet::new(),
+            selection_before: None,
             hover: None,
             pointer: Point::ORIGIN,
             pointer_screen: Point::ORIGIN,
@@ -194,7 +194,10 @@ impl<G: NodeGraph> EditorWorld<G> {
         let rect = self.node_rect(index);
         let links = self.graph.borrow_mut().remove_node(index);
         self.edits.push(Edit::NodeRemoved { index });
-        self.selection.remove(&index);
+        let mut selection = self.selection();
+        if selection.remove(&index) {
+            self.select(selection);
+        }
         self.dirty = true;
         (rect, links)
     }
@@ -216,12 +219,28 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.dirty = true;
     }
 
+    /// The selected nodes, by index: the graph's selection, shared by every view of it.
+    ///
+    /// A `BTreeSet` so that iteration order is the graph's order rather than a hash
+    /// seed's: a test comparing two runs would otherwise compare their orderings.
+    pub fn selection(&self) -> BTreeSet<usize> {
+        self.graph.borrow().views().selection()
+    }
+
+    /// Whether node `index` is selected.
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.graph.borrow().views().is_selected(index)
+    }
+
     /// Replaces the selection, and says whether it changed.
+    ///
+    /// The graph's, not this session's: every view of the graph shows it, as in Blender.
+    /// The driver tells the views after the operator, with what else it changed.
     pub fn select(&mut self, nodes: BTreeSet<usize>) -> bool {
-        if self.selection == nodes {
+        let Some(before) = self.graph.borrow().views().replace_selection(nodes) else {
             return false;
-        }
-        self.selection = nodes;
+        };
+        self.selection_before.get_or_insert(before);
         self.dirty = true;
         true
     }

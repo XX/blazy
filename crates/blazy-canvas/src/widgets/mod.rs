@@ -80,6 +80,13 @@ struct Slot {
     /// class is a name the application's style is written against — code, like an
     /// operator's name — and a node wears one or two.
     classes: Vec<&'static str>,
+    /// When the node was last raised in this canvas, from a counter; zero for never.
+    ///
+    /// The stacking order is `(raised, index)`: names are handed out in insertion order,
+    /// so a node nobody raised stacks where it always did. A stamp rather than a position
+    /// in a list for the reason `classes` lives here: the widget comes and goes, and a
+    /// list of every node ever raised would grow with the graph.
+    raised: u64,
 }
 
 /// How far past the viewport nodes stay materialised, as a fraction of the viewport.
@@ -166,6 +173,7 @@ const EMPTY_SLOT: Slot = Slot {
     pod: None,
     built: None,
     classes: Vec::new(),
+    raised: 0,
 };
 
 /// The subset of a Masonry context this crate needs to invalidate a widget.
@@ -328,6 +336,16 @@ pub struct CanvasContent {
     /// Empty in far-field mode: below the [`Detail::Box`] threshold no node gets a
     /// widget at all.
     live: Vec<usize>,
+    /// `live` in stacking order, bottom first: what `children_ids` hands Masonry.
+    ///
+    /// Masonry paints children in that order and looks for the widget under the pointer
+    /// in reverse (`find_widget_under_pointer`: "assumes children_ids is in increasing
+    /// z-order"), so this one list is both what is drawn on top and what a click reaches.
+    /// Kept apart from `live` because the cull's set difference needs `live` sorted by
+    /// name; rebuilt when the set changes or a node is raised, never per frame.
+    order: Vec<usize>,
+    /// The last stamp handed to [`Slot::raised`].
+    raise_seq: u64,
     /// Indices inside the visible rect, ascending.
     ///
     /// Equal to `live` above the far-field threshold. Below it, this is what gets
@@ -419,6 +437,8 @@ pub struct CanvasContent {
     composes: u64,
     builds: u64,
     class_changes: u64,
+    /// Nodes raised to the top of the stacking order.
+    raises: u64,
     hit_port_tests: u64,
     /// Nodes inserted or removed.
     node_edits: u64,
@@ -452,6 +472,8 @@ impl CanvasContent {
             slots,
             source,
             live: Vec::new(),
+            order: Vec::new(),
+            raise_seq: 0,
             visible: Vec::new(),
             far: FarField::default(),
             links: LinkLayer::default(),
@@ -481,6 +503,7 @@ impl CanvasContent {
             composes: 0,
             builds: 0,
             class_changes: 0,
+            raises: 0,
             hit_port_tests: 0,
             fresh: Vec::new(),
             node_edits: 0,
@@ -536,6 +559,7 @@ impl CanvasContent {
             built: None,
             // A name handed out again is a new node, and wears nothing of the old one's.
             classes: Vec::new(),
+            raised: 0,
         };
         self.index.insert(index, Rect::from_origin_size(pos, size));
         self.node_edits += 1;
@@ -582,6 +606,72 @@ impl CanvasContent {
         self.links.restore(name, link, self.slots.len());
         self.link_edits += 1;
         self.structure_changed();
+    }
+
+    // --- MARK: STACKING
+
+    /// Where node `index` stacks: higher is drawn later and picked first.
+    fn stacking(&self, index: usize) -> (u64, usize) {
+        (self.slots[index].raised, index)
+    }
+
+    /// Orders pick candidates the way a pointer meets them: topmost first.
+    ///
+    /// The grid hands candidates out by name, ascending; while nothing was raised, that
+    /// reversed is already the answer and nothing is sorted.
+    fn sort_topmost_first(&self, candidates: &mut [usize]) {
+        if self.raise_seq == 0 {
+            candidates.reverse();
+        } else {
+            candidates.sort_unstable_by_key(|&index| std::cmp::Reverse(self.stacking(index)));
+        }
+    }
+
+    /// Rebuilds `order` from `live`. Bounded by the widget budget, not by the graph.
+    fn restack(&mut self) {
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        order.extend_from_slice(&self.live);
+        if self.raise_seq > 0 {
+            order.sort_unstable_by_key(|&index| self.stacking(index));
+        }
+        self.order = order;
+    }
+
+    /// Puts node `index` above every other node of this canvas, and says whether its
+    /// place changed.
+    ///
+    /// Raising the node already on top changes nothing, so a click on it again costs no
+    /// frame.
+    fn raise_node(&mut self, index: usize) -> bool {
+        if self.raise_seq > 0 && self.live_slot(index).is_some_and(|slot| slot.raised == self.raise_seq) {
+            return false;
+        }
+        self.stack_node(index, self.raise_seq + 1)
+    }
+
+    /// Gives node `index` the stacking stamp `stamp`, and says whether its place changed.
+    ///
+    /// Setting a stamp rather than raising, so that applying the same change twice — a
+    /// push and then a pull (§47) — is harmless, and so that every view of a graph that
+    /// takes its stamps from one counter stacks the nodes alike.
+    fn stack_node(&mut self, index: usize, stamp: u64) -> bool {
+        if self.live_slot(index).is_none_or(|slot| slot.raised == stamp) {
+            return false;
+        }
+        self.slots[index].raised = stamp;
+        if stamp >= self.raise_seq {
+            self.raise_seq = stamp;
+            if let Some(at) = self.order.iter().position(|&i| i == index) {
+                self.order.remove(at);
+                self.order.push(index);
+            }
+        } else {
+            // A stamp older than the newest: the node goes somewhere in the middle.
+            self.restack();
+        }
+        self.raises += 1;
+        true
     }
 
     /// What every structural edit has to invalidate.
@@ -642,8 +732,9 @@ impl CanvasContent {
             Rect::from_points(canvas_pos, canvas_pos).inflate(radius, radius),
             &mut candidates,
         );
+        self.sort_topmost_first(&mut candidates);
         let mut found = None;
-        'nodes: for &index in candidates.iter().rev() {
+        'nodes: for &index in &candidates {
             let Some(rect) = self.live_rect_of(index) else {
                 continue;
             };
@@ -668,6 +759,14 @@ impl CanvasContent {
                     }
                 }
             }
+            // A node that covers the point hides every port stacked under it — a node
+            // draws its own dots (`PortLayout::paint_ports`), so the dot there is under
+            // this node's paint and must not be grabbed: the press belongs to this node.
+            // Its shape rather than its box, because a corner the node leaves unpainted
+            // shows the dot under it, and what shows can be grabbed.
+            if rect.contains(canvas_pos) && self.source.hit(index, rect, canvas_pos) {
+                break;
+            }
         }
         self.scratch_candidates = candidates;
         found
@@ -683,10 +782,11 @@ impl CanvasContent {
             .candidates(Rect::from_points(canvas_pos, canvas_pos), &mut candidates);
         self.hit_node_tests += candidates.len() as u64;
 
-        // Descending index order: children are placed in ascending order, so the
-        // highest index is the one painted last and therefore on top.
+        // Topmost first, in the order the children are painted in — or a click on two
+        // overlapping nodes would grab the one underneath.
+        self.sort_topmost_first(&mut candidates);
         let mut found = None;
-        for &index in candidates.iter().rev() {
+        for &index in &candidates {
             let Some(rect) = self.live_rect_of(index) else {
                 continue;
             };
@@ -862,6 +962,7 @@ impl CanvasContent {
         // which is what makes the next cull allocation-free.
         this.widget.scratch_desired = std::mem::replace(&mut this.widget.live, desired);
         if changed {
+            this.widget.restack();
             this.ctx.children_changed();
             this.ctx.request_layout();
         }
@@ -1228,35 +1329,6 @@ impl Widget for CanvasContent {
         self.composes += 1;
     }
 
-    /// The dots of the ports of every node that has a widget, over the nodes.
-    ///
-    /// Over rather than under, because a port sits on its node's edge and half of it is
-    /// inside the node. Only for nodes with widgets: in the far field a node is a few
-    /// pixels and a dot on it is noise. Off unless the application sizes the dots
-    /// (`PortLayout::dot_radius`), so an application that draws its own ports, or has none,
-    /// pays nothing.
-    fn post_paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
-        if self.ports.dot_radius <= 0.0 || self.far.active {
-            return;
-        }
-        let mut dots = BezPath::new();
-        for &index in &self.live {
-            let Some(rect) = self.live_rect_of(index) else {
-                continue;
-            };
-            let ports = self.source.ports(index);
-            for (side, count) in [(PortSide::Input, ports.inputs), (PortSide::Output, ports.outputs)] {
-                for port in 0..count {
-                    let at = self.ports.position(rect, side, port);
-                    dots.extend(masonry::kurbo::Circle::new(at, self.ports.dot_radius).path_elements(0.1));
-                }
-            }
-        }
-        if !dots.is_empty() {
-            painter.fill(&dots, self.ports.dot_color).draw();
-        }
-    }
-
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
         // Links go under the nodes, at every detail level: they are the graph's
         // structure, and a graph too small to show a node's controls still has to
@@ -1358,7 +1430,7 @@ impl Widget for CanvasContent {
     }
 
     fn children_ids(&self) -> ChildrenIds {
-        self.live
+        self.order
             .iter()
             .filter_map(|&i| self.slots[i].pod.as_ref())
             .map(|pod| pod.id())

@@ -381,8 +381,8 @@ an `EventCtx` cannot hit-test a child.
 **A window is a map entry, and what an area knows lives beside the tree (§44).** The
 loop holds several windows, each with its own `RenderRoot`, presenter, device and layer
 cache; one `ShellDriver` per process names the window in every method, because detach has
-two ends. What an area holds beyond the graph — the view, the selection, the undo history
-— is an `EditorSession` kept as `AreaScreen`'s per-area payload, so a widget rebuilt in
+two ends. What an area holds beyond the graph — the view and the undo history (the
+selection is the graph's since §50.9) — is an `EditorSession` kept as `AreaScreen`'s per-area payload, so a widget rebuilt in
 another window loses nothing and a joined area takes its session with it. **The §30
 fan-out does not cross a window**: `mutate_later` names a widget in one arena and is
 dropped silently for any other, so the model records what each view still owes and each
@@ -438,9 +438,12 @@ widgets and the snapshot; its `editor` and `ops` modules are aliases and a HUD c
 
 **Undo is a journal, and the number decided it (§38.4).** A snapshot step costs the
 graph — 1.92 MB and 0.29 ms on 20 000 nodes — where a journal step costs what was
-touched: 40 bytes for a one-node drag. The graph is shared and the selection is not,
-deliberately: a selection in the model would repaint every area showing that graph,
-and one drawn inside its own area repaints one of eight (12.99 ms against 50.57).
+touched: 40 bytes for a one-node drag. The selection was kept per area on purpose — one
+drawn inside its own area repaints one of eight — until §50.9 made it the graph's, as in
+Blender: a node dragged in one area moved in the other while a different node there looked
+selected. The price §38.5 named is paid and counted: a click redraws every area over the
+graph (15.16 ms → 66.17 on eight), and `a_selection_reaches_every_area` holds that none is
+left with the old selection.
 
 **A widget set was not needed; a way to hand a scale down was (§46).** Measured before
 designing anything: a stock Masonry widget resolves `Padding`, `CornerRadius`,
@@ -488,8 +491,12 @@ there from §44 to §49. `EditorApp::route_keys` points the fallback at the edit
 under the pointer after every event, reading through a `WidgetRef` (an edit would cost a
 rewrite battery per event); the editor records its own id in its session for that.
 
-**A node looks selected by wearing a class, and its style is data (§50).** The editor
-puts `SELECTED` on the nodes of its own session's selection (per view, by difference), the
+**A node looks selected by wearing a class, and its style is data (§50).** The selection
+lives in the graph's registry (`Views::selection`, §50.9) and `EditorWorld::select` writes it;
+the editor announces a change *after* the gesture's structural edits (`node.add` selects what
+it adds, and a raise filed before the insertion is reset by it), and `Change::Selection` wakes
+the other editors by asking their canvas for a layout. Each editor
+puts `SELECTED` on the nodes of the graph's selection (per view, by difference), the
 canvas remembers a node's classes in its slot and builds every widget wearing them (the
 widget comes and goes, §20.2), and the application's look for the class is a layer of its
 node type's property stack (`DefaultProperties::insert_stack`). Three things bite: the
@@ -501,7 +508,21 @@ of `BorderColor`/`Background` with a *pre*-paint only — a node that draws its 
 snapshot caught it after the editor's own outline was turned off). A class change on a node
 built in the same mutate pass goes through `mutate_later`: the widget is not in the tree
 until the pass after, and `get_mut` panics. `SelectionOutline::Always` stays the default so
-an application that styles nothing does not lose its selection.
+an application that styles nothing does not lose its selection. A node that becomes selected
+is also **raised** (§50.8): the stacking order is `(raised stamp, name)`, and it is one order
+for both answers — Masonry paints children in `children_ids` order and finds the widget under
+the pointer in reverse, so the model pick (`hit_node`, `hit_port`) must walk candidates in the
+same key, or a click on an overlap grabs the node drawn underneath. The order is the
+**graph's**, not the view's: the stamps come from `Views::raise`, a raise travels as
+`Change::Raised` like a move, and `Views::attach` hands a later view the order as it stands —
+kept per view only, the node came to the front in one area and stayed behind in the other. A
+reused name starts at the bottom. **A node draws its own port dots**
+(`PortLayout::paint_ports` from its `post_paint`), so a dot sits at its node's level: drawn by
+the canvas they were over *every* node, and clipping them by the boxes above hid them under
+rounded corners the canvas cannot know about. The canvas still says *where* a port is, because
+curves are built without widgets; a node that does not call it has no dots, which is why
+`hello` has a node widget of its own. The port pick stops at the first node whose *shape*
+(`NodeSource::hit`) covers the pointer — what shows is what can be grabbed.
 
 **A popup is a layer, and the host is what makes one (§51).** A widget asks with
 `create_layer`, which only emits `RenderRootSignal::NewLayer`; the host has to put the root

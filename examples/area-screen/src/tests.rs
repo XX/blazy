@@ -513,6 +513,39 @@ fn an_operator_move_in_one_area_reaches_the_others() {
     );
 }
 
+/// A node selected in one area comes to the front in every view of the graph (§50.8).
+///
+/// The stacking order is the graph's, like a position: raised only in the area that
+/// selected it, the node lay over its neighbour there and under it in the other area.
+#[test]
+fn a_node_raised_in_one_area_is_raised_in_the_others() {
+    use blazy::ops::keymap::Props;
+
+    let (mut harness, _graph) = ops_screen(2, 200);
+    let stacking = |harness: &mut TestHarness<Screen>, area: usize, index: usize| {
+        harness.edit_widget_with_id(editor_id(harness, area), |mut widget| {
+            let mut editor = widget.downcast::<NodeEditor>();
+            NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::node_stacking(&mut canvas, index))
+        })
+    };
+    let (low, high) = (3, 4);
+    assert_eq!(stacking(&mut harness, 1, low), 0, "nothing is raised yet");
+
+    let id = editor_id(&harness, 0);
+    harness.edit_widget_with_id(id, |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", low as i64));
+    });
+    let _ = harness.redraw();
+
+    for area in 0..2 {
+        assert!(
+            stacking(&mut harness, area, low) > stacking(&mut harness, area, high),
+            "area {area}: the selected node is over its neighbour"
+        );
+    }
+}
+
 /// A structural edit in one area reaches the other view of the same graph (§43).
 ///
 /// The §30 rule again, for the shape of the graph rather than for a position — and it
@@ -825,34 +858,87 @@ fn a_detached_area_arrives_with_its_view_its_selection_and_its_history() {
     assert_eq!(editor.stats().zoom, view, "and the view");
 }
 
-/// Selecting in one area is that area's business.
+/// A selection made in one area is the selection of every area over the graph.
 ///
-/// The other half of §30: the *graph* is shared and the *selection* is not, which is
-/// what makes "one gesture repaints one area" possible at all (§36, §38.5). Blender
-/// shares a selection between editors because it belongs to the scene; here it belongs
-/// to the view, and the point of the test is that the two are told apart deliberately
-/// rather than by accident.
+/// It was the other way round until a node dragged in one area moved in the other while a
+/// different node there looked selected: the selection belonged to the view (§38.4), and
+/// this test held that. It belongs to the graph now, as in Blender (§50.8) — and the node
+/// has to *look* selected in the other area, not only be reported so: the class is what an
+/// application styles.
 #[test]
-fn a_selection_stays_in_the_area_that_made_it() {
+fn a_selection_made_in_one_area_shows_in_the_others() {
     use blazy::ops::keymap::Props;
 
     let (mut harness, _graph) = ops_screen(2, 200);
+    let select = |harness: &mut TestHarness<Screen>, area: usize, index: i64| {
+        let id = editor_id(harness, area);
+        harness.edit_widget_with_id(id, |mut widget| {
+            let mut editor = widget.downcast::<NodeEditor>();
+            NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", index));
+        });
+        let _ = harness.redraw();
+    };
+    let wears = |harness: &mut TestHarness<Screen>, area: usize, index: usize| {
+        harness.edit_widget_with_id(editor_id(harness, area), |mut widget| {
+            let mut editor = widget.downcast::<NodeEditor>();
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::node_has_class(&mut canvas, index, blazy::node_editor::SELECTED)
+            })
+        })
+    };
+
+    select(&mut harness, 0, 3);
+    for area in 0..2 {
+        assert!(wears(&mut harness, area, 3), "area {area} shows node 3 selected");
+    }
+    // And back the other way, from the other area: the first node lets go everywhere.
+    select(&mut harness, 1, 4);
+    for area in 0..2 {
+        assert!(!wears(&mut harness, area, 3), "area {area} let node 3 go");
+        assert!(wears(&mut harness, area, 4), "area {area} shows node 4 selected");
+    }
+}
+
+/// A node added in one area arrives selected and on top in the other.
+///
+/// `node.add` selects what it adds, so the selection changes before the other views have
+/// heard of the node: announced in that order, the raise lands on a slot that is not there
+/// yet and the insertion then resets it. The editor announces the selection after the
+/// structural edits of the same gesture.
+#[test]
+fn a_node_added_in_one_area_arrives_selected_and_on_top() {
+    use blazy::ops::keymap::Props;
+
+    let (mut harness, graph) = ops_screen(2, 200);
     let id = editor_id(&harness, 0);
     harness.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
-        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 3));
+        NodeEditor::exec(
+            &mut editor,
+            "node.add",
+            &Props::new().with_float("x", 40.0).with_float("y", 40.0),
+        );
     });
     let _ = harness.redraw();
+    let added = graph.borrow().len() - 1;
 
-    let selected = |harness: &TestHarness<Screen>, area: usize| {
-        harness
-            .get_widget_with_id(editor_id(harness, area))
-            .downcast::<NodeEditor>()
-            .expect("an area holds an editor")
-            .selection()
-    };
-    assert_eq!(selected(&harness, 0).len(), 1, "the area that selected has a selection");
-    assert!(selected(&harness, 1).is_empty(), "the other area does not");
+    let (wears, stamp) = harness.edit_widget_with_id(editor_id(&harness, 1), |mut widget| {
+        let mut editor = widget.downcast::<NodeEditor>();
+        NodeEditor::with_canvas(&mut editor, |mut canvas| {
+            (
+                CanvasLayer::node_has_class(&mut canvas, added, blazy::node_editor::SELECTED),
+                CanvasLayer::node_stacking(&mut canvas, added),
+            )
+        })
+    });
+    assert!(wears, "the new node is selected in the other area");
+    assert!(stamp > 0, "and raised there");
+    // What a window the push does not reach, or a view made later, is handed.
+    assert_eq!(
+        blazy::node_editor::NodeGraph::views(&*graph.borrow()).stacking(added),
+        stamp,
+        "and the graph remembers the raise"
+    );
 }
 
 /// The pre-tree seat belongs to the layer root, and an editor inside an area is not

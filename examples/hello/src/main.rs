@@ -31,14 +31,18 @@ use std::rc::Rc;
 use blazy::app::EditorApp;
 use blazy::areas::SplitTree;
 use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
-use blazy::masonry::core::{DefaultProperties, NewWidget, PropertySet, PropertyStack, Selector, Widget, WidgetId};
+use blazy::masonry::accesskit::{Node as AccessNode, Role};
+use blazy::masonry::core::{
+    AccessCtx, ChildrenIds, DefaultProperties, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef,
+    PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId, WidgetPod,
+};
 use blazy::masonry::imaging::Painter;
-use blazy::masonry::kurbo::{BezPath, Point, Rect, Shape, Size};
-use blazy::masonry::layout::Length;
+use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, Shape, Size};
+use blazy::masonry::layout::{LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
 use blazy::masonry::theme::default_property_set;
-use blazy::masonry::widgets::{Label, SizedBox};
+use blazy::masonry::widgets::Label;
 use blazy::node_editor::{
     NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
 };
@@ -53,6 +57,10 @@ const NODE: Size = Size::new(140.0, 60.0);
 /// Inputs and outputs every node has.
 const PORTS_IN: u16 = 2;
 const PORTS_OUT: u16 = 1;
+const PORTS: Ports = Ports {
+    inputs: PORTS_IN,
+    outputs: PORTS_OUT,
+};
 /// Where they are on a node: in two rows down its edges, drawn as dots.
 const PORT_LAYOUT: PortLayout = PortLayout {
     first: Some(20.0),
@@ -176,10 +184,13 @@ const OUTLINE: Color = Color::from_rgb8(0x50, 0x50, 0x5c);
 const PICKED: Color = Color::from_rgb8(0xff, 0xa5, 0x2c);
 
 impl NodeSource for Nodes {
-    /// A caption in a box. The box is a stock `SizedBox` and everything it looks like —
-    /// selected or not — is in [`properties`]: the node does not know what a selection is.
+    /// A caption in a box. Everything the box looks like — selected or not — is in
+    /// [`properties`]: the node does not know what a selection is.
     fn build(&mut self, index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
-        NewWidget::new(SizedBox::new(NewWidget::new(Label::new(format!("node {index}"))))).erased()
+        NewWidget::new(Node {
+            caption: WidgetPod::new(Label::new(format!("node {index}"))),
+        })
+        .erased()
     }
 
     /// The nodes too small to deserve widgets, all in one fill (§31): without this an
@@ -196,10 +207,7 @@ impl NodeSource for Nodes {
 
     /// Two inputs and an output: what a link can be dragged out of and into.
     fn ports(&mut self, _index: usize) -> Ports {
-        Ports {
-            inputs: PORTS_IN,
-            outputs: PORTS_OUT,
-        }
+        PORTS
     }
 
     fn attached(&mut self, canvas: WidgetId) {
@@ -207,12 +215,70 @@ impl NodeSource for Nodes {
     }
 }
 
+/// A node: a caption in a box, and the dots of its ports.
+///
+/// Its own type rather than a stock `SizedBox` for the dots: they are drawn by the node,
+/// so that they sit at its level among the nodes — a node over this one covers them, and
+/// the corner it leaves unpainted shows them (§50.8). The box is Masonry's: it paints
+/// the background and the border of any widget from its properties.
+struct Node {
+    caption: WidgetPod<Label>,
+}
+
+impl Widget for Node {
+    type Action = NoAction;
+
+    /// The canvas gives a node its size from the graph; this is only a fallback.
+    fn measure(
+        &mut self,
+        _ctx: &mut MeasureCtx<'_>,
+        _props: &PropertiesRef<'_>,
+        axis: Axis,
+        len_req: LenReq,
+        _cross_length: Option<Length>,
+    ) -> Length {
+        match len_req {
+            LenReq::FitContent(space) => space,
+            LenReq::MinContent | LenReq::MaxContent => Length::px(match axis {
+                Axis::Horizontal => NODE.width,
+                Axis::Vertical => NODE.height,
+            }),
+        }
+    }
+
+    fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
+        let caption = ctx.compute_size(&mut self.caption, SizeDef::fit(size), size.into());
+        ctx.run_layout(&mut self.caption, caption);
+        ctx.place_child(&mut self.caption, Point::ORIGIN);
+    }
+
+    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+
+    fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
+        PORT_LAYOUT.paint_ports(painter, ctx.border_box(), PORTS);
+    }
+
+    fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
+        ctx.register_child(&mut self.caption);
+    }
+
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::from_slice(&[self.caption.id()])
+    }
+
+    fn accessibility_role(&self) -> Role {
+        Role::GenericContainer
+    }
+
+    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
+}
+
 /// The theme, plus what a node looks like — and what it looks like selected.
 ///
-/// The node is a `SizedBox` because the theme has no style of its own for one: a
-/// property stack replaces the theme's for its type, and a `Label` would lose every
-/// label's. The box is in the stack rather than on each node because a property put on
-/// the widget itself beats the stack, and the outline could then never change colour.
+/// The style is the node type's own stack: a property stack replaces the theme's for
+/// its type, so styling a `Label` would lose every label's. The box is in the stack
+/// rather than on each node because a property put on the widget itself beats the
+/// stack, and the outline could then never change colour.
 fn properties() -> DefaultProperties {
     let mut properties = default_property_set();
     let mut stack = PropertyStack::new();
@@ -230,7 +296,7 @@ fn properties() -> DefaultProperties {
     // Selected is a class the editor puts on the node; a colour is all it changes, so
     // a click repaints the node and lays nothing out.
     stack.push_layer(Selector::classes(&[SELECTED]), BorderColor { color: PICKED });
-    properties.insert_stack::<SizedBox>(stack);
+    properties.insert_stack::<Node>(stack);
     properties
 }
 

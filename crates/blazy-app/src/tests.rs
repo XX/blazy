@@ -225,6 +225,39 @@ fn a_link_made_in_one_window_reaches_the_other() {
     assert!(!has_link(&mut first, 0, link), "and the removal follows it");
 }
 
+/// A node selected in one window looks selected, and comes to the front, in the other
+/// once it draws (§50.8).
+///
+/// Across windows the push does not reach, so this is the pull's half: the registry
+/// records the selection and the raise, and the other window's editor is woken to re-read
+/// the selection by its canvas collecting them.
+#[test]
+fn a_selection_made_in_one_window_reaches_the_other() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut first = window(&app, 1);
+    let mut second = window(&app, 1);
+
+    edit_editor(&mut second, 0, |editor| {
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 2));
+    });
+    let _ = second.redraw();
+    app.pull(&mut first);
+    let _ = first.redraw();
+
+    let (wears, stamp, other) = edit_editor(&mut first, 0, |editor| {
+        NodeEditor::with_canvas(editor, |mut canvas| {
+            (
+                CanvasLayer::node_has_class(&mut canvas, 2, blazy_node_editor::SELECTED),
+                CanvasLayer::node_stacking(&mut canvas, 2),
+                CanvasLayer::node_stacking(&mut canvas, 3),
+            )
+        })
+    });
+    assert!(wears, "the other window shows the node selected");
+    assert!(stamp > other, "and raised");
+}
+
 /// A view that left the tree is owed nothing, and nobody is woken on its account.
 ///
 /// The other defect: the example registered a canvas as a view and never forgot it, so

@@ -776,3 +776,55 @@ fn panning_at_zoom_one_never_switches_level() {
         "a pan at zoom 1 is two orders of magnitude inside the budget"
     );
 }
+
+/// A port's dot is at its node's level among the nodes: covered by a node stacked above,
+/// and shown in the corner that node leaves unpainted.
+///
+/// The dots were the canvas's, drawn over every node; clipped by the box of each node
+/// above, they vanished under a rounded corner while the links and nodes beside them
+/// showed through it. Pixels, because what is under test is what is on screen.
+#[test]
+fn a_dot_is_covered_by_a_node_above_and_shows_in_its_corner() {
+    use blazy::canvas::PortSide;
+    use blazy::masonry::kurbo::{Affine, Rect};
+
+    use crate::node::PORTS;
+
+    let (canvas, graph) = CanvasSpec::new(2).with_links(Vec::new()).build();
+    let mut harness = TestHarness::create_with_size(
+        property_set(),
+        NewWidget::new(crate::editor::new(canvas)),
+        PhysicalSize::new(600, 400),
+    );
+    let lower = Point::new(100.0, 100.0);
+    let dot = PORTS.position(Rect::from_origin_size(lower, NODE_SIZE), PortSide::Output, 0);
+    let place = |harness: &mut TestHarness<NodeEditor>, upper: Point| {
+        graph.borrow_mut().set_pos(0, lower);
+        graph.borrow_mut().set_pos(1, upper);
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::set_view(&mut canvas, Affine::IDENTITY);
+                CanvasLayer::move_child(&mut canvas, 0, lower);
+                CanvasLayer::move_child(&mut canvas, 1, upper);
+            });
+        });
+        let _ = harness.redraw();
+    };
+    // The pixel whose top-left corner is the dot's centre: inside the dot whole.
+    let is_dot = |harness: &mut TestHarness<NodeEditor>| {
+        let pixel = harness.render().get_pixel(dot.x as u32, dot.y as u32).0;
+        let want = PORTS.dot_color.to_rgba8().to_u8_array();
+        (0..3).all(|c| pixel[c].abs_diff(want[c]) <= 8)
+    };
+
+    place(&mut harness, Point::new(400.0, 300.0));
+    assert!(is_dot(&mut harness), "uncovered, the dot is drawn");
+
+    // Node 1 stacks above node 0 by name, and its header lies over the dot.
+    place(&mut harness, Point::new(dot.x - 60.0, dot.y - 10.0));
+    assert!(!is_dot(&mut harness), "a node above covers the dot");
+
+    // Its top-left corner at the dot's centre: inside its box, outside its rounding.
+    place(&mut harness, dot);
+    assert!(is_dot(&mut harness), "the corner a node leaves unpainted shows the dot");
+}

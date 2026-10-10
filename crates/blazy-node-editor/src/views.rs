@@ -1,6 +1,7 @@
 //! Which canvases show a graph, and what each of them has not been told yet.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use blazy_canvas::CanvasLayer;
@@ -32,6 +33,24 @@ pub enum Change {
         /// The node's name.
         index: usize,
     },
+    /// Node `index` was raised to stacking stamp `stamp` (`CanvasLayer::stack_node`).
+    ///
+    /// The stacking order is the graph's, like a position: a node brought to the front in
+    /// one area and left behind its neighbour in another is two pictures of one graph
+    /// (§50.8).
+    Raised {
+        /// The node's name.
+        index: usize,
+        /// Its stamp from [`Views::raise`]; nodes stack by `(stamp, name)`.
+        stamp: u64,
+    },
+    /// The graph's selection changed ([`Views::selection`]).
+    ///
+    /// Carries nothing: what a node wears is decided by the editor over the canvas, from
+    /// the selection as it is now, so the change only has to wake it. The selection is the
+    /// graph's, as in Blender — kept per area, a node dragged in one area moved in the
+    /// other while a different node there looked selected.
+    Selection,
 }
 
 /// What a graph's views have been through, summed over the registry's life.
@@ -77,6 +96,20 @@ struct Ledger {
     /// Each view, and the changes it has not collected.
     views: Vec<(WidgetId, Vec<Change>)>,
     counters: ViewCounters,
+    /// Each node's stacking stamp, by name; zero, or past the end, for never raised.
+    ///
+    /// Kept here rather than asked of the graph, because the order is the views' business
+    /// and every graph already has a registry: a method on `NodeGraph` would be one more
+    /// thing an application can get wrong, and a default for it would get it wrong
+    /// silently. Here, a view attached later is handed the order as it stands.
+    stacking: Vec<u64>,
+    /// The last stamp handed out.
+    raise_seq: u64,
+    /// The selected nodes, by name.
+    ///
+    /// Here for the reason the stacking is: every graph has a registry, and every view of
+    /// the graph reaches it. Each editor's session reads it rather than keeping its own.
+    selection: BTreeSet<usize>,
 }
 
 impl std::fmt::Debug for Views {
@@ -107,7 +140,18 @@ impl Views {
     pub fn attach(&self, canvas: WidgetId) -> ViewToken {
         let mut ledger = self.0.borrow_mut();
         if !ledger.views.iter().any(|(id, _)| *id == canvas) {
-            ledger.views.push((canvas, Vec::new()));
+            // A canvas is built from the model's geometry and nothing else, so it starts
+            // with every node in name order; the nodes raised before it existed are owed
+            // to it like any change it missed (§44.9).
+            let owed: Vec<Change> = ledger
+                .stacking
+                .iter()
+                .enumerate()
+                .filter(|&(_, &stamp)| stamp > 0)
+                .map(|(index, &stamp)| Change::Raised { index, stamp })
+                .collect();
+            ledger.counters.noted += owed.len() as u64;
+            ledger.views.push((canvas, owed));
             ledger.counters.attached += 1;
         }
         ViewToken {
@@ -128,6 +172,70 @@ impl Views {
     /// Records a change for every view but `origin`, which has shown it already.
     pub fn note_except(&self, origin: WidgetId, change: Change) {
         self.0.borrow_mut().note(Some(origin), change);
+    }
+
+    /// Brings node `index` to the front of every view and hands back its new stamp, or
+    /// `None` when it is in front already.
+    ///
+    /// Only the stamp: the caller stacks its own canvas with it
+    /// (`CanvasLayer::stack_node`) and records [`Change::Raised`] for the others, the way
+    /// a move is recorded.
+    pub fn raise(&self, index: usize) -> Option<u64> {
+        self.0.borrow_mut().raise(index)
+    }
+
+    /// The selected nodes, by name: one selection for every view of the graph.
+    pub fn selection(&self) -> BTreeSet<usize> {
+        self.0.borrow().selection.clone()
+    }
+
+    /// Whether node `index` is selected.
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.0.borrow().selection.contains(&index)
+    }
+
+    /// Replaces the selection and hands back the one it replaced, or `None` if nothing
+    /// changed. Announces nothing: see [`announce_selection`](Self::announce_selection).
+    pub(crate) fn replace_selection(&self, nodes: BTreeSet<usize>) -> Option<BTreeSet<usize>> {
+        let mut ledger = self.0.borrow_mut();
+        if ledger.selection == nodes {
+            return None;
+        }
+        Some(std::mem::replace(&mut ledger.selection, nodes))
+    }
+
+    /// Tells every view that the selection changed, and brings the nodes that `came` into
+    /// it to the front (§50.8).
+    ///
+    /// Apart from [`replace_selection`](Self::replace_selection) because of order: an
+    /// operator that adds a node and selects it changes the selection before the views
+    /// have heard of the node, and a raise filed ahead of the insertion lands on a slot
+    /// that is not there yet — and the insertion then resets the stamp. So the editor
+    /// announces after the structural edits of the same gesture. Noted for *every* view,
+    /// the editor's own included: the editor applies its own share at once.
+    ///
+    /// Hands back what it recorded, for the editor to push to the views in its window.
+    pub(crate) fn announce_selection(&self, came: &[usize]) -> Vec<Change> {
+        let mut ledger = self.0.borrow_mut();
+        let mut announced = Vec::new();
+        for &index in came {
+            if !ledger.selection.contains(&index) {
+                continue;
+            }
+            if let Some(stamp) = ledger.raise(index) {
+                announced.push(Change::Raised { index, stamp });
+            }
+        }
+        announced.push(Change::Selection);
+        for &change in &announced {
+            ledger.note(None, change);
+        }
+        announced
+    }
+
+    /// Node `index`'s stacking stamp; zero for a node never raised.
+    pub fn stacking(&self, index: usize) -> u64 {
+        self.0.borrow().stacking.get(index).copied().unwrap_or(0)
     }
 
     /// Pushes into `out` every view but `this`.
@@ -185,7 +293,32 @@ impl Views {
 }
 
 impl Ledger {
+    fn raise(&mut self, index: usize) -> Option<u64> {
+        if self.raise_seq > 0 && self.stacking.get(index) == Some(&self.raise_seq) {
+            return None;
+        }
+        if self.stacking.len() <= index {
+            self.stacking.resize(index + 1, 0);
+        }
+        self.raise_seq += 1;
+        self.stacking[index] = self.raise_seq;
+        Some(self.raise_seq)
+    }
+
     fn note(&mut self, origin: Option<WidgetId>, change: Change) {
+        // A name a removal frees and an insertion takes back is a new node: it starts at
+        // the bottom — in the canvases (`insert_node`) and so here.
+        if let Change::Structure(Edit::NodeAdded { index, .. } | Edit::NodeRemoved { index }) = change
+            && let Some(stamp) = self.stacking.get_mut(index)
+        {
+            *stamp = 0;
+        }
+        // And a removed node is not selected. Only the removal: an insertion is noted after
+        // the operator that made it, and `node.add` selects what it adds — dropping the
+        // name here took the new node out of the selection it had just been put in.
+        if let Change::Structure(Edit::NodeRemoved { index }) = change {
+            self.selection.remove(&index);
+        }
         for (id, owed) in &mut self.views {
             if Some(*id) != origin {
                 owed.push(change);
@@ -282,12 +415,19 @@ pub fn sync_root(root: &mut masonry::app::RenderRoot, views: &Views) -> usize {
 }
 
 /// One change, against the canvas that shows it.
-fn apply(canvas: &mut WidgetMut<'_, CanvasLayer>, change: Change) {
+pub(crate) fn apply(canvas: &mut WidgetMut<'_, CanvasLayer>, change: Change) {
     match change {
         Change::Moved { index, pos } => CanvasLayer::move_child(canvas, index, pos),
         Change::Structure(edit) => crate::editor::apply_edit(canvas, edit),
         Change::Contents { index } => {
             CanvasLayer::refresh_node(canvas, index);
         },
+        Change::Raised { index, stamp } => {
+            CanvasLayer::stack_node(canvas, index, stamp);
+        },
+        // The canvas has no use for it; the editor above it does, and a layout request
+        // travels up to it: an editor re-reads the selection after its layout. A layout of
+        // the canvas per click, never per frame.
+        Change::Selection => canvas.ctx.request_layout(),
     }
 }

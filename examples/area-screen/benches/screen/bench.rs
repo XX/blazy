@@ -1102,18 +1102,19 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
     }
     if let Some(selects) = cache.iter().find(|row| row.cached && row.what == "one area selects") {
-        // Where a gesture's pixels land (§38.5). A selection is drawn by the driver
-        // inside its own area, so the frame redraws that area and copies the rest —
-        // the shape §36 gave this criterion, in the unit §36 counts in. An overlay
-        // spanning the window would put every area here instead, and would break the
-        // condition the cache cannot check: that a cached layer owns its rectangle.
+        // Where a gesture's pixels land (§38.5, §50.8). The selection is the graph's, so
+        // every area over the graph shows it and has to be drawn again — here, all of
+        // them: the areas share one graph. Counted from the failing side, as an area that
+        // kept its old pixels: one that copied its layer still shows the old selection.
+        // That a selection draws inside the areas and not across them is held by the
+        // overlap criterion above.
         criteria.push(Criterion {
-            name: "a_selection_repaints_one_area",
-            claim: "a selection in one area redraws that area and copies the rest",
+            name: "a_selection_reaches_every_area",
+            claim: "a selection in one area redraws every area over the graph",
             kind: Kind::Counter,
-            measured: selects.drawn,
-            bound: 2.0,
-            unit: "areas drawn/frame",
+            measured: areas as f64 - selects.drawn,
+            bound: 0.5,
+            unit: "areas left with the old selection/frame",
         });
     }
 

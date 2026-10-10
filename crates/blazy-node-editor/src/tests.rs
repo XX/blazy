@@ -170,7 +170,7 @@ fn a_box_selects_what_it_covers_in_the_graph() {
         .with_float("x1", 320.0)
         .with_float("y1", 20.0);
     assert_eq!(runtime.exec(&mut world, "node.box_select", &band), OpResult::Finished);
-    assert_eq!(world.selection.iter().copied().collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(world.selection().iter().copied().collect::<Vec<_>>(), [1, 2]);
 }
 
 /// The recorder is the application's to replace, and a finished move goes through it.
@@ -289,7 +289,11 @@ fn a_freed_name_is_handed_out_again() {
 
     assert_eq!(graph.borrow().node_count(), 3);
     assert_eq!(origin(&graph, 1), Point::new(900.0, 5.0), "the freed name was reused");
-    assert_eq!(world.selection.iter().copied().collect::<Vec<_>>(), [1], "and selected");
+    assert_eq!(
+        world.selection().iter().copied().collect::<Vec<_>>(),
+        [1],
+        "and selected"
+    );
     assert_eq!(runtime.history_mut().undo(&mut world), Some("node.add"));
     assert_eq!(graph.borrow().node_count(), 2);
 }
@@ -447,6 +451,31 @@ fn a_view_is_forgotten_with_its_token() {
     assert_eq!(views.owed(), 0, "and what it was owed goes with it");
     assert!(!views.has_pending());
     assert_eq!(views.counters().detached, 1);
+}
+
+/// A view attached after a node was raised is owed the raise, and a name handed out
+/// again starts at the bottom (§50.8).
+///
+/// A canvas is built from the model's geometry and nothing else, so a view made later — a
+/// split, a detached window — would otherwise stack the graph by name and disagree with
+/// every view that saw the raise.
+#[test]
+fn a_late_view_is_owed_the_stacking_order() {
+    let views = Views::new();
+    assert_eq!(views.raise(3), Some(1));
+    assert_eq!(views.raise(3), None, "the node in front is not raised again");
+    assert_eq!(views.raise(1), Some(2));
+
+    let late = NewWidget::new(Label::new("")).to_pod().id();
+    let _token = views.attach(late);
+    assert_eq!(views.take(late), [
+        crate::Change::Raised { index: 1, stamp: 2 },
+        crate::Change::Raised { index: 3, stamp: 1 },
+    ]);
+
+    views.note(crate::Change::Structure(crate::Edit::NodeRemoved { index: 3 }));
+    assert_eq!(views.stacking(3), 0, "a freed name forgets its place");
+    assert_eq!(views.stacking(1), 2);
 }
 
 /// Collecting a link twice files it once.
@@ -683,6 +712,204 @@ fn a_click_changes_the_class_of_two_nodes() {
         changes(&mut harness) - before,
         2,
         "one node lost the class, one gained it"
+    );
+}
+
+/// The canvas's content widget, the parent of the node widgets, found by type.
+fn canvas_content(widget: masonry::core::WidgetRef<'_, dyn masonry::core::Widget>) -> Option<masonry::core::WidgetId> {
+    if widget.short_type_name() == "CanvasContent" {
+        return Some(widget.id());
+    }
+    widget.children().into_iter().find_map(canvas_content)
+}
+
+/// Selecting a node brings it to the front: it is drawn over the node it overlaps, and a
+/// press on the overlap — through the widget tree and through the canvas's own pick —
+/// reaches it rather than the node underneath.
+#[test]
+fn a_selected_node_comes_to_the_front() {
+    let graph = row(3);
+    // Node 1 slides half over node 0; by name it stacks above it.
+    graph.borrow_mut().set_node_pos(1, Point::new(50.0, 0.0));
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = styled_harness(&graph, &session);
+    let overlap = Point::new(75.0, 30.0);
+
+    let on_top = |harness: &mut TestHarness<NodeEditor<Row>>| {
+        let live = harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::live_children(&mut canvas))
+        });
+        // Masonry paints children in `children_ids` order and searches them in reverse, so
+        // the later of the two in the canvas content's children is the one drawn on top.
+        let content = canvas_content(harness.root_widget().as_dyn()).expect("the editor holds a canvas");
+        let order: Vec<usize> = harness
+            .get_widget_with_id(content)
+            .children()
+            .iter()
+            .filter_map(|child| live.iter().find(|(_, id)| *id == child.id()).map(|(index, _)| *index))
+            .filter(|index| *index < 2)
+            .collect();
+        let drawn = order.last().copied();
+        let picked = harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::hit_test(&mut canvas, overlap))
+        });
+        let picked = match picked {
+            Some(blazy_canvas::CanvasHit::Node { index, .. }) => Some(index),
+            _ => None,
+        };
+        (drawn, picked)
+    };
+    assert_eq!(
+        on_top(&mut harness),
+        (Some(1), Some(1)),
+        "by name, the later node is on top"
+    );
+
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 0));
+    });
+    let _ = harness.redraw();
+    assert_eq!(
+        on_top(&mut harness),
+        (Some(0), Some(0)),
+        "the selected node came to the front"
+    );
+
+    // And it stays there when the selection moves on: the order is not the selection.
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 2));
+    });
+    let _ = harness.redraw();
+    assert_eq!(on_top(&mut harness), (Some(0), Some(0)));
+}
+
+/// A node on top hides the ports of the node under it from the pointer.
+///
+/// The port pick went through the node on top to a port nobody could see, so a press
+/// there pulled a link out of the node underneath. (What the eye sees is the node's: it
+/// draws its own dots, and `node-canvas` checks the pixels.)
+#[test]
+fn a_node_on_top_hides_the_ports_under_it() {
+    let graph = row(3);
+    // Node 1 slides half over node 0: node 0's output port, at (100, 30), is under it.
+    graph.borrow_mut().set_node_pos(1, Point::new(50.0, 0.0));
+    let session = crate::EditorSession::new(&graph).share();
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let ports = blazy_canvas::PortLayout {
+        dot_radius: 4.0,
+        ..Default::default()
+    };
+    let canvas = CanvasLayer::new(3, geometry, source).with_ports(ports);
+    let mut harness = TestHarness::create_with_size(
+        styled_properties(),
+        NewWidget::new(NodeEditor::with_session(canvas, session.clone())),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = harness.redraw();
+    let _ = harness.redraw();
+
+    let pick = |harness: &mut TestHarness<NodeEditor<Row>>, at: Point| {
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::hit_test(&mut canvas, at))
+        })
+    };
+    let output_of_0 = Point::new(100.0, 30.0);
+    let input_of_1 = Point::new(50.0, 30.0);
+    assert!(
+        matches!(
+            pick(&mut harness, output_of_0),
+            Some(blazy_canvas::CanvasHit::Node { index: 1, .. })
+        ),
+        "node 1 is on top of node 0's output port"
+    );
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(&mut editor, "node.select", &Props::new().with_int("index", 0));
+    });
+    let _ = harness.redraw();
+    assert!(matches!(
+        pick(&mut harness, output_of_0),
+        Some(blazy_canvas::CanvasHit::Port { index: 0, .. })
+    ));
+    assert!(
+        matches!(
+            pick(&mut harness, input_of_1),
+            Some(blazy_canvas::CanvasHit::Node { index: 0, .. })
+        ),
+        "raised, node 0 hides node 1's input port in turn"
+    );
+}
+
+/// A port under the corner a node above leaves unpainted is still picked; one under the
+/// node's body is not.
+///
+/// What shows can be grabbed: the dot there is drawn, so the pick stops at the node's
+/// *shape*, which only the application knows (`NodeSource::hit`), not at its box.
+#[test]
+fn a_port_under_a_rounded_corner_is_picked() {
+    use blazy_canvas::{Detail, NodeSource};
+    use masonry::core::Widget;
+    use masonry::kurbo::{RoundedRect, Shape};
+
+    /// Nodes that are labels in rounded rectangles.
+    struct Rounded;
+
+    impl NodeSource for Rounded {
+        fn build(&mut self, index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
+            NewWidget::new(Label::new(format!("node {index}"))).erased()
+        }
+
+        fn hit(&mut self, _index: usize, rect: Rect, point: Point) -> bool {
+            RoundedRect::from_rect(rect, 12.0).contains(point)
+        }
+    }
+
+    let graph = row(3);
+    // Node 1's top-left corner just inside node 0's output port, at (100, 30).
+    graph.borrow_mut().set_node_pos(1, Point::new(96.0, 26.0));
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let ports = blazy_canvas::PortLayout {
+        dot_radius: 4.0,
+        ..Default::default()
+    };
+    let canvas = CanvasLayer::new(3, geometry, Rounded).with_ports(ports);
+    let session = crate::EditorSession::new(&graph).share();
+    let mut harness = TestHarness::create_with_size(
+        styled_properties(),
+        NewWidget::new(NodeEditor::with_session(canvas, session)),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = harness.redraw();
+    let mut pick = |at: Point| {
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| CanvasLayer::hit_test(&mut canvas, at))
+        })
+    };
+    assert!(
+        matches!(
+            pick(Point::new(97.0, 27.0)),
+            Some(blazy_canvas::CanvasHit::Port { index: 0, .. })
+        ),
+        "outside node 1's rounding, node 0's port shows and is picked"
+    );
+    assert!(
+        matches!(
+            pick(Point::new(103.0, 33.0)),
+            Some(blazy_canvas::CanvasHit::Node { index: 1, .. })
+        ),
+        "inside it, the press is node 1's"
     );
 }
 

@@ -92,7 +92,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for SelectOp {
 fn select<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, index: usize) -> OpResult {
     let extend = cx.props().bool("extend", false);
     let mut after = if extend {
-        cx.world().selection.clone()
+        cx.world().selection()
     } else {
         BTreeSet::new()
     };
@@ -114,7 +114,7 @@ fn select<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, index: usize) -> OpR
 /// is undoable" have to stay one decision: an operator that set the selection without
 /// the step would leave a hole in the history that undo walks straight past.
 fn set_selection<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, after: BTreeSet<usize>) {
-    let before = cx.world().selection.clone();
+    let before = cx.world().selection();
     if cx.world_mut().select(after.clone()) {
         cx.push_undo(Box::new(SelectStep { before, after }));
     }
@@ -228,7 +228,7 @@ fn finish_box<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, rect: Rect) {
     let extend = cx.props().bool("extend", false);
     let mut after = cx.world().nodes_in(rect);
     if extend {
-        after.extend(cx.world().selection.iter().copied());
+        after.extend(cx.world().selection().iter().copied());
     }
     set_selection(cx, after);
 }
@@ -267,7 +267,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
             Some(OpEvent::Drag { .. } | OpEvent::Click { .. } | OpEvent::Press { .. }) => {
                 cx.world().hovered_node().is_some()
             },
-            _ => cx.world().hovered_node().is_some() || !cx.world().selection.is_empty(),
+            _ => cx.world().hovered_node().is_some() || !cx.world().selection().is_empty(),
         }
     }
 
@@ -277,7 +277,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
         // is a drag that silently moves something else.
         if let Some(index) = cx.world().hovered_node()
             && self.from_press
-            && !cx.world().selection.contains(&index)
+            && !cx.world().is_selected(index)
         {
             select(cx, index);
         }
@@ -356,7 +356,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
 impl MoveOp {
     /// Records what is being moved and where it started.
     fn grab<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) {
-        self.nodes = cx.world().selection.iter().copied().collect();
+        self.nodes = cx.world().selection().iter().copied().collect();
         self.from = self
             .nodes
             .iter()
@@ -552,7 +552,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddNodeOp {
             cx.props().float("height", default.height),
         );
         let rect = Rect::from_origin_size(origin, size);
-        let selection = cx.world().selection.clone();
+        let selection = cx.world().selection();
         let index = cx.world_mut().add_node(rect);
         // Selected here rather than through `set_selection`, because that records a step
         // of its own and this is one action: see `AddStep`.
@@ -575,23 +575,23 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for DeleteNodeOp {
     }
 
     fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
-        !cx.world().selection.is_empty() || cx.world().hovered_node().is_some() || cx.props().int("index", -1) >= 0
+        !cx.world().selection().is_empty() || cx.world().hovered_node().is_some() || cx.props().int("index", -1) >= 0
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
         let named = cx.props().int("index", -1);
         let doomed: Vec<usize> = if named >= 0 {
             vec![named as usize]
-        } else if cx.world().selection.is_empty() {
+        } else if cx.world().selection().is_empty() {
             cx.world().hovered_node().into_iter().collect()
         } else {
-            cx.world().selection.iter().copied().collect()
+            cx.world().selection().iter().copied().collect()
         };
         if doomed.is_empty() {
             return OpResult::Cancelled;
         }
 
-        let selection = cx.world().selection.clone();
+        let selection = cx.world().selection();
         let nodes: Vec<(usize, Rect, Vec<Link>)> = doomed
             .into_iter()
             .map(|index| {
@@ -618,7 +618,8 @@ fn ends<G: NodeGraph>(cx: &OpCtx<'_, EditorWorld<G>>) -> Option<Link> {
             port("to_port"),
         ));
     }
-    let mut selected = cx.world().selection.iter().copied();
+    let selection = cx.world().selection();
+    let mut selected = selection.iter().copied();
     match (selected.next(), selected.next(), selected.next()) {
         (Some(from), Some(to), None) => Some(Link::new(from, to)),
         _ => None,
