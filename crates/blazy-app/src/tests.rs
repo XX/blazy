@@ -529,3 +529,248 @@ fn the_default_keymap_reads_back_from_its_file() {
     let keymap = crate::default_keymap();
     assert_eq!(blazy_ops::keymap::Keymap::parse(&keymap.write()), Ok(keymap));
 }
+
+/// Delivers a pointer event the way the shell does — the host seat, then the tree — and
+/// then `settled`.
+fn pointer(
+    app: &mut EditorApp<Grid>,
+    cx: &mut ShellCtx,
+    key: blazy_shell::window::WindowKey,
+    root: &mut RenderRoot,
+    kind: &str,
+    at: Point,
+) {
+    use masonry::core::{
+        PointerButton, PointerButtonEvent, PointerEvent, PointerInfo, PointerState, PointerType, PointerUpdate,
+    };
+    use masonry::dpi::PhysicalPosition;
+
+    let pointer = PointerInfo {
+        pointer_id: None,
+        persistent_device_id: None,
+        pointer_type: PointerType::Mouse,
+    };
+    let mut state = PointerState {
+        position: PhysicalPosition::new(at.x, at.y),
+        ..Default::default()
+    };
+    let event = match kind {
+        "down" => {
+            state.buttons.insert(PointerButton::Primary);
+            PointerEvent::Down(PointerButtonEvent {
+                button: Some(PointerButton::Primary),
+                pointer,
+                state,
+            })
+        },
+        "drag" => {
+            state.buttons.insert(PointerButton::Primary);
+            PointerEvent::Move(PointerUpdate {
+                pointer,
+                current: state,
+                coalesced: vec![],
+                predicted: vec![],
+            })
+        },
+        "move" => PointerEvent::Move(PointerUpdate {
+            pointer,
+            current: state,
+            coalesced: vec![],
+            predicted: vec![],
+        }),
+        "up" => PointerEvent::Up(PointerButtonEvent {
+            button: Some(PointerButton::Primary),
+            pointer,
+            state,
+        }),
+        _ => unreachable!("a kind this helper knows"),
+    };
+    let _ = blazy_shell::window::deliver_pointer(app, cx, key, root, event);
+    app.settled(cx, key, root);
+    let _ = root.redraw();
+}
+
+/// A drag that leaves its area goes on, and a release over the area next door ends it.
+///
+/// The press is held, not yet an operator — `node.move` starts on the first move past
+/// the threshold, when Masonry no longer offers capture — and the capture was taken only
+/// for a running operator. So no drag was ever captured: past the border the moves went to
+/// the other editor and the node stopped at the edge, and the release went there too, so
+/// the drag never ended and the node followed the pointer back with the button up.
+#[test]
+fn a_drag_goes_on_past_its_area_and_ends_over_the_next() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    let node = |graph: &SharedGraph<Grid>| graph.borrow().node_rect(1).origin();
+    let depth = |root: &mut RenderRoot| {
+        edit_editor(root, 0, |editor| {
+            (editor.widget.modal_depth(), editor.widget.is_holding())
+        })
+    };
+    let history = |root: &mut RenderRoot| edit_editor(root, 0, |editor| editor.widget.history_depth());
+    let steps = history(&mut root);
+
+    // Node 1 is at (180, 20); the left area ends at 600.
+    let mut at = |kind, x: f64, root: &mut RenderRoot| pointer(&mut app, &mut cx, key, root, kind, Point::new(x, 40.0));
+    at("move", 200.0, &mut root);
+    at("down", 200.0, &mut root);
+    for x in [300.0, 500.0, 700.0, 900.0] {
+        at("drag", x, &mut root);
+    }
+    assert_eq!(node(&graph).x, 880.0, "the node follows the pointer past the border");
+    at("up", 900.0, &mut root);
+    assert_eq!(
+        depth(&mut root),
+        (0, false),
+        "a release over the next area ends the drag"
+    );
+    let done = history(&mut root);
+    assert!(done > steps, "into the history");
+    at("move", 300.0, &mut root);
+    assert_eq!(node(&graph).x, 880.0, "and the node stays where it was let go");
+    assert_eq!(history(&mut root), done, "with nothing still running to add to it");
+}
+
+/// A link dragged out of its area and let go over the next ends there, adding nothing —
+/// and `Escape` there cancels it.
+#[test]
+fn a_link_drag_let_go_over_the_next_area_ends() {
+    use masonry::core::TextEvent;
+    use masonry::core::keyboard::NamedKey;
+
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    let links = graph.borrow().links.len();
+
+    // Node 1's output port: the middle of its right edge, (300, 50).
+    let at = |app: &mut EditorApp<Grid>, cx: &mut ShellCtx, kind, x: f64, root: &mut RenderRoot| {
+        pointer(app, cx, key, root, kind, Point::new(x, 50.0));
+    };
+    at(&mut app, &mut cx, "move", 300.0, &mut root);
+    at(&mut app, &mut cx, "down", 300.0, &mut root);
+    for x in [350.0, 500.0, 700.0, 900.0] {
+        at(&mut app, &mut cx, "drag", x, &mut root);
+    }
+    let running = edit_editor(&mut root, 0, |editor| editor.widget.modal_depth());
+    assert_eq!(running, 1, "the link is being dragged");
+    at(&mut app, &mut cx, "up", 900.0, &mut root);
+    let after = edit_editor(&mut root, 0, |editor| {
+        (editor.widget.modal_depth(), editor.widget.is_holding())
+    });
+    assert_eq!(after, (0, false), "the release ended it");
+    assert_eq!(graph.borrow().links.len(), links, "over no port, nothing was linked");
+
+    // Again, and `Escape` over the next area, with the button still down: the keys stay
+    // with the operator, not with the area the pointer is over.
+    at(&mut app, &mut cx, "move", 300.0, &mut root);
+    at(&mut app, &mut cx, "down", 300.0, &mut root);
+    for x in [350.0, 500.0, 700.0, 900.0] {
+        at(&mut app, &mut cx, "drag", x, &mut root);
+    }
+    let escape = TextEvent::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: Key::Named(NamedKey::Escape),
+        code: Code::Escape,
+        modifiers: Modifiers::empty(),
+        ..KeyboardEvent::default()
+    });
+    let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, escape);
+    let running = edit_editor(&mut root, 0, |editor| editor.widget.modal_depth());
+    assert_eq!(running, 0, "Escape over the next area cancelled the drag");
+    at(&mut app, &mut cx, "up", 900.0, &mut root);
+    assert_eq!(graph.borrow().links.len(), links);
+}
+
+/// An operator started by a key goes on past its area, and ends where it is confirmed.
+///
+/// `G` has no pointer capture and cannot have one — Masonry grants it during a press only
+/// (§38.1) — so past its area the tree gave the moves to the editor next door: the node
+/// stopped at the border, and the click that confirms went there too. The keys followed
+/// the pointer as well, so `Escape` over the next area reached the wrong editor.
+#[test]
+fn a_grab_started_by_a_key_goes_on_past_its_area() {
+    use masonry::core::TextEvent;
+    use masonry::core::keyboard::NamedKey;
+
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    let node = |graph: &SharedGraph<Grid>| graph.borrow().node_rect(1).origin();
+    let state = |root: &mut RenderRoot| {
+        let left = edit_editor(root, 0, |editor| editor.widget.modal_depth());
+        let right = edit_editor(root, 1, |editor| editor.widget.modal_depth());
+        (left, right)
+    };
+    let press_key = |app: &mut EditorApp<Grid>, cx: &mut ShellCtx, root: &mut RenderRoot, key_value: Key| {
+        let event = TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: key_value,
+            code: Code::Unidentified,
+            modifiers: Modifiers::empty(),
+            ..KeyboardEvent::default()
+        });
+        let _ = blazy_shell::window::deliver_text(app, cx, key, root, event);
+        app.settled(cx, key, root);
+        let _ = root.redraw();
+    };
+
+    let start = node(&graph);
+    // Over node 1 in the left area, select it and grab it with `G`.
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(200.0, 40.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 1));
+    });
+    press_key(&mut app, &mut cx, &mut root, Key::Character("g".into()));
+    assert_eq!(state(&mut root), (1, 0), "the grab runs in the left area");
+
+    for x in [400.0, 700.0, 900.0] {
+        pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(x, 40.0));
+    }
+    assert_eq!(
+        node(&graph).x,
+        start.x + 700.0,
+        "the node follows the pointer past the border"
+    );
+    assert_eq!(state(&mut root), (1, 0), "and the right area runs nothing");
+    assert!(app.counters().host_events >= 3);
+
+    // `Escape` over the right area cancels the grab in the left one.
+    press_key(&mut app, &mut cx, &mut root, Key::Named(NamedKey::Escape));
+    assert_eq!(
+        state(&mut root),
+        (0, 0),
+        "Escape reached the operator, not the area under it"
+    );
+    assert_eq!(node(&graph), start, "and put the node back");
+
+    // Again, confirmed with a click over the right area.
+    press_key(&mut app, &mut cx, &mut root, Key::Character("g".into()));
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(900.0, 60.0));
+    pointer(&mut app, &mut cx, key, &mut root, "down", Point::new(900.0, 60.0));
+    pointer(&mut app, &mut cx, key, &mut root, "up", Point::new(900.0, 60.0));
+    assert_eq!(state(&mut root), (0, 0), "a click over the right area confirmed it");
+    let placed = node(&graph);
+    assert_ne!(placed, start);
+    let selection = graph.borrow().views().selection();
+    assert_eq!(selection, std::iter::once(1).collect(), "and selected nothing there");
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(300.0, 60.0));
+    assert_eq!(node(&graph), placed, "the grab is over");
+    let handed = app.counters().host_events;
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(320.0, 60.0));
+    assert_eq!(
+        app.counters().host_events,
+        handed,
+        "and the host hands nothing on any more"
+    );
+}

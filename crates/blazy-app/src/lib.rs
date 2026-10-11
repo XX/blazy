@@ -46,12 +46,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use blazy_areas::{AreaId, AreaScreen, SplitTree, Workspace};
-use blazy_node_editor::{EditorSession, NodeGraph, SessionHandle, SharedGraph, sync_root};
+use blazy_node_editor::{EditorSession, NodeEditor, NodeGraph, SessionHandle, SharedGraph, sync_root};
 use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
 use blazy_shell::window::{Error, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use masonry::app::RenderRoot;
-use masonry::core::{DefaultProperties, Handled, NewWidget, TextEvent, Widget, WidgetId, WidgetMut};
+use masonry::core::{
+    DefaultProperties, Handled, NewWidget, PointerEvent, TextEvent, Widget, WidgetId, WidgetMut, WidgetRef,
+};
 use masonry::dpi::LogicalSize;
 use masonry::kurbo::Axis;
 use masonry::peniko::Color;
@@ -122,6 +124,10 @@ pub struct AppCounters {
     /// One per crossing from one area into another, not one per event: the target is
     /// read on every event, and set only when it changed.
     pub key_targets: u64,
+    /// Pointer events handed from the host seat to an operator started by a key
+    /// ([`NodeEditor::host_pointer_event`]) — each one an edit of a widget, the price
+    /// §38.2 measured. Zero outside such a gesture.
+    pub host_events: u64,
 }
 
 /// Node editors over one graph, in areas, in windows: the [`ShellDriver`] an application
@@ -160,9 +166,9 @@ impl<G: NodeGraph> EditorApp<G> {
     ///
     /// `build` is called for every area that appears — at startup, on a split, when a
     /// workspace is read, in a window that was just opened — with the session the area
-    /// shows. The usual body is a [`NodeEditor`](blazy_node_editor::NodeEditor) over a
+    /// shows. The usual body is a [`NodeEditor`] over a
     /// canvas, made with
-    /// [`NodeEditor::with_session`](blazy_node_editor::NodeEditor::with_session),
+    /// [`NodeEditor::with_session`],
     /// optionally inside an `AreaContent` with a header above it.
     pub fn new(
         graph: &SharedGraph<G>,
@@ -364,6 +370,10 @@ impl<G: NodeGraph> EditorApp<G> {
             let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
                 return;
             };
+            // Mid-gesture the keys stay with the operator without asking: the screen
+            // learns where the pointer is from the moves it sees, and it sees none while
+            // an editor holds the capture or the host hands the moves to a running
+            // operator — so `Escape` over the next area still reaches the one it ends.
             let area = screen.hovered_area().or_else(|| screen.tree().areas().next());
             area.and_then(|area| screen.payload(area))
                 .and_then(|session| session.borrow().editor)
@@ -564,6 +574,42 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
             .unwrap_or_default()
     }
 
+    /// Hands the pointer to an operator started by a key, wherever the pointer is.
+    ///
+    /// A gesture started by a press holds the pointer through capture, and the tree
+    /// routes it; one started by a key cannot (capture is a press's, §38.1), so past its
+    /// area the tree gave its events to the editor next door — the node stopped at the
+    /// border and a click to confirm went to the wrong editor. While such an operator
+    /// runs, every pointer event of the window goes to its editor from here and is kept
+    /// from the tree, which is Blender's arrangement: a modal handler belongs to the
+    /// window. One edit of a widget per event, counted in `host_events`.
+    fn pointer_event(
+        &mut self,
+        _cx: &mut ShellCtx,
+        _window: WindowKey,
+        root: &mut RenderRoot,
+        event: &PointerEvent,
+    ) -> Handled {
+        if root.pointer_capture_target().is_some() {
+            return Handled::No;
+        }
+        let editor = {
+            let screen = root.get_layer_root(0);
+            let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
+                return Handled::No;
+            };
+            modal_editor(&screen)
+        };
+        let Some(editor) = editor else {
+            return Handled::No;
+        };
+        self.counters.host_events += 1;
+        let consumed = root.edit_widget(editor, |mut widget| {
+            NodeEditor::<G>::host_pointer_event(&mut widget.downcast::<NodeEditor<G>>(), event)
+        });
+        if consumed { Handled::Yes } else { Handled::No }
+    }
+
     /// The screen's operations, from the seat in front of the tree.
     ///
     /// Here rather than in a widget because they are the *screen's* operations and the
@@ -580,6 +626,23 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
             None => Handled::No,
         }
     }
+}
+
+/// The editor of a screen whose operator is running, if any — the one that owns the
+/// pointer and the keys until it ends.
+fn modal_editor<G: NodeGraph>(screen: &WidgetRef<'_, EditorScreen<G>>) -> Option<WidgetId> {
+    screen
+        .tree()
+        .areas()
+        .filter_map(|area| screen.payload(area))
+        .find_map(|session| {
+            let session = session.borrow();
+            if session.runtime.modal_depth() > 0 {
+                session.editor
+            } else {
+                None
+            }
+        })
 }
 
 /// Takes an area out of a screen, ready to be built in another window.

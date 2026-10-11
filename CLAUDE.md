@@ -369,6 +369,18 @@ whether the gesture will become a drag. So Blender's `CLICK` / `CLICK_DRAG` even
 values cannot be keymap data here; what the gesture turned out to be is decided by the
 operator holding it, steered by properties on the binding (§38.3).
 
+**A modal operator owns the window's pointer, wherever it goes (§54).** Two ways, because
+capture is a press's: an editor takes capture on a press that is *running an operator or
+held* — counting only running operators left every drag uncaptured since §39.3, since a held
+press starts its operator past the threshold, and past its area the moves and the release
+went to the editor next door (the node stopped at the border, and the drag never ended). An
+operator started by a key gets the window's events from the host seat:
+`EditorApp::pointer_event` hands them to `NodeEditor::host_pointer_event` and keeps them from
+the tree, one widget edit an event (`host_events`, priced in §38.2) — Blender's modal handler
+belongs to the window too. The keys need nothing: the screen learns the hovered area from
+moves it sees, and it sees none mid-gesture. Tests drive events through
+`blazy_shell::window::deliver_pointer`, or the host seat does not exist for them.
+
 **An operator never touches a widget (§38.3).** It changes the model and lists what
 moved — or, for a view operator like `view.pan`, how far the view should move; the
 driver carries that into its own canvas and into the graph's other views.

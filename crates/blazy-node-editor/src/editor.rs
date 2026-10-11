@@ -42,6 +42,7 @@ use masonry::core::{
     NoAction, PaintCtx, PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Update,
     UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod, render_text,
 };
+use masonry::dpi::PhysicalPosition;
 use masonry::imaging::Painter;
 use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
 use masonry::layout::{LenReq, Length, SizeDef};
@@ -390,6 +391,57 @@ impl<G: NodeGraph> NodeEditor<G> {
         };
         Self::flush_mut(this);
         result
+    }
+
+    /// Hands a pointer event to the operator running in this editor, from the host's seat
+    /// in front of the tree (`ShellDriver::pointer_event`), wherever the pointer is.
+    ///
+    /// For an operator started by a key. It has no pointer capture and cannot have one —
+    /// Masonry grants capture during a press only (§38.1) — so past this editor's
+    /// rectangle the tree hands its events to whatever is there: the editor of the next
+    /// area heard the moves, the node stopped at the border, and a click there to confirm
+    /// went to the wrong editor. Positions come in window coordinates, and outside this
+    /// widget they are simply outside it: the operator goes on in this editor's view.
+    ///
+    /// Returns whether the operator consumed the event; the host keeps a consumed event
+    /// from the tree. Costs the host an edit of this widget per event, which §38.2 priced.
+    pub fn host_pointer_event(this: &mut WidgetMut<'_, Self>, event: &PointerEvent) -> bool {
+        if this.widget.session.is_none() {
+            return false;
+        }
+        let scale = this.ctx.scale_factor();
+        let size = this.ctx.content_box().size();
+        let converted = {
+            let ctx = &this.ctx;
+            to_op_event_in(
+                |p| {
+                    let p = p.to_logical::<f64>(scale);
+                    ctx.to_local(Point::new(p.x, p.y))
+                },
+                scale,
+                size,
+                event,
+            )
+        };
+        let Some((op_event, sample)) = converted else {
+            return false;
+        };
+        let tracking = this
+            .widget
+            .session
+            .as_ref()
+            .is_some_and(|session| session.borrow().world.track_hover);
+        let (view, hover) = {
+            let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
+            let hover = match op_event.pos() {
+                Some(pos) if tracking => CanvasLayer::hit_test(&mut canvas, pos),
+                _ => canvas.widget.stats().hovered,
+            };
+            (canvas.widget.view(), hover)
+        };
+        let consumed = this.widget.feed(&op_event, sample, Seat::Host, view, hover);
+        Self::flush_mut(this);
+        consumed
     }
 
     /// The menu this editor has open, by its layer's root, if any.
@@ -822,8 +874,47 @@ impl<G: NodeGraph> NodeEditor<G> {
             let (canvas, mut raw) = ctx.get_raw_mut(&mut self.canvas);
             hover = canvas.hit_test_raw(pos, window, &mut raw);
         }
-        self.view = view;
         let is_press = matches!(event, OpEvent::Press { .. });
+        let consumed = self.feed(event, sample, seat, view, hover);
+
+        // Masonry's own modality. It may be taken during a press and at no other time,
+        // and only where the event is addressed to this widget — the pre-tree seat is
+        // given a context that refuses it (§38.1). Kept even though the layer seat can
+        // now withhold events on its own: capture is what stops the *tree* from acting
+        // on a gesture this driver already owns.
+        //
+        // A held press owns the gesture as much as a running operator does: a binding on
+        // `Drag` holds the press and starts its operator on the first move past the
+        // threshold, when capture is no longer on offer. Counting only running operators
+        // left every drag uncaptured — the moves past the area's edge went to the editor
+        // next door, the node stopped at the border, and a release there never reached
+        // the operator, which went on dragging with the button up.
+        if seat != Seat::Layer {
+            let running = self.modal_depth() > 0 || self.is_holding();
+            let holds = ctx.pointer_capture_target_id() == Some(ctx.widget_id());
+            if running && is_press && !holds {
+                ctx.capture_pointer();
+            } else if !running && holds && !is_press {
+                ctx.release_pointer();
+            }
+        }
+
+        self.flush(ctx);
+        consumed
+    }
+
+    /// Hands one event to the runtime, in canvas coordinates and with what is under the
+    /// pointer filled in, and says whether it was consumed. What it changed is carried
+    /// out by the caller, which is the one holding a context.
+    fn feed(
+        &mut self,
+        event: &OpEvent,
+        sample: Sample,
+        seat: Seat,
+        view: Affine,
+        mut hover: Option<CanvasHit>,
+    ) -> bool {
+        self.view = view;
 
         // A held press is decided — click or drag — on the first move past the threshold,
         // and what it is decided *about* is where it was pressed: `OpEvent::Drag` carries
@@ -832,7 +923,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         // move instead handed every fast drag that left its target before the threshold —
         // out of a port, off the edge of a node — to whatever was under the pointer by
         // then, usually the view (§52).
-        if is_press {
+        if matches!(event, OpEvent::Press { .. }) {
             self.press_hover = hover;
         } else if self
             .session
@@ -863,23 +954,6 @@ impl<G: NodeGraph> NodeEditor<G> {
                 .runtime
                 .feed(&mut session.world, &event, sample, Scope(&CANVAS_SCOPE), seat)
         };
-
-        // Masonry's own modality. It may be taken during a press and at no other time,
-        // and only where the event is addressed to this widget — the pre-tree seat is
-        // given a context that refuses it (§38.1). Kept even though the layer seat can
-        // now withhold events on its own: capture is what stops the *tree* from acting
-        // on a gesture this driver already owns.
-        if seat != Seat::Layer {
-            let running = self.modal_depth() > 0;
-            let holds = ctx.pointer_capture_target_id() == Some(ctx.widget_id());
-            if running && is_press && !holds {
-                ctx.capture_pointer();
-            } else if !running && holds && !is_press {
-                ctx.release_pointer();
-            }
-        }
-
-        self.flush(ctx);
         result.is_consumed()
     }
 
@@ -1050,11 +1124,27 @@ impl<G: NodeGraph> NodeEditor<G> {
 /// Returns `None` for the events an operator layer has no use for — enter, leave and
 /// gestures. The scroll is `view.zoom`'s since the wheel became a binding.
 fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sample)> {
+    to_op_event_in(
+        |p| ctx.local_position(p),
+        ctx.scale_factor(),
+        ctx.content_box().size(),
+        event,
+    )
+}
+
+/// [`to_op_event`] for a caller with no `EventCtx`: `local` takes a window position into
+/// this widget's space, `scale` is the display's and `size` the widget's.
+fn to_op_event_in(
+    local: impl Fn(PhysicalPosition<f64>) -> Point,
+    scale: f64,
+    size: Size,
+    event: &PointerEvent,
+) -> Option<(OpEvent, Sample)> {
     let (op_event, state, info) = match event {
         PointerEvent::Down(e) => (
             OpEvent::Press {
                 button: e.button?,
-                pos: ctx.local_position(e.state.position),
+                pos: local(e.state.position),
                 mods: e.state.modifiers,
             },
             &e.state,
@@ -1063,7 +1153,7 @@ fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sam
         PointerEvent::Up(e) => (
             OpEvent::Release {
                 button: e.button?,
-                pos: ctx.local_position(e.state.position),
+                pos: local(e.state.position),
                 mods: e.state.modifiers,
             },
             &e.state,
@@ -1071,7 +1161,7 @@ fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sam
         ),
         PointerEvent::Move(PointerUpdate { current, pointer, .. }) => (
             OpEvent::Move {
-                pos: ctx.local_position(current.position),
+                pos: local(current.position),
                 mods: current.modifiers,
             },
             current,
@@ -1081,8 +1171,8 @@ fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sam
             delta, state, pointer, ..
         }) => (
             OpEvent::Scroll {
-                pos: ctx.local_position(state.position),
-                dy: wheel_pixels(*delta, ctx.scale_factor(), ctx.content_box().size()),
+                pos: local(state.position),
+                dy: wheel_pixels(*delta, scale, size),
                 mods: state.modifiers,
             },
             state,
@@ -1108,7 +1198,7 @@ fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sam
             PointerType::Touch => Device::Touch,
             _ => Device::Other,
         },
-        screen: ctx.local_position(state.position),
+        screen: local(state.position),
     };
     Some((op_event, sample))
 }
