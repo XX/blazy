@@ -284,6 +284,18 @@ impl<W> OpRuntime<W> {
         self.stack.last().map(|modal| self.names[modal.op])
     }
 
+    /// The properties the operator currently receiving events was started with, if any.
+    ///
+    /// For a driver that does something on the operator's behalf the operator cannot do
+    /// itself — scrolling the view at the edge of an area while the pointer stands still
+    /// and sends no events — and has to know whether the binding asked for it. A binding's
+    /// properties are where Blender keeps that choice (`view2d_edge_pan`), and reading them
+    /// here keeps it there rather than in a flag every operator would have to set and
+    /// clear on every way it can end.
+    pub fn modal_props(&self) -> Option<&Props> {
+        self.stack.last().map(|modal| &modal.props)
+    }
+
     /// The counters, for a criterion or a status line.
     pub fn counters(&self) -> OpCounters {
         self.counters

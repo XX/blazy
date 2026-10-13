@@ -18,9 +18,10 @@
 //!
 //! Drag a node to move it, drag out of a port (the dots on a node's edges) into another
 //! node's port to link them, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
-//! delete, `F` to link the two selected nodes, `Ctrl+Z` to undo. `Alt+X` / `Alt+Y` split
-//! the area under the pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another
-//! window over the same graph and `Alt+D` moves the area into one of its own.
+//! delete, `F` to link the two selected nodes, `Ctrl+Z` to undo. A node or a link held at
+//! the edge of an area scrolls the view. `Alt+X` / `Alt+Y` split the area under the
+//! pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another window over the same
+//! graph and `Alt+D` moves the area into one of its own.
 
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
@@ -44,7 +45,7 @@ use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRad
 use blazy::masonry::theme::default_property_set;
 use blazy::masonry::widgets::Label;
 use blazy::node_editor::{
-    NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
+    EdgePan, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
 };
 use blazy::shell::window::{Error, WindowConfig};
 
@@ -323,6 +324,10 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
         };
         NewWidget::new(NodeEditor::with_session(canvas, session.clone()).with_style(style)).erased()
     })
+    // A node or a link held at the edge of an area scrolls the view, as in Blender. A
+    // choice rather than a default: without it the gesture carries on past the border and
+    // the view stands still.
+    .with_edge_pan(EdgePan::default())
 }
 
 impl Graph {

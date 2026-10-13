@@ -51,9 +51,10 @@ use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerScrollEvent, PointerType, PointerUpdate};
 use masonry::{TextAlign, TextAlignOptions};
 
+use crate::edge_pan::{EdgePan, EdgePanCounters, EdgePanState};
 use crate::menu::MenuLayer;
 use crate::ops::CANVAS_SCOPE;
-use crate::{Change, Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
+use crate::{Change, EDGE_PAN, Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
 
 /// What a view of a graph holds that the graph does not.
 ///
@@ -84,6 +85,13 @@ pub struct EditorSession<G: NodeGraph> {
     /// and an area knows its session, not its widgets. Recorded by the editor itself when
     /// it is added, and overwritten by the next one when the area is rebuilt elsewhere.
     pub editor: Option<WidgetId>,
+    /// How the view scrolls at the edge of the area during a gesture, or `None` for not at
+    /// all — the default, which leaves a gesture carrying on past the border while the
+    /// view stands still. A binding still has to ask for it ([`EDGE_PAN`](crate::EDGE_PAN)).
+    ///
+    /// The session's rather than the widget's, so that the choice goes with the area into
+    /// another window, as the view and the history do (§44).
+    pub edge_pan: Option<EdgePan>,
 }
 
 impl<G: NodeGraph> EditorSession<G> {
@@ -99,7 +107,26 @@ impl<G: NodeGraph> EditorSession<G> {
             runtime,
             view: Affine::IDENTITY,
             editor: None,
+            edge_pan: None,
         }
+    }
+
+    /// The same session, scrolling at the edge of its area as `edge_pan` says, or not at
+    /// all for `None`. See [`edge_pan`](Self::edge_pan).
+    #[must_use]
+    pub fn with_edge_pan(mut self, edge_pan: Option<EdgePan>) -> Self {
+        self.edge_pan = edge_pan;
+        self
+    }
+
+    /// The edge pan the running operator scrolls by: the session's, if its binding asked
+    /// for it ([`EDGE_PAN`](crate::EDGE_PAN)), and `None` between gestures.
+    fn edge_pan_in_force(&self) -> Option<EdgePan> {
+        let asked = self
+            .runtime
+            .modal_props()
+            .is_some_and(|props| props.bool(EDGE_PAN, false));
+        self.edge_pan.filter(|_| asked)
     }
 
     /// Wraps the session in the handle an editor takes.
@@ -202,6 +229,8 @@ pub struct NodeEditor<G: NodeGraph> {
     menu: Option<WidgetId>,
     /// What the pointer was over when the press now held was made.
     press_hover: Option<CanvasHit>,
+    /// The running gesture's edge pan, and what edge pan has done here.
+    edge: EdgePanState,
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
@@ -244,6 +273,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             shown: BTreeSet::new(),
             menu: None,
             press_hover: None,
+            edge: EdgePanState::default(),
         }
     }
 
@@ -372,6 +402,11 @@ impl<G: NodeGraph> NodeEditor<G> {
             .map_or(0, |session| session.borrow().runtime.history().bytes())
     }
 
+    /// What edge pan has done in this editor. See [`EdgePanCounters`].
+    pub fn edge_pan_counters(&self) -> EdgePanCounters {
+        self.edge.counters
+    }
+
     /// Runs an operator by name, from outside the tree.
     ///
     /// The `exec` half of §11 — a script, a test, a redo — and it goes through the
@@ -440,8 +475,107 @@ impl<G: NodeGraph> NodeEditor<G> {
             (canvas.widget.view(), hover)
         };
         let consumed = this.widget.feed(&op_event, sample, Seat::Host, view, hover);
+        if this.widget.watch_edge_pan(Some(&op_event), size) {
+            this.ctx.request_anim_frame();
+        }
         Self::flush_mut(this);
         consumed
+    }
+
+    /// Follows the running gesture's pointer for edge pan, and says whether to ask for an
+    /// animation frame.
+    ///
+    /// Called after every event the operators were offered, and after the gesture was
+    /// cancelled from outside: it is where a gesture that may scroll begins and ends. One
+    /// that was cancelled after scrolling puts the view back where it was, as Blender's
+    /// does — what the operator puts back is in canvas coordinates, and a view left
+    /// scrolled would show the node returned somewhere off the area. The pan back goes
+    /// out with what the operator changed (`EditorWorld::pan`), so the caller's flush
+    /// carries it.
+    fn watch_edge_pan(&mut self, event: Option<&OpEvent>, size: Size) -> bool {
+        let Some(session) = self.session.clone() else {
+            return false;
+        };
+        let (config, cancels) = {
+            let session = session.borrow();
+            (session.edge_pan_in_force(), session.runtime.counters().modal_cancels)
+        };
+        let Some(config) = config else {
+            let edge = &mut self.edge;
+            if edge.gesture {
+                edge.gesture = false;
+                if cancels > edge.cancels && edge.total != Vec2::ZERO {
+                    session.borrow_mut().world.pan -= edge.total;
+                    edge.counters.restores += 1;
+                }
+                edge.total = Vec2::ZERO;
+            }
+            return false;
+        };
+        if !self.edge.gesture {
+            self.edge.begin(cancels);
+        }
+        let pos = event.and_then(OpEvent::pos);
+        if let (Some(event), Some(_)) = (event, pos) {
+            self.edge.mods = event.mods();
+        }
+        if !self.edge.track(&config, pos, size) || self.edge.frame_pending {
+            return false;
+        }
+        self.edge.frame_pending = true;
+        self.edge.counters.frames += 1;
+        true
+    }
+
+    /// One animation frame of edge pan: moves the view, and hands the operator a move at
+    /// the same screen position — which is somewhere else on the graph now.
+    ///
+    /// From the mutate pass, because that is where a frame can reach the canvas and the
+    /// other views of the graph through the path a host event takes (`flush_mut`).
+    fn edge_pan_frame(this: &mut WidgetMut<'_, Self>, interval_ns: u64) {
+        let Some(session) = this.widget.session.clone() else {
+            return;
+        };
+        let config = session.borrow().edge_pan_in_force();
+        // The gesture ended between the request and the frame, and the event that ended it
+        // has closed it already.
+        let (Some(config), Some(pointer)) = (config, this.widget.edge.pointer) else {
+            return;
+        };
+        if !this.widget.edge.gesture {
+            return;
+        }
+        let size = this.ctx.content_box().size();
+        let tracking = session.borrow().world.track_hover;
+        let (delta, view, hover) = {
+            let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
+            let delta = this.widget.edge.step(&config, size, canvas.widget.zoom(), interval_ns);
+            if delta != Vec2::ZERO {
+                CanvasLayer::pan(&mut canvas, delta);
+            }
+            let hover = if tracking {
+                CanvasLayer::hit_test(&mut canvas, pointer)
+            } else {
+                canvas.widget.stats().hovered
+            };
+            (delta, canvas.widget.view(), hover)
+        };
+        if delta != Vec2::ZERO {
+            this.widget.edge.total += delta;
+            this.widget.edge.counters.pans += 1;
+            let event = OpEvent::Move {
+                pos: pointer,
+                mods: this.widget.edge.mods,
+            };
+            // `Tree`: nothing below was offered this move, because there was no move.
+            this.widget.feed(&event, Sample::at(pointer), Seat::Tree, view, hover);
+            Self::flush_mut(this);
+        }
+        if this.widget.edge.in_band(&config, size) {
+            this.widget.edge.frame_pending = true;
+            this.widget.edge.counters.frames += 1;
+            this.ctx.request_anim_frame();
+        }
     }
 
     /// The menu this editor has open, by its layer's root, if any.
@@ -876,6 +1010,9 @@ impl<G: NodeGraph> NodeEditor<G> {
         }
         let is_press = matches!(event, OpEvent::Press { .. });
         let consumed = self.feed(event, sample, seat, view, hover);
+        if self.watch_edge_pan(Some(event), ctx.content_box().size()) {
+            ctx.request_anim_frame();
+        }
 
         // Masonry's own modality. It may be taken during a press and at no other time,
         // and only where the event is addressed to this widget — the pre-tree seat is
@@ -1227,6 +1364,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                 let session = &mut *session.borrow_mut();
                 session.runtime.cancel_all(&mut session.world);
             }
+            self.watch_edge_pan(None, ctx.content_box().size());
             self.flush(ctx);
             return;
         }
@@ -1268,6 +1406,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                     let session = &mut *session.borrow_mut();
                     session.runtime.cancel_all(&mut session.world);
                 }
+                self.watch_edge_pan(None, ctx.content_box().size());
                 self.flush(ctx);
             },
             // While its menu is open the keys are the menu's, and the menu cannot take
@@ -1300,6 +1439,14 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
             },
             _ => {},
         }
+    }
+
+    /// Edge pan's frame, asked for only while a gesture's pointer is in the band.
+    fn on_anim_frame(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, interval: u64) {
+        if !mem::take(&mut self.edge.frame_pending) {
+            return;
+        }
+        ctx.mutate_self_later(move |mut widget| Self::edge_pan_frame(&mut widget.downcast::<Self>(), interval));
     }
 
     /// Tells the session which widget shows it, so a driver can send this one keys.

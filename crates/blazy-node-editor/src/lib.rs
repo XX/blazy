@@ -33,6 +33,7 @@
 
 #![warn(missing_docs, unreachable_pub)]
 
+mod edge_pan;
 mod editor;
 mod menu;
 pub mod ops;
@@ -48,6 +49,7 @@ use std::rc::Rc;
 pub use blazy_canvas::Link;
 use masonry::kurbo::{Point, Rect};
 
+pub use crate::edge_pan::{EDGE_PAN, EdgePan, EdgePanCounters};
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
 pub use crate::menu::{Menu, MenuItem, MenuLayer, MenuOp};
 pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};

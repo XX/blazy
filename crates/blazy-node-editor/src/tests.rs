@@ -1216,3 +1216,173 @@ mod link_drag {
         assert!(links(&graph).is_empty(), "the release after a cancel adds nothing");
     }
 }
+
+/// A harness for edge pan: node 0 is held by its middle at `(50, 30)` and dragged into the
+/// right-hand band of the 800-pixel editor, at `(790, 200)`, where the pointer then stands
+/// still. (Not at `y = 30`: that is in the top band, and the pointer would never have been
+/// inside.)
+fn edge_pan_harness(session: crate::SessionHandle<Row>, graph: &SharedGraph<Row>) -> TestHarness<NodeEditor<Row>> {
+    let mut harness = editor_harness(graph, &session);
+    harness.mouse_move(Point::new(50.0, 30.0));
+    harness.mouse_button_press(Some(masonry::core::PointerButton::Primary));
+    // Inside the band's inner edge first: a gesture that begins in the band waits for that.
+    harness.mouse_move(Point::new(200.0, 200.0));
+    harness.mouse_move(Point::new(790.0, 200.0));
+    let _ = harness.redraw();
+    harness
+}
+
+fn view_of(harness: &mut TestHarness<NodeEditor<Row>>) -> masonry::kurbo::Affine {
+    harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.view()))
+}
+
+/// From the canvas itself: the editor's copy is refreshed by the editor's own layout, and a
+/// scroll lays out the canvas alone — so the copy would not see a scroll at all.
+fn child_layouts(harness: &mut TestHarness<NodeEditor<Row>>) -> u64 {
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats().counters.child_layouts)
+    })
+}
+
+/// Sixty frames of a sixtieth of a second each, with the pointer where it is.
+fn hold_still(harness: &mut TestHarness<NodeEditor<Row>>) {
+    for _ in 0..60 {
+        harness.animate_ms(16);
+        let _ = harness.redraw();
+    }
+}
+
+/// A node held in the band scrolls the view while the pointer stands still, stays under
+/// the pointer as it does, and the scrolling stops — frames and all — when the pointer
+/// comes back inside.
+///
+/// The pointer sends nothing while it stands still, so all of the movement here comes
+/// from animation frames: the editor's, asked for only while the pointer is in the band.
+#[test]
+fn a_node_held_at_the_edge_scrolls_the_view_and_stays_under_the_pointer() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph)
+        .with_edge_pan(Some(crate::EdgePan::default()))
+        .share();
+    let mut harness = edge_pan_harness(session.clone(), &graph);
+    let before = view_of(&mut harness);
+    let layouts = child_layouts(&mut harness);
+
+    hold_still(&mut harness);
+    let after = view_of(&mut harness);
+    let scrolled = before.translation().x - after.translation().x;
+    // About a second at full speed, less the eased-in half second of the delay.
+    assert!(scrolled > 200.0, "the view scrolled right: {scrolled}");
+    assert_eq!(after.translation().y, before.translation().y, "and only right");
+    let node = after * origin(&graph, 0);
+    assert!(
+        (node.x - 740.0).abs() < 1e-6 && (node.y - 170.0).abs() < 1e-6,
+        "node 0 is still held by its middle, under the pointer: {node:?}"
+    );
+    assert_eq!(
+        child_layouts(&mut harness),
+        layouts,
+        "a scroll is the view's, and the view goes into paint (§22)"
+    );
+    let counters = harness.root_widget().edge_pan_counters();
+    assert!(counters.pans >= 50, "{counters:?}");
+
+    // Back inside: the frame already asked for arrives and asks for no other.
+    harness.mouse_move(Point::new(400.0, 200.0));
+    harness.animate_ms(16);
+    let _ = harness.redraw();
+    let frames = harness.root_widget().edge_pan_counters().frames;
+    let view = view_of(&mut harness);
+    hold_still(&mut harness);
+    assert_eq!(
+        harness.root_widget().edge_pan_counters().frames,
+        frames,
+        "no frames asked for"
+    );
+    assert_eq!(view_of(&mut harness), view, "and the view stands");
+
+    harness.mouse_button_release(Some(masonry::core::PointerButton::Primary));
+    assert_eq!(harness.root_widget().modal_depth(), 0);
+    assert_eq!(harness.root_widget().history_depth(), 2, "a selection and a move");
+}
+
+/// With edge pan off, the same gesture carries on past the edge and the view stands —
+/// whether the application turned it off or the binding did not ask for it.
+#[test]
+fn without_edge_pan_the_view_stands_and_the_node_follows_the_pointer() {
+    use blazy_ops::event::Pattern;
+    use blazy_ops::keymap::{Binding, Keymap};
+
+    let drag = |props: Props| {
+        Keymap::new().with(crate::ops::CANVAS_CONTEXT, vec![
+            Binding::new(Pattern::drag(masonry::core::PointerButton::Primary), "node.move").with_props(props),
+        ])
+    };
+    let cases = [
+        ("the session has none", None),
+        (
+            "the binding says false",
+            Some(drag(Props::new().with_bool(crate::EDGE_PAN, false))),
+        ),
+        ("the binding says nothing", Some(drag(Props::new()))),
+    ];
+    for (case, keymap) in cases {
+        let graph = row(3);
+        let session = match keymap {
+            None => crate::EditorSession::new(&graph),
+            Some(keymap) => crate::EditorSession::with_runtime(&graph, crate::ops::runtime_with(keymap))
+                .with_edge_pan(Some(crate::EdgePan::default())),
+        }
+        .share();
+        let mut harness = edge_pan_harness(session.clone(), &graph);
+        let before = view_of(&mut harness);
+        assert_eq!(harness.root_widget().modal_depth(), 1, "{case}: the node is held");
+        hold_still(&mut harness);
+        assert_eq!(view_of(&mut harness), before, "{case}: the view stands");
+        assert_eq!(
+            harness.root_widget().edge_pan_counters().frames,
+            0,
+            "{case}: no frames asked for"
+        );
+        // Past the edge of the editor, the node goes on following the pointer.
+        harness.mouse_move(Point::new(1000.0, 200.0));
+        assert_eq!(origin(&graph, 0), Point::new(950.0, 170.0), "{case}");
+        harness.mouse_button_release(Some(masonry::core::PointerButton::Primary));
+        assert_eq!(harness.root_widget().modal_depth(), 0, "{case}");
+    }
+}
+
+/// A gesture cancelled after scrolling puts the view back with the node, as Blender's does.
+#[test]
+fn a_cancelled_gesture_puts_the_view_back() {
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph)
+        .with_edge_pan(Some(crate::EdgePan::default()))
+        .share();
+    let mut harness = edge_pan_harness(session.clone(), &graph);
+    let before = view_of(&mut harness);
+    let start = Point::new(0.0, 0.0);
+    hold_still(&mut harness);
+    assert_ne!(view_of(&mut harness), before, "it scrolled");
+
+    let editor = harness.root_widget().ctx().widget_id();
+    harness.set_focus_fallback(Some(editor));
+    harness.process_text_event(masonry::core::TextEvent::Keyboard(
+        masonry::core::keyboard::KeyboardEvent {
+            state: masonry::core::keyboard::KeyState::Down,
+            key: masonry::core::keyboard::Key::Named(masonry::core::keyboard::NamedKey::Escape),
+            code: masonry::core::keyboard::Code::Escape,
+            modifiers: masonry::core::keyboard::Modifiers::empty(),
+            ..Default::default()
+        },
+    ));
+    let _ = harness.redraw();
+    assert_eq!(harness.root_widget().modal_depth(), 0, "Escape cancelled the move");
+    assert_eq!(origin(&graph, 0), start, "the node went back");
+    assert_eq!(view_of(&mut harness), before, "and so did the view");
+    assert_eq!(harness.root_widget().edge_pan_counters().restores, 1);
+    let frames = harness.root_widget().edge_pan_counters().frames;
+    hold_still(&mut harness);
+    assert_eq!(harness.root_widget().edge_pan_counters().frames, frames);
+    harness.mouse_button_release(Some(masonry::core::PointerButton::Primary));
+}

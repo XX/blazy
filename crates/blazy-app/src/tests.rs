@@ -614,6 +614,10 @@ fn a_drag_goes_on_past_its_area_and_ends_over_the_next() {
     let history = |root: &mut RenderRoot| edit_editor(root, 0, |editor| editor.widget.history_depth());
     let steps = history(&mut root);
 
+    // The window asks for one frame as it starts; drawn, it asks for none.
+    hold_still(&mut root);
+    assert!(!root.needs_anim());
+
     // Node 1 is at (180, 20); the left area ends at 600.
     let mut at = |kind, x: f64, root: &mut RenderRoot| pointer(&mut app, &mut cx, key, root, kind, Point::new(x, 40.0));
     at("move", 200.0, &mut root);
@@ -622,6 +626,10 @@ fn a_drag_goes_on_past_its_area_and_ends_over_the_next() {
         at("drag", x, &mut root);
     }
     assert_eq!(node(&graph).x, 880.0, "the node follows the pointer past the border");
+    assert!(
+        !root.needs_anim(),
+        "with no edge pan asked for, nothing asks for a frame"
+    );
     at("up", 900.0, &mut root);
     assert_eq!(
         depth(&mut root),
@@ -773,4 +781,119 @@ fn a_grab_started_by_a_key_goes_on_past_its_area() {
         handed,
         "and the host hands nothing on any more"
     );
+}
+
+/// Sixty frames of a sixtieth of a second, the pointer standing still.
+fn hold_still(root: &mut RenderRoot) {
+    for _ in 0..60 {
+        root.handle_window_event(masonry::core::WindowEvent::AnimFrame(std::time::Duration::from_millis(
+            16,
+        )));
+        let _ = root.redraw();
+    }
+}
+
+fn view(root: &mut RenderRoot, area: usize) -> masonry::kurbo::Affine {
+    edit_editor(root, area, |editor| {
+        NodeEditor::with_canvas(editor, |canvas| canvas.widget.view())
+    })
+}
+
+/// With edge pan asked for, a node dragged out of its area into the next scrolls its own
+/// area's view while the pointer stands there, stays under the pointer, and the window
+/// stops asking for frames once the drag is over (§55).
+///
+/// Past the border is in the band: Blender's node editor scrolls wherever the pointer is
+/// beyond the edge, and so does the default [`EdgePan`](blazy_node_editor::EdgePan).
+#[test]
+fn a_node_dragged_into_the_next_area_scrolls_its_own() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph).with_edge_pan(blazy_node_editor::EdgePan::default());
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    let (left, right) = (view(&mut root, 0), view(&mut root, 1));
+
+    // Node 1 is at (180, 20), held 20 pixels in; through the middle of the area, then into
+    // the right one, where the pointer stays.
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(200.0, 40.0));
+    pointer(&mut app, &mut cx, key, &mut root, "down", Point::new(200.0, 40.0));
+    pointer(&mut app, &mut cx, key, &mut root, "drag", Point::new(300.0, 200.0));
+    pointer(&mut app, &mut cx, key, &mut root, "drag", Point::new(900.0, 200.0));
+    assert!(root.needs_anim(), "the pointer is past the edge: a frame is asked for");
+    hold_still(&mut root);
+
+    let scrolled = view(&mut root, 0);
+    assert!(
+        left.translation().x - scrolled.translation().x > 200.0,
+        "the left area scrolled: {scrolled:?}"
+    );
+    assert_eq!(view(&mut root, 1), right, "the right one did not");
+    let node = scrolled * graph.borrow().node_rect(1).origin();
+    assert!(
+        (node - Point::new(880.0, 180.0)).hypot() < 1e-6,
+        "the node is still under the pointer: {node:?}"
+    );
+
+    pointer(&mut app, &mut cx, key, &mut root, "up", Point::new(900.0, 200.0));
+    hold_still(&mut root);
+    assert!(!root.needs_anim(), "the drag is over, and so are the frames");
+    assert_eq!(view(&mut root, 0), scrolled, "and the view stands where it scrolled to");
+}
+
+/// A grab started by a key scrolls too: its events come through the host seat (§54.3),
+/// and so does the pointer edge pan follows. `Escape` puts the node and the view back.
+#[test]
+fn a_grab_started_by_a_key_scrolls_and_escape_puts_the_view_back() {
+    use masonry::core::TextEvent;
+    use masonry::core::keyboard::NamedKey;
+
+    let graph = Grid::new(8);
+    let mut app = app(&graph).with_edge_pan(blazy_node_editor::EdgePan::default());
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    let press_key = |app: &mut EditorApp<Grid>, cx: &mut ShellCtx, root: &mut RenderRoot, key_value: Key| {
+        let event = TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: key_value,
+            code: Code::Unidentified,
+            modifiers: Modifiers::empty(),
+            ..KeyboardEvent::default()
+        });
+        let _ = blazy_shell::window::deliver_text(app, cx, key, root, event);
+        app.settled(cx, key, root);
+        let _ = root.redraw();
+    };
+    let start = graph.borrow().node_rect(1).origin();
+    let before = view(&mut root, 0);
+
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(200.0, 200.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 1));
+    });
+    press_key(&mut app, &mut cx, &mut root, Key::Character("g".into()));
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(300.0, 200.0));
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(900.0, 200.0));
+    let handed = app.counters().host_events;
+    hold_still(&mut root);
+    assert_eq!(app.counters().host_events, handed, "frames, not events, scrolled it");
+    let scrolled = view(&mut root, 0);
+    assert!(
+        before.translation().x - scrolled.translation().x > 200.0,
+        "{scrolled:?}"
+    );
+    let node = scrolled * graph.borrow().node_rect(1).origin();
+    assert!(
+        (node - (start + Point::new(700.0, 0.0).to_vec2())).hypot() < 1e-6,
+        "the node is where the pointer took it, on screen: {node:?}"
+    );
+
+    press_key(&mut app, &mut cx, &mut root, Key::Named(NamedKey::Escape));
+    assert_eq!(graph.borrow().node_rect(1).origin(), start, "the node went back");
+    assert_eq!(view(&mut root, 0), before, "and so did the view");
+    hold_still(&mut root);
+    assert!(!root.needs_anim());
 }

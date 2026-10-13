@@ -56,7 +56,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, VisualLayerPlan, WindowSizePolicy};
 use masonry::core::{
@@ -620,8 +620,14 @@ struct ShellWindow {
     /// acted on against the wrong one.
     signals: Rc<RefCell<Vec<RenderRootSignal>>>,
     reducer: WindowEventReducer,
-    /// When the last animation frame ran, for the interval the next one gets.
-    last_anim: Instant,
+    /// When the last animation frame ran, for the interval the next one gets — `None`
+    /// when the frame before this one did not animate.
+    ///
+    /// Masonry's contract is that the first frame after idling gets an interval of zero
+    /// (`Widget::on_anim_frame`), and an animation that moves by time relies on it: kept
+    /// as the time of the last animation ever, the first frame of the next one was handed
+    /// the whole idle in between, and edge pan (§55) would have thrown the view by it.
+    last_anim: Option<Instant>,
     /// Whether the last frame was refused by the rasteriser (§33).
     ///
     /// Kept so the warning is logged when the state changes rather than sixty times a
@@ -716,7 +722,7 @@ impl ShellApp {
             root: render_root,
             signals,
             reducer: WindowEventReducer::default(),
-            last_anim: Instant::now(),
+            last_anim: None,
             refusing: false,
         });
         Ok(())
@@ -752,9 +758,11 @@ impl ShellApp {
 
         if root.needs_anim() {
             let now = Instant::now();
-            let interval = now.duration_since(shell.last_anim);
-            shell.last_anim = now;
+            let interval = shell.last_anim.map_or(Duration::ZERO, |last| now.duration_since(last));
+            shell.last_anim = Some(now);
             root.handle_window_event(WindowEvent::AnimFrame(interval));
+        } else {
+            shell.last_anim = None;
         }
 
         // Layers, before the plan is built: a widget that wants to be one has to be

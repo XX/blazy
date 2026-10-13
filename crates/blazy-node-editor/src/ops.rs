@@ -32,7 +32,7 @@ use masonry::kurbo::{Point, Rect, Size, Vec2};
 use masonry::ui_events::pointer::PointerButton;
 
 use crate::world::{AddStep, DeleteStep, LinkStep, SelectStep};
-use crate::{EditorWorld, Link, MoveRecord, NodeGraph};
+use crate::{EDGE_PAN, EditorWorld, Link, MoveRecord, NodeGraph};
 
 /// The keymap context a node canvas's bindings live in.
 pub const CANVAS_CONTEXT: &str = "canvas";
@@ -880,8 +880,16 @@ pub fn default_keymap() -> Keymap {
             // Left drag: a link out of the port under the pointer, the node under the
             // pointer, or the view. Three rows, and the polls tell them apart — the port
             // first, because a port is part of its node and `node.move` would take it.
-            Binding::new(Pattern::drag(PointerButton::Primary), "link.drag"),
-            Binding::new(Pattern::drag(PointerButton::Primary), "node.move"),
+            //
+            // `edge_pan` on the two that carry something, as Blender's node keymap puts
+            // `view2d_edge_pan` on its translate: the view scrolls at the area's edge when
+            // the application turns edge pan on (`EditorSession::edge_pan`), and a keymap
+            // file can take it off one gesture alone. Not on the rubber band, which
+            // Blender does not scroll either.
+            Binding::new(Pattern::drag(PointerButton::Primary), "link.drag")
+                .with_props(Props::new().with_bool(EDGE_PAN, true)),
+            Binding::new(Pattern::drag(PointerButton::Primary), "node.move")
+                .with_props(Props::new().with_bool(EDGE_PAN, true)),
             Binding::new(Pattern::drag(PointerButton::Primary), "view.pan"),
             // Left click: the node under the pointer, or nothing at all — the sentence
             // that used to live inside `view.pan` as `click_deselects`.
@@ -908,7 +916,7 @@ pub fn default_keymap() -> Keymap {
             .with_props(Props::new().with_bool("extend", true)),
             // The keyboard half.
             Binding::new(Pattern::key("b"), "node.box_select"),
-            Binding::new(Pattern::key("g"), "node.move"),
+            Binding::new(Pattern::key("g"), "node.move").with_props(Props::new().with_bool(EDGE_PAN, true)),
             // Structure (§43). `X` is two bindings on one key and the polls tell them
             // apart, exactly as the mouse buttons do: a link under the pointer goes
             // first, because pointing at something is how a gesture names its target.

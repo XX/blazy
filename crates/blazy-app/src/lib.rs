@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use blazy_areas::{AreaId, AreaScreen, SplitTree, Workspace};
-use blazy_node_editor::{EditorSession, NodeEditor, NodeGraph, SessionHandle, SharedGraph, sync_root};
+use blazy_node_editor::{EdgePan, EditorSession, NodeEditor, NodeGraph, SessionHandle, SharedGraph, sync_root};
 use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
 use blazy_shell::window::{Error, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
@@ -139,6 +139,8 @@ pub struct EditorApp<G: NodeGraph> {
     graph: SharedGraph<G>,
     build: Rc<BuildArea<G>>,
     session: Rc<MakeSession<G>>,
+    /// Edge pan for every session the application makes, when it asked for it.
+    edge_pan: Option<EdgePan>,
     keys: ScreenKeys,
     workspace: Option<PathBuf>,
     layers: bool,
@@ -179,6 +181,7 @@ impl<G: NodeGraph> EditorApp<G> {
             graph: graph.clone(),
             build: Rc::new(build),
             session: Rc::new(|graph| EditorSession::new(graph).share()),
+            edge_pan: None,
             keys: ScreenKeys::default(),
             workspace: None,
             layers: true,
@@ -202,6 +205,20 @@ impl<G: NodeGraph> EditorApp<G> {
     #[must_use]
     pub fn with_sessions(mut self, make: impl Fn(&SharedGraph<G>) -> SessionHandle<G> + 'static) -> Self {
         self.session = Rc::new(make);
+        self
+    }
+
+    /// The same application, scrolling the view at the edge of an area while a gesture
+    /// holds a node or a link there ([`EdgePan`]).
+    ///
+    /// Off unless asked for: without it a gesture carries on past the area's border and the
+    /// view stands still. Laid over every session the application makes, whichever of
+    /// [`with_sessions`](Self::with_sessions) and [`with_keymap`](Self::with_keymap) made it,
+    /// so the order of the calls does not matter. Which gestures scroll is the keymap's
+    /// ([`EDGE_PAN`](blazy_node_editor::EDGE_PAN) on a binding).
+    #[must_use]
+    pub fn with_edge_pan(mut self, edge_pan: EdgePan) -> Self {
+        self.edge_pan = Some(edge_pan);
         self
     }
 
@@ -292,12 +309,19 @@ impl<G: NodeGraph> EditorApp<G> {
     /// the session is the one the area had (§44).
     pub fn screen_carrying(&self, tree: SplitTree, carried: Option<SessionHandle<G>>) -> EditorScreen<G> {
         let (graph, build, session) = (self.graph.clone(), self.build.clone(), self.session.clone());
+        let edge_pan = self.edge_pan;
         let mut carried = carried;
         AreaScreen::with_payloads(tree, move |area| {
             // The carried session goes to the first area asked for and to no other: an
             // area that appears later is a new view and needs a session of its own, or
             // two areas would share one selection.
-            let session = carried.take().unwrap_or_else(|| session(&graph));
+            let session = carried.take().unwrap_or_else(|| {
+                let session = session(&graph);
+                if edge_pan.is_some() {
+                    session.borrow_mut().edge_pan = edge_pan;
+                }
+                session
+            });
             (build(area, &session), session)
         })
     }

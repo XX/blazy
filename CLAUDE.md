@@ -381,6 +381,18 @@ belongs to the window too. The keys need nothing: the screen learns the hovered 
 moves it sees, and it sees none mid-gesture. Tests drive events through
 `blazy_shell::window::deliver_pointer`, or the host seat does not exist for them.
 
+**Edge pan is the application's choice and the binding's, and the driver does it (§55).**
+The view scrolls at an area's edge only when the session holds an `EdgePan` (`None` by
+default — the gesture then carries on past the border and the view stands) *and* the running
+operator's binding carries `edge_pan = true`, read through `OpRuntime::modal_props`, as
+Blender's keymap puts `view2d_edge_pan` on translate. A pointer standing in the band sends
+nothing, so the editor asks for one animation frame at a time while the gesture's pointer is
+in the band and for none otherwise, moves the view on the frame and hands the operator a move
+at the same screen point. Two traps: `NodeEditor::stats()` is a copy refreshed by the
+*editor's* layout and a scroll lays out only the canvas, so read a scroll's counters from the
+canvas; and the host's animation interval has to be zero on the first frame after idling
+(Masonry's contract), or a time-driven animation is handed the whole idle at once.
+
 **An operator never touches a widget (§38.3).** It changes the model and lists what
 moved — or, for a view operator like `view.pan`, how far the view should move; the
 driver carries that into its own canvas and into the graph's other views.
