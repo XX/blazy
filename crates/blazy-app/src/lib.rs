@@ -49,6 +49,7 @@ use blazy_areas::{AreaId, AreaScreen, SplitTree, Workspace};
 use blazy_node_editor::{EdgePan, EditorSession, NodeEditor, NodeGraph, SessionHandle, SharedGraph, sync_root};
 use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
+use blazy_shell::text::text_input_focused;
 use blazy_shell::window::{Error, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use masonry::app::RenderRoot;
 use masonry::core::{
@@ -638,6 +639,11 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
     ///
     /// Here rather than in a widget because they are the *screen's* operations and the
     /// screen is the root: there is nothing above it to bubble to.
+    ///
+    /// **Not while a text field has focus.** This seat hears a key before the field does,
+    /// so a binding here would take the key from the text — and the defaults are `Alt`
+    /// and `Ctrl` with a letter, which on macOS is how `Option` types a character.
+    /// Blender's text field takes every key while it is edited; so does this one.
     fn text_event(
         &mut self,
         cx: &mut ShellCtx,
@@ -645,6 +651,9 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         root: &mut RenderRoot,
         event: &TextEvent,
     ) -> Handled {
+        if text_input_focused(root) {
+            return Handled::No;
+        }
         match self.keys.action_for(event) {
             Some(action) => self.perform(cx, root, action),
             None => Handled::No,

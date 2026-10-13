@@ -393,6 +393,18 @@ at the same screen point. Two traps: `NodeEditor::stats()` is a copy refreshed b
 canvas; and the host's animation interval has to be zero on the first frame after idling
 (Masonry's contract), or a time-driven animation is handed the whole idle at once.
 
+**A text field needs the host, and `Ctrl+V` is text only inside one (§56).** Masonry's text
+widgets ask the platform for the clipboard and the input method through signals the host
+used to drop — every test passed, because the harness needs neither (§51 again). Paste is not
+a signal: upstream's runner turns `Ctrl+V` into `TextEvent::ClipboardPaste` itself, always,
+which would make the key unreachable for a keymap. `blazy_shell::text` turns it into text only
+while the focused widget `accepts_text_input()` (read through a `WidgetRef`, no rewrite pass),
+in `deliver_text` before either seat — and swallows it on an empty clipboard, because a
+`TextArea` types any character it is handed, modifiers or not: `Ctrl+V` as a key types a `v`.
+The screen's keys step aside while a field has focus for the same reason. The clipboard lives
+in `ShellCtx`, one per process and reachable by a driver. A `RenderRoot` built for a test with
+no font copies nothing — an empty selection over no glyphs — so text tests take `ROBOTO`.
+
 **An operator never touches a widget (§38.3).** It changes the model and lists what
 moved — or, for a view operator like `view.pan`, how far the view should move; the
 driver carries that into its own canvas and into the graph's other views.

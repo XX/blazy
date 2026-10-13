@@ -22,7 +22,7 @@ use masonry::core::{NewWidget, Widget, WidgetId, WidgetMut};
 use masonry::dpi::PhysicalSize;
 use masonry::kurbo::{Point, Rect, Size};
 use masonry::theme::default_property_set;
-use masonry::widgets::Label;
+use masonry::widgets::{Label, TextArea};
 
 use crate::{EditorApp, EditorScreen, ScreenAction, ScreenKeys, detach_area};
 
@@ -116,14 +116,18 @@ impl NodeGraph for Grid {
     }
 }
 
-/// Nodes as labels, and the canvas's place among the graph's views.
+/// Nodes as labels — or as text fields — and the canvas's place among the graph's views.
 struct Source {
     graph: SharedGraph<Grid>,
     view: Option<ViewToken>,
+    fields: bool,
 }
 
 impl NodeSource for Source {
     fn build(&mut self, index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
+        if self.fields {
+            return NewWidget::new(TextArea::<true>::new_editable(&format!("node {index}"))).erased();
+        }
         NewWidget::new(Label::new(format!("node {index}"))).erased()
     }
 
@@ -134,6 +138,11 @@ impl NodeSource for Source {
 
 /// What an application writes: the editor an area holds.
 fn app(graph: &SharedGraph<Grid>) -> EditorApp<Grid> {
+    app_of(graph, false)
+}
+
+/// The same, with nodes that are text fields when `fields` is set.
+fn app_of(graph: &SharedGraph<Grid>, fields: bool) -> EditorApp<Grid> {
     let building = graph.clone();
     EditorApp::new(graph, move |_area, session: &SessionHandle<Grid>| {
         let names = building.borrow().rects.len();
@@ -152,6 +161,7 @@ fn app(graph: &SharedGraph<Grid>) -> EditorApp<Grid> {
         let source = Source {
             graph: building.clone(),
             view: None,
+            fields,
         };
         let canvas = CanvasLayer::new(names, geometry, source).with_links(building.borrow().links.clone());
         NewWidget::new(NodeEditor::with_session(canvas, session.clone())).erased()
@@ -896,4 +906,56 @@ fn a_grab_started_by_a_key_scrolls_and_escape_puts_the_view_back() {
     assert_eq!(view(&mut root, 0), before, "and so did the view");
     hold_still(&mut root);
     assert!(!root.needs_anim());
+}
+
+/// A screen key is text while a text field has focus, and the screen's otherwise.
+///
+/// The screen's seat hears a key before the tree does, so without the rule `Alt+X` typed
+/// into a node's field split the area instead — and on macOS `Option` with a letter is
+/// how a character is typed.
+#[test]
+fn a_screen_key_typed_into_a_text_field_is_text() {
+    let graph = Grid::new(4);
+    let mut app = app_of(&graph, true);
+    let mut root = window(&app, 1);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    // The pointer over the area, so the split has an area to split.
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(600.0, 500.0));
+
+    let field = edit_editor(&mut root, 0, |editor| {
+        NodeEditor::with_canvas(editor, |mut canvas| {
+            let mut id = None;
+            CanvasLayer::update_child(&mut canvas, 0, |node| id = Some(node.ctx.widget_id()));
+            id
+        })
+    })
+    .expect("node 0 is on screen");
+    let alt_x = || {
+        masonry::core::TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: Key::Character("x".into()),
+            code: Code::Unidentified,
+            modifiers: Modifiers::ALT,
+            ..KeyboardEvent::default()
+        })
+    };
+    let areas = |root: &mut RenderRoot| editors(root).len();
+
+    assert!(root.focus_on(Some(field)));
+    let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, alt_x());
+    let _ = root.redraw();
+    assert_eq!(areas(&mut root), 1, "the key went to the field, not to the screen");
+    let text: String = {
+        let widget = root.get_widget(field).expect("the field is still there");
+        let area = widget.downcast::<TextArea<true>>().expect("a text field");
+        area.inner().text().into_iter().collect()
+    };
+    assert!(text.ends_with('x'), "{text:?}");
+
+    assert!(root.focus_on(None));
+    let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, alt_x());
+    let _ = root.redraw();
+    assert_eq!(areas(&mut root), 2, "outside a field the same key splits");
 }

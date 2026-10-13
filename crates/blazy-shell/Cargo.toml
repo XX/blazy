@@ -27,7 +27,7 @@ default = ["window"]
 # Off by default: it needs a graphics device, which a build machine may not have.
 vello = ["dep:imaging_vello", "dep:imaging_wgpu", "dep:wgpu"]
 # Owner mode: our own window and event loop.
-window = ["dep:winit", "dep:softbuffer", "dep:ui-events-winit"]
+window = ["dep:winit", "dep:softbuffer", "dep:ui-events-winit", "dep:arboard"]
 
 [dependencies]
 masonry = { workspace = true }
@@ -38,6 +38,7 @@ wgpu = { workspace = true, optional = true }
 winit = { workspace = true, optional = true }
 softbuffer = { workspace = true, optional = true }
 ui-events-winit = { workspace = true, optional = true }
+arboard = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

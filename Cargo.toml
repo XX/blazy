@@ -44,6 +44,9 @@ winit = "0.30"
 softbuffer = "0.4"
 tracing = "0.1"
 ui-events-winit = "0.3"
+# The system clipboard, text only: `image-data` would pull an image decoder in for a
+# clipboard that carries nothing but text (`issues/ime and clipboard in the host.md`).
+arboard = { version = "3.6", default-features = false }
 clap = { version = "4.6", features = ["derive"] }
 image = { version = "0.25", default-features = false }
 imaging_vello_cpu = "0.0.2"

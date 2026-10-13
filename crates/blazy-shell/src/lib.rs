@@ -21,14 +21,14 @@
 //!   (§35.1).
 //! * [`window`] — owner mode, behind `window`: windows, an event loop, frames on the screen, and the host seat of the
 //!   operator layer (§39.5). One driver per process, and every window it hears from is named (§44).
+//! * [`text`] — the clipboard and the input method, behind `window`: what the text widgets inside nodes need from the
+//!   platform, and the rule that keeps `Ctrl+V` a key for a keymap outside a text field.
 //!
 //! # What is deliberately not here
 //!
 //! Guest mode (§14) — an engine handing us its device, queue and texture — is nearly
 //! free from upstream (`render_to_texture` already accepts them) but cannot be
 //! checked without a real engine, so it waits for `blazy-embed-*` (§16 item 13).
-//! The owner-mode loop holds one window; a second one and detaching an area into it
-//! are §16 item 6, still open.
 
 #![warn(missing_docs, unreachable_pub)]
 
@@ -46,6 +46,8 @@ pub mod layers;
 mod present;
 pub mod tiles;
 
+#[cfg(feature = "window")]
+pub mod text;
 #[cfg(feature = "window")]
 pub mod window;
 

@@ -16,12 +16,15 @@
 //! cargo run -p hello -- my.keymap     # with keymap overrides
 //! ```
 //!
-//! Drag a node to move it, drag out of a port (the dots on a node's edges) into another
+//! Drag a node to move it (by its body: the name field at its top is a text field, and
+//! a press there edits the name), drag out of a port (the dots on a node's edges) into another
 //! node's port to link them, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
 //! delete, `F` to link the two selected nodes, `Ctrl+Z` to undo. A node or a link held at
 //! the edge of an area scrolls the view. `Alt+X` / `Alt+Y` split the area under the
 //! pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another window over the same
-//! graph and `Alt+D` moves the area into one of its own.
+//! graph and `Alt+D` moves the area into one of its own. Click a node's name to rename
+//! it — copy, paste and an input method work there — and `Enter` or `Escape` to leave
+//! the field; the other areas show the new name.
 
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
@@ -34,18 +37,19 @@ use blazy::areas::SplitTree;
 use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
-    AccessCtx, ChildrenIds, DefaultProperties, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef,
-    PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId, WidgetPod,
+    AccessCtx, ActionCtx, ChildrenIds, DefaultProperties, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction,
+    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId,
+    WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, Shape, Size};
-use blazy::masonry::layout::{LenReq, Length, SizeDef};
+use blazy::masonry::layout::{LenDef, LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
 use blazy::masonry::theme::default_property_set;
-use blazy::masonry::widgets::Label;
+use blazy::masonry::widgets::{TextAction, TextInput};
 use blazy::node_editor::{
-    EdgePan, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
+    Change, EdgePan, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
 };
 use blazy::shell::window::{Error, WindowConfig};
 
@@ -53,8 +57,8 @@ use blazy::shell::window::{Error, WindowConfig};
 const NODES: usize = 12;
 /// Nodes per row of the grid they start on.
 const COLS: usize = 4;
-/// Every node's size.
-const NODE: Size = Size::new(140.0, 60.0);
+/// Every node's size: room for the name field and a body below it to drag the node by.
+const NODE: Size = Size::new(140.0, 80.0);
 /// Inputs and outputs every node has.
 const PORTS_IN: u16 = 2;
 const PORTS_OUT: u16 = 1;
@@ -70,13 +74,17 @@ const PORT_LAYOUT: PortLayout = PortLayout {
     dot_color: Color::from_rgb8(0x9a, 0x9a, 0xa8),
 };
 
-/// The graph: where each node is, which nodes are linked, and who is looking.
+/// The graph: where each node is, what it is called, which nodes are linked, and who is
+/// looking.
 ///
-/// A name is an index with holes where removals were, and a freed name is handed out
-/// again first — the rule `NodeGraph::insert_node` asks for (§43).
+/// A node's index is an index with holes where removals were, and a freed one is handed
+/// out again first — the rule `NodeGraph::insert_node` asks for (§43). Its title is what
+/// the user typed into its field; the model holds it, because the field's widget comes
+/// and goes with the view (§20.2) and there is one per area (§30).
 #[derive(Default)]
 struct Graph {
     nodes: Vec<Option<Rect>>,
+    titles: Vec<String>,
     free: Vec<usize>,
     links: Vec<Link>,
     views: Views,
@@ -96,6 +104,7 @@ impl Graph {
             .collect();
         Rc::new(RefCell::new(Self {
             nodes,
+            titles: (0..NODES).map(default_title).collect(),
             links,
             ..Self::default()
         }))
@@ -121,22 +130,29 @@ impl NodeGraph for Graph {
         &self.views
     }
 
+    /// A new node gets a title of its own, even under a name a removal freed.
     fn insert_node(&mut self, rect: Rect) -> usize {
         match self.free.pop() {
             Some(index) => {
                 self.nodes[index] = Some(rect);
+                self.titles[index] = default_title(index);
                 index
             },
             None => {
                 self.nodes.push(Some(rect));
+                self.titles.push(default_title(self.nodes.len() - 1));
                 self.nodes.len() - 1
             },
         }
     }
 
+    /// The title stays in the slot of a removed node, so an undone delete brings it back.
+    /// Not if the name was handed out again in between: the graph trait carries geometry,
+    /// not contents (`issues/duplicate copy and paste.md`).
     fn restore_node(&mut self, index: usize, rect: Rect) {
         if self.nodes.len() <= index {
             self.nodes.resize(index + 1, None);
+            self.titles.resize_with(index + 1, String::new);
         }
         self.free.retain(|&free| free != index);
         self.nodes[index] = Some(rect);
@@ -178,6 +194,11 @@ struct Nodes {
     view: Option<ViewToken>,
 }
 
+/// The title a node starts with.
+fn default_title(index: usize) -> String {
+    format!("node {index}")
+}
+
 /// A node's fill, and its outline.
 const FILL: Color = Color::from_rgb8(0x2c, 0x2c, 0x34);
 const OUTLINE: Color = Color::from_rgb8(0x50, 0x50, 0x5c);
@@ -185,11 +206,15 @@ const OUTLINE: Color = Color::from_rgb8(0x50, 0x50, 0x5c);
 const PICKED: Color = Color::from_rgb8(0xff, 0xa5, 0x2c);
 
 impl NodeSource for Nodes {
-    /// A caption in a box. Everything the box looks like — selected or not — is in
+    /// A title field in a box. Everything the box looks like — selected or not — is in
     /// [`properties`]: the node does not know what a selection is.
     fn build(&mut self, index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
+        let title = self.graph.borrow().titles.get(index).cloned().unwrap_or_default();
         NewWidget::new(Node {
-            caption: WidgetPod::new(Label::new(format!("node {index}"))),
+            title: WidgetPod::new(TextInput::new(&title)),
+            graph: self.graph.clone(),
+            index,
+            canvas: self.view.as_ref().map(ViewToken::canvas),
         })
         .erased()
     }
@@ -216,14 +241,21 @@ impl NodeSource for Nodes {
     }
 }
 
-/// A node: a caption in a box, and the dots of its ports.
+/// A node: its title in a text field, a box, and the dots of its ports.
 ///
 /// Its own type rather than a stock `SizedBox` for the dots: they are drawn by the node,
 /// so that they sit at its level among the nodes — a node over this one covers them, and
 /// the corner it leaves unpainted shows them (§50.8). The box is Masonry's: it paints
 /// the background and the border of any widget from its properties.
+///
+/// The field is a stock `TextInput`, which is the point of having one: it is what needs
+/// the host's clipboard and input method (`issues/ime and clipboard in the host.md`).
 struct Node {
-    caption: WidgetPod<Label>,
+    title: WidgetPod<TextInput>,
+    graph: SharedGraph<Graph>,
+    index: usize,
+    /// The canvas this node is in, so an edit is recorded for the others only.
+    canvas: Option<WidgetId>,
 }
 
 impl Widget for Node {
@@ -247,10 +279,45 @@ impl Widget for Node {
         }
     }
 
+    /// The field across the top at its own height; the rest of the box is what a drag
+    /// takes the node by, because a press on the field is the field's.
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
-        let caption = ctx.compute_size(&mut self.caption, SizeDef::fit(size), size.into());
-        ctx.run_layout(&mut self.caption, caption);
-        ctx.place_child(&mut self.caption, Point::ORIGIN);
+        let auto = SizeDef::new(LenDef::Fixed(Length::px(size.width)), LenDef::MaxContent);
+        let title = ctx.compute_size(&mut self.title, auto, size.into());
+        ctx.run_layout(&mut self.title, title);
+        ctx.place_child(&mut self.title, Point::ORIGIN);
+    }
+
+    /// An edit of the title goes into the model, and is recorded for the other views.
+    ///
+    /// For the others only: this field shows the edit already, and a change owed to its
+    /// own canvas would rebuild the node — and the field — under the cursor on every key
+    /// (§47). `Enter` and `Escape` leave the field, so the keys are the editor's again.
+    fn on_action(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        _props: &mut PropertiesMut<'_>,
+        action: &ErasedAction,
+        _source: WidgetId,
+    ) {
+        let Some(action) = action.downcast_ref::<TextAction>() else {
+            return;
+        };
+        match action {
+            TextAction::Changed(text) => {
+                let graph = &mut *self.graph.borrow_mut();
+                if let Some(title) = graph.titles.get_mut(self.index) {
+                    title.clone_from(text);
+                }
+                let change = Change::Contents { index: self.index };
+                match self.canvas {
+                    Some(canvas) => graph.views().note_except(canvas, change),
+                    None => graph.views().note(change),
+                }
+            },
+            TextAction::Entered(_) | TextAction::Cancelled => ctx.resign_focus(),
+        }
+        ctx.set_handled();
     }
 
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
@@ -260,11 +327,11 @@ impl Widget for Node {
     }
 
     fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
-        ctx.register_child(&mut self.caption);
+        ctx.register_child(&mut self.title);
     }
 
     fn children_ids(&self) -> ChildrenIds {
-        ChildrenIds::from_slice(&[self.caption.id()])
+        ChildrenIds::from_slice(&[self.title.id()])
     }
 
     fn accessibility_role(&self) -> Role {
@@ -362,6 +429,8 @@ fn main() -> Result<(), Error> {
 mod tests {
     use blazy::masonry::dpi::PhysicalSize;
     use blazy::masonry::testing::TestHarness;
+    use blazy::masonry::widgets::TextArea;
+    use blazy::node_editor::sync_canvas;
     use blazy::ops::keymap::Props;
 
     use super::*;
@@ -443,5 +512,70 @@ mod tests {
             graph.borrow().links.contains(&Link::between(0, 0, 1, 1)),
             "the pull made a link, from node 0's output to node 1's second input"
         );
+    }
+
+    /// The text field inside node `index` of area `area`, by id.
+    fn title_field(
+        harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>,
+        area: WidgetId,
+        index: usize,
+    ) -> WidgetId {
+        harness.edit_widget_with_id(area, |mut widget| {
+            let mut editor = widget.downcast::<NodeEditor<Graph>>();
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                let mut id = None;
+                CanvasLayer::update_child(&mut canvas, index, |mut node| {
+                    let mut node = node.downcast::<Node>();
+                    let mut input = node.ctx.get_mut(&mut node.widget.title);
+                    id = Some(TextInput::text_mut(&mut input).ctx.widget_id());
+                });
+                id.expect("the node is on screen")
+            })
+        })
+    }
+
+    fn text_of(harness: &TestHarness<blazy::app::EditorScreen<Graph>>, field: WidgetId) -> String {
+        let widget = harness.get_widget_with_id(field);
+        let area = widget.downcast::<TextArea<true>>().expect("a text field");
+        area.inner().text().into_iter().collect()
+    }
+
+    /// A title typed into a node's field is the model's, and the other area shows it once
+    /// it collects what it is owed — without the field being typed into rebuilt under the
+    /// cursor (§47).
+    #[test]
+    fn a_title_typed_in_one_area_reaches_the_other() {
+        let graph = Graph::grid();
+        let screen = app(&graph).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
+        let _ = harness.redraw();
+        let areas = harness.root_widget().area_ids();
+
+        let field = title_field(&mut harness, areas[0], 0);
+        harness.focus_on(Some(field));
+        harness.keyboard_type_chars("!");
+        let _ = harness.redraw();
+        let typed = text_of(&harness, field);
+        assert!(typed.contains('!'), "{typed:?}");
+        assert_eq!(graph.borrow().titles[0], typed, "the model holds what was typed");
+
+        // What the window does before it draws: each view collects what it is owed.
+        let views = graph.borrow().views().ids();
+        for canvas in views {
+            let graph = graph.clone();
+            harness.edit_widget_with_id(canvas, |mut widget| {
+                sync_canvas(&mut widget.downcast::<CanvasLayer>(), graph.borrow().views())
+            });
+        }
+        let _ = harness.redraw();
+
+        assert_eq!(
+            harness.focused_widget_id(),
+            Some(field),
+            "the field typed into is still there, focused"
+        );
+        let other = title_field(&mut harness, areas[1], 0);
+        assert_eq!(text_of(&harness, other), typed, "the other area shows the new title");
     }
 }

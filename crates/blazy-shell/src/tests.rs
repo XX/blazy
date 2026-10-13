@@ -759,3 +759,226 @@ mod layers_in_the_window {
         assert!(apply_layer_signal(&mut root, RenderRootSignal::RequestRedraw).is_some());
     }
 }
+
+/// Text: the clipboard and the input method reach a text field, and `Ctrl+V` outside one
+/// stays a key.
+#[cfg(feature = "window")]
+mod text_in_the_window {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use masonry::app::{RenderRoot, RenderRootOptions, RenderRootSignal, WindowSizePolicy};
+    use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers};
+    use masonry::core::{Handled, NewWidget, TextEvent, WidgetId};
+    use masonry::dpi::{LogicalPosition, LogicalSize};
+    use masonry::peniko::Blob;
+    use masonry::testing::ROBOTO;
+    use masonry::widgets::TextArea;
+
+    use super::*;
+    use crate::text::{ImeWindow, MemoryClipboard, apply_text_signal, ime_event, text_input_focused};
+    use crate::window::{ShellCtx, ShellDriver, WindowKey, deliver_text};
+
+    type Signals = Rc<RefCell<Vec<RenderRootSignal>>>;
+
+    /// A window holding one editable text field, and the signals it sent.
+    ///
+    /// With the harness's font: a field with no font has no glyphs, and a selection over no
+    /// glyphs is empty, so nothing would be copied.
+    fn field(text: &str) -> (RenderRoot, WidgetId, Signals) {
+        let signals: Signals = Rc::new(RefCell::new(Vec::new()));
+        let sink = signals.clone();
+        let area = NewWidget::new(TextArea::<true>::new_editable(text));
+        let id = area.id();
+        let mut root = RenderRoot::new(
+            area.erased(),
+            move |signal| sink.borrow_mut().push(signal),
+            RenderRootOptions {
+                default_properties: Arc::new(default_property_set()),
+                use_system_fonts: false,
+                size_policy: WindowSizePolicy::User,
+                size: PhysicalSize::new(300, 100),
+                scale_factor: 1.0,
+                test_font: Some(Blob::new(Arc::new(ROBOTO))),
+            },
+        );
+        let _ = root.redraw();
+        (root, id, signals)
+    }
+
+    fn text_of(root: &RenderRoot, id: WidgetId) -> String {
+        let widget = root.get_widget(id).expect("the field is in the window");
+        let area = widget.downcast::<TextArea<true>>().expect("a text area");
+        area.inner().text().into_iter().collect()
+    }
+
+    fn key(name: &str, state: KeyState, modifiers: Modifiers) -> TextEvent {
+        TextEvent::Keyboard(KeyboardEvent {
+            state,
+            key: Key::Character(name.into()),
+            code: Code::Unidentified,
+            modifiers,
+            ..KeyboardEvent::default()
+        })
+    }
+
+    /// The paste key's modifier on this platform.
+    fn action() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers::META
+        } else {
+            Modifiers::CONTROL
+        }
+    }
+
+    /// What the seat in front of the tree was offered.
+    #[derive(Default)]
+    struct Seat(Vec<String>);
+
+    impl ShellDriver for Seat {
+        fn text_event(
+            &mut self,
+            _cx: &mut ShellCtx,
+            _window: WindowKey,
+            _root: &mut RenderRoot,
+            event: &TextEvent,
+        ) -> Handled {
+            self.0.push(match event {
+                TextEvent::Keyboard(key) => format!("key {:?} {:?}", key.key, key.state),
+                TextEvent::ClipboardPaste(text) => format!("paste {text}"),
+                other => format!("{other:?}"),
+            });
+            Handled::No
+        }
+    }
+
+    /// What the host asked of the platform's window.
+    #[derive(Default)]
+    struct Platform(RefCell<Vec<String>>);
+
+    impl ImeWindow for Platform {
+        fn set_ime_allowed(&self, allowed: bool) {
+            self.0.borrow_mut().push(format!("allowed {allowed}"));
+        }
+
+        fn set_ime_cursor_area(&self, _position: LogicalPosition<f64>, _size: LogicalSize<f64>) {
+            self.0.borrow_mut().push("area".into());
+        }
+    }
+
+    /// Hands every signal the root sent to the host's handler, as the loop does.
+    fn drain(cx: &mut ShellCtx, platform: &Platform, signals: &Signals) {
+        let pending: Vec<_> = signals.borrow_mut().drain(..).collect();
+        for signal in pending {
+            let _ = apply_text_signal(cx, platform, signal);
+        }
+    }
+
+    /// `Ctrl+V` in a text field is the clipboard's text; anywhere else it is a key.
+    ///
+    /// Both halves are the point. Upstream's runner turns the key into text whatever has
+    /// focus, which makes it unreachable for a keymap; this loop used to do nothing at all,
+    /// and nothing could be pasted.
+    #[test]
+    fn paste_in_a_text_field_is_text_and_elsewhere_a_key() {
+        let (mut root, id, _signals) = field("ab");
+        let mut cx = ShellCtx::new().with_clipboard(Box::new(MemoryClipboard::holding("XY")));
+        let window = cx.name_window();
+        let mut seat = Seat::default();
+
+        assert!(root.focus_on(Some(id)));
+        assert!(text_input_focused(&root));
+        for state in [KeyState::Down, KeyState::Up] {
+            let _ = deliver_text(&mut seat, &mut cx, window, &mut root, key("v", state, action()));
+        }
+        assert_eq!(seat.0, ["paste XY"], "the press is text, and the release goes with it");
+        let text = text_of(&root, id);
+        assert!(text.contains("XY") && !text.contains('v'), "{text:?}");
+        assert_eq!(cx.text_counters().pastes, 1);
+
+        // Outside a text field the same key is a key — for a keymap to bind.
+        assert!(root.focus_on(None));
+        assert!(!text_input_focused(&root));
+        let _ = deliver_text(
+            &mut seat,
+            &mut cx,
+            window,
+            &mut root,
+            key("v", KeyState::Down, action()),
+        );
+        assert_eq!(seat.0.len(), 2);
+        assert!(seat.0[1].starts_with("key"), "{:?}", seat.0[1]);
+        assert_eq!(cx.text_counters().pastes, 1, "nothing was pasted");
+    }
+
+    /// An empty clipboard pastes nothing — and does not type the key instead.
+    ///
+    /// A text area inserts any character it is handed, modifiers or not, so the paste key
+    /// delivered as a key types a `v`. Checked here first, so the test stands on the
+    /// reason rather than on a guess about it.
+    #[test]
+    fn an_empty_clipboard_types_nothing() {
+        let (mut root, id, _signals) = field("ab");
+        assert!(root.focus_on(Some(id)));
+        let _ = root.handle_text_event(key("v", KeyState::Down, action()));
+        assert!(text_of(&root, id).contains('v'), "the trap: the key as a key is typed");
+
+        let (mut root, id, _signals) = field("ab");
+        let mut cx = ShellCtx::new();
+        let window = cx.name_window();
+        assert!(root.focus_on(Some(id)));
+        let handled = deliver_text(&mut (), &mut cx, window, &mut root, key("v", KeyState::Down, action()));
+        assert!(handled.is_handled());
+        assert_eq!(text_of(&root, id), "ab");
+        assert_eq!(cx.text_counters().empty_pastes, 1);
+    }
+
+    /// Text copied in a field reaches the clipboard, and the next paste brings it back.
+    #[test]
+    fn copy_reaches_the_clipboard() {
+        let (mut root, id, signals) = field("hello");
+        let mut cx = ShellCtx::new();
+        let window = cx.name_window();
+        let platform = Platform::default();
+        assert!(root.focus_on(Some(id)));
+        for name in ["a", "c"] {
+            let _ = deliver_text(&mut (), &mut cx, window, &mut root, key(name, KeyState::Down, action()));
+        }
+        drain(&mut cx, &platform, &signals);
+        assert_eq!(cx.text_counters().stores, 1);
+        assert_eq!(cx.clipboard().read().as_deref(), Some("hello"));
+    }
+
+    /// The input method is allowed while a text field has focus, told where the text is,
+    /// and stopped when the field loses focus; what it composes lands in the field.
+    #[test]
+    fn the_input_method_follows_the_text_field() {
+        let (mut root, id, signals) = field("");
+        let mut cx = ShellCtx::new();
+        let window = cx.name_window();
+        let platform = Platform::default();
+
+        assert!(root.focus_on(Some(id)));
+        let _ = root.redraw();
+        drain(&mut cx, &platform, &signals);
+        assert_eq!(platform.0.borrow().first().map(String::as_str), Some("allowed true"));
+        assert!(cx.text_counters().ime_moves >= 1, "the candidate window is placed");
+
+        let ime = |event| ime_event(event);
+        for event in [
+            winit::event::Ime::Enabled,
+            winit::event::Ime::Preedit("ё".into(), Some((0, 2))),
+            winit::event::Ime::Preedit(String::new(), None),
+            winit::event::Ime::Commit("ёж".into()),
+        ] {
+            let _ = deliver_text(&mut (), &mut cx, window, &mut root, ime(event));
+        }
+        assert_eq!(text_of(&root, id), "ёж");
+
+        assert!(root.focus_on(None));
+        drain(&mut cx, &platform, &signals);
+        assert_eq!(platform.0.borrow().last().map(String::as_str), Some("allowed false"));
+        let counters = cx.text_counters();
+        assert_eq!((counters.ime_starts, counters.ime_ends), (1, 1));
+    }
+}

@@ -44,12 +44,12 @@
 //!
 //! # What this does not do yet
 //!
-//! IME, the clipboard, accessibility, and window-manager gestures — dragging by a
-//! custom title bar, resize handles, the system menu. Masonry emits signals for all
-//! of them and this loop ignores those signals rather than pretending: each is a
-//! platform integration of its own, and none is on the critical path for the
-//! question this crate exists to answer. Layers are not among them: a popup is a layer,
-//! and [`apply_layer_signal`] puts it in the window.
+//! Accessibility, and window-manager gestures — dragging by a custom title bar, resize
+//! handles, the system menu. Masonry emits signals for all of them and this loop ignores
+//! those signals rather than pretending: each is a platform integration of its own.
+//! Layers are not among them: a popup is a layer, and [`apply_layer_signal`] puts it in
+//! the window. Nor are the clipboard and the input method, which
+//! [`text`](crate::text) handles.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -75,6 +75,9 @@ use crate::backend::Backend;
 use crate::compose::Hole;
 use crate::host::Host;
 use crate::present::{PresentCounters, PresentError, Presenter};
+use crate::text::{
+    Clipboard, MemoryClipboard, SystemClipboard, TextCounters, apply_text_signal, ime_event, paste_or_key,
+};
 
 /// How the window should be created.
 pub struct WindowConfig {
@@ -193,6 +196,9 @@ pub struct NewWindow {
 pub struct ShellCtx {
     requests: Vec<ShellRequest>,
     next: u64,
+    /// The process's clipboard: one for every window, as the platform has one.
+    clipboard: Box<dyn Clipboard>,
+    text: TextCounters,
 }
 
 impl Default for ShellCtx {
@@ -203,11 +209,41 @@ impl Default for ShellCtx {
 
 impl ShellCtx {
     /// A context with nothing asked for yet. For an embedder running its own loop.
+    ///
+    /// Its clipboard is a [`MemoryClipboard`]; the shell's own loop puts the system's in
+    /// its place, and an embedder gives its own with
+    /// [`with_clipboard`](Self::with_clipboard).
     pub fn new() -> Self {
         Self {
             requests: Vec::new(),
             next: 0,
+            clipboard: Box::new(MemoryClipboard::default()),
+            text: TextCounters::default(),
         }
+    }
+
+    /// The same context, copying to and pasting from `clipboard`.
+    #[must_use]
+    pub fn with_clipboard(mut self, clipboard: Box<dyn Clipboard>) -> Self {
+        self.clipboard = clipboard;
+        self
+    }
+
+    /// The clipboard text widgets copy to and paste from.
+    ///
+    /// Here rather than in the shell's loop because a driver may want it too: anything an
+    /// application copies past the text widgets goes on the same clipboard.
+    pub fn clipboard(&mut self) -> &mut dyn Clipboard {
+        self.clipboard.as_mut()
+    }
+
+    /// What the host has done with text so far.
+    pub fn text_counters(&self) -> TextCounters {
+        self.text
+    }
+
+    pub(crate) fn text_counters_mut(&mut self) -> &mut TextCounters {
+        &mut self.text
     }
 
     /// Asks for a window, and names it.
@@ -414,7 +450,11 @@ pub fn deliver_pointer(
     root.handle_pointer_event(event)
 }
 
-/// As [`deliver_pointer`], for keys.
+/// As [`deliver_pointer`], for keys and text.
+///
+/// The paste key becomes the clipboard's text here, before either seat sees it, and only
+/// while a text field has focus — otherwise it is a key like any other, for a keymap to
+/// bind ([`text`](crate::text) says why both halves are needed).
 pub fn deliver_text(
     driver: &mut dyn ShellDriver,
     cx: &mut ShellCtx,
@@ -422,6 +462,9 @@ pub fn deliver_text(
     root: &mut RenderRoot,
     event: TextEvent,
 ) -> Handled {
+    let Some(event) = paste_or_key(cx, root, event) else {
+        return Handled::Yes;
+    };
     if driver.text_event(cx, window, root, &event).is_handled() {
         return Handled::Yes;
     }
@@ -510,7 +553,7 @@ pub fn run(
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
     // The first window is asked for exactly the way a second one is, so there is one
     // path that opens a window and not two that drift apart.
-    let mut cx = ShellCtx::new();
+    let mut cx = ShellCtx::new().with_clipboard(system_clipboard());
     cx.open_window(config, root);
     let mut app = ShellApp {
         windows: HashMap::new(),
@@ -850,6 +893,14 @@ impl ShellApp {
                             let _ = shell.window.request_inner_size(size);
                         }
                     },
+                    signal @ (RenderRootSignal::StartIme
+                    | RenderRootSignal::EndIme
+                    | RenderRootSignal::ImeMoved(..)
+                    | RenderRootSignal::ClipboardStore(_)) => {
+                        if let Some(shell) = self.windows.get(&key) {
+                            let _ = apply_text_signal(&mut self.cx, shell.window.as_ref(), signal);
+                        }
+                    },
                     // The application exiting, rather than one window closing: a window
                     // goes through `ShellCtx::close_window` or its own close button.
                     RenderRootSignal::Exit => event_loop.exit(),
@@ -861,9 +912,8 @@ impl ShellApp {
                             shell.window.request_redraw();
                         }
                     },
-                    // Deliberately unhandled, and listed in the module docs: IME, the
-                    // clipboard, accessibility and window-manager gestures are platform
-                    // integrations of their own.
+                    // Deliberately unhandled, and listed in the module docs: accessibility
+                    // and window-manager gestures are platform integrations of their own.
                     _ => {},
                 }
             }
@@ -906,6 +956,20 @@ fn open_presenter(config: &WindowConfig, window: &Arc<Window>) -> Result<Box<dyn
         })
         .unwrap_or(Backend::VelloCpu);
     Ok(Box::new(BlitPresenter::new(backend, window.clone(), base)?))
+}
+
+/// The platform's clipboard, or the in-process one when there is none to open.
+///
+/// A window without a clipboard is still a window: copy and paste then work inside the
+/// application and not with others, and the warning says so.
+fn system_clipboard() -> Box<dyn Clipboard> {
+    match SystemClipboard::open() {
+        Ok(clipboard) => Box::new(clipboard),
+        Err(error) => {
+            tracing::warn!(%error, "no system clipboard; copy and paste stay inside the application");
+            Box::new(MemoryClipboard::default())
+        },
+    }
 }
 
 /// Reports holes to whoever is watching. Filling them is the owner's business.
@@ -985,6 +1049,10 @@ impl ApplicationHandler for ShellApp {
                 // scales the drawing, so a display change costs a frame and not a
                 // relayout.
                 shell.root.handle_window_event(WindowEvent::Rescale(scale_factor));
+            },
+            // Composed text: not a key, so the reducer does not translate it.
+            WinitWindowEvent::Ime(ime) => {
+                deliver_text(self.driver.as_mut(), &mut self.cx, key, &mut shell.root, ime_event(ime));
             },
             WinitWindowEvent::Focused(focused) => {
                 deliver_text(
