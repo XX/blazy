@@ -1217,3 +1217,33 @@ fn a_link_moved_in_one_area_is_moved_in_the_other() {
         assert!(!has_link(&mut root, area, Link::new(0, 1)), "and not the old one");
     }
 }
+
+/// A graph that says nothing about its inputs gets Blender's: one link each. A link put on
+/// a full input takes the place of the one there, in both areas in the same frame.
+#[test]
+fn an_input_holds_one_link_unless_the_graph_says_otherwise() {
+    let graph = Grid::new(8);
+    let app = app(&graph);
+    let mut root = window(&app, 2);
+    for from in [0, 2] {
+        edit_editor(&mut root, 0, |editor| {
+            NodeEditor::exec(
+                editor,
+                "link.add",
+                &Props::new().with_int("from", from).with_int("to", 1),
+            );
+        });
+    }
+    let _ = root.redraw();
+    assert_eq!(graph.borrow().links, [Link::new(2, 1)], "2 → 1 took the place of 0 → 1");
+    for area in 0..2 {
+        assert!(
+            has_link(&mut root, area, Link::new(2, 1)),
+            "area {area} shows the new link"
+        );
+        assert!(
+            !has_link(&mut root, area, Link::new(0, 1)),
+            "and not the one it replaced"
+        );
+    }
+}

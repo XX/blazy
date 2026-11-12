@@ -36,6 +36,8 @@ struct Row {
     views: Views,
     /// A node no link may go into: the port type the test graph has.
     refuses: Option<u32>,
+    /// How many links an input holds, when not the default one.
+    holds: Option<usize>,
 }
 
 impl NodeGraph for Row {
@@ -106,6 +108,10 @@ impl NodeGraph for Row {
 
     fn accepts_link(&self, link: Link) -> bool {
         self.refuses != Some(link.to)
+    }
+
+    fn input_limit(&self, _index: usize, _port: u16) -> usize {
+        self.holds.unwrap_or(1)
     }
 
     type Content = u32;
@@ -1728,6 +1734,80 @@ mod relink {
             port_hint(&runtime, &world, Modifiers::ALT),
             Some((1, PortSide::Input, 0))
         );
+    }
+
+    /// An input holds one link by default, as in Blender: a link dropped on an input that has
+    /// one takes its place — new or carried off another input — in one step that undo takes
+    /// back whole. A graph whose inputs hold more keeps both.
+    #[test]
+    fn a_link_dropped_on_a_full_input_takes_its_place() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+
+        // A new link out of node 3 onto node 1's input, which 0 → 1 holds.
+        over(&mut world, 3, PortSide::Output);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        over(&mut world, 1, PortSide::Input);
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(
+            links(&graph),
+            [Link::new(1, 2), Link::new(3, 1)],
+            "3 → 1 replaced 0 → 1"
+        );
+        assert_eq!(runtime.history().depth(), depth + 1, "in one step");
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("link.drag"));
+        assert_eq!(state(&graph), before, "which undo takes back whole");
+
+        // 0 → 1 taken off node 1's input and dropped on node 2's, which 1 → 2 holds.
+        over(&mut world, 1, PortSide::Input);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        over(&mut world, 2, PortSide::Input);
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(links(&graph), [Link::new(0, 2)], "carried, it replaced 1 → 2");
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("link.drag"));
+        assert_eq!(state(&graph), before, "and one undo puts both back");
+
+        // The same from node 3's output, which the graph now lets inputs gather.
+        graph.borrow_mut().holds = Some(2);
+        over(&mut world, 3, PortSide::Output);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        over(&mut world, 1, PortSide::Input);
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(
+            links(&graph),
+            [Link::new(0, 1), Link::new(1, 2), Link::new(3, 1)],
+            "an input that holds two keeps both"
+        );
+    }
+
+    /// `link.add` connects as a drag does: onto a full input, in place of what was there.
+    #[test]
+    fn link_add_on_a_full_input_takes_its_place() {
+        use blazy_ops::keymap::Props;
+
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        let add = Props::new().with_int("from", 3).with_int("to", 2);
+        assert_eq!(
+            runtime.exec(&mut world, "link.add", &add),
+            blazy_ops::OpResult::Finished
+        );
+        assert_eq!(
+            links(&graph),
+            [Link::new(0, 1), Link::new(3, 2)],
+            "3 → 2 replaced 1 → 2"
+        );
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("link.drag"));
+        assert_eq!(state(&graph), before);
+
+        // A link the graph refuses changes nothing — not even the link it would have
+        // replaced, which `connect` takes off first and has to put back.
+        assert_eq!(world.connect(Link::new(1, 1)), None, "a node to itself is refused");
+        assert_eq!(state(&graph), before, "and 0 → 1 is still there");
     }
 
     /// `Ctrl` on an output takes every link off it and carries their output ends together,

@@ -822,11 +822,19 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddLinkOp {
             return OpResult::Cancelled;
         };
         // The graph refuses an end that is not there and a link it already holds, and
-        // either way there is nothing to put in the history.
-        if !cx.world_mut().add_link(link) {
+        // either way there is nothing to put in the history. A full input gives up its
+        // oldest link, in the same step (`EditorWorld::connect`).
+        let Some(removed) = cx.world_mut().connect(link) else {
             return OpResult::Cancelled;
+        };
+        if removed.is_empty() {
+            cx.push_undo(Box::new(LinkStep { link, added: true }));
+        } else {
+            cx.push_undo(Box::new(RelinkStep {
+                removed,
+                added: vec![link],
+            }));
         }
-        cx.push_undo(Box::new(LinkStep { link, added: true }));
         OpResult::Finished
     }
 }
@@ -1076,10 +1084,14 @@ impl LinkDragOp {
         end_drag(cx);
         self.fixed = None;
         let mut removed = std::mem::take(&mut self.detached);
-        let mut added: Vec<Link> = links
-            .into_iter()
-            .filter(|&link| cx.world_mut().add_link(link))
-            .collect();
+        // Through `connect`, so a full input gives up its oldest link and the step records it.
+        let mut added = Vec::new();
+        for link in links {
+            if let Some(displaced) = cx.world_mut().connect(link) {
+                removed.extend(displaced);
+                added.push(link);
+            }
+        }
         // A link dropped back where it came from is no change, and in neither list.
         added.retain(|link| match removed.iter().position(|old| old == link) {
             Some(at) => {

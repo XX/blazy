@@ -638,6 +638,14 @@ not pick afresh on the release — two Phase 0 criteria count picks per gesture.
 a widget** — it has no target; the pointer leaving the editor is
 `Update::ChildHoveredChanged(false)`.
 
+**An input holds one link unless the graph says otherwise (§59.7).** `NodeGraph::input_limit`
+defaults to 1, as Blender's ordinary input: links of one input meet it tangentially and lie on
+top of each other for 50–100 px, so no pick can tell them apart there. Connect through
+`EditorWorld::connect` — it takes off the oldest links the input has no room for and hands them
+back for the same undo step; never `add_link` straight from an operator that makes a link a
+user asked for. A test graph that overrides `input_limit` cannot see the default — the
+`blazy-app` `Grid` keeps it. Blender-style multi-input is `issues/multi-input sockets.md`.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

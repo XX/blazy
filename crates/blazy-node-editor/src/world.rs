@@ -250,6 +250,40 @@ impl<G: NodeGraph> EditorWorld<G> {
         true
     }
 
+    /// Connects `link`, first taking off what its input can no longer hold — the oldest links
+    /// there, as many as [`NodeGraph::input_limit`] leaves no room for. Hands back the links
+    /// taken off, or `None` if the graph refused the link, in which case nothing changed.
+    ///
+    /// What `link.drag` and `link.add` both connect through, so a link dropped on a full
+    /// input replaces what was there whichever way it came, and the caller records the links
+    /// taken off in the same step as the one put on.
+    pub fn connect(&mut self, link: Link) -> Option<Vec<Link>> {
+        let (limit, mut held) = {
+            let graph = self.graph.borrow();
+            let held: Vec<Link> = graph
+                .links_of(link.to as usize)
+                .into_iter()
+                .filter(|other| other.to == link.to && other.to_port == link.to_port && *other != link)
+                .collect();
+            (graph.input_limit(link.to as usize, link.to_port), held)
+        };
+        if limit == 0 {
+            return None;
+        }
+        // Oldest first: the graph lists them in the order they came.
+        held.truncate((held.len() + 1).saturating_sub(limit));
+        for &old in &held {
+            self.remove_link(old);
+        }
+        if self.add_link(link) {
+            return Some(held);
+        }
+        for &old in &held {
+            self.add_link(old);
+        }
+        None
+    }
+
     /// Removes a link.
     pub fn remove_link(&mut self, link: Link) {
         self.graph.borrow_mut().remove_link(link);

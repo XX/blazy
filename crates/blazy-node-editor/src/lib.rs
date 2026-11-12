@@ -148,6 +148,21 @@ pub trait NodeGraph: 'static {
         true
     }
 
+    /// How many links input `port` of node `index` holds at most; `usize::MAX` for no limit.
+    ///
+    /// One by default, as an ordinary input in Blender (`node_socket_link_limit`): a link
+    /// connected to a full input takes off the oldest link there, in the same undo step
+    /// (`EditorWorld::connect`). That is what keeps the links of one input from lying on top
+    /// of each other where they meet it, where no pick can tell them apart — and what makes
+    /// "take one link off" a drag from its input. Outputs have no limit, as in Blender. A
+    /// graph whose input gathers several links by meaning answers more; drawing such an input
+    /// so that its links do not overlap is `issues/multi-input sockets.md`. Zero refuses
+    /// every link into the input.
+    fn input_limit(&self, index: usize, port: u16) -> usize {
+        let _ = (index, port);
+        1
+    }
+
     /// Removes a link, in either direction.
     fn remove_link(&mut self, link: Link);
 
