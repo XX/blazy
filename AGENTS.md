@@ -615,6 +615,29 @@ port used to be handed to whatever the pointer had reached by then — the view,
 panned. The editor's own harness never moved the hover with the button down; the window
 did, and the regression test lives in `hello`.
 
+**A link drag can take links off, and the graph is asked on the way (§59).** As Blender's
+`node_link_init`: a drag on an input with a link takes it off (no modifier), `Ctrl` on an
+output (`detach`) takes all its links off; they leave the graph as the drag *starts*, so the
+cancel arm (`Escape`, other button, `None`) must put them back, and a release on nothing leaves
+them off as one `RelinkStep`. A link let go where it came from is no change and writes no step.
+`NodeGraph::accepts_link` (defaulted `true` — the old behaviour, and `insert_link` keeps the
+last word) is asked for the port under the pointer on every move and again on the release;
+the refusal shows as `LinkPreview::refused`, drawn in `OverlayStyle::refused`. The curve of a
+link taken off an input starts at an output the pointer is not on, which is why the editor
+copies the canvas's `PortLayout` into `EditorWorld::ports` — a world built without an editor
+has the default layout.
+Every port a press and drag would start `link.drag` from is lit under the pointer by the
+editor (`port_hint`, drawn over the nodes because nodes draw their own dots), with the
+modifiers matched against the keymap's `link.drag` bindings; so are the port a dragged link
+would connect to (`LinkPreview::target`, in `refused` where the graph refuses) and the port a
+new link is drawn out of (`LinkPreview::source`; none for links taken off). Lit means the dot
+again at its own size in another colour — a layout without dots lights nothing. **After a
+gesture an operator held, the canvas's hover is stale** (it saw none of the moves, and the
+release reaches the editor twice): the editor lights nothing until the next move, and must
+not pick afresh on the release — two Phase 0 criteria count picks per gesture. **`PointerEvent::Leave` never reaches
+a widget** — it has no target; the pointer leaving the editor is
+`Update::ChildHoveredChanged(false)`.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

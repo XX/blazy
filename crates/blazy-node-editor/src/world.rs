@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use blazy_canvas::CanvasHit;
+use blazy_canvas::{CanvasHit, PortLayout, PortSide};
 use blazy_ops::undo::Step;
 use masonry::kurbo::{Point, Rect, Size, Vec2};
 
@@ -39,6 +39,25 @@ pub enum Edit {
     LinkAdded(Link),
     /// A link went.
     LinkRemoved(Link),
+}
+
+/// What a link drag shows: one curve per link being dragged, and whether the port under
+/// the pointer would take them.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct LinkPreview {
+    /// Each curve from its output end to its input end, in canvas coordinates. One for a
+    /// new link or a link taken off an input; one per link for the links of an output.
+    pub curves: Vec<(Point, Point)>,
+    /// The port under the pointer the links would be connected to, by node, side and
+    /// number; `None` while the pointer is on no port they could go to.
+    pub target: Option<(usize, PortSide, u16)>,
+    /// The port a new link is being drawn out of; `None` when the drag carries links taken
+    /// off a port, whose fixed ends are only where those links already were.
+    pub source: Option<(usize, PortSide, u16)>,
+    /// The graph refuses the links at the port under the pointer
+    /// ([`NodeGraph::accepts_link`]): letting go there makes none of them.
+    pub refused: bool,
 }
 
 /// Everything the operators are allowed to touch.
@@ -92,9 +111,15 @@ pub struct EditorWorld<G: NodeGraph> {
     /// Left here rather than opened by the operator, for the reason everything here is:
     /// an operator never touches a widget, and a menu on screen is one (§38.3).
     pub menu: Option<crate::Menu>,
-    /// A link being dragged out of a port: from its output end to its input end, in canvas
-    /// coordinates, for the driver to draw over the canvas.
-    pub link_preview: Option<(Point, Point)>,
+    /// The links being dragged, for the driver to draw over the canvas.
+    pub link_preview: Option<LinkPreview>,
+    /// Where the canvas puts its ports, for an operator that has to know where a port is
+    /// without the pointer on it — the far end of a link taken off an input.
+    ///
+    /// The canvas's rule (§52), copied in by the editor when it is built over a canvas
+    /// (`NodeEditor::with_session`); the default puts every port at the middle of its edge,
+    /// as the canvas's own default does.
+    pub ports: PortLayout,
     /// Whether the running operator needs to know what is under the pointer on every move.
     ///
     /// While an operator holds the pointer the canvas below sees no events and publishes no
@@ -140,6 +165,7 @@ impl<G: NodeGraph> EditorWorld<G> {
             zoom: Vec::new(),
             menu: None,
             link_preview: None,
+            ports: PortLayout::default(),
             track_hover: false,
             dirty: false,
             edits: Vec::new(),
@@ -615,5 +641,44 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for LinkStep {
 
     fn bytes(&self) -> usize {
         size_of::<Link>()
+    }
+}
+
+/// Links taken off and put on in one gesture: a link dragged off an input onto another
+/// port, or onto nothing, or the links of an output carried to another output.
+///
+/// One step rather than a delete and an add, because the user did one thing; undo takes
+/// the new links off and puts the old ones back. The two lists share no link: one dropped
+/// back where it came from is taken out of both by the operator.
+pub(crate) struct RelinkStep {
+    pub(crate) removed: Vec<Link>,
+    pub(crate) added: Vec<Link>,
+}
+
+impl<G: NodeGraph> Step<EditorWorld<G>> for RelinkStep {
+    fn name(&self) -> &'static str {
+        "link.drag"
+    }
+
+    fn undo(&mut self, world: &mut EditorWorld<G>) {
+        for &link in &self.added {
+            world.remove_link(link);
+        }
+        for &link in &self.removed {
+            world.add_link(link);
+        }
+    }
+
+    fn redo(&mut self, world: &mut EditorWorld<G>) {
+        for &link in &self.removed {
+            world.remove_link(link);
+        }
+        for &link in &self.added {
+            world.add_link(link);
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        (self.removed.len() + self.added.len()) * size_of::<Link>()
     }
 }

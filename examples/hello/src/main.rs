@@ -18,10 +18,12 @@
 //!
 //! Drag a node to move it (by its body: the name field at its top is a text field, and
 //! a press there edits the name), drag out of a port (the dots on a node's edges) into another
-//! node's port to link them, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
-//! delete, `F` to link the two selected nodes, `Shift+D` to duplicate the selection and
-//! grab the copies, `Ctrl+C` / `Ctrl+V` to copy it and paste it at the pointer — in any
-//! area, in any window — and `Ctrl+Z` to undo. A node or a link held at
+//! node's port to link them — out of an input that has a link to move the link, or to let
+//! it go on nothing and drop it; `Ctrl`-drag an output to move all of its links. `B` to box
+//! select, `G` to grab, `Shift+A` to add, `X` to delete, `F` to link the two selected
+//! nodes, `Shift+D` to duplicate the selection and grab the copies, `Ctrl+C` / `Ctrl+V`
+//! to copy it and paste it at the pointer — in any area, in any window — and `Ctrl+Z` to
+//! undo. A node or a link held at
 //! the edge of an area scrolls the view. `Alt+X` / `Alt+Y` split the area under the
 //! pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another window over the same
 //! graph and `Alt+D` moves the area into one of its own. Click a node's name to rename
@@ -172,12 +174,16 @@ impl NodeGraph for Graph {
     fn insert_link(&mut self, link: Link) -> bool {
         let live = |end: u32| self.nodes.get(end as usize).is_some_and(Option::is_some);
         let known = self.links.iter().any(|&l| l == link || l == link.reversed());
-        let ports = link.from_port < PORTS_OUT && link.to_port < PORTS_IN;
-        if link.from == link.to || !live(link.from) || !live(link.to) || known || !ports {
+        if !self.accepts_link(link) || !live(link.from) || !live(link.to) || known {
             return false;
         }
         self.links.push(link);
         true
+    }
+
+    /// The rule a link drag shows before the release: ports that exist, on two nodes.
+    fn accepts_link(&self, link: Link) -> bool {
+        link.from != link.to && link.from_port < PORTS_OUT && link.to_port < PORTS_IN
     }
 
     fn remove_link(&mut self, link: Link) {

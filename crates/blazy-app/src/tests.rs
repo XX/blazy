@@ -1178,3 +1178,42 @@ fn copy_and_paste_keys_in_a_text_field_are_the_fields() {
         "outside a field the keys are the editor's"
     );
 }
+
+/// A link taken off an input in one area and let go on another input is moved in both
+/// areas in the same frame, and stays so after the window collects what it is owed.
+#[test]
+fn a_link_moved_in_one_area_is_moved_in_the_other() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "link.add", &Props::new().with_int("from", 0).with_int("to", 1));
+    });
+    let _ = root.redraw();
+    assert!(has_link(&mut root, 1, Link::new(0, 1)));
+
+    // Node 1's input is the middle of its left edge, (180, 50); node 2's, (340, 50).
+    let mut at = |kind, x: f64, root: &mut RenderRoot| pointer(&mut app, &mut cx, key, root, kind, Point::new(x, 50.0));
+    at("move", 180.0, &mut root);
+    at("down", 180.0, &mut root);
+    for x in [200.0, 250.0, 300.0, 340.0] {
+        at("drag", x, &mut root);
+    }
+    for area in 0..2 {
+        assert!(!has_link(&mut root, area, Link::new(0, 1)), "area {area}: it came off");
+    }
+    at("up", 340.0, &mut root);
+    assert_eq!(graph.borrow().links, [Link::new(0, 2)]);
+    app.pull(&mut root);
+    let _ = root.redraw();
+    for area in 0..2 {
+        assert!(
+            has_link(&mut root, area, Link::new(0, 2)),
+            "area {area} shows the new end"
+        );
+        assert!(!has_link(&mut root, area, Link::new(0, 1)), "and not the old one");
+    }
+}

@@ -30,13 +30,13 @@ use std::fmt::Write as _;
 use std::mem;
 use std::rc::Rc;
 
-use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, wheel_pixels};
+use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, PortSide, wheel_pixels};
 use blazy_ops::event::{Device, OpEvent, Sample};
 use blazy_ops::keymap::{Props, Scope};
 use blazy_ops::runtime::{OpRuntime, Seat};
 use blazy_ops::{OpCounters, OpResult};
 use masonry::accesskit::{Node as AccessNode, Role};
-use masonry::core::keyboard::KeyState;
+use masonry::core::keyboard::{KeyState, Modifiers};
 use masonry::core::{
     AccessCtx, BrushIndex, ChildrenIds, EventCtx, Handled, Layer, LayerType, LayoutCtx, MeasureCtx, NewWidget,
     NoAction, PaintCtx, PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Update,
@@ -44,7 +44,7 @@ use masonry::core::{
 };
 use masonry::dpi::PhysicalPosition;
 use masonry::imaging::Painter;
-use masonry::kurbo::{Affine, Axis, Point, Rect, Size, Stroke, Vec2};
+use masonry::kurbo::{Affine, Axis, Circle, Point, Rect, Size, Stroke, Vec2};
 use masonry::layout::{LenReq, Length, SizeDef};
 use masonry::parley::Layout;
 use masonry::peniko::Color;
@@ -155,6 +155,15 @@ pub struct OverlayStyle {
     pub selection: Color,
     /// The inside of the rubber band.
     pub band_fill: Color,
+    /// The dot of a lit port: the one under the pointer a press and drag would start a link
+    /// drag from, the one a new link is being drawn out of, and the one a link being dragged
+    /// would be connected to. The canvas's default link hover colour, so the two highlights
+    /// read as one. Only the colour changes: a layout without dots
+    /// (`PortLayout::dot_radius` at zero) has nothing to light.
+    pub port_hover: Color,
+    /// A link being dragged onto a port the graph would not connect it to
+    /// ([`NodeGraph::accepts_link`]) — red, as Blender draws an invalid link.
+    pub refused: Color,
     /// Where the editor outlines selected nodes itself.
     pub outline: SelectionOutline,
 }
@@ -184,6 +193,8 @@ impl Default for OverlayStyle {
             selection: Color::from_rgb8(0xff, 0xa5, 0x2c),
             outline: SelectionOutline::Always,
             band_fill: Color::from_rgba8(0xff, 0xa5, 0x2c, 0x20),
+            refused: Color::from_rgb8(0xe0, 0x40, 0x40),
+            port_hover: Color::from_rgb8(0xd8, 0xd8, 0xe4),
         }
     }
 }
@@ -229,6 +240,15 @@ pub struct NodeEditor<G: NodeGraph> {
     menu: Option<WidgetId>,
     /// What the pointer was over when the press now held was made.
     press_hover: Option<CanvasHit>,
+    /// The port under the pointer, when a press and drag from it would start a link drag —
+    /// lit up over the canvas, as the canvas lights up the link under the pointer (§59.6).
+    port_hint: Option<(usize, PortSide, u16)>,
+    /// The modifiers held as of the last event, keys included: `Ctrl` pressed with the
+    /// pointer standing still changes what a drag from the port under it would do.
+    mods: Modifiers,
+    /// The canvas's hover is from before a gesture an operator held, which the canvas saw
+    /// none of; it is trusted again from the next move.
+    hover_stale: bool,
     /// The running gesture's edge pan, and what edge pan has done here.
     edge: EdgePanState,
 }
@@ -273,6 +293,9 @@ impl<G: NodeGraph> NodeEditor<G> {
             shown: BTreeSet::new(),
             menu: None,
             press_hover: None,
+            port_hint: None,
+            mods: Modifiers::empty(),
+            hover_stale: false,
             edge: EdgePanState::default(),
         }
     }
@@ -314,6 +337,8 @@ impl<G: NodeGraph> NodeEditor<G> {
             .with_builtin_gestures(false)
             .with_wheel_zoom(false)
             .with_view(session.borrow().view);
+        // Where the ports are, for a link drag whose fixed end the pointer is not on.
+        session.borrow_mut().world.ports = canvas.ports();
         Self {
             session: Some(session),
             ..Self::new(canvas)
@@ -1010,7 +1035,20 @@ impl<G: NodeGraph> NodeEditor<G> {
             hover = canvas.hit_test_raw(pos, window, &mut raw);
         }
         let is_press = matches!(event, OpEvent::Press { .. });
+        // A release that ends a gesture an operator held: the canvas saw none of its moves,
+        // so what it last published is where the press was, and lighting from it lit the
+        // port the drag had started from until the pointer moved again. Not picked afresh
+        // instead: two criteria hold a gesture to the one pick at its press.
+        // Until the next move, which the canvas does see: a release reaches this editor twice,
+        // through the layer seat and then the tree, and by the second no operator is running.
+        if matches!(event, OpEvent::Release { .. }) && self.modal_depth() > 0 {
+            self.hover_stale = true;
+        } else if matches!(event, OpEvent::Move { .. }) {
+            self.hover_stale = false;
+        }
         let consumed = self.feed(event, sample, seat, view, hover);
+        self.mods = held_after(event);
+        self.show_port_hint(ctx, self.hover_stale);
         if self.watch_edge_pan(Some(event), ctx.content_box().size()) {
             ctx.request_anim_frame();
         }
@@ -1039,6 +1077,27 @@ impl<G: NodeGraph> NodeEditor<G> {
 
         self.flush(ctx);
         consumed
+    }
+
+    /// Lights up the port under the pointer if a press and drag from it would start a link
+    /// drag, and puts the light out when that stops being so; a repaint only when it changes.
+    ///
+    /// `stale` says the hover cannot be trusted — the release in `dispatch` — and puts the
+    /// light out until the next move.
+    fn show_port_hint(&mut self, ctx: &mut EventCtx<'_>, stale: bool) {
+        let hint = self.session.as_ref().filter(|_| !stale).and_then(|session| {
+            let session = session.borrow();
+            crate::ops::port_hint(&session.runtime, &session.world, self.mods)
+        });
+        if hint != self.port_hint {
+            self.port_hint = hint;
+            ctx.request_post_paint();
+        }
+    }
+
+    /// The port lit up because a press and drag from it would start a link drag, if any.
+    pub fn port_hint(&self) -> Option<(usize, PortSide, u16)> {
+        self.port_hint
     }
 
     /// Hands one event to the runtime, in canvas coordinates and with what is under the
@@ -1227,11 +1286,48 @@ impl<G: NodeGraph> NodeEditor<G> {
         let session = session.borrow();
         let viewport = ctx.content_box();
         let graph = session.world.graph.borrow();
-        // A link being dragged out of a port: the curve it will be, in the colour of the
-        // selection, over everything else the editor draws.
-        if let Some((start, end)) = session.world.link_preview {
-            let curve = self.view * blazy_canvas::link_curve(start, end);
-            painter.stroke(curve, &Stroke::new(2.0), self.style.selection).draw();
+        // The links being dragged: the curves they will be, in the colour of the selection —
+        // or of a refusal, where the port under the pointer would not take them — over
+        // everything else the editor draws.
+        if let Some(preview) = &session.world.link_preview {
+            let colour = if preview.refused {
+                self.style.refused
+            } else {
+                self.style.selection
+            };
+            for &(start, end) in &preview.curves {
+                let curve = self.view * blazy_canvas::link_curve(start, end);
+                painter.stroke(curve, &Stroke::new(2.0), colour).draw();
+            }
+        }
+        // Lit ports: the one a press and drag would start from, the one a new link is being drawn
+        // out of, and the one a link being dragged would be connected to — in the colour of a
+        // refusal where the graph refuses it. The dot again, the same size, over the node that
+        // drew it.
+        let preview = session.world.link_preview.as_ref();
+        let source = preview.and_then(|preview| preview.source);
+        let target = preview.and_then(|preview| {
+            let colour = if preview.refused {
+                self.style.refused
+            } else {
+                self.style.port_hover
+            };
+            preview.target.map(|port| (port, colour))
+        });
+        let lit = self
+            .port_hint
+            .into_iter()
+            .chain(source)
+            .map(|port| (port, self.style.port_hover))
+            .chain(target);
+        let ports = session.world.ports;
+        let radius = ports.dot_radius * self.view.as_coeffs()[0];
+        for ((index, side, port), colour) in lit.filter(|_| radius > 0.0) {
+            if index >= graph.node_count() {
+                continue;
+            }
+            let at = self.view * ports.position(graph.node_rect(index), side, port);
+            painter.fill(Circle::new(at, radius), colour).draw();
         }
         // Nodes with widgets wear the class and can look selected by themselves; the far
         // field has no widgets and nothing to wear it on.
@@ -1257,6 +1353,32 @@ impl<G: NodeGraph> NodeEditor<G> {
             painter.stroke(rect, &Stroke::new(1.0), self.style.selection).draw();
         }
     }
+}
+
+/// The modifiers held once `event` has happened.
+///
+/// An event reports the modifiers held *as* it happened, and a modifier key's own press
+/// may or may not include itself, depending on the platform; so a modifier key is applied
+/// here, and the hint follows `Ctrl` pressed with the pointer standing still.
+fn held_after(event: &OpEvent) -> Modifiers {
+    let mut mods = event.mods();
+    if let OpEvent::Key {
+        key: masonry::core::keyboard::Key::Named(named),
+        down,
+        ..
+    } = event
+    {
+        use masonry::core::keyboard::NamedKey;
+        let modifier = match named {
+            NamedKey::Control => Modifiers::CONTROL,
+            NamedKey::Shift => Modifiers::SHIFT,
+            NamedKey::Alt => Modifiers::ALT,
+            NamedKey::Meta => Modifiers::META,
+            _ => Modifiers::empty(),
+        };
+        mods.set(modifier, *down);
+    }
+    mods
 }
 
 /// Converts a Masonry pointer event into the one the keymap matches.
@@ -1452,6 +1574,12 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     fn update(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
         if let (Update::WidgetAdded, Some(session)) = (event, self.session.as_ref()) {
             session.borrow_mut().editor = Some(ctx.widget_id());
+        }
+        // The pointer has left this editor and everything in it. A `PointerEvent::Leave`
+        // has no target and never reaches `on_pointer_event`, so this is the one notice:
+        // without it the port the pointer last stood on stayed lit after it had gone.
+        if matches!(event, Update::ChildHoveredChanged(false)) && self.port_hint.take().is_some() {
+            ctx.request_post_paint();
         }
     }
 

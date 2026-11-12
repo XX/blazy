@@ -34,6 +34,8 @@ struct Row {
     free: Vec<usize>,
     links: Vec<Link>,
     views: Views,
+    /// A node no link may go into: the port type the test graph has.
+    refuses: Option<u32>,
 }
 
 impl NodeGraph for Row {
@@ -100,6 +102,10 @@ impl NodeGraph for Row {
 
     fn remove_link(&mut self, link: Link) {
         self.links.retain(|&other| !same_link(other, link));
+    }
+
+    fn accepts_link(&self, link: Link) -> bool {
+        self.refuses != Some(link.to)
     }
 
     type Content = u32;
@@ -431,6 +437,24 @@ fn a_new_widget_over_the_same_session_keeps_the_view_the_selection_and_the_histo
         view,
         "and the new canvas opens where the old one was looking"
     );
+}
+
+/// The operators know where the canvas puts its ports: a link taken off an input is drawn
+/// from an output the pointer is not on, and only the canvas's layout says where it is.
+#[test]
+fn the_editor_hands_the_canvas_port_layout_to_its_operators() {
+    let graph = row(2);
+    let session = crate::EditorSession::new(&graph).share();
+    let ports = blazy_canvas::PortLayout {
+        first: Some(12.0),
+        step: 18.0,
+        ..Default::default()
+    };
+    let geometry = |_index: usize| Some((Point::ORIGIN, SIZE));
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let canvas = CanvasLayer::new(2, geometry, source).with_ports(ports);
+    let _editor = NodeEditor::with_session(canvas, session.clone());
+    assert_eq!(session.borrow().world.ports, ports);
 }
 
 /// A harness over a fresh canvas and an existing session.
@@ -1251,6 +1275,489 @@ mod link_drag {
         release(&mut harness);
         assert!(links(&graph).is_empty(), "the release after a cancel adds nothing");
     }
+
+    /// A drag that starts on an input with a link takes the link off and carries its input
+    /// end, from the output it still leaves; let go on another input, the link is there —
+    /// in the canvas too — and one undo puts it back where it was.
+    #[test]
+    fn a_link_dragged_off_an_input_comes_off_and_goes_where_it_is_let_go() {
+        let graph = row(3);
+        let session = crate::EditorSession::new(&graph).share();
+        let mut harness = editor_harness(&graph, &session);
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::exec(
+                &mut editor,
+                "link.add",
+                &Props::new().with_int("from", 0).with_int("to", 1),
+            );
+        });
+        let depth = session.borrow().runtime.history().depth();
+
+        // Node 1's input is at (150, 30), node 2's at (300, 30), node 0's output at (100, 30).
+        drag(&mut harness, Point::new(150.0, 30.0), Point::new(300.0, 30.0));
+        assert!(links(&graph).is_empty(), "the link came off as the drag began");
+        let preview = session.borrow().world.link_preview.clone().expect("a curve");
+        assert_eq!(
+            preview.curves,
+            [(Point::new(100.0, 30.0), Point::new(300.0, 30.0))],
+            "from the output it leaves, to the input under the pointer"
+        );
+        release(&mut harness);
+        assert_eq!(links(&graph), [Link::new(0, 2)]);
+        let shown = |harness: &mut TestHarness<NodeEditor<Row>>, link| {
+            harness.edit_root_widget(|mut editor| {
+                NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                    CanvasLayer::link_name(&mut canvas, link).is_some()
+                })
+            })
+        };
+        assert!(shown(&mut harness, Link::new(0, 2)) && !shown(&mut harness, Link::new(0, 1)));
+        assert_eq!(session.borrow().runtime.history().depth(), depth + 1, "one step");
+
+        harness.edit_root_widget(|mut editor| {
+            NodeEditor::exec(&mut editor, "ed.undo", &Props::new());
+        });
+        assert_eq!(links(&graph), [Link::new(0, 1)], "undo puts it back where it was");
+    }
+}
+
+/// Every port a press and drag would start a link drag from is lit while the pointer is on
+/// it — before the press, whether the drag would draw a new link or take one off — and put
+/// out when the pointer leaves. A modifier the keymap asks for counts, pressed with the
+/// pointer standing still. While a link is dragged, the port it is drawn out of and the
+/// port it would be connected to are lit instead, the second in the colour of a refusal
+/// where the graph refuses it. Lit in pixels, not only in a field: the dot in another
+/// colour, at its own size.
+#[test]
+fn a_port_a_press_and_drag_would_start_from_is_lit() {
+    use masonry::core::TextEvent;
+    use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers, NamedKey};
+    use masonry::peniko::Color;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use crate::OverlayStyle;
+
+    let graph = row(3);
+    let session = crate::EditorSession::new(&graph).share();
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let dots = blazy_canvas::PortLayout {
+        dot_radius: 4.0,
+        ..Default::default()
+    };
+    let canvas = CanvasLayer::new(3, geometry, source).with_ports(dots);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(NodeEditor::with_session(canvas, session.clone())),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = harness.redraw();
+    let editor = harness.root_widget().ctx().widget_id();
+    harness.set_focus_fallback(Some(editor));
+    harness.edit_root_widget(|mut editor| {
+        NodeEditor::exec(
+            &mut editor,
+            "link.add",
+            &Props::new().with_int("from", 0).with_int("to", 1),
+        );
+    });
+    let hint = |harness: &TestHarness<NodeEditor<Row>>| harness.root_widget().port_hint();
+    let ctrl = |harness: &mut TestHarness<NodeEditor<Row>>, down: bool| {
+        harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
+            state: if down { KeyState::Down } else { KeyState::Up },
+            key: Key::Named(NamedKey::Control),
+            code: Code::ControlLeft,
+            modifiers: Modifiers::empty(),
+            ..KeyboardEvent::default()
+        }));
+    };
+    let pixel = |harness: &mut TestHarness<NodeEditor<Row>>, at: Point| {
+        let image = harness.render();
+        let p = image.get_pixel(at.x as u32, at.y as u32).0;
+        Color::from_rgba8(p[0], p[1], p[2], p[3])
+    };
+    let style = OverlayStyle::default();
+    // Node 1's input, (150, 30), has the link; node 2's input, (300, 30), has none; node
+    // 0's output, (100, 30), has it at its other end.
+    let (input_1, input_2, output_0) = (
+        Point::new(150.0, 30.0),
+        Point::new(300.0, 30.0),
+        Point::new(100.0, 30.0),
+    );
+    // Just outside the dot, whose radius is 4: above it, where the curve of a link dragged
+    // to it, which arrives from the left, does not pass.
+    let beside_input_1 = Point::new(150.0, 25.0);
+    let unlit = pixel(&mut harness, beside_input_1);
+
+    harness.mouse_move(input_1);
+    assert_eq!(hint(&harness), Some((1, blazy_canvas::PortSide::Input, 0)));
+    assert_eq!(pixel(&mut harness, input_1), style.port_hover, "and drawn");
+    assert_eq!(pixel(&mut harness, beside_input_1), unlit, "at the dot's own size");
+
+    harness.mouse_move(input_2);
+    assert_eq!(
+        hint(&harness),
+        Some((2, blazy_canvas::PortSide::Input, 0)),
+        "an input with no link is lit too: a drag from it draws a new one"
+    );
+    assert_eq!(pixel(&mut harness, input_2), style.port_hover);
+    harness.mouse_move(Point::new(50.0, 200.0));
+    assert_eq!(hint(&harness), None, "off every port, nothing is lit");
+    harness.mouse_move(output_0);
+    assert_eq!(
+        hint(&harness),
+        Some((0, blazy_canvas::PortSide::Output, 0)),
+        "and so is an output, without Ctrl"
+    );
+
+    // A new link out of node 2's output, carried to node 1's input: the press hint is out
+    // — the drag runs — and the port the link would go to is lit by the drag.
+    harness.mouse_move(Point::new(400.0, 30.0));
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    for x in [380.0, 300.0, 200.0, 150.0] {
+        harness.mouse_move(Point::new(x, 30.0));
+    }
+    let target = session
+        .borrow()
+        .world
+        .link_preview
+        .as_ref()
+        .and_then(|preview| preview.target);
+    assert_eq!(
+        target,
+        Some((1, blazy_canvas::PortSide::Input, 0)),
+        "the drag is on node 1's input"
+    );
+    assert_eq!(hint(&harness), None, "the press hint is out while it runs");
+    let output_2 = Point::new(400.0, 30.0);
+    let source = session
+        .borrow()
+        .world
+        .link_preview
+        .as_ref()
+        .and_then(|preview| preview.source);
+    assert_eq!(
+        source,
+        Some((2, blazy_canvas::PortSide::Output, 0)),
+        "drawn out of node 2's output"
+    );
+    assert_eq!(
+        pixel(&mut harness, output_2),
+        style.port_hover,
+        "which is lit while it is"
+    );
+    assert_eq!(
+        pixel(&mut harness, input_1),
+        style.port_hover,
+        "the port it would go to is lit"
+    );
+    assert_eq!(pixel(&mut harness, beside_input_1), unlit, "at the dot's own size");
+    // The graph stops taking links into node 1: on the next move the port says so.
+    graph.borrow_mut().refuses = Some(1);
+    harness.mouse_move(Point::new(151.0, 30.0));
+    assert_eq!(
+        pixel(&mut harness, input_1),
+        style.refused,
+        "in the colour of a refusal"
+    );
+    harness.mouse_move(Point::new(225.0, 200.0));
+    let off = pixel(&mut harness, input_1);
+    assert!(off != style.refused && off != style.port_hover, "off it, out: {off:?}");
+    harness.mouse_button_release(Some(PointerButton::Primary));
+    graph.borrow_mut().refuses = None;
+    assert_ne!(
+        pixel(&mut harness, output_2),
+        style.port_hover,
+        "and out once it is over"
+    );
+
+    // Taking node 1's link off: its fixed end is where the link already was, not a port a
+    // new link is drawn out of, so nothing is lit there.
+    harness.mouse_move(input_1);
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    for y in [40.0, 80.0, 150.0] {
+        harness.mouse_move(Point::new(150.0, y));
+    }
+    let source = session
+        .borrow()
+        .world
+        .link_preview
+        .as_ref()
+        .and_then(|preview| preview.source);
+    assert_eq!(source, None, "a link taken off is not drawn out of anything");
+    assert_ne!(pixel(&mut harness, output_0), style.port_hover);
+    let pointer_info = masonry::core::PointerInfo {
+        pointer_id: None,
+        persistent_device_id: None,
+        pointer_type: masonry::core::PointerType::Mouse,
+    };
+    harness.process_pointer_event(masonry::core::PointerEvent::Cancel(pointer_info));
+    assert_eq!(graph.borrow().links, [Link::new(0, 1)], "cancelled, it is back");
+
+    // In a keymap whose only `link.drag` wants `Ctrl`, a port is lit only while it is held —
+    // pressed and let go with the pointer standing still.
+    session
+        .borrow_mut()
+        .runtime
+        .set_keymap(
+            blazy_ops::keymap::Keymap::new().with("canvas", vec![blazy_ops::keymap::Binding::new(
+                blazy_ops::event::Pattern::drag(PointerButton::Primary).with_mods(Modifiers::CONTROL),
+                "link.drag",
+            )]),
+        );
+    harness.mouse_move(Point::new(50.0, 200.0));
+    harness.mouse_move(output_0);
+    assert_eq!(hint(&harness), None, "no drag starts here without Ctrl");
+    ctrl(&mut harness, true);
+    assert_eq!(
+        hint(&harness),
+        Some((0, blazy_canvas::PortSide::Output, 0)),
+        "with it, one does"
+    );
+    ctrl(&mut harness, false);
+    assert_eq!(hint(&harness), None, "and Ctrl coming up puts it out");
+    session.borrow_mut().runtime.set_keymap(crate::ops::default_keymap());
+
+    harness.mouse_move(input_1);
+    assert!(hint(&harness).is_some());
+    let pointer = masonry::core::PointerInfo {
+        pointer_id: None,
+        persistent_device_id: None,
+        pointer_type: masonry::core::PointerType::Mouse,
+    };
+    harness.process_pointer_event(masonry::core::PointerEvent::Leave(pointer));
+    assert_eq!(hint(&harness), None, "nothing is lit once the pointer has left");
+    let _ = harness.redraw();
+    assert_ne!(pixel(&mut harness, input_1), style.port_hover);
+}
+
+// --- MARK: RELINK (`issues/relink and port types.md`)
+
+mod relink {
+    use blazy_canvas::{CanvasHit, PortSide};
+    use blazy_ops::event::OpEvent;
+    use blazy_ops::keymap::Scope;
+    use blazy_ops::runtime::{OpRuntime, Seat};
+    use masonry::core::keyboard::{Key, Modifiers, NamedKey};
+    use masonry::kurbo::Point;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use super::copies::{linked, state};
+    use super::{Row, SharedGraph};
+    use crate::ops::CANVAS_SCOPE;
+    use crate::{EditorWorld, Link};
+
+    type Runtime = OpRuntime<EditorWorld<Row>>;
+
+    fn send(runtime: &mut Runtime, world: &mut EditorWorld<Row>, event: &OpEvent) {
+        let _ = runtime.dispatch(world, event, Scope(&CANVAS_SCOPE), Seat::Tree);
+    }
+
+    /// Puts the pointer on a port, as the canvas's pick would report it.
+    fn over(world: &mut EditorWorld<Row>, index: usize, side: PortSide) {
+        let pos = world.ports.position(world.node_rect(index), side, 0);
+        world.pointer = pos;
+        world.hover = Some(CanvasHit::Port {
+            index,
+            side,
+            port: 0,
+            pos,
+        });
+    }
+
+    /// Puts the pointer on nothing at `pos`.
+    fn nowhere(world: &mut EditorWorld<Row>, pos: Point) {
+        world.pointer = pos;
+        world.hover = None;
+    }
+
+    fn moved(runtime: &mut Runtime, world: &mut EditorWorld<Row>) {
+        let event = OpEvent::Move {
+            pos: world.pointer,
+            mods: Modifiers::empty(),
+        };
+        send(runtime, world, &event);
+    }
+
+    /// Starts a drag where the pointer is, with `mods` held.
+    fn grab(runtime: &mut Runtime, world: &mut EditorWorld<Row>, mods: Modifiers) {
+        let event = OpEvent::Drag {
+            button: PointerButton::Primary,
+            pos: world.pointer,
+            screen: world.pointer,
+            mods,
+        };
+        send(runtime, world, &event);
+        assert_eq!(runtime.modal_name(), Some("link.drag"));
+    }
+
+    fn let_go(runtime: &mut Runtime, world: &mut EditorWorld<Row>) {
+        let event = OpEvent::Release {
+            button: PointerButton::Primary,
+            pos: world.pointer,
+            mods: Modifiers::empty(),
+        };
+        send(runtime, world, &event);
+        assert_eq!(runtime.modal_depth(), 0);
+    }
+
+    fn links(graph: &SharedGraph<Row>) -> Vec<Link> {
+        let mut links = graph.borrow().links.clone();
+        links.sort_by_key(|link| (link.from, link.to));
+        links
+    }
+
+    /// Let go on nothing, a link taken off an input is gone — in one step, which undo
+    /// takes back.
+    #[test]
+    fn a_link_taken_off_and_let_go_on_nothing_is_deleted_in_one_step() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+        over(&mut world, 1, PortSide::Input);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        nowhere(&mut world, Point::new(120.0, 300.0));
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(links(&graph), [Link::new(1, 2)], "0 → 1 is gone, 1 → 2 untouched");
+        assert_eq!(runtime.history().depth(), depth + 1);
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("link.drag"));
+        assert_eq!(state(&graph), before);
+    }
+
+    /// `Escape`, and a link let go where it came from, leave the graph as it was and the
+    /// history without a step.
+    #[test]
+    fn escape_or_letting_go_where_it_came_from_changes_nothing() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+
+        over(&mut world, 1, PortSide::Input);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        nowhere(&mut world, Point::new(120.0, 300.0));
+        moved(&mut runtime, &mut world);
+        let escape = OpEvent::Key {
+            key: Key::Named(NamedKey::Escape),
+            mods: Modifiers::empty(),
+            down: true,
+        };
+        send(&mut runtime, &mut world, &escape);
+        assert_eq!(state(&graph), before, "Escape puts the link back");
+
+        over(&mut world, 1, PortSide::Input);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(state(&graph), before, "let go where it came from, it is where it was");
+        assert_eq!(runtime.history().depth(), depth, "and neither wrote a step");
+    }
+
+    /// A port the graph will not connect to shows it while the pointer is on it, and
+    /// letting go there makes nothing — a link taken off stays off, as on empty canvas.
+    #[test]
+    fn a_refused_port_shows_before_the_release_and_takes_nothing() {
+        let (graph, mut runtime, mut world) = linked();
+        graph.borrow_mut().refuses = Some(3);
+        let depth = runtime.history().depth();
+
+        over(&mut world, 2, PortSide::Output);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        over(&mut world, 0, PortSide::Input);
+        moved(&mut runtime, &mut world);
+        assert!(
+            !world.link_preview.as_ref().expect("a curve").refused,
+            "node 0 takes it"
+        );
+        over(&mut world, 3, PortSide::Input);
+        moved(&mut runtime, &mut world);
+        let preview = world.link_preview.clone().expect("a curve");
+        assert!(preview.refused, "node 3 does not, and it shows before the release");
+        let at = world.ports.position(world.node_rect(3), PortSide::Input, 0);
+        assert_eq!(preview.curves[0].1, at, "on the port it would go to");
+        let_go(&mut runtime, &mut world);
+        assert_eq!(links(&graph), [Link::new(0, 1), Link::new(1, 2)], "nothing made");
+        assert_eq!(runtime.history().depth(), depth, "and no step");
+
+        over(&mut world, 2, PortSide::Input);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        over(&mut world, 3, PortSide::Input);
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(links(&graph), [Link::new(0, 1)], "taken off and refused: off");
+        assert_eq!(runtime.history().depth(), depth + 1);
+    }
+
+    /// Which port is lit is the keymap's to say: a port lights if some `link.drag` binding
+    /// starts from it with the modifiers held — whether that drag draws a new link or takes
+    /// one off — and with `link.drag` moved to `Alt`, only `Alt` lights it.
+    #[test]
+    fn the_keymap_says_which_port_a_press_and_drag_starts_from() {
+        use blazy_ops::event::Pattern;
+        use blazy_ops::keymap::{Binding, Keymap, Props};
+
+        use crate::ops::port_hint;
+
+        let (_graph, mut runtime, mut world) = linked();
+        for (index, side) in [(1, PortSide::Input), (1, PortSide::Output), (3, PortSide::Output)] {
+            over(&mut world, index, side);
+            for mods in [Modifiers::empty(), Modifiers::CONTROL] {
+                assert_eq!(
+                    port_hint(&runtime, &world, mods),
+                    Some((index, side, 0)),
+                    "node {index} {side:?} with {mods:?}: the default keymap drags from every port"
+                );
+            }
+            assert_eq!(port_hint(&runtime, &world, Modifiers::ALT), None, "no drag on Alt");
+        }
+
+        runtime.set_keymap(Keymap::new().with("canvas", vec![
+            Binding::new(Pattern::drag(PointerButton::Primary).with_mods(Modifiers::ALT), "link.drag")
+                .with_props(Props::new().with_bool("detach", true)),
+        ]));
+        over(&mut world, 1, PortSide::Input);
+        assert_eq!(port_hint(&runtime, &world, Modifiers::empty()), None);
+        assert_eq!(port_hint(&runtime, &world, Modifiers::CONTROL), None);
+        assert_eq!(
+            port_hint(&runtime, &world, Modifiers::ALT),
+            Some((1, PortSide::Input, 0))
+        );
+    }
+
+    /// `Ctrl` on an output takes every link off it and carries their output ends together,
+    /// to another node's output; a plain drag there starts a new link instead.
+    #[test]
+    fn ctrl_on_an_output_carries_all_its_links() {
+        let (graph, mut runtime, mut world) = linked();
+        assert!(world.add_link(Link::new(1, 3)));
+        let before = state(&graph);
+
+        over(&mut world, 1, PortSide::Output);
+        grab(&mut runtime, &mut world, Modifiers::CONTROL);
+        assert_eq!(
+            links(&graph),
+            [Link::new(0, 1)],
+            "both links of node 1's output came off"
+        );
+        assert_eq!(world.link_preview.as_ref().expect("curves").curves.len(), 2);
+        over(&mut world, 0, PortSide::Output);
+        moved(&mut runtime, &mut world);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(links(&graph), [Link::new(0, 1), Link::new(0, 2), Link::new(0, 3)]);
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("link.drag"));
+        assert_eq!(state(&graph), before, "one undo for the lot");
+
+        over(&mut world, 1, PortSide::Output);
+        grab(&mut runtime, &mut world, Modifiers::empty());
+        assert_eq!(state(&graph), before, "without Ctrl nothing comes off");
+        runtime.cancel_all(&mut world);
+    }
 }
 
 /// A harness for edge pan: node 0 is held by its middle at `(50, 30)` and dragged into the
@@ -1683,8 +2190,8 @@ mod cut_off {
     ///
     /// Keyed by the registry's names, and the test fails on a name this does not know: a
     /// new operator has to be put here, modal or not, before it passes.
-    fn start(name: &str) -> Option<(Begin, bool)> {
-        Some(match name {
+    fn start(name: &str) -> Option<Vec<(Begin, bool)>> {
+        Some(vec![match name {
             "node.box_select" => (
                 |runtime, world| {
                     key(runtime, world, "b", Modifiers::empty());
@@ -1723,24 +2230,44 @@ mod cut_off {
                 },
                 false,
             ),
-            "link.drag" => (
-                |runtime, world| {
-                    world.hover = Some(CanvasHit::Port {
-                        index: 0,
-                        side: PortSide::Output,
-                        port: 0,
-                        pos: world.pointer,
-                    });
-                    send(runtime, world, &drag(PointerButton::Primary, world.pointer));
-                    move_to(runtime, world, Point::new(300.0, 200.0));
-                    assert!(world.link_preview.is_some(), "the curve is showing");
-                },
-                false,
-            ),
+            "link.drag" => {
+                return Some(vec![
+                    (
+                        |runtime, world| {
+                            world.hover = Some(CanvasHit::Port {
+                                index: 0,
+                                side: PortSide::Output,
+                                port: 0,
+                                pos: world.pointer,
+                            });
+                            send(runtime, world, &drag(PointerButton::Primary, world.pointer));
+                            move_to(runtime, world, Point::new(300.0, 200.0));
+                            assert!(world.link_preview.is_some(), "the curve is showing");
+                        },
+                        false,
+                    ),
+                    // Off an input with a link: cut off, the link has to come back, or it
+                    // stays off with nothing in the history to undo it by.
+                    (
+                        |runtime, world| {
+                            world.hover = Some(CanvasHit::Port {
+                                index: 1,
+                                side: PortSide::Input,
+                                port: 0,
+                                pos: world.pointer,
+                            });
+                            send(runtime, world, &drag(PointerButton::Primary, world.pointer));
+                            move_to(runtime, world, Point::new(300.0, 200.0));
+                            assert_eq!(world.graph.borrow().links.len(), 1, "the link came off");
+                        },
+                        false,
+                    ),
+                ]);
+            },
             "node.select" | "view.zoom" | "menu.node" | "node.add" | "node.delete" | "node.copy" | "node.paste"
             | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
             other => panic!("`{other}` is not classified: modal or not, put it in `start`"),
-        })
+        }])
     }
 
     /// Every modal operator of the editor, cut off mid-gesture — the window lost focus —
@@ -1754,10 +2281,11 @@ mod cut_off {
     fn every_modal_operator_cut_off_leaves_nothing_behind() {
         let names = crate::ops::runtime::<Row>().operators().to_vec();
         let mut modal = 0;
-        for name in names {
-            let Some((begin, recorded)) = start(name) else {
-                continue;
-            };
+        let scenarios = names
+            .into_iter()
+            .filter_map(|name| Some(start(name)?.into_iter().map(move |scenario| (name, scenario))))
+            .flatten();
+        for (name, (begin, recorded)) in scenarios {
             modal += 1;
             let (graph, mut runtime, mut world) = linked();
             move_to(&mut runtime, &mut world, Point::new(10.0, 10.0));
@@ -1788,6 +2316,6 @@ mod cut_off {
                 assert_eq!(runtime.history().depth(), depth, "{name} wrote a step");
             }
         }
-        assert_eq!(modal, 5, "every modal operator was reached");
+        assert_eq!(modal, 6, "every modal operator was reached, `link.drag` twice");
     }
 }

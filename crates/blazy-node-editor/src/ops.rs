@@ -25,15 +25,15 @@ use std::rc::Rc;
 
 use blazy_canvas::{CanvasHit, PortSide};
 use blazy_ops::event::{OpEvent, Pattern};
-use blazy_ops::keymap::{Binding, Keymap, Props};
+use blazy_ops::keymap::{Binding, Keymap, Props, Scope};
 use blazy_ops::runtime::{OpCtx, OpRuntime};
 use blazy_ops::{OpResult, Operator};
 use masonry::core::keyboard::{Key, Modifiers, NamedKey};
 use masonry::kurbo::{Point, Rect, Size, Vec2};
 use masonry::ui_events::pointer::PointerButton;
 
-use crate::world::{AddStep, Clip, CopyStep, DeleteStep, LinkStep, SelectStep};
-use crate::{EDGE_PAN, EditorWorld, Link, MoveRecord, NodeGraph};
+use crate::world::{AddStep, Clip, CopyStep, DeleteStep, LinkStep, RelinkStep, SelectStep};
+use crate::{EDGE_PAN, EditorWorld, Link, LinkPreview, MoveRecord, NodeGraph};
 
 /// The keymap context a node canvas's bindings live in.
 pub const CANVAS_CONTEXT: &str = "canvas";
@@ -831,20 +831,36 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddLinkOp {
     }
 }
 
-/// Drags a link out of a port and drops it on another node's port.
+/// Drags a link out of a port and drops it on another node's port — or takes one off a
+/// port and drops it elsewhere, as Blender's `node.link` does (`node_link_init`).
 ///
 /// Modal, started by a drag that began on a port (bound ahead of `node.move`, whose poll
-/// would otherwise take the press, since a port is part of its node). While it runs it
-/// asks the driver to pick on every move (`EditorWorld::track_hover`) — the pointer is the
-/// operator's, the canvas below sees no events and publishes no hover — and leaves the
-/// curve to draw in `EditorWorld::link_preview`. On release over a port of the other side
-/// of another node, the link goes into the graph through the same path `link.add` takes,
-/// undo step included; anywhere else nothing happens. `Escape` or the other button
-/// cancels.
+/// would otherwise take the press, since a port is part of its node). What it carries
+/// depends on where it started:
+///
+/// * **An input with a link** — the link comes off the input and its input end follows the pointer, from the output it
+///   still leaves. The last of them, if the graph lets an input take several.
+/// * **An output with links, and `detach`** (`Ctrl` in the default keymap) — every link of the output comes off, and
+///   their output ends follow the pointer together.
+/// * **Anything else** — a new link out of the port.
+///
+/// While it runs it asks the driver to pick on every move (`EditorWorld::track_hover`) —
+/// the pointer is the operator's, the canvas below sees no events and publishes no hover —
+/// and leaves the curves in `EditorWorld::link_preview`, with the graph's answer
+/// ([`NodeGraph::accepts_link`]) for the port under the pointer, so a refusal shows before
+/// the release. Letting go on a port that takes them makes the links; anywhere else makes
+/// none, and a link that was taken off stays off — one step either way, through the same
+/// history as everything else. `Escape`, the other button, or the runtime cutting the
+/// gesture off puts back what was taken off and leaves no step.
 #[derive(Default)]
 pub struct LinkDragOp {
-    /// The port the drag started from: node, side, number, and where it is.
-    start: Option<(usize, PortSide, u16, Point)>,
+    /// The side the ends that stay put are on; the pointer's end goes to the other.
+    fixed: Option<PortSide>,
+    /// The ends that stay put, by node and port: one for a new link or a link taken off an
+    /// input, one per link for the links of an output.
+    anchors: Vec<(usize, u16)>,
+    /// The links taken off when the drag started, to be put back if it is cancelled.
+    detached: Vec<Link>,
 }
 
 impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
@@ -857,73 +873,45 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
-        let Some(CanvasHit::Port { index, side, port, pos }) = cx.world().hover else {
+        let Some(CanvasHit::Port { index, side, port, .. }) = cx.world().hover else {
             return OpResult::Cancelled;
         };
-        self.start = Some((index, side, port, pos));
-        let pointer = cx.world().pointer;
-        let world = cx.world_mut();
-        world.track_hover = true;
-        world.link_preview = Some(preview(side, pos, pointer));
-        world.dirty = true;
+        let detach = cx.props().bool("detach", false);
+        let taken = taken_off(&*cx.world().graph.borrow(), index, side, port, detach);
+        (self.fixed, self.anchors) = match (side, taken.first()) {
+            (PortSide::Input, Some(&link)) => (Some(PortSide::Output), vec![(link.from as usize, link.from_port)]),
+            (PortSide::Output, Some(_)) => (
+                Some(PortSide::Input),
+                taken.iter().map(|link| (link.to as usize, link.to_port)).collect(),
+            ),
+            (_, None) => (Some(side), vec![(index, port)]),
+        };
+        self.detached = taken;
+        for &link in &self.detached {
+            cx.world_mut().remove_link(link);
+        }
+        cx.world_mut().track_hover = true;
+        self.show(cx);
         OpResult::Running
     }
 
     fn modal(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
-        let Some((node, side, port, at)) = self.start else {
+        if self.fixed.is_none() {
             return OpResult::Cancelled;
-        };
+        }
         let event = cx.event().cloned();
         match event {
             Some(OpEvent::Move { .. }) => {
-                let pointer = cx.world().pointer;
-                // To the port under the pointer if it would take the link, so the curve
-                // shows where it will land; to the pointer otherwise.
-                let end = match cx.world().hover {
-                    Some(CanvasHit::Port {
-                        index,
-                        side: other,
-                        pos,
-                        ..
-                    }) if index != node && other != side => pos,
-                    _ => pointer,
-                };
-                let world = cx.world_mut();
-                world.link_preview = Some(preview(side, at, end));
-                world.dirty = true;
+                self.show(cx);
                 OpResult::Running
             },
             Some(OpEvent::Release {
                 button: PointerButton::Primary,
                 ..
-            }) => {
-                let target = cx.world().hover;
-                end_drag(cx);
-                let Some(CanvasHit::Port {
-                    index,
-                    side: other,
-                    port: other_port,
-                    ..
-                }) = target
-                else {
-                    return OpResult::Cancelled;
-                };
-                if index == node || other == side {
-                    return OpResult::Cancelled;
-                }
-                // Out of an output, into an input, whichever end the drag started from.
-                let link = match side {
-                    PortSide::Output => Link::between(node, port, index, other_port),
-                    PortSide::Input => Link::between(index, other_port, node, port),
-                };
-                if !cx.world_mut().add_link(link) {
-                    return OpResult::Cancelled;
-                }
-                cx.push_undo(Box::new(LinkStep { link, added: true }));
-                OpResult::Finished
-            },
-            // Cut off by the runtime, too: otherwise the curve stays on screen and every
-            // move goes on picking for an operator that is gone.
+            }) => self.let_go(cx),
+            // Cut off by the runtime, too: otherwise the curve stays on screen, every move
+            // goes on picking for an operator that is gone, and a link taken off stays off
+            // with nothing in the history to bring it back (§58).
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
@@ -935,6 +923,10 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
             })
             | None => {
                 end_drag(cx);
+                for link in std::mem::take(&mut self.detached) {
+                    cx.world_mut().add_link(link);
+                }
+                self.fixed = None;
                 OpResult::Cancelled
             },
             _ => OpResult::Running,
@@ -942,11 +934,172 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
     }
 }
 
-/// The preview of a link being dragged, from its output end to its input end.
-fn preview(side: PortSide, port: Point, other: Point) -> (Point, Point) {
+/// The links a link drag that starts on port `port` of `side` of node `index` takes off:
+/// the last link into an input, every link out of an output when `detach` asks — and none,
+/// for a drag that starts a new link.
+///
+/// Separate from the operator so that the rule has a name a test can call; the editor's
+/// light ([`port_hint`]) does not need it — a port lights whether a drag from it takes
+/// links off or draws a new one.
+pub(crate) fn taken_off<G: NodeGraph>(graph: &G, index: usize, side: PortSide, port: u16, detach: bool) -> Vec<Link> {
+    let mut on_port: Vec<Link> = graph
+        .links_of(index)
+        .into_iter()
+        .filter(|link| match side {
+            PortSide::Input => link.to as usize == index && link.to_port == port,
+            PortSide::Output => link.from as usize == index && link.from_port == port,
+        })
+        .collect();
     match side {
-        PortSide::Output => (port, other),
-        PortSide::Input => (other, port),
+        PortSide::Input => on_port.split_off(on_port.len().saturating_sub(1)),
+        PortSide::Output if detach => on_port,
+        PortSide::Output => Vec::new(),
+    }
+}
+
+/// The port under the pointer, if a press and drag from it with `mods` held would start a
+/// link drag — a new link out of it, or the links it would take off (`taken_off`) — which
+/// is what the editor lights up, as the canvas lights up the link under the pointer.
+///
+/// Asks the keymap rather than assuming: a port is lit only if some `link.drag` binding, on
+/// any button, matches a drag with `mods`. `None` while an operator runs — a link drag
+/// lights its own ends (`LinkPreview::source`, `LinkPreview::target`). Only `link.drag`
+/// bindings are read: a binding of another operator ahead of it for the same drag would be
+/// told apart by polls, which this does not run, because asking polls on every move would
+/// be counted as asking (`OpCounters::polled`).
+pub(crate) fn port_hint<G: NodeGraph>(
+    runtime: &OpRuntime<EditorWorld<G>>,
+    world: &EditorWorld<G>,
+    mods: Modifiers,
+) -> Option<(usize, PortSide, u16)> {
+    if runtime.modal_depth() > 0 {
+        return None;
+    }
+    let Some(CanvasHit::Port { index, side, port, pos }) = world.hover else {
+        return None;
+    };
+    let drags = [
+        PointerButton::Primary,
+        PointerButton::Secondary,
+        PointerButton::Auxiliary,
+    ]
+    .map(|button| OpEvent::Drag {
+        button,
+        pos,
+        screen: pos,
+        mods,
+    });
+    runtime
+        .keymap()
+        .sections_for(Scope(&CANVAS_SCOPE))
+        .any(|binding| &*binding.op == "link.drag" && drags.iter().any(|drag| binding.pattern.matches(drag)))
+        .then_some((index, side, port))
+}
+
+/// A port by node, side and number, and where it is in canvas coordinates.
+type PortAt = (usize, PortSide, u16, Point);
+
+impl LinkDragOp {
+    /// The links the drag would make on the port under the pointer, if it is one they can
+    /// go to: the other side from the anchors, on another node than each anchor's.
+    ///
+    /// Empty when the pointer is not on such a port. An anchor on the hovered node is left
+    /// out rather than refusing the lot, as Blender skips it.
+    fn targets<G: NodeGraph>(&self, world: &EditorWorld<G>) -> (Vec<Link>, Option<PortAt>) {
+        let (Some(fixed), Some(CanvasHit::Port { index, side, port, pos })) = (self.fixed, world.hover) else {
+            return (Vec::new(), None);
+        };
+        if side == fixed {
+            return (Vec::new(), None);
+        }
+        let links: Vec<Link> = self
+            .anchors
+            .iter()
+            .filter(|&&(node, _)| node != index)
+            .map(|&(node, anchor)| match fixed {
+                PortSide::Output => Link::between(node, anchor, index, port),
+                PortSide::Input => Link::between(index, port, node, anchor),
+            })
+            .collect();
+        let at = (!links.is_empty()).then_some((index, side, port, pos));
+        (links, at)
+    }
+
+    /// Puts the curves in the world: from each anchor to the port under the pointer if
+    /// the links could go there, to the pointer otherwise — with the graph's answer.
+    fn show<G: NodeGraph>(&self, cx: &mut OpCtx<'_, EditorWorld<G>>) {
+        let Some(fixed) = self.fixed else {
+            return;
+        };
+        let world = cx.world();
+        let (links, at) = self.targets(world);
+        let refused = {
+            let graph = world.graph.borrow();
+            links.iter().any(|&link| !graph.accepts_link(link))
+        };
+        let end = at.map_or(world.pointer, |(.., pos)| pos);
+        let target = at.map(|(index, side, port, _)| (index, side, port));
+        let curves = {
+            let graph = world.graph.borrow();
+            self.anchors
+                .iter()
+                .map(|&(node, port)| {
+                    let anchor = world.ports.position(graph.node_rect(node), fixed, port);
+                    match fixed {
+                        PortSide::Output => (anchor, end),
+                        PortSide::Input => (end, anchor),
+                    }
+                })
+                .collect()
+        };
+        // A new link has one anchor, the port it is drawn out of.
+        let source = match (self.detached.is_empty(), self.anchors.as_slice()) {
+            (true, &[(node, port)]) => Some((node, fixed, port)),
+            _ => None,
+        };
+        let world = cx.world_mut();
+        world.link_preview = Some(LinkPreview {
+            curves,
+            target,
+            source,
+            refused,
+        });
+        world.dirty = true;
+    }
+
+    /// Lets go: makes the links on a port that takes them, and records what changed.
+    fn let_go<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let (mut links, _) = self.targets(cx.world());
+        if links.iter().any(|&link| !cx.world().graph.borrow().accepts_link(link)) {
+            links.clear();
+        }
+        end_drag(cx);
+        self.fixed = None;
+        let mut removed = std::mem::take(&mut self.detached);
+        let mut added: Vec<Link> = links
+            .into_iter()
+            .filter(|&link| cx.world_mut().add_link(link))
+            .collect();
+        // A link dropped back where it came from is no change, and in neither list.
+        added.retain(|link| match removed.iter().position(|old| old == link) {
+            Some(at) => {
+                removed.swap_remove(at);
+                false
+            },
+            None => true,
+        });
+        match (removed.is_empty(), added.as_slice()) {
+            (true, []) => OpResult::Cancelled,
+            // A new link, as `link.add` records one.
+            (true, &[link]) => {
+                cx.push_undo(Box::new(LinkStep { link, added: true }));
+                OpResult::Finished
+            },
+            _ => {
+                cx.push_undo(Box::new(RelinkStep { removed, added }));
+                OpResult::Finished
+            },
+        }
     }
 }
 
@@ -1061,6 +1214,13 @@ pub fn default_keymap() -> Keymap {
             // Blender does not scroll either.
             Binding::new(Pattern::drag(PointerButton::Primary), "link.drag")
                 .with_props(Props::new().with_bool(EDGE_PAN, true)),
+            // `Ctrl`-drag on an output takes all its links off and carries them, as
+            // Blender's `node.link` with `detach`. On an input a plain drag already does.
+            Binding::new(
+                Pattern::drag(PointerButton::Primary).with_mods(Modifiers::CONTROL),
+                "link.drag",
+            )
+            .with_props(Props::new().with_bool("detach", true).with_bool(EDGE_PAN, true)),
             Binding::new(Pattern::drag(PointerButton::Primary), "node.move")
                 .with_props(Props::new().with_bool(EDGE_PAN, true)),
             Binding::new(Pattern::drag(PointerButton::Primary), "view.pan"),

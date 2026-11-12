@@ -55,7 +55,7 @@ pub use crate::edge_pan::{EDGE_PAN, EdgePan, EdgePanCounters};
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
 pub use crate::menu::{Menu, MenuItem, MenuLayer, MenuOp};
 pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};
-pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, Removed, journal};
+pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, LinkPreview, MoveRecord, MoveRecorder, Removed, journal};
 
 /// The class a selected node wears (`CanvasLayer::set_node_class`).
 ///
@@ -126,6 +126,27 @@ pub trait NodeGraph: 'static {
     /// Adds a link. `false` if the graph refused it — an end that does not exist, or a
     /// link that is already there.
     fn insert_link(&mut self, link: Link) -> bool;
+
+    /// Whether `link` may be made at all: whether its two ports go together.
+    ///
+    /// Asked **while a link is being dragged**, for the port under the pointer only, so
+    /// the refusal shows before the button comes up (`link.drag` draws the curve in
+    /// [`OverlayStyle::refused`](crate::OverlayStyle::refused)), and asked again on the
+    /// release; a link it refuses is not offered to [`insert_link`](Self::insert_link).
+    /// A question to the graph rather than to the canvas's `NodeSource`, because what a
+    /// port takes follows from what its node is — the graph's
+    /// [`Content`](Self::Content) — and because it is one rule for every view of the
+    /// graph, not a matter of how one of them draws it.
+    ///
+    /// Defaulted, unlike everything here that carries what a node is (§42): "every link
+    /// goes" is what a graph without port types means and what the editor did before the
+    /// question existed. A typed graph that forgets it loses the warning, not the rule —
+    /// [`insert_link`](Self::insert_link) still has the last word, and a link that is
+    /// already there is refused there, not here.
+    fn accepts_link(&self, link: Link) -> bool {
+        let _ = link;
+        true
+    }
 
     /// Removes a link, in either direction.
     fn remove_link(&mut self, link: Link);
