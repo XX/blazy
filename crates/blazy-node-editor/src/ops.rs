@@ -203,12 +203,14 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for BoxSelectOp {
                 finish_box(cx, rect);
                 OpResult::Finished
             },
-            // Escape, or the other button: both mean "not this".
+            // Escape, or the other button: both mean "not this". So does no event at all —
+            // the runtime cutting the gesture off — or the band stays on screen.
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
                 ..
-            }) => {
+            })
+            | None => {
                 cx.world_mut().band = None;
                 cx.world_mut().dirty = true;
                 OpResult::Cancelled
@@ -493,6 +495,11 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for PanOp {
                 cx.world_mut().pan -= self.total;
                 OpResult::Cancelled
             },
+            // Cut off by the runtime: the view stays where it was taken, unlike `Escape`.
+            // A view is not the graph and has no history (§30), so leaving it moved is
+            // neither a trace nor a change nobody can undo — and a view that jumps back
+            // when the window loses focus is a surprise, not a cancel.
+            None => OpResult::Finished,
             _ => OpResult::Running,
         }
     }
@@ -915,6 +922,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
                 cx.push_undo(Box::new(LinkStep { link, added: true }));
                 OpResult::Finished
             },
+            // Cut off by the runtime, too: otherwise the curve stays on screen and every
+            // move goes on picking for an operator that is gone.
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
@@ -923,7 +932,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
             | Some(OpEvent::Press {
                 button: PointerButton::Secondary,
                 ..
-            }) => {
+            })
+            | None => {
                 end_drag(cx);
                 OpResult::Cancelled
             },

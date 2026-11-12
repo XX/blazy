@@ -144,6 +144,14 @@ pub trait Operator<W> {
     ///
     /// The event is in `cx.event()`. Returning [`OpResult::Running`] keeps the
     /// operator on the stack; anything else takes it off.
+    ///
+    /// **No event at all means the gesture was cut off** — the window lost focus, the
+    /// driver is going away ([`OpRuntime::cancel_all`](runtime::OpRuntime::cancel_all)).
+    /// The operator is off the stack whatever it answers, and this call is its one chance
+    /// to leave the world either as it found it or recorded in the history: a preview, a
+    /// band or a half-made change it leaves behind stays there. Answering `Running`, as an
+    /// unknown event is usually answered, is the mistake, and the runtime counts it
+    /// ([`OpCounters::cut_off_running`]).
     fn modal(&mut self, cx: &mut OpCtx<'_, W>) -> OpResult {
         let _ = cx;
         OpResult::Finished
@@ -180,6 +188,15 @@ pub struct OpCounters {
     pub modal_finishes: u64,
     /// Modal operators that were cancelled.
     pub modal_cancels: u64,
+    /// Operators cut off by [`OpRuntime::cancel_all`](runtime::OpRuntime::cancel_all)
+    /// that answered as if the gesture went on.
+    ///
+    /// The miss that looks like nothing: an operator that answers the missing event
+    /// `Running` or `PassThrough` has not cleaned up, and is taken off the stack anyway,
+    /// so whatever it was showing or holding stays. Zero when every operator honours
+    /// [`Operator::modal`]'s rule; a number rather than an assertion because the
+    /// operators are the application's as well as ours.
+    pub cut_off_running: u64,
     /// Events a modal operator deliberately let past.
     pub passthrough: u64,
     /// Events that reached the widget tree before the runtime, while a modal operator

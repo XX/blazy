@@ -416,6 +416,14 @@ between two deleted nodes is refused while its other end is still gone; and `nod
 runs the grab itself (`MoveOp::follow`) so that `Shift+D` plus the move is **one** undo step.
 A modal operator handed no event is being cancelled (`cancel_all`), not asked to go on.
 
+**A modal operator cut off cleans up in `modal(None)` (§58).** `cancel_all` takes it off the
+stack whatever it answers, so that call is its only chance: leave the world as it found it or
+recorded in the history, and no band, preview or `track_hover` behind. `_ => Running` swallows
+`None` — write the `None` arm explicitly. `OpCounters::cut_off_running` counts operators that
+forget; `every_modal_operator_cut_off_leaves_nothing_behind` walks `OpRuntime::operators()` and
+fails on a name it does not know, so **a new operator has to be added to its `start` table**,
+modal or not. `view.pan` keeps the view on a cut-off (no history, §30), unlike `Escape`.
+
 **An operator never touches a widget (§38.3).** It changes the model and lists what
 moved — or, for a view operator like `view.pan`, how far the view should move; the
 driver carries that into its own canvas and into the graph's other views.

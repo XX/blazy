@@ -244,6 +244,15 @@ impl<W> OpRuntime<W> {
         }
     }
 
+    /// The names of every registered operator, in the order they were first registered.
+    ///
+    /// For a check that has to reach every operator — that each one cut off cleans up
+    /// after itself, say — and should fail when a new one arrives rather than pass
+    /// without it.
+    pub fn operators(&self) -> &[&'static str] {
+        &self.names
+    }
+
     /// Where an operator sits in the registry, if it is registered at all.
     fn index_of(&self, name: &str) -> Option<usize> {
         self.by_name.get(name).copied()
@@ -636,6 +645,10 @@ impl<W> OpRuntime<W> {
     ///
     /// What a window losing focus, or a driver being torn down, has to do: a modal
     /// stack with no way to empty it is a hang with extra steps.
+    ///
+    /// Each operator hears it as [`Operator::modal`] with no event, and has to clean up
+    /// there; one that answers as if it went on is counted
+    /// ([`OpCounters::cut_off_running`](crate::OpCounters::cut_off_running)).
     pub fn cancel_all(&mut self, world: &mut W) {
         while let Some(modal) = self.stack.pop() {
             let props = modal.props;
@@ -647,10 +660,12 @@ impl<W> OpRuntime<W> {
                 scope: &[],
                 undo: &mut self.undo,
             };
-            let _ = op.modal(&mut cx);
             // Whatever it answers, it is off the stack: this is the caller saying the
             // gesture is over, not the operator being asked whether it would like to
             // continue.
+            if matches!(op.modal(&mut cx), OpResult::Running | OpResult::PassThrough) {
+                self.counters.cut_off_running += 1;
+            }
             self.ops[modal.op] = Some(op);
             self.counters.modal_cancels += 1;
         }
@@ -1274,6 +1289,41 @@ mod tests {
         runtime.cancel_all(&mut world);
         assert_eq!(runtime.modal_depth(), 0);
         assert_eq!(runtime.counters().modal_cancels, 1);
+    }
+
+    /// An operator cut off that answers as if it went on has cleaned up nothing, and is
+    /// counted; one that ends on the missing event is not.
+    #[test]
+    fn an_operator_that_goes_on_when_cut_off_is_counted() {
+        /// Ends on a release, and on being cut off.
+        struct Tidy;
+        impl Operator<World> for Tidy {
+            fn name(&self) -> &'static str {
+                "test.grab"
+            }
+            fn invoke(&mut self, _cx: &mut OpCtx<'_, World>) -> OpResult {
+                OpResult::Running
+            }
+            fn modal(&mut self, cx: &mut OpCtx<'_, World>) -> OpResult {
+                match cx.event() {
+                    Some(OpEvent::Release { .. }) | None => OpResult::Cancelled,
+                    _ => OpResult::Running,
+                }
+            }
+        }
+
+        let mut runtime = runtime();
+        let mut world = World::default();
+        runtime.dispatch(&mut world, &press(), SCOPE, Seat::Tree);
+        runtime.cancel_all(&mut world);
+        assert_eq!(runtime.counters().cut_off_running, 1, "`Grab` answers `Running`");
+
+        runtime.register(Tidy);
+        runtime.dispatch(&mut world, &press(), SCOPE, Seat::Tree);
+        assert_eq!(runtime.modal_depth(), 1);
+        runtime.cancel_all(&mut world);
+        assert_eq!(runtime.counters().cut_off_running, 1, "and `Tidy` does not");
+        assert_eq!(runtime.operators(), ["test.add", "test.grab"], "one name for both");
     }
 
     /// The keymap is data, so rebinding is data too — no operator changes.

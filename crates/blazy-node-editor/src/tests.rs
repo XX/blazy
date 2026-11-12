@@ -1440,9 +1440,9 @@ mod copies {
 
     /// Everything the graph holds, as a value: each live node's name, rectangle and number,
     /// and the links as a set. What "undo returns the graph" is compared on.
-    type State = (Vec<(usize, Rect, u32)>, BTreeSet<(u32, u16, u32, u16)>);
+    pub(super) type State = (Vec<(usize, Rect, u32)>, BTreeSet<(u32, u16, u32, u16)>);
 
-    fn state(graph: &SharedGraph<Row>) -> State {
+    pub(super) fn state(graph: &SharedGraph<Row>) -> State {
         let graph = graph.borrow();
         let nodes = (0..graph.rects.len())
             .filter_map(|i| graph.rects[i].map(|rect| (i, rect, graph.values[i])))
@@ -1457,7 +1457,7 @@ mod copies {
 
     /// Four nodes in a row, `0 → 1 → 2`, with 0 and 1 selected: a link inside the
     /// selection and one leaving it.
-    fn linked() -> (SharedGraph<Row>, OpRuntime<EditorWorld<Row>>, EditorWorld<Row>) {
+    pub(super) fn linked() -> (SharedGraph<Row>, OpRuntime<EditorWorld<Row>>, EditorWorld<Row>) {
         let graph = row(4);
         let mut runtime = crate::ops::runtime();
         let mut world = EditorWorld::new(&graph);
@@ -1472,7 +1472,12 @@ mod copies {
         (graph, runtime, world)
     }
 
-    fn key(runtime: &mut OpRuntime<EditorWorld<Row>>, world: &mut EditorWorld<Row>, key: &str, mods: Modifiers) {
+    pub(super) fn key(
+        runtime: &mut OpRuntime<EditorWorld<Row>>,
+        world: &mut EditorWorld<Row>,
+        key: &str,
+        mods: Modifiers,
+    ) {
         let event = OpEvent::Key {
             key: Key::Character(key.into()),
             mods,
@@ -1481,7 +1486,7 @@ mod copies {
         let _ = runtime.dispatch(world, &event, Scope(&CANVAS_SCOPE), Seat::Tree);
     }
 
-    fn move_to(runtime: &mut OpRuntime<EditorWorld<Row>>, world: &mut EditorWorld<Row>, pos: Point) {
+    pub(super) fn move_to(runtime: &mut OpRuntime<EditorWorld<Row>>, world: &mut EditorWorld<Row>, pos: Point) {
         world.pointer = pos;
         world.pointer_screen = pos;
         let event = OpEvent::Move {
@@ -1635,5 +1640,154 @@ mod copies {
         assert_eq!(graph.borrow().node_count(), 2);
         assert_eq!(runtime.history_mut().undo(&mut world), Some("node.delete"));
         assert_eq!(state(&graph), before);
+    }
+}
+
+// --- MARK: CUT OFF (`issues/modal operators cut off without an event.md`)
+
+mod cut_off {
+    use blazy_canvas::{CanvasHit, PortSide};
+    use blazy_ops::event::OpEvent;
+    use blazy_ops::keymap::Scope;
+    use blazy_ops::runtime::{OpRuntime, Seat};
+    use masonry::core::keyboard::Modifiers;
+    use masonry::kurbo::{Point, Vec2};
+    use masonry::ui_events::pointer::PointerButton;
+
+    use super::Row;
+    use super::copies::{key, linked, move_to, state};
+    use crate::EditorWorld;
+    use crate::ops::CANVAS_SCOPE;
+
+    type Runtime = OpRuntime<EditorWorld<Row>>;
+    /// What takes an operator from nothing to the middle of its gesture.
+    type Begin = fn(&mut Runtime, &mut EditorWorld<Row>);
+
+    fn send(runtime: &mut Runtime, world: &mut EditorWorld<Row>, event: &OpEvent) {
+        let _ = runtime.dispatch(world, event, Scope(&CANVAS_SCOPE), Seat::Tree);
+    }
+
+    /// A drag that began at `at`, as the runtime hands one on once it is decided.
+    fn drag(button: PointerButton, at: Point) -> OpEvent {
+        OpEvent::Drag {
+            button,
+            pos: at,
+            screen: at,
+            mods: Modifiers::empty(),
+        }
+    }
+
+    /// How each modal operator is started and taken somewhere, and whether it is recorded
+    /// when cut off (`true`) or leaves the graph as it found it (`false`). `None` for an
+    /// operator that is never modal.
+    ///
+    /// Keyed by the registry's names, and the test fails on a name this does not know: a
+    /// new operator has to be put here, modal or not, before it passes.
+    fn start(name: &str) -> Option<(Begin, bool)> {
+        Some(match name {
+            "node.box_select" => (
+                |runtime, world| {
+                    key(runtime, world, "b", Modifiers::empty());
+                    let press = OpEvent::Press {
+                        button: PointerButton::Primary,
+                        pos: world.pointer,
+                        mods: Modifiers::empty(),
+                    };
+                    send(runtime, world, &press);
+                    move_to(runtime, world, Point::new(300.0, 200.0));
+                    assert!(world.band.is_some(), "the band is showing");
+                },
+                false,
+            ),
+            "node.move" => (
+                |runtime, world| {
+                    key(runtime, world, "g", Modifiers::empty());
+                    move_to(runtime, world, Point::new(50.0, 70.0));
+                },
+                false,
+            ),
+            "node.duplicate" => (
+                |runtime, world| {
+                    key(runtime, world, "d", Modifiers::SHIFT);
+                    move_to(runtime, world, Point::new(50.0, 70.0));
+                },
+                // The duplicate happened; only the move is cut off (§57).
+                true,
+            ),
+            "view.pan" => (
+                |runtime, world| {
+                    world.hover = None;
+                    send(runtime, world, &drag(PointerButton::Primary, world.pointer));
+                    move_to(runtime, world, Point::new(40.0, 30.0));
+                    assert_ne!(world.pan, Vec2::ZERO, "the view moved");
+                },
+                false,
+            ),
+            "link.drag" => (
+                |runtime, world| {
+                    world.hover = Some(CanvasHit::Port {
+                        index: 0,
+                        side: PortSide::Output,
+                        port: 0,
+                        pos: world.pointer,
+                    });
+                    send(runtime, world, &drag(PointerButton::Primary, world.pointer));
+                    move_to(runtime, world, Point::new(300.0, 200.0));
+                    assert!(world.link_preview.is_some(), "the curve is showing");
+                },
+                false,
+            ),
+            "node.select" | "view.zoom" | "menu.node" | "node.add" | "node.delete" | "node.copy" | "node.paste"
+            | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
+            other => panic!("`{other}` is not classified: modal or not, put it in `start`"),
+        })
+    }
+
+    /// Every modal operator of the editor, cut off mid-gesture — the window lost focus —
+    /// ends, says so, and leaves nothing behind: no band, no curve, no pick on every move,
+    /// and a graph that is either as it was or recorded in one step.
+    ///
+    /// `link.drag` and `node.box_select` used to answer the missing event as they answer
+    /// every unknown one — keep going — and their curve and band stayed on screen; `node.move`
+    /// did the same until §57.
+    #[test]
+    fn every_modal_operator_cut_off_leaves_nothing_behind() {
+        let names = crate::ops::runtime::<Row>().operators().to_vec();
+        let mut modal = 0;
+        for name in names {
+            let Some((begin, recorded)) = start(name) else {
+                continue;
+            };
+            modal += 1;
+            let (graph, mut runtime, mut world) = linked();
+            move_to(&mut runtime, &mut world, Point::new(10.0, 10.0));
+            let before = state(&graph);
+            let depth = runtime.history().depth();
+            begin(&mut runtime, &mut world);
+            assert_eq!(runtime.modal_name(), Some(name), "{name} is running");
+
+            runtime.cancel_all(&mut world);
+            assert_eq!(runtime.modal_depth(), 0);
+            assert_eq!(
+                runtime.counters().cut_off_running,
+                0,
+                "{name} answered as if it went on"
+            );
+            assert_eq!(world.band, None, "{name} left a band");
+            assert_eq!(world.link_preview, None, "{name} left a curve");
+            assert!(!world.track_hover, "{name} left the pick on every move");
+            if name == "view.pan" {
+                // Not a trace: the view has no history, and one that jumps back when the
+                // window loses focus is a surprise (`PanOp::modal`).
+                assert_ne!(world.pan, Vec2::ZERO, "a pan cut off keeps the view where it went");
+            }
+            if recorded {
+                assert_eq!(runtime.history().depth(), depth + 1, "{name} recorded what it did");
+            } else {
+                assert_eq!(state(&graph), before, "{name} left the graph changed");
+                assert_eq!(runtime.history().depth(), depth, "{name} wrote a step");
+            }
+        }
+        assert_eq!(modal, 5, "every modal operator was reached");
     }
 }
