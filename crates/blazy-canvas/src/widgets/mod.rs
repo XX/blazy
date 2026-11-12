@@ -544,13 +544,27 @@ impl CanvasContent {
     /// model is the truth (§30), a name is part of the truth, and this array is a mirror
     /// of it. A name a removal freed is handed out again by whoever owns the model; a
     /// name beyond the end grows the mirror with holes in between.
+    ///
+    /// A name that is alive already is the same insertion delivered again — the push and
+    /// then the pull of a window (`blazy_node_editor::Views`) — and only its geometry is
+    /// taken. Replacing the slot dropped its widget without taking it out of `live`, so
+    /// the cull saw nothing to build and the node was counted and drawn nowhere.
     fn insert_node(&mut self, index: usize, pos: Point, size: Size) -> Invalidate {
+        if self.live_slot(index).is_some() {
+            if self.slots[index].size == size {
+                return self.store_child_pos(index, pos);
+            }
+            self.slots[index].size = size;
+            self.index
+                .insert(index, Rect::from_origin_size(self.slots[index].pos, size));
+            self.structure_changed();
+            let _ = self.store_child_pos(index, pos);
+            return Invalidate::LayoutAndPaint;
+        }
         if self.slots.len() <= index {
             self.slots.resize_with(index + 1, || EMPTY_SLOT);
         }
-        if !self.slots[index].alive {
-            self.alive_nodes += 1;
-        }
+        self.alive_nodes += 1;
         self.slots[index] = Slot {
             alive: true,
             pos,

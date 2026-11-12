@@ -20,14 +20,17 @@ use masonry::widgets::Label;
 
 use crate::{EditorWorld, Link, MoveRecord, NodeEditor, NodeGraph, SharedGraph, Views};
 
-/// The smallest graph the seam allows: rectangles in a row, its links, and the views
-/// showing it.
+/// The smallest graph the seam allows: rectangles in a row, a number in each, its links,
+/// and the views showing it.
 ///
 /// Names are indices with holes, and the holes are handed out again before fresh names
-/// — the free list of §41.2, which is what `insert_node` asks an application for.
+/// — the free list of §41.2, which is what `insert_node` asks an application for. A
+/// removed node's number is wiped with its rectangle, so whatever brings it back has to
+/// have kept it.
 #[derive(Default)]
 struct Row {
     rects: Vec<Option<Rect>>,
+    values: Vec<u32>,
     free: Vec<usize>,
     links: Vec<Link>,
     views: Views,
@@ -53,26 +56,19 @@ impl NodeGraph for Row {
     }
 
     fn insert_node(&mut self, rect: Rect) -> usize {
-        match self.free.pop() {
-            Some(index) => {
-                self.rects[index] = Some(rect);
-                index
-            },
-            None => {
-                self.rects.push(Some(rect));
-                self.rects.len() - 1
-            },
-        }
+        self.insert_copy(rect, 0)
     }
 
-    fn restore_node(&mut self, index: usize, rect: Rect) {
+    fn restore_node(&mut self, index: usize, rect: Rect, value: u32) {
         if self.rects.len() <= index {
             self.rects.resize(index + 1, None);
+            self.values.resize(index + 1, 0);
         }
         if let Some(at) = self.free.iter().position(|&free| free == index) {
             self.free.swap_remove(at);
         }
         self.rects[index] = Some(rect);
+        self.values[index] = value;
     }
 
     fn remove_node(&mut self, index: usize) -> Vec<Link> {
@@ -80,6 +76,7 @@ impl NodeGraph for Row {
             return Vec::new();
         }
         self.rects[index] = None;
+        self.values[index] = 0;
         self.free.push(index);
         let (gone, kept): (Vec<Link>, Vec<Link>) = self
             .links
@@ -104,6 +101,32 @@ impl NodeGraph for Row {
     fn remove_link(&mut self, link: Link) {
         self.links.retain(|&other| !same_link(other, link));
     }
+
+    type Content = u32;
+
+    fn content(&self, index: usize) -> u32 {
+        self.values[index]
+    }
+
+    fn insert_copy(&mut self, rect: Rect, value: u32) -> usize {
+        match self.free.pop() {
+            Some(index) => {
+                self.rects[index] = Some(rect);
+                self.values[index] = value;
+                index
+            },
+            None => {
+                self.rects.push(Some(rect));
+                self.values.push(value);
+                self.rects.len() - 1
+            },
+        }
+    }
+
+    fn links_of(&self, index: usize) -> Vec<Link> {
+        let ends_here = |link: &&Link| link.from as usize == index || link.to as usize == index;
+        self.links.iter().filter(ends_here).copied().collect()
+    }
 }
 
 /// Two links are the same link whichever way round they are written.
@@ -119,6 +142,7 @@ fn row(count: usize) -> SharedGraph<Row> {
         .collect();
     Rc::new(RefCell::new(Row {
         rects,
+        values: (0..count as u32).map(|i| 100 + i).collect(),
         ..Row::default()
     }))
 }
@@ -411,6 +435,14 @@ fn a_new_widget_over_the_same_session_keeps_the_view_the_selection_and_the_histo
 
 /// A harness over a fresh canvas and an existing session.
 fn editor_harness(graph: &SharedGraph<Row>, session: &crate::SessionHandle<Row>) -> TestHarness<NodeEditor<Row>> {
+    editor_harness_sized(graph, session, PhysicalSize::new(800, 400))
+}
+
+fn editor_harness_sized(
+    graph: &SharedGraph<Row>,
+    session: &crate::SessionHandle<Row>,
+    size: PhysicalSize<u32>,
+) -> TestHarness<NodeEditor<Row>> {
     let geometry = {
         let graph = graph.clone();
         move |index: usize| {
@@ -423,7 +455,7 @@ fn editor_harness(graph: &SharedGraph<Row>, session: &crate::SessionHandle<Row>)
     let mut harness = TestHarness::create_with_size(
         default_property_set(),
         NewWidget::new(NodeEditor::with_session(canvas, session.clone())),
-        PhysicalSize::new(800, 400),
+        size,
     );
     let _ = harness.redraw();
     harness
@@ -1086,6 +1118,10 @@ mod menus {
 }
 
 /// A menu opened near the bottom-right corner is moved inside the window.
+///
+/// In a window the menu fits: moving it in is all the editor does, and a menu taller than
+/// its window is cut off — the editor's own menu grew past 400 px with the copy entries
+/// (§57.6).
 #[test]
 fn a_menu_opened_by_the_edge_stays_inside_the_window() {
     use masonry::core::TextEvent;
@@ -1093,10 +1129,10 @@ fn a_menu_opened_by_the_edge_stays_inside_the_window() {
     use masonry::kurbo::Point;
     let graph = row(3);
     let session = crate::EditorSession::new(&graph).share();
-    let mut harness = editor_harness(&graph, &session);
+    let mut harness = editor_harness_sized(&graph, &session, PhysicalSize::new(800, 600));
     let editor = harness.root_widget().ctx().widget_id();
     harness.set_focus_fallback(Some(editor));
-    harness.mouse_move(Point::new(790.0, 390.0));
+    harness.mouse_move(Point::new(790.0, 590.0));
     harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
         state: KeyState::Down,
         key: Key::Character("w".into()),
@@ -1111,7 +1147,7 @@ fn a_menu_opened_by_the_edge_stays_inside_the_window() {
     let size = widget.ctx().border_box().size();
     assert!(origin.x >= 0.0 && origin.y >= 0.0, "{origin:?}");
     assert!(origin.x + size.width <= 800.0 + 1e-9, "{origin:?} {size:?}");
-    assert!(origin.y + size.height <= 400.0 + 1e-9, "{origin:?} {size:?}");
+    assert!(origin.y + size.height <= 600.0 + 1e-9, "{origin:?} {size:?}");
 }
 
 mod link_drag {
@@ -1385,4 +1421,219 @@ fn a_cancelled_gesture_puts_the_view_back() {
     hold_still(&mut harness);
     assert_eq!(harness.root_widget().edge_pan_counters().frames, frames);
     harness.mouse_button_release(Some(masonry::core::PointerButton::Primary));
+}
+
+// --- MARK: COPIES (§57)
+
+mod copies {
+    use std::collections::BTreeSet;
+
+    use blazy_ops::event::OpEvent;
+    use blazy_ops::keymap::{Props, Scope};
+    use blazy_ops::runtime::{OpRuntime, Seat};
+    use masonry::core::keyboard::{Key, Modifiers};
+    use masonry::kurbo::{Point, Rect};
+
+    use super::{Row, row};
+    use crate::ops::CANVAS_SCOPE;
+    use crate::{EditorWorld, Link, NodeGraph, SharedGraph};
+
+    /// Everything the graph holds, as a value: each live node's name, rectangle and number,
+    /// and the links as a set. What "undo returns the graph" is compared on.
+    type State = (Vec<(usize, Rect, u32)>, BTreeSet<(u32, u16, u32, u16)>);
+
+    fn state(graph: &SharedGraph<Row>) -> State {
+        let graph = graph.borrow();
+        let nodes = (0..graph.rects.len())
+            .filter_map(|i| graph.rects[i].map(|rect| (i, rect, graph.values[i])))
+            .collect();
+        let links = graph
+            .links
+            .iter()
+            .map(|l| (l.from, l.from_port, l.to, l.to_port))
+            .collect();
+        (nodes, links)
+    }
+
+    /// Four nodes in a row, `0 → 1 → 2`, with 0 and 1 selected: a link inside the
+    /// selection and one leaving it.
+    fn linked() -> (SharedGraph<Row>, OpRuntime<EditorWorld<Row>>, EditorWorld<Row>) {
+        let graph = row(4);
+        let mut runtime = crate::ops::runtime();
+        let mut world = EditorWorld::new(&graph);
+        for (from, to) in [(0, 1), (1, 2)] {
+            let link = Props::new().with_int("from", from).with_int("to", to);
+            assert_eq!(
+                runtime.exec(&mut world, "link.add", &link),
+                blazy_ops::OpResult::Finished
+            );
+        }
+        world.select(BTreeSet::from([0, 1]));
+        (graph, runtime, world)
+    }
+
+    fn key(runtime: &mut OpRuntime<EditorWorld<Row>>, world: &mut EditorWorld<Row>, key: &str, mods: Modifiers) {
+        let event = OpEvent::Key {
+            key: Key::Character(key.into()),
+            mods,
+            down: true,
+        };
+        let _ = runtime.dispatch(world, &event, Scope(&CANVAS_SCOPE), Seat::Tree);
+    }
+
+    fn move_to(runtime: &mut OpRuntime<EditorWorld<Row>>, world: &mut EditorWorld<Row>, pos: Point) {
+        world.pointer = pos;
+        world.pointer_screen = pos;
+        let event = OpEvent::Move {
+            pos,
+            mods: Modifiers::empty(),
+        };
+        let _ = runtime.dispatch(world, &event, Scope(&CANVAS_SCOPE), Seat::Tree);
+    }
+
+    /// A duplicate of two linked nodes is two new nodes holding what they held, the link
+    /// between them and not the one leaving them, selected — one step, which undo takes
+    /// back to the graph exactly as it was and redo brings back exactly as it came.
+    #[test]
+    fn a_duplicate_copies_contents_and_the_links_between_in_one_step() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+
+        let offset = Props::new().with_float("dx", 0.0).with_float("dy", 200.0);
+        assert_eq!(
+            runtime.exec(&mut world, "node.duplicate", &offset),
+            blazy_ops::OpResult::Finished
+        );
+        assert_eq!(runtime.history().depth(), depth + 1, "one step for the lot");
+        let after = state(&graph);
+        let rect = |i: usize| graph.borrow().node_rect(i);
+        assert_eq!(graph.borrow().node_count(), 6);
+        assert_eq!(
+            graph.borrow().values[4..],
+            [100, 101],
+            "the copies hold what they copied"
+        );
+        assert_eq!(rect(4), rect(0) + masonry::kurbo::Vec2::new(0.0, 200.0));
+        assert!(
+            graph.borrow().links.contains(&Link::new(4, 5)),
+            "the link between them came"
+        );
+        assert_eq!(graph.borrow().links.len(), 3, "and the one leaving them did not");
+        assert_eq!(world.selection(), BTreeSet::from([4, 5]), "the copies are selected");
+
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("node.duplicate"));
+        assert_eq!(state(&graph), before, "undo is the graph as it was");
+        assert_eq!(world.selection(), BTreeSet::from([0, 1]), "with its selection");
+        assert_eq!(runtime.history_mut().redo(&mut world), Some("node.duplicate"));
+        assert_eq!(state(&graph), after, "redo is the graph as it came");
+    }
+
+    /// A copy pastes in another session over the graph — another area, or another window
+    /// — centred on that session's pointer, into that session's history.
+    #[test]
+    fn a_paste_lands_at_the_pointer_of_the_area_it_runs_in() {
+        let (graph, mut here, mut world) = linked();
+        let mut there = crate::ops::runtime();
+        let mut other = EditorWorld::new(&graph);
+        assert!(!there.poll(&mut other, "node.paste", &Props::new()).unwrap_or(true));
+
+        assert_eq!(
+            here.exec(&mut world, "node.copy", &Props::new()),
+            blazy_ops::OpResult::Finished
+        );
+        assert_eq!(graph.borrow().node_count(), 4, "a copy changes nothing");
+        let depth = here.history().depth();
+
+        let at = Point::new(1000.0, 500.0);
+        move_to(&mut there, &mut other, at);
+        key(&mut there, &mut other, "v", Modifiers::CONTROL);
+        assert_eq!(graph.borrow().node_count(), 6, "Ctrl+V pasted two nodes");
+        let pasted = graph.borrow().node_rect(4).union(graph.borrow().node_rect(5));
+        assert_eq!(pasted.center(), at, "centred on the pointer of the area that pasted");
+        assert!(graph.borrow().links.contains(&Link::new(4, 5)));
+        assert_eq!(there.history().depth(), 1, "the step is in the pasting area's history");
+        assert_eq!(here.history().depth(), depth, "and not in the copying one's");
+
+        // Again: the clipboard is not used up.
+        key(&mut there, &mut other, "v", Modifiers::CONTROL);
+        assert_eq!(graph.borrow().node_count(), 8);
+    }
+
+    /// `Shift+D` copies and grabs: the copies follow the pointer, a click puts them down,
+    /// and one undo takes back both halves. A grab cut off by the runtime — the window
+    /// lost focus — leaves the copies where they were made, with their step.
+    #[test]
+    fn shift_d_grabs_the_copies_and_one_undo_takes_back_both() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        let start = Point::new(10.0, 10.0);
+        move_to(&mut runtime, &mut world, start);
+        key(&mut runtime, &mut world, "d", Modifiers::SHIFT);
+        assert_eq!(runtime.modal_name(), Some("node.duplicate"));
+        move_to(&mut runtime, &mut world, start + masonry::kurbo::Vec2::new(30.0, 300.0));
+        let moved = graph.borrow().node_rect(0) + masonry::kurbo::Vec2::new(30.0, 300.0);
+        assert_eq!(graph.borrow().node_rect(4), moved, "the copy follows the pointer");
+        assert_eq!(runtime.history().depth(), 2, "nothing is written while it runs");
+
+        let press = OpEvent::Press {
+            button: masonry::ui_events::pointer::PointerButton::Primary,
+            pos: world.pointer,
+            mods: Modifiers::empty(),
+        };
+        let _ = runtime.dispatch(&mut world, &press, Scope(&CANVAS_SCOPE), Seat::Tree);
+        assert_eq!(runtime.modal_depth(), 0, "a click puts the copies down");
+        assert_eq!(runtime.history().depth(), 3, "in one step");
+        let placed = state(&graph);
+
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("node.duplicate"));
+        assert_eq!(state(&graph), before, "one undo takes back the copy and the move");
+        assert_eq!(runtime.history_mut().redo(&mut world), Some("node.duplicate"));
+        assert_eq!(state(&graph), placed, "and redo puts them where they were put down");
+
+        // Cut off: the copies stay, at the place they were made, and are undoable.
+        key(&mut runtime, &mut world, "d", Modifiers::SHIFT);
+        move_to(&mut runtime, &mut world, Point::new(400.0, 400.0));
+        runtime.cancel_all(&mut world);
+        assert_eq!(graph.borrow().node_count(), 8);
+        assert_eq!(graph.borrow().node_rect(6), graph.borrow().node_rect(4));
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("node.duplicate"));
+        assert_eq!(state(&graph), placed);
+    }
+
+    /// A grab the runtime cuts off puts the nodes back, as `Escape` does.
+    ///
+    /// It used to answer the missing event as it answers every unknown one — keep going —
+    /// and the window losing focus mid-drag left the nodes where the pointer had taken
+    /// them, with no step in the history to undo it by.
+    #[test]
+    fn a_grab_cut_off_puts_the_nodes_back() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        move_to(&mut runtime, &mut world, Point::ORIGIN);
+        key(&mut runtime, &mut world, "g", Modifiers::empty());
+        move_to(&mut runtime, &mut world, Point::new(50.0, 70.0));
+        assert_ne!(state(&graph), before);
+        runtime.cancel_all(&mut world);
+        assert_eq!(state(&graph), before);
+    }
+
+    /// Undoing a delete brings back what the nodes held and every link between them.
+    ///
+    /// Two defects the copies found: the content was left to the graph's slot — which one
+    /// example wiped, so a deleted node came back with its slider at the default — and the
+    /// nodes came back one at a time with their links, so a link between two deleted
+    /// nodes was offered while its other end was still gone, refused, and lost.
+    #[test]
+    fn an_undone_delete_brings_back_contents_and_the_links_between() {
+        let (graph, mut runtime, mut world) = linked();
+        let before = state(&graph);
+        assert_eq!(
+            runtime.exec(&mut world, "node.delete", &Props::new()),
+            blazy_ops::OpResult::Finished
+        );
+        assert_eq!(graph.borrow().node_count(), 2);
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("node.delete"));
+        assert_eq!(state(&graph), before);
+    }
 }

@@ -84,7 +84,7 @@ impl NodeGraph for Grid {
         }
     }
 
-    fn restore_node(&mut self, index: usize, rect: Rect) {
+    fn restore_node(&mut self, index: usize, rect: Rect, (): ()) {
         if self.rects.len() <= index {
             self.rects.resize(index + 1, None);
         }
@@ -113,6 +113,20 @@ impl NodeGraph for Grid {
 
     fn remove_link(&mut self, link: Link) {
         self.links.retain(|&l| l != link);
+    }
+
+    /// Nodes that hold nothing but their rectangle.
+    type Content = ();
+
+    fn content(&self, _index: usize) {}
+
+    fn insert_copy(&mut self, rect: Rect, (): ()) -> usize {
+        self.insert_node(rect)
+    }
+
+    fn links_of(&self, index: usize) -> Vec<Link> {
+        let ends_here = |link: &&Link| link.from as usize == index || link.to as usize == index;
+        self.links.iter().filter(ends_here).copied().collect()
     }
 }
 
@@ -958,4 +972,209 @@ fn a_screen_key_typed_into_a_text_field_is_text() {
     let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, alt_x());
     let _ = root.redraw();
     assert_eq!(areas(&mut root), 2, "outside a field the same key splits");
+}
+
+/// A key with modifiers, through the host's seat and the tree as the loop delivers it.
+fn chord(
+    app: &mut EditorApp<Grid>,
+    cx: &mut ShellCtx,
+    key: blazy_shell::window::WindowKey,
+    root: &mut RenderRoot,
+    character: &str,
+    modifiers: Modifiers,
+) {
+    let event = masonry::core::TextEvent::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: Key::Character(character.into()),
+        code: Code::Unidentified,
+        modifiers,
+        ..KeyboardEvent::default()
+    });
+    let _ = blazy_shell::window::deliver_text(app, cx, key, root, event);
+    app.settled(cx, key, root);
+    let _ = root.redraw();
+}
+
+/// The nodes of area `area` that have a widget, and so are drawn.
+fn with_widget(root: &mut RenderRoot, area: usize) -> Vec<usize> {
+    edit_editor(root, area, |editor| {
+        NodeEditor::with_canvas(editor, |mut canvas| {
+            let live = CanvasLayer::live_children(&mut canvas);
+            live.into_iter().map(|(index, _)| index).collect()
+        })
+    })
+}
+
+/// Nodes on the canvas of area `area`, as its last layout counted them.
+fn shown(root: &mut RenderRoot, area: usize) -> usize {
+    edit_editor(root, area, |editor| editor.widget.stats().total)
+}
+
+/// Copied in one area with `Ctrl+C`, pasted in the other with `Ctrl+V` at its pointer:
+/// both areas show the copies in the same frame, and another window once it draws (§57).
+#[test]
+fn a_copy_pastes_in_another_area_and_reaches_another_window() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut second = window(&app, 1);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(100.0, 100.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "link.add", &Props::new().with_int("from", 0).with_int("to", 1));
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 0));
+        NodeEditor::exec(
+            editor,
+            "node.select",
+            &Props::new().with_int("index", 1).with_bool("extend", true),
+        );
+    });
+    chord(&mut app, &mut cx, key, &mut root, "c", Modifiers::CONTROL);
+    assert_eq!(graph.borrow().node_count(), 8, "a copy changes nothing");
+
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(900.0, 400.0));
+    chord(&mut app, &mut cx, key, &mut root, "v", Modifiers::CONTROL);
+    assert_eq!(graph.borrow().node_count(), 10, "the other area pasted");
+    assert!(graph.borrow().links.contains(&Link::new(8, 9)), "with the link between");
+    let at = edit_editor(&mut root, 1, |editor| {
+        editor.widget.session().expect("a session").borrow().world.pointer
+    });
+    let pasted = graph.borrow().node_rect(8).union(graph.borrow().node_rect(9));
+    assert_eq!(pasted.center(), at, "at the pointer of the area that pasted");
+    assert_eq!(
+        (shown(&mut root, 0), shown(&mut root, 1)),
+        (10, 10),
+        "both areas show it in the same frame"
+    );
+    assert_eq!(
+        edit_editor(&mut root, 1, |editor| editor.widget.history_depth()),
+        1,
+        "one step, in the history of the area that pasted"
+    );
+
+    // What the window does before it draws: it collects what its views are owed, and the
+    // area that did not paste is owed the insertions it was already pushed. Counting nodes
+    // cannot see the second delivery go wrong — it emptied the slot's widget and kept the
+    // node, so the copies were there and drawn nowhere.
+    app.pull(&mut root);
+    let _ = root.redraw();
+    for area in 0..2 {
+        let built = with_widget(&mut root, area);
+        assert!(
+            built.contains(&8) && built.contains(&9),
+            "area {area} draws the copies after the pull: {built:?}"
+        );
+    }
+
+    app.pull(&mut second);
+    let _ = second.redraw();
+    assert_eq!(shown(&mut second, 0), 10, "and the other window once it draws");
+    assert!(has_link(&mut second, 0, Link::new(8, 9)));
+}
+
+/// Whether node `index` wears the selected class in area `area`.
+fn looks_selected(root: &mut RenderRoot, area: usize, index: usize) -> bool {
+    edit_editor(root, area, |editor| {
+        NodeEditor::with_canvas(editor, |mut canvas| {
+            CanvasLayer::node_has_class(&mut canvas, index, blazy_node_editor::SELECTED)
+        })
+    })
+}
+
+/// `Shift+D` as a window delivers it — `D`, or `В` on a Russian layout — duplicates, and
+/// the copy looks selected in the area it was made in as well as in the other one.
+///
+/// The area that made it was told of the selection before it had the node: the class went
+/// onto a slot that was not there yet, and the selection counted as shown.
+#[test]
+fn a_duplicate_looks_selected_in_both_areas() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(200.0, 40.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 1));
+    });
+    for (typed, code, copy) in [("D", Code::KeyD, 8), ("В", Code::KeyD, 9)] {
+        let event = masonry::core::TextEvent::Keyboard(KeyboardEvent {
+            state: KeyState::Down,
+            key: Key::Character(typed.into()),
+            code,
+            modifiers: Modifiers::SHIFT,
+            ..KeyboardEvent::default()
+        });
+        let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, event);
+        app.settled(&mut cx, key, &mut root);
+        let _ = root.redraw();
+        assert_eq!(graph.borrow().node_count(), copy + 1, "Shift+{typed} duplicated");
+        pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(200.0, 300.0));
+        pointer(&mut app, &mut cx, key, &mut root, "down", Point::new(200.0, 300.0));
+        pointer(&mut app, &mut cx, key, &mut root, "up", Point::new(200.0, 300.0));
+        app.pull(&mut root);
+        let _ = root.redraw();
+        assert_eq!(graph.borrow().views().selection(), std::iter::once(copy).collect());
+        for area in 0..2 {
+            assert!(
+                looks_selected(&mut root, area, copy),
+                "the copy looks selected in area {area}"
+            );
+            assert!(!looks_selected(&mut root, area, 1), "and the original does not");
+        }
+    }
+}
+
+/// Inside a text field the copy and paste keys are the field's: `Ctrl+C` copies no nodes
+/// and `Ctrl+V` pastes text, not nodes (§56).
+#[test]
+fn copy_and_paste_keys_in_a_text_field_are_the_fields() {
+    use blazy_shell::text::MemoryClipboard;
+
+    let graph = Grid::new(4);
+    let mut app = app_of(&graph, true);
+    let mut root = window(&app, 1);
+    let mut cx = ShellCtx::new().with_clipboard(Box::new(MemoryClipboard::holding("ab")));
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(300.0, 300.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 1));
+    });
+    let field = edit_editor(&mut root, 0, |editor| {
+        NodeEditor::with_canvas(editor, |mut canvas| {
+            let mut id = None;
+            CanvasLayer::update_child(&mut canvas, 0, |node| id = Some(node.ctx.widget_id()));
+            id
+        })
+    })
+    .expect("node 0 is on screen");
+
+    assert!(root.focus_on(Some(field)));
+    chord(&mut app, &mut cx, key, &mut root, "c", Modifiers::CONTROL);
+    chord(&mut app, &mut cx, key, &mut root, "v", Modifiers::CONTROL);
+    let text: String = {
+        let widget = root.get_widget(field).expect("the field is still there");
+        let area = widget.downcast::<TextArea<true>>().expect("a text field");
+        area.inner().text().into_iter().collect()
+    };
+    assert!(text.ends_with("ab"), "the field pasted the text: {text:?}");
+    assert_eq!(graph.borrow().node_count(), 4, "and no node");
+
+    // Outside the field there is nothing to paste: the field's `Ctrl+C` copied no nodes.
+    assert!(root.focus_on(None));
+    chord(&mut app, &mut cx, key, &mut root, "v", Modifiers::CONTROL);
+    assert_eq!(graph.borrow().node_count(), 4, "the clipboard of nodes is empty");
+    chord(&mut app, &mut cx, key, &mut root, "c", Modifiers::CONTROL);
+    chord(&mut app, &mut cx, key, &mut root, "v", Modifiers::CONTROL);
+    assert_eq!(
+        graph.borrow().node_count(),
+        5,
+        "outside a field the keys are the editor's"
+    );
 }

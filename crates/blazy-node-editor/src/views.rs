@@ -1,5 +1,6 @@
 //! Which canvases show a graph, and what each of them has not been told yet.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -110,6 +111,14 @@ struct Ledger {
     /// Here for the reason the stacking is: every graph has a registry, and every view of
     /// the graph reaches it. Each editor's session reads it rather than keeping its own.
     selection: BTreeSet<usize>,
+    /// What `node.copy` copied last, for `node.paste` — a `Clip` of the graph's content
+    /// type, behind `Any` because the registry is not generic over the graph.
+    ///
+    /// Here for the reason the selection is: copy in one area and paste in another, or in
+    /// another window, is the case that matters, and every view of the graph reaches the
+    /// registry. Per graph rather than per process, which is narrower than Blender's
+    /// (§57.5).
+    clip: Option<Rc<dyn Any>>,
 }
 
 impl std::fmt::Debug for Views {
@@ -231,6 +240,16 @@ impl Views {
             ledger.note(None, change);
         }
         announced
+    }
+
+    /// Puts a copy on the graph's clipboard, in place of whatever was there.
+    pub(crate) fn set_clip(&self, clip: Rc<dyn Any>) {
+        self.0.borrow_mut().clip = Some(clip);
+    }
+
+    /// What is on the graph's clipboard.
+    pub(crate) fn clip(&self) -> Option<Rc<dyn Any>> {
+        self.0.borrow().clip.clone()
     }
 
     /// Node `index`'s stacking stamp; zero for a node never raised.

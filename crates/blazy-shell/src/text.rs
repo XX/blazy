@@ -21,7 +21,7 @@
 //! `Ctrl+V` delivered as a key would type a `v`.
 
 use masonry::app::{RenderRoot, RenderRootSignal};
-use masonry::core::keyboard::{Key, KeyState};
+use masonry::core::keyboard::{Code, Key, KeyState};
 use masonry::core::{Ime, TextEvent};
 use masonry::dpi::{LogicalPosition, LogicalSize};
 
@@ -183,7 +183,13 @@ pub fn is_paste_key(event: &TextEvent) -> bool {
     } else {
         key.modifiers.ctrl()
     };
-    action && matches!(&key.key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+    // By its place when it types no Latin letter (`м` on a Russian layout), and by its
+    // letter otherwise — the rule the keymap names keys by (`OpEvent::from_keyboard`).
+    action
+        && match &key.key {
+            Key::Character(c) if c.chars().all(|c| c.is_ascii_graphic()) => c.eq_ignore_ascii_case("v"),
+            _ => key.code == Code::KeyV,
+        }
 }
 
 /// What the tree should get for `event`: the event itself, the clipboard's text in place

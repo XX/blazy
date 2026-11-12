@@ -629,6 +629,29 @@ fn an_edit_re_chooses_the_recorded_sets() {
     );
 }
 
+/// The same insertion delivered twice is one node: it keeps its place in the stack and
+/// what it was built as, and takes the geometry — the second delivery is what every
+/// window's pull does after the push, and replacing the slot dropped the widget while
+/// `live` still named it, so the cull built nothing and the node was drawn nowhere.
+#[test]
+fn a_live_name_inserted_again_is_the_same_node() {
+    let mut canvas = chain();
+    canvas.cull();
+    canvas.live = canvas.visible.clone();
+    canvas.restack();
+    assert!(canvas.raise_node(1));
+    let built = Some((Detail::Full, Detail::Full));
+    canvas.slots[1].built = built;
+    let count = canvas.node_count();
+    let size = canvas.live_rect_of(1).expect("node 1 is there").size();
+
+    let _ = canvas.insert_node(1, Point::new(600.0, 300.0), size);
+    assert_eq!(canvas.node_count(), count, "no node more");
+    assert_eq!(canvas.slots[1].built, built, "and the widget it had is still its own");
+    assert_eq!(canvas.order.last(), Some(&1), "still on top");
+    assert_eq!(node_at(&mut canvas, 650.0, 330.0), Some(1), "where it was put");
+}
+
 /// A node inserted at a name nothing holds is found there, by the index as well as by
 /// the slot array — the pick goes through the grid, so a node missing from it is
 /// invisible to the pointer while being drawn.

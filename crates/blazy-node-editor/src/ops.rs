@@ -21,6 +21,7 @@
 //! during a press — and every event reaches the tree first.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use blazy_canvas::{CanvasHit, PortSide};
 use blazy_ops::event::{OpEvent, Pattern};
@@ -31,7 +32,7 @@ use masonry::core::keyboard::{Key, Modifiers, NamedKey};
 use masonry::kurbo::{Point, Rect, Size, Vec2};
 use masonry::ui_events::pointer::PointerButton;
 
-use crate::world::{AddStep, DeleteStep, LinkStep, SelectStep};
+use crate::world::{AddStep, Clip, CopyStep, DeleteStep, LinkStep, SelectStep};
 use crate::{EDGE_PAN, EditorWorld, Link, MoveRecord, NodeGraph};
 
 /// The keymap context a node canvas's bindings live in.
@@ -281,11 +282,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
         {
             select(cx, index);
         }
-        self.anchor = match cx.event() {
-            Some(OpEvent::Drag { pos, .. }) => *pos,
-            _ => cx.world().pointer,
-        };
-        self.grab(cx);
+        self.start(cx);
         OpResult::Running
     }
 
@@ -302,37 +299,65 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
     }
 
     fn modal(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        match self.follow(cx) {
+            Gesture::Running => OpResult::Running,
+            Gesture::Confirmed => {
+                self.commit(cx);
+                OpResult::Finished
+            },
+            Gesture::Cancelled => OpResult::Cancelled,
+        }
+    }
+}
+
+/// What one event did to a grab.
+enum Gesture {
+    Running,
+    Confirmed,
+    /// The nodes are back where they started.
+    Cancelled,
+}
+
+impl MoveOp {
+    /// Starts a grab of the selection from the event that started the operator.
+    fn start<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) {
+        self.anchor = match cx.event() {
+            Some(OpEvent::Drag { pos, .. }) => *pos,
+            _ => cx.world().pointer,
+        };
+        self.grab(cx);
+    }
+
+    /// Follows one event of the gesture: moves the nodes, or says it is over.
+    ///
+    /// Apart from [`modal`](Operator::modal) because `node.duplicate` ends in the same
+    /// gesture and records it differently. No event at all is the runtime cancelling
+    /// every operator (`OpRuntime::cancel_all`, when the window loses focus), and it
+    /// cancels: answering `Running`, as every unknown event does, left a drag cut off that
+    /// way where the pointer had taken it, with nothing in the history to undo it by.
+    fn follow<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> Gesture {
         let event = cx.event().cloned();
         match event {
             Some(OpEvent::Move { .. }) => {
                 let delta = cx.world().pointer - self.anchor;
                 self.apply(cx, delta);
-                OpResult::Running
+                Gesture::Running
             },
             // The button that started it coming up, for a drag; the next press, for a
             // grab started from the keyboard.
             Some(OpEvent::Release {
                 button: PointerButton::Primary,
                 ..
-            }) if self.from_press => {
-                self.commit(cx);
-                OpResult::Finished
-            },
+            }) if self.from_press => Gesture::Confirmed,
             Some(OpEvent::Press {
                 button: PointerButton::Primary,
                 ..
-            }) if !self.from_press => {
-                self.commit(cx);
-                OpResult::Finished
-            },
+            }) if !self.from_press => Gesture::Confirmed,
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Enter),
                 down: true,
                 ..
-            }) => {
-                self.commit(cx);
-                OpResult::Finished
-            },
+            }) => Gesture::Confirmed,
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
@@ -341,19 +366,18 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
             | Some(OpEvent::Press {
                 button: PointerButton::Secondary,
                 ..
-            }) => {
+            })
+            | None => {
                 // Cancelling is the operator's own job: the runtime keeps no snapshot
                 // on anyone's behalf, and the operator is the only thing that knows
                 // what "before" was.
                 self.apply(cx, Vec2::ZERO);
-                OpResult::Cancelled
+                Gesture::Cancelled
             },
-            _ => OpResult::Running,
+            _ => Gesture::Running,
         }
     }
-}
 
-impl MoveOp {
     /// Records what is being moved and where it started.
     fn grab<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) {
         self.nodes = cx.world().selection().iter().copied().collect();
@@ -554,10 +578,16 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddNodeOp {
         let rect = Rect::from_origin_size(origin, size);
         let selection = cx.world().selection();
         let index = cx.world_mut().add_node(rect);
+        let content = cx.world().graph.borrow().content(index);
         // Selected here rather than through `set_selection`, because that records a step
         // of its own and this is one action: see `AddStep`.
         cx.world_mut().select(BTreeSet::from([index]));
-        cx.push_undo(Box::new(AddStep { index, rect, selection }));
+        cx.push_undo(Box::new(AddStep {
+            index,
+            rect,
+            content,
+            selection,
+        }));
         OpResult::Finished
     }
 }
@@ -592,14 +622,147 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for DeleteNodeOp {
         }
 
         let selection = cx.world().selection();
-        let nodes: Vec<(usize, Rect, Vec<Link>)> = doomed
+        let nodes = doomed
             .into_iter()
-            .map(|index| {
-                let (rect, links) = cx.world_mut().remove_node(index);
-                (index, rect, links)
-            })
+            .map(|index| cx.world_mut().remove_node(index))
             .collect();
         cx.push_undo(Box::new(DeleteStep { nodes, selection }));
+        OpResult::Finished
+    }
+}
+
+/// Copies the selection, and the links between the selected nodes, to the graph's
+/// clipboard — Blender's `node.clipboard_copy`.
+///
+/// Changes nothing in the graph, so it writes no step. The clipboard is the graph's
+/// ([`Views`](crate::Views)), so a copy made in one area pastes in any other, in any
+/// window (§57).
+#[derive(Default)]
+pub struct CopyOp;
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for CopyOp {
+    fn name(&self) -> &'static str {
+        "node.copy"
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        !cx.world().selection().is_empty()
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let selection = cx.world().selection();
+        let graph = cx.world().graph.borrow();
+        let clip = Clip::of(&*graph, &selection);
+        graph.views().set_clip(Rc::new(clip));
+        OpResult::Finished
+    }
+}
+
+/// The graph's clipboard, if it holds a copy of this graph's nodes.
+fn clip<G: NodeGraph>(world: &EditorWorld<G>) -> Option<Rc<Clip<G::Content>>> {
+    let clip = world.graph.borrow().views().clip()?;
+    clip.downcast().ok()
+}
+
+/// Pastes the graph's clipboard, centred on the pointer — Blender's
+/// `node.clipboard_paste` — and selects what it pasted.
+///
+/// At the pointer of the area it runs in, and the area is what decides it: every area
+/// over the graph shares its canvas coordinates, so a copy made in one area and pasted in
+/// another lands where that area's pointer is. A script names the centre with `x` and
+/// `y`. One step in the history for the nodes and their links together.
+#[derive(Default)]
+pub struct PasteOp;
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for PasteOp {
+    fn name(&self) -> &'static str {
+        "node.paste"
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        clip(cx.world()).is_some_and(|clip| !clip.nodes.is_empty())
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let Some(clip) = clip(cx.world()) else {
+            return OpResult::Cancelled;
+        };
+        let pointer = cx.world().pointer;
+        let at = Point::new(cx.props().float("x", pointer.x), cx.props().float("y", pointer.y));
+        let step = clip.paste_into(cx.world_mut(), at - clip.bounds().center(), "node.paste");
+        cx.push_undo(Box::new(step));
+        OpResult::Finished
+    }
+}
+
+/// Duplicates the selection in place and grabs the copies — Blender's
+/// `node.duplicate_move`.
+///
+/// Blender's is a macro, a duplicate followed by a translate; there are no macros here,
+/// so the operator holds both halves: it pastes a copy of the selection where it stands,
+/// then runs the same grab `node.move` runs (`MoveOp::follow`) until it is confirmed.
+/// That makes the whole thing **one step** in the history, with the copies where they
+/// ended up — a duplicate followed by a move step would take two undos to take back one
+/// `Shift+D`. Cancelling the grab leaves the copies where they were made, as Blender's
+/// does: the duplicate happened, only the move is cancelled.
+///
+/// From a script — or a menu, which runs through `exec` and cannot hold the pointer —
+/// the copies are moved by `dx` and `dy` instead, and nothing is grabbed.
+///
+/// Generic over the graph's content because it holds the step it is building while the
+/// grab runs.
+pub struct DuplicateOp<C> {
+    grab: MoveOp,
+    pending: Option<CopyStep<C>>,
+}
+
+impl<C> Default for DuplicateOp<C> {
+    fn default() -> Self {
+        Self {
+            grab: MoveOp::default(),
+            pending: None,
+        }
+    }
+}
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for DuplicateOp<G::Content> {
+    fn name(&self) -> &'static str {
+        "node.duplicate"
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        !cx.world().selection().is_empty()
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let clip = Clip::of(&*cx.world().graph.borrow(), &cx.world().selection());
+        self.pending = Some(clip.paste_into(cx.world_mut(), Vec2::ZERO, "node.duplicate"));
+        self.grab.from_press = matches!(cx.event(), Some(OpEvent::Drag { .. } | OpEvent::Press { .. }));
+        self.grab.start(cx);
+        OpResult::Running
+    }
+
+    fn exec(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let clip = Clip::of(&*cx.world().graph.borrow(), &cx.world().selection());
+        let delta = Vec2::new(cx.props().float("dx", 0.0), cx.props().float("dy", 0.0));
+        let step = clip.paste_into(cx.world_mut(), delta, "node.duplicate");
+        cx.push_undo(Box::new(step));
+        OpResult::Finished
+    }
+
+    fn modal(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        if let Gesture::Running = self.grab.follow(cx) {
+            return OpResult::Running;
+        }
+        let Some(mut step) = self.pending.take() else {
+            return OpResult::Cancelled;
+        };
+        // Where the copies ended up, so a redo puts them there rather than on top of
+        // what they were copied from.
+        for (index, rect, _) in &mut step.nodes {
+            *rect = cx.world().node_rect(*index);
+        }
+        cx.push_undo(Box::new(step));
         OpResult::Finished
     }
 }
@@ -924,6 +1087,12 @@ pub fn default_keymap() -> Keymap {
             Binding::new(Pattern::key("x"), "link.delete"),
             Binding::new(Pattern::key("x"), "node.delete"),
             Binding::new(Pattern::key("f"), "link.add"),
+            // Copies (§57), on Blender's keys. `Ctrl+V` reaches this only outside a text
+            // field: inside one the host turns it into text first (§56).
+            Binding::new(Pattern::key("d").with_mods(Modifiers::SHIFT), "node.duplicate")
+                .with_props(Props::new().with_bool(EDGE_PAN, true)),
+            Binding::new(Pattern::key("c").with_mods(Modifiers::CONTROL), "node.copy"),
+            Binding::new(Pattern::key("v").with_mods(Modifiers::CONTROL), "node.paste"),
             // The view. The wheel used to be the canvas's own and nobody's to rebind; `=`
             // and `-` are the keys of a laptop with no numpad, where Blender's own are.
             Binding::new(Pattern::scroll(), "view.zoom"),
@@ -953,6 +1122,11 @@ pub fn node_menu() -> crate::Menu {
     crate::Menu::new("Node")
         .with("Add node", "node.add", Props::new())
         .with("Delete", "node.delete", Props::new())
+        // The binding's properties, so the entry shows `Shift+D`: a menu runs `exec`, which
+        // grabs nothing and ignores `edge_pan`, and the copies stay where they were made.
+        .with("Duplicate", "node.duplicate", Props::new().with_bool(EDGE_PAN, true))
+        .with("Copy", "node.copy", Props::new())
+        .with("Paste", "node.paste", Props::new())
         .with("Link selected", "link.add", Props::new())
         .with("Box select", "node.box_select", Props::new())
         .with("Zoom in", "view.zoom", Props::new().with_float("factor", ZoomOp::STEP))
@@ -986,6 +1160,9 @@ pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
     runtime.register(crate::MenuOp::new(NODE_MENU, node_menu()));
     runtime.register(AddNodeOp);
     runtime.register(DeleteNodeOp);
+    runtime.register(DuplicateOp::<G::Content>::default());
+    runtime.register(CopyOp);
+    runtime.register(PasteOp);
     runtime.register(AddLinkOp);
     runtime.register(DeleteLinkOp);
     runtime.register(UndoOp);

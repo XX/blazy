@@ -19,7 +19,9 @@
 //! Drag a node to move it (by its body: the name field at its top is a text field, and
 //! a press there edits the name), drag out of a port (the dots on a node's edges) into another
 //! node's port to link them, `B` to box select, `G` to grab, `Shift+A` to add, `X` to
-//! delete, `F` to link the two selected nodes, `Ctrl+Z` to undo. A node or a link held at
+//! delete, `F` to link the two selected nodes, `Shift+D` to duplicate the selection and
+//! grab the copies, `Ctrl+C` / `Ctrl+V` to copy it and paste it at the pointer — in any
+//! area, in any window — and `Ctrl+Z` to undo. A node or a link held at
 //! the edge of an area scrolls the view. `Alt+X` / `Alt+Y` split the area under the
 //! pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another window over the same
 //! graph and `Alt+D` moves the area into one of its own. Click a node's name to rename
@@ -146,16 +148,16 @@ impl NodeGraph for Graph {
         }
     }
 
-    /// The title stays in the slot of a removed node, so an undone delete brings it back.
-    /// Not if the name was handed out again in between: the graph trait carries geometry,
-    /// not contents (`issues/duplicate copy and paste.md`).
-    fn restore_node(&mut self, index: usize, rect: Rect) {
+    /// Back with the title it had: the history keeps it, so it comes back even when the
+    /// name was handed out again in between.
+    fn restore_node(&mut self, index: usize, rect: Rect, title: String) {
         if self.nodes.len() <= index {
             self.nodes.resize(index + 1, None);
             self.titles.resize_with(index + 1, String::new);
         }
         self.free.retain(|&free| free != index);
         self.nodes[index] = Some(rect);
+        self.titles[index] = title;
     }
 
     fn remove_node(&mut self, index: usize) -> Vec<Link> {
@@ -180,6 +182,24 @@ impl NodeGraph for Graph {
 
     fn remove_link(&mut self, link: Link) {
         self.links.retain(|&l| l != link && l != link.reversed());
+    }
+
+    /// A node holds its title, and a copy of it is called the same.
+    type Content = String;
+
+    fn content(&self, index: usize) -> String {
+        self.titles.get(index).cloned().unwrap_or_default()
+    }
+
+    fn insert_copy(&mut self, rect: Rect, title: String) -> usize {
+        let index = self.insert_node(rect);
+        self.titles[index] = title;
+        index
+    }
+
+    fn links_of(&self, index: usize) -> Vec<Link> {
+        let ends_here = |link: &&Link| link.from as usize == index || link.to as usize == index;
+        self.links.iter().filter(ends_here).copied().collect()
     }
 }
 
@@ -577,5 +597,45 @@ mod tests {
         );
         let other = title_field(&mut harness, areas[1], 0);
         assert_eq!(text_of(&harness, other), typed, "the other area shows the new title");
+    }
+    /// A duplicate is called what its original is called, in both areas, and an undone
+    /// delete brings a node back under its name even when the name was handed out again
+    /// in between — the title travels with the history, not in the graph's slot (§57).
+    #[test]
+    fn a_copy_keeps_the_title_and_an_undone_delete_brings_it_back() {
+        let graph = Graph::grid();
+        let screen = app(&graph).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
+        let _ = harness.redraw();
+        let areas = harness.root_widget().area_ids();
+        graph.borrow_mut().titles[0] = "source".into();
+
+        let exec = |harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>, op: &str, props: Props| {
+            harness.edit_widget_with_id(areas[0], |mut widget| {
+                let mut editor = widget.downcast::<NodeEditor<Graph>>();
+                NodeEditor::exec(&mut editor, op, &props);
+            });
+            let _ = harness.redraw();
+        };
+        exec(&mut harness, "node.select", Props::new().with_int("index", 0));
+        exec(
+            &mut harness,
+            "node.duplicate",
+            Props::new().with_float("dx", 0.0).with_float("dy", 400.0),
+        );
+        let copy = NODES;
+        assert_eq!(graph.borrow().titles[copy], "source", "the copy is called the same");
+        let field = title_field(&mut harness, areas[1], copy);
+        assert_eq!(text_of(&harness, field), "source", "and the other area shows it so");
+
+        // Delete the original, let `Shift+A` take its name, and undo both: the original
+        // comes back with its title, not with the one the new node was given.
+        exec(&mut harness, "node.delete", Props::new().with_int("index", 0));
+        exec(&mut harness, "node.add", Props::new());
+        assert_eq!(graph.borrow().titles[0], "node 0", "the name was handed out again");
+        exec(&mut harness, "ed.undo", Props::new());
+        exec(&mut harness, "ed.undo", Props::new());
+        assert_eq!(graph.borrow().titles[0], "source");
     }
 }

@@ -13,9 +13,11 @@
 //! # The seam
 //!
 //! The graph is the application's. What this crate needs from it is [`NodeGraph`]:
-//! how many nodes, where each one is, how to move one, and which other canvases show
-//! the same graph. Nothing else — not what a node looks like (that is the canvas's
-//! [`NodeSource`](blazy_canvas::NodeSource)), not what a node holds.
+//! how many nodes, where each one is, how to move one, add one and take one away, and
+//! which other canvases show the same graph. Not what a node looks like (that is the
+//! canvas's [`NodeSource`](blazy_canvas::NodeSource)), and not what a node holds — only
+//! a way to carry it, unread, from a node into the history or the clipboard and back
+//! ([`NodeGraph::Content`], §57).
 //!
 //! * [`EditorWorld`] — everything an operator may touch: the graph, the selection, the pointer and what it is over. No
 //!   widget in it (§38.3).
@@ -53,7 +55,7 @@ pub use crate::edge_pan::{EDGE_PAN, EdgePan, EdgePanCounters};
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
 pub use crate::menu::{Menu, MenuItem, MenuLayer, MenuOp};
 pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};
-pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, journal};
+pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, MoveRecord, MoveRecorder, Removed, journal};
 
 /// The class a selected node wears (`CanvasLayer::set_node_class`).
 ///
@@ -103,12 +105,17 @@ pub trait NodeGraph: 'static {
     /// for areas (§41.2), for the same reason.
     fn insert_node(&mut self, rect: Rect) -> usize;
 
-    /// Puts a node back under the name it had, for undo.
+    /// Puts a node back under the name it had, holding `content`, for undo and redo.
     ///
     /// Separate from [`insert_node`](Self::insert_node) rather than a lucky consequence
     /// of it: a free list hands the last freed name back first, which is the right name
     /// only while nothing else was added in between. Undo has to be right always.
-    fn restore_node(&mut self, index: usize, rect: Rect);
+    ///
+    /// The content comes from the history rather than from the slot the removal left:
+    /// a slot keeps it only until an insertion takes the name back, and one example's
+    /// slot did not keep it at all — an undone delete brought its node back with the
+    /// slider at its default (§57).
+    fn restore_node(&mut self, index: usize, rect: Rect, content: Self::Content);
 
     /// Removes a node and every link that ended on it, and hands the links back.
     ///
@@ -122,6 +129,32 @@ pub trait NodeGraph: 'static {
 
     /// Removes a link, in either direction.
     fn remove_link(&mut self, link: Link);
+
+    /// What a node holds past its rectangle — its type, its values — as the application
+    /// keeps it.
+    ///
+    /// Opaque to the editor, which only carries it: from a node into the history, from
+    /// a node into the clipboard, and back into the graph (§57). `()` for a graph whose
+    /// nodes hold nothing.
+    type Content: Clone + 'static;
+
+    /// What node `index` holds.
+    fn content(&self, index: usize) -> Self::Content;
+
+    /// Adds a node at `rect` holding `content`, and hands back the name it got — a copy,
+    /// for duplicate and paste.
+    ///
+    /// Named as [`insert_node`](Self::insert_node) names. Required, like everything here
+    /// that carries what a node is: a default answering with a fresh node would compile,
+    /// pass every test that counts nodes, and paste empty boxes — the reason
+    /// [`views`](Self::views) has no default either (§42).
+    fn insert_copy(&mut self, rect: Rect, content: Self::Content) -> usize;
+
+    /// The links that end on node `index`, at either end.
+    ///
+    /// What a copy of several nodes keeps the links between them by. Called once per
+    /// copied node, not per frame.
+    fn links_of(&self, index: usize) -> Vec<Link>;
 }
 
 /// A graph shared by the editor, its operators and every view of it.

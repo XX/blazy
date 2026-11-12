@@ -1,6 +1,6 @@
 //! Everything an operator may touch, and the undo steps that change it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use blazy_canvas::CanvasHit;
 use blazy_ops::undo::Step;
@@ -177,21 +177,28 @@ impl<G: NodeGraph> EditorWorld<G> {
         index
     }
 
-    /// Puts a node back under its own name, with the links it had.
-    pub fn restore_node(&mut self, index: usize, rect: Rect, links: &[Link]) {
-        self.graph.borrow_mut().restore_node(index, rect);
+    /// Adds a node at `rect` holding `content` — a copy — and returns its name.
+    pub fn add_copy(&mut self, rect: Rect, content: G::Content) -> usize {
+        let index = self.graph.borrow_mut().insert_copy(rect, content);
+        self.edits.push(Edit::NodeAdded { index, rect });
+        self.dirty = true;
+        index
+    }
+
+    /// Puts a node back under its own name, holding what it held, with the links it had.
+    pub fn restore_node(&mut self, index: usize, rect: Rect, content: G::Content, links: &[Link]) {
+        self.graph.borrow_mut().restore_node(index, rect, content);
         self.edits.push(Edit::NodeAdded { index, rect });
         for &link in links {
-            if self.graph.borrow_mut().insert_link(link) {
-                self.edits.push(Edit::LinkAdded(link));
-            }
+            self.add_link(link);
         }
         self.dirty = true;
     }
 
     /// Removes a node, and hands back what it takes to put it back.
-    pub fn remove_node(&mut self, index: usize) -> (Rect, Vec<Link>) {
+    pub fn remove_node(&mut self, index: usize) -> Removed<G::Content> {
         let rect = self.node_rect(index);
+        let content = self.graph.borrow().content(index);
         let links = self.graph.borrow_mut().remove_node(index);
         self.edits.push(Edit::NodeRemoved { index });
         let mut selection = self.selection();
@@ -199,7 +206,12 @@ impl<G: NodeGraph> EditorWorld<G> {
             self.select(selection);
         }
         self.dirty = true;
-        (rect, links)
+        Removed {
+            index,
+            rect,
+            content,
+            links,
+        }
     }
 
     /// Adds a link, unless the graph refuses it.
@@ -341,6 +353,31 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for SelectStep {
     }
 }
 
+/// A node that went, and what it takes to bring it back: [`EditorWorld::remove_node`]'s
+/// answer.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Removed<C> {
+    /// Its name, free now.
+    pub index: usize,
+    /// Where it was, in canvas coordinates.
+    pub rect: Rect,
+    /// What it held. Kept by whoever means to put the node back, rather than left in the
+    /// graph's slot, which keeps it only until an insertion takes the name back (§57).
+    pub content: C,
+    /// The links that ended on it.
+    pub links: Vec<Link>,
+}
+
+impl<C> Removed<C> {
+    /// What the history holds for it, by the step's own reckoning: the content's inline
+    /// size, not what it owns on the heap — a journal entry is priced at what it touched
+    /// (§38.4), and the editor cannot see past an opaque type.
+    fn bytes(&self) -> usize {
+        size_of::<usize>() + size_of::<Rect>() + size_of::<C>() + self.links.len() * size_of::<Link>()
+    }
+}
+
 /// A node that appeared: undo takes it away, redo puts it back under its own name.
 ///
 /// The selection travels with it, and that is the point: adding a node selects it, which
@@ -348,14 +385,16 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for SelectStep {
 /// step of its own — which is what pushing it through the shared selection path did —
 /// makes one `Shift+A` take two undos, and the second one does something the user never
 /// asked for.
-pub(crate) struct AddStep {
+pub(crate) struct AddStep<C> {
     pub(crate) index: usize,
     pub(crate) rect: Rect,
+    /// What the new node held, so redo brings back the same node rather than a fresh one.
+    pub(crate) content: C,
     /// What was selected before, so undo puts it back.
     pub(crate) selection: BTreeSet<usize>,
 }
 
-impl<G: NodeGraph> Step<EditorWorld<G>> for AddStep {
+impl<G: NodeGraph> Step<EditorWorld<G>> for AddStep<G::Content> {
     fn name(&self) -> &'static str {
         "node.add"
     }
@@ -366,12 +405,12 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for AddStep {
     }
 
     fn redo(&mut self, world: &mut EditorWorld<G>) {
-        world.restore_node(self.index, self.rect, &[]);
+        world.restore_node(self.index, self.rect, self.content.clone(), &[]);
         world.select(BTreeSet::from([self.index]));
     }
 
     fn bytes(&self) -> usize {
-        size_of::<usize>() + size_of::<Rect>() + self.selection.len() * size_of::<usize>()
+        size_of::<usize>() + size_of::<Rect>() + size_of::<G::Content>() + self.selection.len() * size_of::<usize>()
     }
 }
 
@@ -380,35 +419,170 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for AddStep {
 /// The links come with the nodes rather than as steps of their own: deleting a node and
 /// deleting its links is one thing the user did, and an undo that returned the node
 /// without its links would be a different graph wearing the same names.
-pub(crate) struct DeleteStep {
-    pub(crate) nodes: Vec<(usize, Rect, Vec<Link>)>,
+pub(crate) struct DeleteStep<C> {
+    pub(crate) nodes: Vec<Removed<C>>,
     pub(crate) selection: BTreeSet<usize>,
 }
 
-impl<G: NodeGraph> Step<EditorWorld<G>> for DeleteStep {
+impl<G: NodeGraph> Step<EditorWorld<G>> for DeleteStep<G::Content> {
     fn name(&self) -> &'static str {
         "node.delete"
     }
 
     fn undo(&mut self, world: &mut EditorWorld<G>) {
-        for (index, rect, links) in &self.nodes {
-            world.restore_node(*index, *rect, links);
+        // Every node first, then the links: a link between two deleted nodes is refused
+        // while its other end is still gone.
+        for node in &self.nodes {
+            world.restore_node(node.index, node.rect, node.content.clone(), &[]);
+        }
+        for node in &self.nodes {
+            for &link in &node.links {
+                world.add_link(link);
+            }
         }
         world.select(self.selection.clone());
     }
 
     fn redo(&mut self, world: &mut EditorWorld<G>) {
-        for (index, ..) in &self.nodes {
-            world.remove_node(*index);
+        for node in &self.nodes {
+            world.remove_node(node.index);
         }
     }
 
     fn bytes(&self) -> usize {
+        self.nodes.iter().map(Removed::bytes).sum::<usize>() + self.selection.len() * size_of::<usize>()
+    }
+}
+
+/// Nodes that came in as copies — a duplicate or a paste — with the links between them.
+///
+/// One step for the lot, as a delete is one step: undo removes every node it added (the
+/// links go with them) and puts the selection back; redo brings back the same names,
+/// holding the same contents, where the nodes ended up — after the move a duplicate
+/// starts, which is part of the same step (§57).
+pub(crate) struct CopyStep<C> {
+    pub(crate) name: &'static str,
+    pub(crate) nodes: Vec<(usize, Rect, C)>,
+    pub(crate) links: Vec<Link>,
+    /// What was selected before, so undo puts it back.
+    pub(crate) selection: BTreeSet<usize>,
+}
+
+impl<G: NodeGraph> Step<EditorWorld<G>> for CopyStep<G::Content> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn undo(&mut self, world: &mut EditorWorld<G>) {
+        for &(index, ..) in &self.nodes {
+            world.remove_node(index);
+        }
+        world.select(self.selection.clone());
+    }
+
+    fn redo(&mut self, world: &mut EditorWorld<G>) {
+        for (index, rect, content) in &self.nodes {
+            world.restore_node(*index, *rect, content.clone(), &[]);
+        }
+        for &link in &self.links {
+            world.add_link(link);
+        }
+        world.select(self.nodes.iter().map(|&(index, ..)| index).collect());
+    }
+
+    fn bytes(&self) -> usize {
+        self.nodes.len() * (size_of::<usize>() + size_of::<Rect>() + size_of::<G::Content>())
+            + self.links.len() * size_of::<Link>()
+            + self.selection.len() * size_of::<usize>()
+    }
+}
+
+/// Nodes copied out of a graph, with the links between them: what `node.copy` leaves on
+/// the graph's clipboard and what `node.duplicate` copies without one.
+///
+/// Links with one end outside the copy are not in it, as in Blender's duplicate and its
+/// clipboard: a copy is a subgraph, and a link into the rest of the graph would be a
+/// second edge into a node nobody copied.
+#[derive(Debug)]
+pub(crate) struct Clip<C> {
+    /// Each node's rectangle where it was copied from, and what it held.
+    pub(crate) nodes: Vec<(Rect, C)>,
+    /// The links between them, their ends named by position in `nodes`.
+    pub(crate) links: Vec<Link>,
+}
+
+impl<C: Clone + 'static> Clip<C> {
+    /// Copies `nodes` out of `graph`, in name order.
+    pub(crate) fn of<G: NodeGraph<Content = C>>(graph: &G, nodes: &BTreeSet<usize>) -> Self {
+        let positions: BTreeMap<usize, usize> = nodes.iter().enumerate().map(|(at, &index)| (index, at)).collect();
+        let position = |index: usize| positions.get(&index).copied();
+        let mut links = Vec::new();
+        for (at, &index) in nodes.iter().enumerate() {
+            // Each link is seen from both ends; it is taken from its output end alone.
+            for link in graph.links_of(index) {
+                if link.from as usize != index {
+                    continue;
+                }
+                if let Some(to) = position(link.to as usize) {
+                    links.push(Link::between(at, link.from_port, to, link.to_port));
+                }
+            }
+        }
+        Self {
+            nodes: nodes
+                .iter()
+                .map(|&index| (graph.node_rect(index), graph.content(index)))
+                .collect(),
+            links,
+        }
+    }
+
+    /// The box around every copied node, where they were copied from.
+    pub(crate) fn bounds(&self) -> Rect {
         self.nodes
             .iter()
-            .map(|(_, _, links)| size_of::<usize>() + size_of::<Rect>() + links.len() * size_of::<Link>())
-            .sum::<usize>()
-            + self.selection.len() * size_of::<usize>()
+            .map(|&(rect, _)| rect)
+            .reduce(|all, rect| all.union(rect))
+            .unwrap_or_default()
+    }
+
+    /// Adds the copy to `world`'s graph, every node moved by `delta`, and hands back the
+    /// step that undoes it. Selects what it added, and nothing else.
+    pub(crate) fn paste_into<G: NodeGraph<Content = C>>(
+        &self,
+        world: &mut EditorWorld<G>,
+        delta: Vec2,
+        name: &'static str,
+    ) -> CopyStep<C> {
+        let selection = world.selection();
+        let nodes: Vec<(usize, Rect, C)> = self
+            .nodes
+            .iter()
+            .map(|(rect, content)| {
+                let rect = *rect + delta;
+                (world.add_copy(rect, content.clone()), rect, content.clone())
+            })
+            .collect();
+        let links = self
+            .links
+            .iter()
+            .map(|link| {
+                Link::between(
+                    nodes[link.from as usize].0,
+                    link.from_port,
+                    nodes[link.to as usize].0,
+                    link.to_port,
+                )
+            })
+            .filter(|&link| world.add_link(link))
+            .collect();
+        world.select(nodes.iter().map(|&(index, ..)| index).collect());
+        CopyStep {
+            name,
+            nodes,
+            links,
+            selection,
+        }
     }
 }
 

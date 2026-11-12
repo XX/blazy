@@ -319,22 +319,20 @@ impl NodeGraph for GraphModel {
         }
     }
 
-    fn restore_node(&mut self, index: usize, rect: Rect) {
+    /// Back under its own name, holding what it held when it went.
+    ///
+    /// The state comes from the history: this slot is emptied by the removal, and the
+    /// node used to come back with its slider and checkbox at their defaults (§57).
+    fn restore_node(&mut self, index: usize, rect: Rect, content: NodeState) {
         if self.nodes.len() <= index {
             self.nodes.resize(index + 1, None);
         }
         if let Some(at) = self.free.iter().position(|&free| free == index) {
             self.free.swap_remove(at);
         }
-        let state = self.nodes[index].unwrap_or(NodeState {
-            pos: rect.origin(),
-            tint: Color::from_rgb8(0x3c, 0x6e, 0x71),
-            value: 0.5,
-            checked: false,
-        });
         self.nodes[index] = Some(NodeState {
             pos: rect.origin(),
-            ..state
+            ..content
         });
     }
 
@@ -370,6 +368,32 @@ impl NodeGraph for GraphModel {
         if let Some(name) = self.link_named(link) {
             self.unfile_link(name);
         }
+    }
+
+    /// The whole state; its `pos` is the rectangle's, and a copy put elsewhere takes the
+    /// rectangle it is given.
+    type Content = NodeState;
+
+    fn content(&self, index: usize) -> NodeState {
+        self.node(index)
+    }
+
+    fn insert_copy(&mut self, rect: Rect, content: NodeState) -> usize {
+        let index = self.insert_node(rect);
+        self.nodes[index] = Some(NodeState {
+            pos: rect.origin(),
+            ..content
+        });
+        index
+    }
+
+    fn links_of(&self, index: usize) -> Vec<Link> {
+        self.by_node
+            .get(&(index as u32))
+            .into_iter()
+            .flatten()
+            .filter_map(|&name| self.links[name])
+            .collect()
     }
 }
 

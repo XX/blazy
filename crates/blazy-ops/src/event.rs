@@ -9,7 +9,7 @@
 //! never interprets them. The example converts to canvas coordinates before it builds
 //! the event, because that is the space its operators think in.
 
-use masonry::core::keyboard::{Key, Modifiers};
+use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers};
 use masonry::kurbo::Point;
 use masonry::ui_events::pointer::PointerButton;
 
@@ -207,6 +207,27 @@ impl OpEvent {
         }
     }
 
+    /// A keyboard event, in the form a keymap matches.
+    ///
+    /// What every driver should build its key events with, because a key as the platform
+    /// reports it is the *text* it would type, and a binding names a key:
+    ///
+    /// * **Case is dropped.** `Shift+D` arrives as `"D"`, and so does `D` with Caps Lock on; both are the `d` key.
+    /// * **The layout is seen past.** On a layout whose letters are not Latin a key types a character no binding names
+    ///   — `Shift+D` is `"В"` on a Russian one, `Ctrl+C` is `"с"` — so the key is named by where it is, as the US
+    ///   layout would name that place. A layout that does type Latin letters keeps them, so on AZERTY the key labelled
+    ///   `A` is still `a`.
+    ///
+    /// Shifted punctuation keeps what it types (`Shift+=` is `"+"`): every layout agrees
+    /// it is ASCII, and only its position would say otherwise.
+    pub fn from_keyboard(event: &KeyboardEvent) -> Self {
+        Self::Key {
+            key: binding_key(&event.key, event.code),
+            mods: event.modifiers,
+            down: event.state == KeyState::Down,
+        }
+    }
+
     /// The modifiers held when the event happened.
     pub fn mods(&self) -> Modifiers {
         match self {
@@ -346,8 +367,8 @@ impl Pattern {
         match (&self.trigger, event) {
             (Trigger::Press(want), OpEvent::Press { button, .. }) => want == button,
             (Trigger::Release(want), OpEvent::Release { button, .. }) => want == button,
-            (Trigger::Key(want), OpEvent::Key { key, down: true, .. }) => want == key,
-            (Trigger::KeyUp(want), OpEvent::Key { key, down: false, .. }) => want == key,
+            (Trigger::Key(want), OpEvent::Key { key, down: true, .. }) => same_key(want, key),
+            (Trigger::KeyUp(want), OpEvent::Key { key, down: false, .. }) => same_key(want, key),
             // A double click is also a click, and the keymap's order decides which
             // binding gets it: a `DoubleClick` binding placed first wins, and one that
             // is not there leaves the second click behaving like any other.
@@ -358,6 +379,89 @@ impl Pattern {
             _ => false,
         }
     }
+}
+
+/// Whether a binding's key is the event's key.
+///
+/// A letter matches in either case: a keymap file says `Shift+D` as naturally as
+/// `Shift+d`, and [`OpEvent::from_keyboard`] already gives the event in lower case.
+fn same_key(want: &Key, key: &Key) -> bool {
+    match (want, key) {
+        (Key::Character(want), Key::Character(key)) => want.eq_ignore_ascii_case(key),
+        _ => want == key,
+    }
+}
+
+/// The key a binding names for what the platform reported: see [`OpEvent::from_keyboard`].
+fn binding_key(key: &Key, code: Code) -> Key {
+    let Key::Character(text) = key else {
+        return key.clone();
+    };
+    if text.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return Key::Character(text.to_ascii_lowercase());
+    }
+    // A character no binding can name — another script, or a control character some
+    // platforms report for `Ctrl+letter` — so the key is named by its place.
+    match us_character(code) {
+        Some(character) => Key::Character(character.into()),
+        None => key.clone(),
+    }
+}
+
+/// What the key at `code` types on the US layout, unshifted, for the keys that type
+/// something: the names the default keymap is written in.
+fn us_character(code: Code) -> Option<&'static str> {
+    Some(match code {
+        Code::KeyA => "a",
+        Code::KeyB => "b",
+        Code::KeyC => "c",
+        Code::KeyD => "d",
+        Code::KeyE => "e",
+        Code::KeyF => "f",
+        Code::KeyG => "g",
+        Code::KeyH => "h",
+        Code::KeyI => "i",
+        Code::KeyJ => "j",
+        Code::KeyK => "k",
+        Code::KeyL => "l",
+        Code::KeyM => "m",
+        Code::KeyN => "n",
+        Code::KeyO => "o",
+        Code::KeyP => "p",
+        Code::KeyQ => "q",
+        Code::KeyR => "r",
+        Code::KeyS => "s",
+        Code::KeyT => "t",
+        Code::KeyU => "u",
+        Code::KeyV => "v",
+        Code::KeyW => "w",
+        Code::KeyX => "x",
+        Code::KeyY => "y",
+        Code::KeyZ => "z",
+        Code::Digit0 => "0",
+        Code::Digit1 => "1",
+        Code::Digit2 => "2",
+        Code::Digit3 => "3",
+        Code::Digit4 => "4",
+        Code::Digit5 => "5",
+        Code::Digit6 => "6",
+        Code::Digit7 => "7",
+        Code::Digit8 => "8",
+        Code::Digit9 => "9",
+        Code::Minus => "-",
+        Code::Equal => "=",
+        Code::BracketLeft => "[",
+        Code::BracketRight => "]",
+        Code::Backslash => "\\",
+        Code::Semicolon => ";",
+        Code::Quote => "'",
+        Code::Comma => ",",
+        Code::Period => ".",
+        Code::Slash => "/",
+        Code::Backquote => "`",
+        Code::Space => " ",
+        _ => return None,
+    })
 }
 
 /// Whether two modifier sets are the same, ignoring the lock keys.
@@ -430,5 +534,59 @@ mod tests {
             mods: Modifiers::empty(),
             down: true,
         }));
+    }
+
+    /// A key as the platform reports it: what it types, and where it is.
+    fn typed(text: &str, code: Code, mods: Modifiers) -> OpEvent {
+        OpEvent::from_keyboard(&KeyboardEvent {
+            state: KeyState::Down,
+            key: Key::Character(text.into()),
+            code,
+            modifiers: mods,
+            ..KeyboardEvent::default()
+        })
+    }
+
+    /// `Shift+D` types `D`, and a binding written `Shift+d` is the same key — as is one
+    /// written `Shift+D` in a keymap file. Caps Lock changes the text, not the key.
+    #[test]
+    fn a_letter_is_a_key_whatever_its_case() {
+        let shift_d = Pattern::key("d").with_mods(Modifiers::SHIFT);
+        assert!(shift_d.matches(&typed("D", Code::KeyD, Modifiers::SHIFT)));
+        assert!(
+            Pattern::key("D")
+                .with_mods(Modifiers::SHIFT)
+                .matches(&typed("D", Code::KeyD, Modifiers::SHIFT))
+        );
+        assert!(Pattern::key("g").matches(&typed("G", Code::KeyG, Modifiers::CAPS_LOCK)));
+        assert!(
+            !shift_d.matches(&typed("D", Code::KeyD, Modifiers::empty())),
+            "modifiers still count"
+        );
+    }
+
+    /// On a layout without Latin letters the key is named by its place: `Shift+В` is
+    /// `Shift+D` and `Ctrl+С` is `Ctrl+C` on a Russian layout. A layout with Latin letters
+    /// keeps them: the AZERTY key labelled `A`, where QWERTY has `Q`, is `a`.
+    #[test]
+    fn a_key_on_another_layout_is_named_by_its_place_unless_it_types_latin() {
+        let shift_d = Pattern::key("d").with_mods(Modifiers::SHIFT);
+        assert!(shift_d.matches(&typed("В", Code::KeyD, Modifiers::SHIFT)));
+        let ctrl_c = Pattern::key("c").with_mods(Modifiers::CONTROL);
+        assert!(ctrl_c.matches(&typed("с", Code::KeyC, Modifiers::CONTROL)));
+        assert!(
+            ctrl_c.matches(&typed("\u{3}", Code::KeyC, Modifiers::CONTROL)),
+            "a control character too"
+        );
+        assert!(Pattern::key("-").matches(&typed("-", Code::Minus, Modifiers::empty())));
+
+        assert!(Pattern::key("a").matches(&typed("a", Code::KeyQ, Modifiers::empty())));
+        assert!(!Pattern::key("q").matches(&typed("a", Code::KeyQ, Modifiers::empty())));
+        // A character with no place to name it stays what it was.
+        assert_eq!(typed("ж", Code::Unidentified, Modifiers::empty()), OpEvent::Key {
+            key: Key::Character("ж".into()),
+            mods: Modifiers::empty(),
+            down: true
+        });
     }
 }

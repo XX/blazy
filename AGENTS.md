@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI agent tool when working with code in this repository.
 
 ## What this repository is
 
@@ -405,6 +405,17 @@ The screen's keys step aside while a field has focus for the same reason. The cl
 in `ShellCtx`, one per process and reachable by a driver. A `RenderRoot` built for a test with
 no font copies nothing — an empty selection over no glyphs — so text tests take `ROBOTO`.
 
+**What a node holds is the graph's opaque `Content`, and the history carries it (§57).** A
+copy needs to know what a node *is*, which only the application does, so `NodeGraph` has a
+`Content` type the editor carries unread — into the clipboard (the graph's, in `Views`, so a
+copy pastes in any area of any window), and into every step that can bring a node back:
+`restore_node` takes the content from the step, because a removed node's slot keeps it only
+until an insertion takes the name back, and one example's slot did not keep it at all. Two
+consequences: undoing a delete restores **every node first, then the links**, or a link
+between two deleted nodes is refused while its other end is still gone; and `node.duplicate`
+runs the grab itself (`MoveOp::follow`) so that `Shift+D` plus the move is **one** undo step.
+A modal operator handed no event is being cancelled (`cancel_all`), not asked to go on.
+
 **An operator never touches a widget (§38.3).** It changes the model and lists what
 moved — or, for a view operator like `view.pan`, how far the view should move; the
 driver carries that into its own canvas and into the graph's other views.
@@ -464,7 +475,7 @@ of the graph the moment there are two views. A structural edit invalidates both 
 sets by hand, because they are chosen by where the *view* is and an edit does not move
 it (§28.4 from the other side).
 
-**A node editor needs four things from a graph (§42), and nine to edit one (§43).** `blazy-node-editor`'s
+**A node editor needs four things from a graph (§42), nine to edit one (§43), and twelve plus a content type to copy one (§57).** `blazy-node-editor`'s
 `NodeGraph` is a count, a rectangle, a position setter and the other views — and the
 last is required rather than defaulted, because "no peers" compiles, passes every
 single-view test and splits two views of one graph apart (§30). The one place the
@@ -526,11 +537,19 @@ nothing — every test named one itself, the window did not, and `G`/`X`/`Ctrl+Z
 there from §44 to §49. `EditorApp::route_keys` points the fallback at the editor of the area
 under the pointer after every event, reading through a `WidgetRef` (an edit would cost a
 rewrite battery per event); the editor records its own id in its session for that.
+**A driver builds key events with `OpEvent::from_keyboard`**, never from `key.key` directly:
+the platform reports the text a key types, so `Shift+D` arrives as `"D"` and on a Russian
+layout as `"В"`. It lowercases Latin text and names a key that types no Latin character by its
+place (`Code`, as the US layout names it); `Pattern::matches` compares letters
+case-insensitively, so a file may write `Shift+D`. Tests that send `"d"` with `SHIFT` could
+not see this — send what a window sends (`"D"`, a `Code`).
 
 **A node looks selected by wearing a class, and its style is data (§50).** The selection
 lives in the graph's registry (`Views::selection`, §50.9) and `EditorWorld::select` writes it;
 the editor announces a change *after* the gesture's structural edits (`node.add` selects what
-it adds, and a raise filed before the insertion is reset by it), and `Change::Selection` wakes
+it adds, and a raise filed before the insertion is reset by it) — and its own canvas's
+classes are synced after those edits too, in both flush paths, or the class lands on a slot
+that does not exist yet and the copy looks unselected only where it was made — and `Change::Selection` wakes
 the other editors by asking their canvas for a layout. Each editor
 puts `SELECTED` on the nodes of the graph's selection (per view, by difference), the
 canvas remembers a node's classes in its slot and builds every widget wearing them (the

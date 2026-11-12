@@ -597,8 +597,10 @@ impl CanvasLayer {
     /// freed — and this array follows. A name beyond the end leaves holes behind it, and
     /// they are the names the next insertions will use.
     ///
-    /// Re-inserting a live name replaces what was there, which is what undo of a removal
-    /// needs and what a second insertion under the same name has no business doing.
+    /// Inserting a live name again changes nothing but its geometry: it is the same
+    /// insertion delivered twice, which inside a window is the normal case (the push and
+    /// then the pull). The node keeps its widget, its classes and its place in the stack.
+    /// A name a removal freed starts over, which is what undo of a removal needs.
     pub fn insert_node(this: &mut WidgetMut<'_, Self>, index: usize, pos: Point, size: Size) {
         {
             let mut content = this.ctx.get_mut(&mut this.widget.content);

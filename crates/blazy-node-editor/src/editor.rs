@@ -691,11 +691,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             this.widget.menu = Some(menu.id());
             this.ctx.create_layer(LayerType::Other, menu, at);
         }
-        Self::sync_selection(this);
-        if changes.is_empty() {
-            return;
-        }
-        {
+        if !changes.is_empty() {
             let mut canvas = this.ctx.get_mut(&mut this.widget.canvas);
             apply_edits(&mut canvas, &changes.edits);
             for &(index, pos) in &changes.positions {
@@ -708,6 +704,10 @@ impl<G: NodeGraph> NodeEditor<G> {
                 CanvasLayer::zoom_around(&mut canvas, origin, factor);
             }
         }
+        // After the edits: a node added and selected in one step — a duplicate, a paste,
+        // `node.add` — has to be in the canvas before its class can go on it. Before them
+        // the class went onto a slot that was not there and the selection counted as shown.
+        Self::sync_selection(this);
         if !changes.concerns_the_graph() {
             return;
         }
@@ -801,7 +801,8 @@ fn apply_edits(canvas: &mut WidgetMut<'_, CanvasLayer>, edits: &[Edit]) {
 /// Twice is the normal case rather than a hazard: inside a window the push delivers an
 /// edit to the graph's other views in the same frame, and the pull that carries it across
 /// windows delivers it to them again (`Views`). A node inserted again under its own name
-/// replaces itself and a removal of something absent is nothing — but a link is named by
+/// keeps its widget and takes the geometry (`CanvasLayer::insert_node`) and a removal of
+/// something absent is nothing — but a link is named by
 /// the canvas, so inserting one twice would file it twice, and that is what the lookup
 /// here is for.
 pub(crate) fn apply_edit(canvas: &mut WidgetMut<'_, CanvasLayer>, edit: Edit) {
@@ -1114,8 +1115,17 @@ impl<G: NodeGraph> NodeEditor<G> {
             self.menu = Some(menu.id());
             ctx.create_layer(LayerType::Other, menu, at);
         }
+        // Structure goes through the mutate pass even for this canvas, because adding a
+        // node may add a child and removing one may drop a child, and that is the only
+        // pass allowed to do either. A drag does not wait for it; an edit can.
+        if !changes.edits.is_empty() {
+            let edits = changes.edits.clone();
+            ctx.mutate_later(self.canvas.id(), move |widget| apply_moves(widget, Vec::new(), edits));
+        }
         // Classes are changed from the mutate pass: it is where a child's `WidgetMut` is to
-        // be had, and a selection is a click, not a frame of a drag.
+        // be had, and a selection is a click, not a frame of a drag. Queued after the
+        // edits, which the pass runs in order: a node added and selected in one step has
+        // to be in the canvas before its class can go on it.
         if self.selection_stale() {
             ctx.mutate_self_later(|mut widget| Self::sync_selection(&mut widget.downcast::<Self>()));
         }
@@ -1133,13 +1143,6 @@ impl<G: NodeGraph> NodeEditor<G> {
             for &(origin, factor) in &changes.zoom {
                 canvas.zoom_raw(origin, factor, &mut raw);
             }
-        }
-        // Structure goes through the mutate pass even for this canvas, because adding a
-        // node may add a child and removing one may drop a child, and that is the only
-        // pass allowed to do either. A drag does not wait for it; an edit can.
-        if !changes.edits.is_empty() {
-            let edits = changes.edits.clone();
-            ctx.mutate_later(self.canvas.id(), move |widget| apply_moves(widget, Vec::new(), edits));
         }
         if !changes.concerns_the_graph() {
             return;
@@ -1421,11 +1424,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                 ctx.set_handled();
             },
             TextEvent::Keyboard(key) if !ctx.is_handled() => {
-                let op_event = OpEvent::Key {
-                    key: key.key.clone(),
-                    mods: key.modifiers,
-                    down: key.state == KeyState::Down,
-                };
+                let op_event = OpEvent::from_keyboard(key);
                 let seat = if ctx.target() == ctx.widget_id() {
                     Seat::Tree
                 } else {

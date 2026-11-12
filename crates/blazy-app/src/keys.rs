@@ -3,7 +3,7 @@
 use blazy_ops::event::{OpEvent, Pattern};
 use blazy_ops::keymap::{Binding, Keymap};
 use masonry::core::TextEvent;
-use masonry::core::keyboard::{KeyState, Modifiers};
+use masonry::core::keyboard::Modifiers;
 
 /// An operation on the screen or on the area under the pointer (§41, §44).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,11 +169,7 @@ impl ScreenKeys {
         let TextEvent::Keyboard(key) = event else {
             return None;
         };
-        let event = OpEvent::Key {
-            key: key.key.clone(),
-            mods: key.modifiers,
-            down: key.state == KeyState::Down,
-        };
+        let event = OpEvent::from_keyboard(key);
         self.bindings
             .iter()
             .find(|(pattern, _)| pattern.matches(&event))
