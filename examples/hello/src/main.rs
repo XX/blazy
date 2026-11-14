@@ -26,8 +26,9 @@
 //! undo. A node or a link held at
 //! the edge of an area scrolls the view. `Alt+X` / `Alt+Y` split the area under the
 //! pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another window over the same
-//! graph and `Alt+D` moves the area into one of its own. `N` shows the area's sidebar, and
-//! its left edge widens it. Click a node's name to rename
+//! graph and `Alt+D` moves the area into one of its own. `N` shows the area's sidebar — the
+//! selected node's name, place and size, and arrows that move it — and its left edge widens
+//! it. Click a node's name to rename
 //! it — copy, paste and an input method work there — and `Enter` or `Escape` to leave
 //! the field; the other areas show the new name.
 
@@ -38,13 +39,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use blazy::app::EditorApp;
-use blazy::areas::SplitTree;
+use blazy::areas::{CarriesScale, ScaleCarrier, SplitTree, push_ui_scale};
 use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, DefaultProperties, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction,
     PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId,
-    WidgetPod,
+    WidgetMut, WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, Shape, Size};
@@ -52,11 +53,14 @@ use blazy::masonry::layout::{LenDef, LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
 use blazy::masonry::theme::default_property_set;
-use blazy::masonry::widgets::{TextAction, TextInput};
+use blazy::masonry::widgets::{Button, ButtonPress, TextAction, TextInput};
 use blazy::node_editor::{
-    Change, EdgePan, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
+    Change, EdgePan, GraphPanel, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph,
+    ViewToken, Views,
 };
+use blazy::ops::keymap::Props;
 use blazy::shell::window::{Error, WindowConfig};
+use blazy::widgets::{Bar, Label, Metrics};
 
 /// Nodes the graph starts with.
 const NODES: usize = 12;
@@ -381,6 +385,189 @@ impl Widget for Node {
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
 }
 
+/// How far a press of an arrow in the panel moves the node, in canvas units.
+const NUDGE: f64 = 20.0;
+
+/// What the panel shows for `selection`: the node's name, to edit; where it is and how
+/// big; two arrows that move it — or a word, for no node or several.
+///
+/// Every container a carrier, so the sidebar's interface scale reaches the last caption in
+/// the event it is set in (§62).
+fn properties_of(
+    graph: &SharedGraph<Graph>,
+    selection: &std::collections::BTreeSet<usize>,
+    panel: WidgetId,
+    editor: Option<WidgetId>,
+) -> NewWidget<dyn Widget> {
+    let row = |bar: Bar| NewWidget::new(bar).with_props(ScaleCarrier::of::<Bar>()).erased();
+    let caption = |text: String| NewWidget::new(Label::new(text)).erased();
+    let metrics = Metrics {
+        padding: 4.0,
+        gap: 6.0,
+        ..Metrics::default()
+    };
+    let mut column = Bar::column(metrics);
+    let shown = match selection.iter().collect::<Vec<_>>()[..] {
+        [&index] if graph.borrow().node_rect_of(index).is_some() => Some(index),
+        _ => None,
+    };
+    let Some(index) = shown else {
+        let word = if selection.is_empty() {
+            "No node selected"
+        } else {
+            "Several nodes selected"
+        };
+        column = column.with(row(Bar::new(metrics).with(caption(word.into()), metrics)), metrics);
+        return NewWidget::new(column).with_props(ScaleCarrier::of::<Bar>()).erased();
+    };
+    let (title, rect) = {
+        let graph = graph.borrow();
+        (
+            graph.titles.get(index).cloned().unwrap_or_default(),
+            graph.node_rect(index),
+        )
+    };
+    let name = NewWidget::new(TextInput::new(&title));
+    let left = NewWidget::new(Button::with_text("<"));
+    let right = NewWidget::new(Button::with_text(">"));
+    let (left_id, right_id) = (left.id(), right.id());
+    let line = |label: &str, value: NewWidget<dyn Widget>| {
+        row(Bar::new(metrics)
+            .with(caption(label.into()), metrics)
+            .with(value, metrics))
+    };
+    column = column
+        .with(line("Name", name.erased()), metrics)
+        .with(
+            line("Position", caption(format!("{:.0}, {:.0}", rect.x0, rect.y0))),
+            metrics,
+        )
+        .with(
+            line("Size", caption(format!("{:.0} x {:.0}", rect.width(), rect.height()))),
+            metrics,
+        )
+        .with(
+            row(Bar::new(metrics)
+                .with(caption("Move".into()), metrics)
+                .with(left.erased(), metrics)
+                .with(right.erased(), metrics)),
+            metrics,
+        );
+    NewWidget::new(Properties {
+        content: NewWidget::new(column)
+            .with_props(ScaleCarrier::of::<Bar>())
+            .erased()
+            .to_pod(),
+        graph: graph.clone(),
+        index,
+        panel,
+        editor,
+        nudges: [(left_id, -NUDGE), (right_id, NUDGE)],
+    })
+    .with_props(ScaleCarrier::of::<Properties>())
+    .erased()
+}
+
+/// One node's properties: what the panel's controls do.
+///
+/// The name is the model's, written as the node's own field writes it and recorded past
+/// the panel — the panel shows the edit already, and rebuilding it would take the field
+/// from under the caret (§47). The arrows are a move, so they go through the editor's
+/// `node.move`: a step in the history, which `Ctrl+Z` undoes, and in every view.
+struct Properties {
+    content: WidgetPod<dyn Widget>,
+    graph: SharedGraph<Graph>,
+    index: usize,
+    /// The `GraphPanel` this is the content of: the id the name's edits are recorded past.
+    panel: WidgetId,
+    /// The editor of the area, which runs the move.
+    editor: Option<WidgetId>,
+    /// Each arrow, and how far it moves the node along x.
+    nudges: [(WidgetId, f64); 2],
+}
+
+impl CarriesScale for Properties {
+    fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
+        let mut content = this.ctx.get_mut(&mut this.widget.content);
+        push_ui_scale(&mut content, scale);
+    }
+}
+
+impl Widget for Properties {
+    type Action = NoAction;
+
+    fn measure(
+        &mut self,
+        _ctx: &mut MeasureCtx<'_>,
+        _props: &PropertiesRef<'_>,
+        _axis: Axis,
+        len_req: LenReq,
+        _cross_length: Option<Length>,
+    ) -> Length {
+        match len_req {
+            LenReq::FitContent(space) => space,
+            _ => Length::ZERO,
+        }
+    }
+
+    fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
+        ctx.run_layout(&mut self.content, size);
+        ctx.place_child(&mut self.content, Point::ORIGIN);
+    }
+
+    fn on_action(
+        &mut self,
+        ctx: &mut ActionCtx<'_>,
+        _props: &mut PropertiesMut<'_>,
+        action: &ErasedAction,
+        source: WidgetId,
+    ) {
+        // The one text field is the name. Its action comes from the text area inside the
+        // `TextInput`, not from the input itself, so it is told by its type and not its id.
+        if let Some(action) = action.downcast_ref::<TextAction>() {
+            match action {
+                TextAction::Changed(text) => {
+                    let graph = &mut *self.graph.borrow_mut();
+                    if let Some(title) = graph.titles.get_mut(self.index) {
+                        title.clone_from(text);
+                    }
+                    graph
+                        .views()
+                        .note_except(self.panel, Change::Contents { index: self.index });
+                },
+                TextAction::Entered(_) | TextAction::Cancelled => ctx.resign_focus(),
+            }
+            ctx.set_handled();
+        } else if action.downcast_ref::<ButtonPress>().is_some()
+            && let Some(&(_, dx)) = self.nudges.iter().find(|(id, _)| *id == source)
+            && let Some(editor) = self.editor
+        {
+            // The move is the selection's — this node, since the panel shows one.
+            ctx.mutate_later(editor, move |mut widget| {
+                let props = Props::new().with_float("dx", dx);
+                let _ = NodeEditor::<Graph>::exec(&mut widget.downcast(), "node.move", &props);
+            });
+            ctx.set_handled();
+        }
+    }
+
+    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
+
+    fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
+        ctx.register_child(&mut self.content);
+    }
+
+    fn children_ids(&self) -> ChildrenIds {
+        ChildrenIds::from_slice(&[self.content.id()])
+    }
+
+    fn accessibility_role(&self) -> Role {
+        Role::Form
+    }
+
+    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
+}
+
 /// The theme, plus what a node looks like — and what it looks like selected.
 ///
 /// The style is the node type's own stack: a property stack replaces the theme's for
@@ -435,9 +622,19 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
     // choice rather than a default: without it the gesture carries on past the border and
     // the view stands still.
     .with_edge_pan(EdgePan::default())
-    // A sidebar on every area, `N` to show it, its left edge to widen it. Empty for now: the
-    // properties of the selected node are `issues/26-11-13 properties panel.md`.
-    .with_sidebar(|_area, _session| NewWidget::new(blazy::masonry::widgets::Label::new("Properties (N)")).erased())
+    // A sidebar on every area, `N` to show it, its left edge to widen it: the properties of
+    // the selected node.
+    .with_sidebar(|_area, session| {
+        let session = session.clone();
+        let graph = session.borrow().world.graph.clone();
+        let panel = GraphPanel::new(&graph, move |graph, selection, panel| {
+            let editor = session.borrow().editor;
+            properties_of(graph, selection, panel, editor)
+        });
+        NewWidget::new(panel)
+            .with_props(ScaleCarrier::of::<GraphPanel<Graph>>())
+            .erased()
+    })
 }
 
 impl Graph {
@@ -708,5 +905,118 @@ mod tests {
         let _ = harness.redraw();
         assert_eq!(graph.borrow().node_rect(0).width(), 200.0, "60 wider");
         assert_eq!(field_width(&mut harness), before + 60.0, "and the name field too");
+    }
+
+    /// Every widget of type `T` under `root`, depth first.
+    fn find_all<T: Widget>(harness: &TestHarness<blazy::app::EditorScreen<Graph>>, root: WidgetId) -> Vec<WidgetId> {
+        fn walk<T: Widget>(widget: blazy::masonry::core::WidgetRef<'_, dyn Widget>, out: &mut Vec<WidgetId>) {
+            if widget.downcast::<T>().is_some() {
+                out.push(widget.id());
+            }
+            for child in widget.children() {
+                walk::<T>(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk::<T>(harness.get_widget_with_id(root), &mut out);
+        out
+    }
+
+    /// What a window does before it draws: each canvas and each panel collects its share.
+    fn pull(harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>, graph: &SharedGraph<Graph>) {
+        let views = graph.borrow().views().clone();
+        for canvas in views.ids() {
+            harness.edit_widget_with_id(canvas, |mut widget| {
+                sync_canvas(&mut widget.downcast::<CanvasLayer>(), &views)
+            });
+        }
+        for (watcher, refresh) in views.owed_watchers() {
+            harness.edit_widget_with_id(watcher, |mut widget| refresh(&mut widget));
+        }
+        let _ = harness.redraw();
+    }
+
+    /// The sidebar shows the selected node: a name typed there reaches the node in both
+    /// areas without rebuilding the panel under the caret, and an arrow moves the node
+    /// through `node.move`, so undo puts it back. Both areas' panels follow the selection.
+    #[test]
+    fn the_panel_shows_the_selected_node_and_edits_it() {
+        use blazy::masonry::ui_events::pointer::PointerButton;
+
+        let graph = Graph::grid();
+        let screen = app(&graph).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
+        let _ = harness.redraw();
+        // Show both sidebars, as `N` does.
+        let area_widgets = harness.root_widget().area_ids();
+        for (area, &id) in area_widgets.iter().enumerate() {
+            let session = harness.root_widget().payload(area).expect("a session").clone();
+            session.borrow().sidebar.set(blazy::areas::Sidebar::new(true, 240.0));
+            harness.edit_widget_with_id(id, |mut widget| {
+                blazy::areas::AreaContent::refresh(&mut widget.downcast::<blazy::areas::AreaContent>());
+            });
+        }
+        let _ = harness.redraw();
+        let editors = editor_ids(&harness);
+        let panel_of = |harness: &TestHarness<blazy::app::EditorScreen<Graph>>, area: usize| {
+            let content = harness.get_widget_with_id(area_widgets[area]);
+            content
+                .downcast::<blazy::areas::AreaContent>()
+                .expect("an area with regions")
+                .inner()
+                .region_ids()[1]
+        };
+        let fields = |harness: &TestHarness<blazy::app::EditorScreen<Graph>>, area: usize| {
+            // The editable text inside each field: what `text_of` reads and focus lands on.
+            find_all::<TextArea<true>>(harness, panel_of(harness, area))
+        };
+        assert!(fields(&harness, 0).is_empty(), "nothing selected, no name to edit");
+
+        // Select node 0 in the left area, on its body below the name.
+        harness.mouse_move(Point::new(100.0, 108.0));
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+        let name = fields(&harness, 0);
+        assert_eq!(name.len(), 1, "the left panel shows the node");
+        assert_eq!(text_of(&harness, name[0]), "node 0");
+        assert_eq!(
+            fields(&harness, 1).len(),
+            1,
+            "and so does the right one, in the same frame"
+        );
+
+        harness.focus_on(Some(name[0]));
+        harness.keyboard_type_chars("!");
+        pull(&mut harness, &graph);
+        // Where the caret lands in a field focused from a test is the field's business.
+        let typed = graph.borrow().titles[0].clone();
+        assert!(
+            typed.contains('!') && typed.len() == "node 0!".len(),
+            "the model holds it: {typed:?}"
+        );
+        assert_eq!(
+            harness.focused_widget_id(),
+            Some(name[0]),
+            "the field typed into is the one still there"
+        );
+        for (area, &editor) in editors.iter().enumerate() {
+            let field = title_field(&mut harness, editor, 0);
+            assert_eq!(text_of(&harness, field), typed, "area {area}'s node shows it");
+        }
+        let far = fields(&harness, 1)[0];
+        assert_eq!(text_of(&harness, far), typed, "and the other panel");
+        harness.focus_on(None);
+
+        let right = find_all::<Button>(&harness, panel_of(&harness, 0))[1];
+        harness.mouse_click_on(right, Some(PointerButton::Primary));
+        pull(&mut harness, &graph);
+        assert_eq!(graph.borrow().node_rect(0).x0, 40.0 + NUDGE, "the arrow moved it");
+        harness.edit_widget_with_id(editors[0], |mut widget| {
+            NodeEditor::<Graph>::exec(&mut widget.downcast(), "ed.undo", &Props::new())
+        });
+        pull(&mut harness, &graph);
+        assert_eq!(graph.borrow().node_rect(0).x0, 40.0, "and undo put it back");
     }
 }

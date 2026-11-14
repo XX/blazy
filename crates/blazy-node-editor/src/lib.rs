@@ -39,6 +39,7 @@ mod edge_pan;
 mod editor;
 mod menu;
 pub mod ops;
+mod panel;
 mod views;
 mod world;
 
@@ -54,7 +55,8 @@ use masonry::kurbo::{Point, Rect};
 pub use crate::edge_pan::{EDGE_PAN, EdgePan, EdgePanCounters};
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
 pub use crate::menu::{Menu, MenuItem, MenuLayer, MenuOp};
-pub use crate::views::{Change, ViewCounters, ViewToken, Views, sync_canvas, sync_root};
+pub use crate::panel::{BuildPanel, GraphPanel, PanelCounters};
+pub use crate::views::{Change, Refresh, ViewCounters, ViewToken, Views, WatchToken, sync_canvas, sync_root};
 pub use crate::world::{DEFAULT_NODE_SIZE, Edit, EditorWorld, LinkPreview, MoveRecord, MoveRecorder, Removed, journal};
 
 /// The class a selected node wears (`CanvasLayer::set_node_class`).

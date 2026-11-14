@@ -48,6 +48,8 @@ pub struct Bar {
     /// The scale the children were last pushed at, so an unchanged scale costs nothing.
     applied: Option<f64>,
     counters: BarCounters,
+    /// Along which axis the children follow one another: a row, or a column (§62).
+    axis: Axis,
 }
 
 struct Child {
@@ -63,6 +65,20 @@ impl Bar {
             metrics,
             applied: None,
             counters: BarCounters::default(),
+            axis: Axis::Horizontal,
+        }
+    }
+
+    /// An empty column: the children one under another, each as wide as the column.
+    ///
+    /// What a properties panel is made of (§62). A stock `Flex` would do the layout, but
+    /// not the carrying: its children cannot be reached through its `WidgetMut` on this
+    /// Masonry, so a scale stops at it and goes on a pass per level (§48). A column of
+    /// rows of this type carries the scale to the last control in the pass it arrived in.
+    pub fn column(metrics: Metrics) -> Self {
+        Self {
+            axis: Axis::Vertical,
+            ..Self::new(metrics)
         }
     }
 
@@ -191,7 +207,8 @@ impl Widget for Bar {
         // to resolve against.
         let context = masonry::layout::LayoutSize::default();
         match (axis, len_req) {
-            (Axis::Horizontal, LenReq::MinContent | LenReq::MaxContent) => {
+            (_, LenReq::FitContent(space)) => space,
+            (_, LenReq::MinContent | LenReq::MaxContent) if axis == self.axis => {
                 let mut width = 2.0 * metrics.padding;
                 for (index, child) in self.children.iter_mut().enumerate() {
                     if index > 0 {
@@ -203,7 +220,7 @@ impl Widget for Bar {
                 }
                 Length::px(width)
             },
-            (Axis::Vertical, LenReq::MinContent | LenReq::MaxContent) => {
+            (_, LenReq::MinContent | LenReq::MaxContent) => {
                 let mut height: f64 = 0.0;
                 for child in &mut self.children {
                     let length = ctx
@@ -213,7 +230,6 @@ impl Widget for Bar {
                 }
                 Length::px(height + 2.0 * metrics.padding)
             },
-            (_, LenReq::FitContent(space)) => space,
         }
     }
 
@@ -221,6 +237,26 @@ impl Widget for Bar {
         let scale = props.get::<UiScale>(ctx.property_cache()).0;
         self.carry(ctx, scale);
         let metrics = self.metrics.at(scale);
+        if self.axis == Axis::Vertical {
+            let inner_width = (size.width - 2.0 * metrics.padding).max(0.0);
+            let mut y = metrics.padding;
+            for child in &mut self.children {
+                let height = ctx
+                    .compute_length(
+                        &mut child.pod,
+                        masonry::layout::LenDef::MaxContent,
+                        size.into(),
+                        Axis::Vertical,
+                        Some(Length::px(inner_width)),
+                    )
+                    .get();
+                let chosen = Size::new(inner_width, height);
+                ctx.run_layout(&mut child.pod, chosen);
+                ctx.place_child(&mut child.pod, Point::new(metrics.padding, y));
+                y += height + metrics.gap;
+            }
+            return;
+        }
         let inner_height = (size.height - 2.0 * metrics.padding).max(0.0);
         let mut x = metrics.padding;
         for child in &mut self.children {

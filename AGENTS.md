@@ -665,6 +665,16 @@ never keep region state in `AreaContent`. The assembly builds the regions when a
 sidebar an area's widget is an `AreaContent`, not the editor: find the editor through the
 session (`editor`) or the main region, as `hello`'s tests do.
 
+**A widget that shows the graph but is not a canvas is a watcher (§62).** `Views::watch`
+registers it with a refresh function; any recorded change marks it owed (a flag, not a list),
+the editor's flush refreshes owed watchers in its own window and `sync_root` in any other, and
+the refresh must call `Views::refreshed`. `GraphPanel` is the ready one: the application builds
+its content from the graph and selection, and **records the panel's own edits with
+`note_except(panel_id)`** or the panel is rebuilt under the caret. Geometry edited from a panel
+goes through operators (`NodeEditor::exec`), so it is undoable. Panel layouts are made of
+`Bar::column`/`Bar` carriers, not stock `Flex`/`Grid`, whose children cannot be reached to
+carry the scale.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

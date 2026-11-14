@@ -119,7 +119,18 @@ struct Ledger {
     /// registry. Per graph rather than per process, which is narrower than Blender's
     /// (§57.5).
     clip: Option<Rc<dyn Any>>,
+    /// Widgets that show the graph without being a canvas — a properties panel (§62) — and
+    /// whether each is owed a refresh, with the function that refreshes it.
+    ///
+    /// A flag rather than a list of changes: such a widget re-reads what it shows from the
+    /// model, so all it needs to know is *that* something changed, and many changes before
+    /// a frame cost one refresh.
+    watchers: Vec<(WidgetId, bool, Refresh)>,
 }
+
+/// What brings a watcher up to date, given its `WidgetMut`. A function rather than a
+/// downcast, because the registry is not generic over the watcher's type.
+pub type Refresh = fn(&mut WidgetMut<'_, dyn masonry::core::Widget>);
 
 impl std::fmt::Debug for Views {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -166,6 +177,44 @@ impl Views {
         ViewToken {
             ledger: self.0.clone(),
             canvas,
+        }
+    }
+
+    /// Registers a widget that shows the graph but is not a canvas — a properties panel —
+    /// for as long as the token lives (§62).
+    ///
+    /// It is owed a refresh after every change recorded here, whoever made it, unless it
+    /// made it ([`note_except`](Self::note_except) with its own id); `refresh` is called on
+    /// it by the push in its own window ([`owed_watchers`](Self::owed_watchers)) and by the
+    /// pull in any other ([`sync_root`]), and has to call [`refreshed`](Self::refreshed).
+    /// A watcher nothing changed for is not woken: a panel costs an idle frame nothing.
+    #[must_use = "the watcher is forgotten as soon as the token is dropped"]
+    pub fn watch(&self, widget: WidgetId, refresh: Refresh) -> WatchToken {
+        let mut ledger = self.0.borrow_mut();
+        if !ledger.watchers.iter().any(|(id, ..)| *id == widget) {
+            ledger.watchers.push((widget, false, refresh));
+        }
+        WatchToken {
+            ledger: self.0.clone(),
+            widget,
+        }
+    }
+
+    /// The watchers owed a refresh, with what refreshes each.
+    pub fn owed_watchers(&self) -> Vec<(WidgetId, Refresh)> {
+        let ledger = self.0.borrow();
+        ledger
+            .watchers
+            .iter()
+            .filter(|(_, owed, _)| *owed)
+            .map(|&(id, _, refresh)| (id, refresh))
+            .collect()
+    }
+
+    /// Says watcher `widget` is up to date.
+    pub fn refreshed(&self, widget: WidgetId) {
+        if let Some((_, owed, _)) = self.0.borrow_mut().watchers.iter_mut().find(|(id, ..)| *id == widget) {
+            *owed = false;
         }
     }
 
@@ -284,7 +333,8 @@ impl Views {
     /// What a driver asks before waking other windows: an idle window is idle on
     /// purpose (§36), and waking it after every event would undo that.
     pub fn has_pending(&self) -> bool {
-        self.0.borrow().views.iter().any(|(_, owed)| !owed.is_empty())
+        let ledger = self.0.borrow();
+        ledger.views.iter().any(|(_, owed)| !owed.is_empty()) || ledger.watchers.iter().any(|(_, owed, _)| *owed)
     }
 
     /// How many changes the views owe, summed.
@@ -344,6 +394,11 @@ impl Ledger {
                 self.counters.noted += 1;
             }
         }
+        for (id, owed, _) in &mut self.watchers {
+            if Some(*id) != origin {
+                *owed = true;
+            }
+        }
     }
 }
 
@@ -383,6 +438,29 @@ impl Drop for ViewToken {
         if ledger.views.len() != before {
             ledger.counters.detached += 1;
         }
+    }
+}
+
+/// A watcher's place in a graph's [`Views`], given up when the token is dropped — the
+/// [`ViewToken`] of a widget that is not a canvas.
+pub struct WatchToken {
+    ledger: Rc<RefCell<Ledger>>,
+    widget: WidgetId,
+}
+
+impl std::fmt::Debug for WatchToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WatchToken").field(&self.widget).finish()
+    }
+}
+
+impl Drop for WatchToken {
+    fn drop(&mut self) {
+        let Ok(mut ledger) = self.ledger.try_borrow_mut() else {
+            debug_assert!(false, "the view registry was borrowed while a watcher left the tree");
+            return;
+        };
+        ledger.watchers.retain(|(id, ..)| *id != self.widget);
     }
 }
 
@@ -429,6 +507,14 @@ pub fn sync_root(root: &mut masonry::app::RenderRoot, views: &Views) -> usize {
                 },
             }
         });
+    }
+    // And the watchers this window holds: a panel shows what the graph's other windows
+    // changed once its own window draws, as a canvas does.
+    for (id, refresh) in views.owed_watchers() {
+        if root.get_widget(id).is_some() {
+            root.edit_widget(id, |mut widget| refresh(&mut widget));
+            applied += 1;
+        }
     }
     applied
 }

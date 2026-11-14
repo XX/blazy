@@ -759,6 +759,12 @@ impl<G: NodeGraph> NodeEditor<G> {
             this.ctx
                 .mutate_later(peer, move |widget| apply_to_peer(widget, positions, edits, announced));
         }
+        // The panels showing the graph, in this window in the same frame (§62); one in
+        // another window is not in this tree, and its mutate is dropped — its own pull
+        // refreshes it.
+        for (watcher, refresh) in session.borrow().world.graph.borrow().views().owed_watchers() {
+            this.ctx.mutate_later(watcher, move |mut widget| refresh(&mut widget));
+        }
     }
 }
 
@@ -1249,6 +1255,10 @@ impl<G: NodeGraph> NodeEditor<G> {
         for peer in peers {
             let (positions, edits, announced) = (changes.positions.clone(), changes.edits.clone(), announced.clone());
             ctx.mutate_later(peer, move |widget| apply_to_peer(widget, positions, edits, announced));
+        }
+        // The panels showing the graph, as in `flush_mut`.
+        for (watcher, refresh) in session.borrow().world.graph.borrow().views().owed_watchers() {
+            ctx.mutate_later(watcher, move |mut widget| refresh(&mut widget));
         }
     }
 

@@ -2708,3 +2708,119 @@ fn a_node_edge_under_the_pointer_resizes_the_node() {
         "its output port went with the edge"
     );
 }
+
+// --- MARK: PANEL (`issues/26-11-13.5 properties panel.md`)
+
+/// A panel beside an editor sees a selection made in the editor in the same frame, and a
+/// panel in another window sees it when that window collects; an idle frame builds
+/// nothing, and the panel's own edits do not rebuild it.
+#[test]
+fn a_panel_follows_the_selection_in_its_window_and_in_another() {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use blazy_areas::{AreaContent, RegionKind, Sidebar};
+    use masonry::app::{RenderRoot, RenderRootOptions, WindowSizePolicy};
+    use masonry::ui_events::pointer::PointerButton;
+
+    use crate::{Change, GraphPanel};
+
+    let graph = row(3);
+    let seen: Rc<RefCell<Vec<BTreeSet<usize>>>> = Rc::default();
+    let panel_of = |seen: &Rc<RefCell<Vec<BTreeSet<usize>>>>| {
+        let seen = seen.clone();
+        GraphPanel::new(&graph, move |_graph, selection, _panel| {
+            seen.borrow_mut().push(selection.clone());
+            NewWidget::new(Label::new(format!("{selection:?}"))).erased()
+        })
+    };
+    let panel = NewWidget::new(panel_of(&seen));
+    let panel_id = panel.id();
+    let session = crate::EditorSession::new(&graph).share();
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let editor = NodeEditor::with_session(CanvasLayer::new(3, geometry, source), session);
+    let content = AreaContent::new(vec![(RegionKind::Main, 0.0, NewWidget::new(editor).erased())])
+        .with_sidebar(panel.erased(), Rc::new(std::cell::Cell::new(Sidebar::new(true, 200.0))));
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(content),
+        PhysicalSize::new(1000, 400),
+    );
+    let _ = harness.redraw();
+    let builds = |harness: &TestHarness<AreaContent>| {
+        harness
+            .get_widget_with_id(panel_id)
+            .downcast::<GraphPanel<Row>>()
+            .expect("the panel")
+            .inner()
+            .counters()
+            .builds
+    };
+    assert_eq!(builds(&harness), 1, "built once, when added");
+    assert_eq!(seen.borrow().last(), Some(&BTreeSet::new()));
+
+    // A second window holding a panel alone.
+    let far_seen: Rc<RefCell<Vec<BTreeSet<usize>>>> = Rc::default();
+    let mut far = RenderRoot::new(
+        NewWidget::new(panel_of(&far_seen)).erased(),
+        |_signal| {},
+        RenderRootOptions {
+            default_properties: Arc::new(default_property_set()),
+            use_system_fonts: false,
+            size_policy: WindowSizePolicy::User,
+            size: PhysicalSize::new(300, 300),
+            scale_factor: 1.0,
+            test_font: None,
+        },
+    );
+    let _ = far.redraw();
+    assert_eq!(far_seen.borrow().len(), 1);
+
+    // Click node 1 (x 150..250).
+    harness.mouse_move(Point::new(200.0, 30.0));
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    harness.mouse_button_release(Some(PointerButton::Primary));
+    let _ = harness.redraw();
+    assert_eq!(
+        seen.borrow().last(),
+        Some(&BTreeSet::from([1])),
+        "the panel beside it, at once"
+    );
+    let after_click = builds(&harness);
+
+    for _ in 0..3 {
+        let _ = harness.redraw();
+    }
+    assert_eq!(builds(&harness), after_click, "an idle frame builds nothing");
+
+    assert_eq!(far_seen.borrow().len(), 1, "the other window has not drawn yet");
+    crate::sync_root(&mut far, &graph.borrow().views().clone());
+    assert_eq!(
+        far_seen.borrow().last(),
+        Some(&BTreeSet::from([1])),
+        "and it sees it when it does"
+    );
+    assert!(!graph.borrow().views().has_pending(), "nothing is owed after both");
+
+    // An edit the panel makes is announced past the panel itself.
+    graph
+        .borrow()
+        .views()
+        .note_except(panel_id, Change::Contents { index: 1 });
+    let _ = harness.redraw();
+    assert_eq!(builds(&harness), after_click, "its own edit does not rebuild it");
+    assert_eq!(
+        graph.borrow().views().owed_watchers().len(),
+        1,
+        "but the far panel is owed it"
+    );
+}

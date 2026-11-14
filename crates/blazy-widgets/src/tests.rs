@@ -345,4 +345,97 @@ mod depth {
         assert_eq!(scale_through(2, false), (true, 0));
         assert_eq!(scale_through(3, false), (false, 1));
     }
+
+    /// A properties panel as `hello` builds one (§62): a sidebar holding a panel, holding a
+    /// column of rows,
+    /// each row a caption and a stock text field. The sidebar's scale reaches the caption of
+    /// the last row in the event it was set in, with no frame after — and without the
+    /// carriers on the column and the rows it does not.
+    #[test]
+    fn a_column_of_rows_in_a_sidebar_takes_its_scale_in_one_event() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use blazy_areas::{RegionKind, Sidebar};
+
+        fn panel(carriers: bool) -> (bool, usize) {
+            let mut column = Bar::column(Metrics::default());
+            let mut last = None;
+            for name in ["name", "x", "y", "width"] {
+                let label = NewWidget::new(Label::new(name));
+                last = Some(label.id());
+                let row = Bar::new(Metrics::default())
+                    .with(label.erased(), Metrics::default())
+                    .with(
+                        NewWidget::new(masonry::widgets::TextInput::new("0")).erased(),
+                        Metrics::default(),
+                    );
+                let row = NewWidget::new(row);
+                let row = if carriers {
+                    row.with_props(ScaleCarrier::of::<Bar>())
+                } else {
+                    row
+                };
+                column = column.with(row.erased(), Metrics::default());
+            }
+            let column = NewWidget::new(column);
+            let column = if carriers {
+                column.with_props(ScaleCarrier::of::<Bar>())
+            } else {
+                column
+            };
+            // A sub-panel around the rows (Blender's collapsible group) and the panel at the
+            // region's root (`GraphPanel`, a carrier), each stood in for by a nest: four
+            // containers above the caption. Without the sub-panel it is three, which an
+            // event still carries by layout alone, with nothing to spare (§48, §62).
+            let mut column = column.erased();
+            for _ in 0..2 {
+                let nest = NewWidget::new(Nest {
+                    child: column.to_pod(),
+                    carried: None,
+                });
+                column = if carriers {
+                    nest.with_props(ScaleCarrier::of::<Nest>()).erased()
+                } else {
+                    nest.erased()
+                };
+            }
+            let state = Rc::new(Cell::new(Sidebar::new(true, 240.0)));
+            let content = AreaContent::new(vec![(
+                RegionKind::Main,
+                0.0,
+                NewWidget::new(Button::with_text("main")).erased(),
+            )])
+            .with_sidebar(column, state);
+            let mut root = RenderRoot::new(NewWidget::new(content).erased(), |_signal| {}, RenderRootOptions {
+                default_properties: Arc::new(default_property_set()),
+                use_system_fonts: false,
+                size_policy: WindowSizePolicy::User,
+                size: PhysicalSize::new(super::AREA.0, super::AREA.1),
+                scale_factor: 1.0,
+                test_font: None,
+            });
+            let _ = root.redraw();
+            let area = root.get_layer_root(0).id();
+            root.edit_widget(area, |mut widget| {
+                AreaContent::set_ui_scale(&mut widget.downcast::<AreaContent>(), 1, 2.0);
+            });
+            let settled = !root.needs_rewrite_passes();
+            let last = last.expect("four rows");
+            let applied = |root: &RenderRoot| {
+                root.get_widget(last)
+                    .and_then(|widget| widget.downcast::<Label>())
+                    .map(|label| label.applied_scale())
+            };
+            let mut frames = 0;
+            while applied(&root) != Some(2.0) && frames < 10 {
+                let _ = root.redraw();
+                frames += 1;
+            }
+            (settled, frames)
+        }
+
+        assert_eq!(panel(true), (true, 0), "through carriers, in the event");
+        assert_ne!(panel(false), (true, 0), "without them, not");
+    }
 }
