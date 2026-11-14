@@ -1295,3 +1295,103 @@ fn a_node_resized_in_one_area_is_resized_in_the_other() {
         );
     }
 }
+
+/// An application whose areas have a sidebar: `N` shows and hides the sidebar of the area
+/// under the pointer and of no other, rebuilding nothing; the state is the area's session's,
+/// so a detached area shows its sidebar as it was, and the workspace file brings it back.
+#[test]
+fn n_shows_the_sidebar_of_the_area_under_the_pointer_and_it_outlives_the_area() {
+    let graph = Grid::new(8);
+    let path = std::env::temp_dir().join(format!("blazy-sidebar-{}.workspace", std::process::id()));
+    let mut app = app(&graph)
+        .with_sidebar(|_area, _session| NewWidget::new(Label::new("panel")).erased())
+        .with_workspace(&path);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    let sidebar = |root: &mut RenderRoot, area: usize| {
+        root.edit_base_layer(|mut widget| {
+            let screen = widget.downcast::<EditorScreen<Grid>>();
+            let session = screen.widget.payload(area).expect("a session").clone();
+            session.borrow().sidebar.get()
+        })
+    };
+    let builds = |root: &mut RenderRoot| {
+        root.edit_base_layer(|mut widget| widget.downcast::<EditorScreen<Grid>>().widget.stats().counters.builds)
+    };
+    let editor = edit_editor_in_area(&mut root, 1);
+    let before = builds(&mut root);
+
+    // Over the right-hand area.
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(900.0, 400.0));
+    chord(&mut app, &mut cx, key, &mut root, "n", Modifiers::empty());
+    assert!(sidebar(&mut root, 1).shown, "N showed the right-hand area's sidebar");
+    assert!(!sidebar(&mut root, 0).shown, "and not the left one's");
+    assert_eq!(builds(&mut root), before, "building nothing");
+    assert_eq!(
+        edit_editor_in_area(&mut root, 1),
+        editor,
+        "the editor is the one it was"
+    );
+    let width = |root: &mut RenderRoot| {
+        let id = edit_editor_in_area(root, 1);
+        root.get_widget(id).expect("the editor").ctx().border_box().width()
+    };
+    let area_width = {
+        let id = root.edit_base_layer(|mut widget| {
+            widget
+                .downcast::<EditorScreen<Grid>>()
+                .widget
+                .area_widget(1)
+                .expect("area 1")
+        });
+        root.get_widget(id).expect("the area").ctx().border_box().width()
+    };
+    assert_eq!(
+        width(&mut root),
+        area_width - 240.0 - blazy_areas::SIDEBAR_GRIP,
+        "beside it, narrower"
+    );
+
+    // To the file and back, after N hid it again.
+    app.perform(&mut cx, &mut root, crate::ScreenAction::SaveWorkspace);
+    chord(&mut app, &mut cx, key, &mut root, "n", Modifiers::empty());
+    assert!(!sidebar(&mut root, 1).shown);
+    app.perform(&mut cx, &mut root, crate::ScreenAction::LoadWorkspace);
+    let _ = root.redraw();
+    assert!(sidebar(&mut root, 1).shown, "the workspace brought it back");
+    assert_eq!(
+        width(&mut root),
+        area_width - 240.0 - blazy_areas::SIDEBAR_GRIP,
+        "and laid it out"
+    );
+    let _ = std::fs::remove_file(&path);
+
+    // Detached into another window: the session goes, and its sidebar with it.
+    let taken = root.edit_base_layer(|mut widget| crate::detach_area(&mut widget.downcast::<EditorScreen<Grid>>(), 1));
+    let taken = taken.expect("the right-hand area detaches");
+    let mut second = RenderRoot::new(
+        NewWidget::new(app.screen_carrying(SplitTree::balanced(1), Some(taken))).erased(),
+        |_signal| {},
+        masonry::app::RenderRootOptions {
+            default_properties: Arc::new(default_property_set()),
+            use_system_fonts: false,
+            size_policy: WindowSizePolicy::User,
+            size: PhysicalSize::new(1200, 800),
+            scale_factor: 1.0,
+            test_font: None,
+        },
+    );
+    let _ = second.redraw();
+    assert!(sidebar(&mut second, 0).shown, "the detached area shows its sidebar");
+}
+
+/// The editor in area `area` of a window whose areas have regions: the main region.
+fn edit_editor_in_area(root: &mut RenderRoot, area: usize) -> WidgetId {
+    root.edit_base_layer(|mut widget| {
+        let screen = widget.downcast::<EditorScreen<Grid>>();
+        let session = screen.widget.payload(area).expect("a session").clone();
+        session.borrow().editor.expect("an editor in the tree")
+    })
+}

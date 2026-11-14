@@ -26,6 +26,8 @@
 //! a finding, not a design choice — see `rnd/architecture.md` §22.
 
 use std::any::TypeId;
+use std::cell::Cell;
+use std::rc::Rc;
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
@@ -38,16 +40,65 @@ use masonry::layout::{LenReq, Length, SizeDef};
 
 /// What a region is for.
 ///
-/// Two of the five §8 lists. A header and a main view are enough to ask every
-/// question this spike asks; a toolbar and a sidebar would only be more of the same
-/// arithmetic.
+/// Three of the five §8 lists. Headers stack down the area's height; a sidebar takes its
+/// width off the right of the body below them — the second axis, which is not "more of
+/// the same arithmetic" (§61). A toolbar would be the sidebar's arithmetic on the left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegionKind {
     /// A strip of fixed logical height across the top, scaled by its `ui_scale`.
     Header,
     /// Whatever is left. The editor proper.
     Main,
+    /// A panel on the right of the body, as wide as its [`SidebarState`] says, shown or
+    /// hidden — Blender's sidebar (`N`). Added with [`AreaContent::with_sidebar`].
+    Sidebar,
 }
+
+/// What a sidebar is: whether it is shown, and how wide it is, in logical pixels at
+/// `ui_scale` 1.0.
+///
+/// Kept out of the widget (§61): an area is built again when it is detached into another
+/// window or a workspace is read (§41.2, §44), and a sidebar that lived in its widget
+/// would come back hidden and at the default width. The owner of the area's other state —
+/// its session — holds the [`SidebarState`], and the widget reads it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Sidebar {
+    /// Whether the sidebar takes its width off the main region.
+    pub shown: bool,
+    /// Its width at `ui_scale` 1.0.
+    pub width: f64,
+}
+
+impl Sidebar {
+    /// A sidebar `width` wide, shown or not.
+    pub fn new(shown: bool, width: f64) -> Self {
+        Self {
+            shown,
+            width: width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
+        }
+    }
+}
+
+impl Default for Sidebar {
+    /// Hidden, as Blender's starts, and as wide as Blender's default.
+    fn default() -> Self {
+        Self::new(false, 240.0)
+    }
+}
+
+/// A sidebar's state, shared between the area's widget and whoever keeps the area's state
+/// across rebuilds.
+pub type SidebarState = Rc<Cell<Sidebar>>;
+
+/// The narrowest a sidebar is dragged to, in logical pixels at scale 1.0.
+pub const SIDEBAR_MIN_WIDTH: f64 = 120.0;
+/// The widest, likewise.
+pub const SIDEBAR_MAX_WIDTH: f64 = 900.0;
+/// The grip between the main region and a shown sidebar, in logical pixels: the strip a
+/// drag resizes the sidebar by, and the one place in the area that is the area's own.
+pub const SIDEBAR_GRIP: f64 = 4.0;
 
 /// The interface scale of a region, as a property on its root widget.
 ///
@@ -198,6 +249,8 @@ struct Slot {
     pushed_scale: Option<f64>,
     /// Border-box size the region was last given.
     size: Option<Size>,
+    /// A sidebar's state; `None` for every other kind.
+    sidebar: Option<SidebarState>,
 }
 
 /// The stack of regions filling one area.
@@ -220,6 +273,10 @@ pub struct AreaContent {
     isolated: bool,
     /// Regions whose root needs a new [`UiScale`], applied in the mutate pass.
     pending: Vec<usize>,
+    /// Where the grip is, as of the last layout, if a sidebar is shown.
+    grip: Option<masonry::kurbo::Rect>,
+    /// A drag of the grip: the sidebar's slot, and the pointer's distance from its edge.
+    dragging: Option<(usize, f64)>,
     layouts: u64,
     resizes: u64,
     scale_pushes: u64,
@@ -243,10 +300,13 @@ impl AreaContent {
                     ui_scale: 1.0,
                     pushed_scale: None,
                     size: None,
+                    sidebar: None,
                 })
                 .collect(),
             isolated: false,
             pending: Vec::new(),
+            grip: None,
+            dragging: None,
             layouts: 0,
             resizes: 0,
             scale_pushes: 0,
@@ -259,6 +319,34 @@ impl AreaContent {
             (RegionKind::Header, base_height, header),
             (RegionKind::Main, 0.0, main),
         ])
+    }
+
+    /// The same area with a sidebar on the right of its body, shown and sized as `state`
+    /// says.
+    ///
+    /// The state is the caller's to keep: the widget reads it in every layout and writes
+    /// the width a drag of the grip gives it. After changing it from outside — `N` — call
+    /// [`refresh`](Self::refresh).
+    #[must_use]
+    pub fn with_sidebar(mut self, widget: NewWidget<dyn Widget>, state: SidebarState) -> Self {
+        self.slots.push(Slot {
+            kind: RegionKind::Sidebar,
+            pod: widget.to_pod(),
+            base_height: 0.0,
+            ui_scale: 1.0,
+            pushed_scale: None,
+            size: None,
+            sidebar: Some(state),
+        });
+        self
+    }
+
+    /// Lays the regions out again after their state changed from outside the widget.
+    ///
+    /// Showing or hiding a sidebar builds nothing: the sidebar's widget stays, stashed while
+    /// hidden, and the main region keeps its widget and only changes width.
+    pub fn refresh(this: &mut WidgetMut<'_, Self>) {
+        this.ctx.request_layout();
     }
 
     /// Asks to be recorded as a scene layer of its own.
@@ -338,6 +426,25 @@ impl AreaContent {
         this.ctx.request_layout();
     }
 
+    /// Lays out and places region `i` at `origin`, `size` big, counting a change of size.
+    fn place(&mut self, ctx: &mut LayoutCtx<'_>, i: usize, origin: Point, size: Size) {
+        if self.slots[i].size != Some(size) {
+            self.slots[i].size = Some(size);
+            self.resizes += 1;
+        }
+        let pod = &mut self.slots[i].pod;
+        let chosen = ctx.compute_size(pod, SizeDef::fixed(size), size.into());
+        ctx.run_layout(pod, chosen);
+        ctx.place_child(pod, origin);
+    }
+
+    /// The width a drag of the grip to `x` gives the sidebar in slot `i`, at scale 1.0.
+    fn dragged_width(&self, i: usize, x: f64, offset: f64, area_width: f64) -> f64 {
+        let scale = self.slots[i].ui_scale.max(f64::EPSILON);
+        let width = (area_width - (x - offset) - SIDEBAR_GRIP) / scale;
+        width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+    }
+
     /// Pushes queued scales onto region roots. Runs in the mutate pass.
     fn apply_pending(this: &mut WidgetMut<'_, Self>) {
         let pending = std::mem::take(&mut this.widget.pending);
@@ -358,6 +465,62 @@ impl Widget for AreaContent {
     fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
         // An area nested inside a scaled region scales with it.
         UiScale::prop_changed(ctx, property_type);
+    }
+
+    /// The grip: a press on it takes the pointer, a move resizes the sidebar, a release
+    /// lets go. The grip is the one place in the area no region covers, so these reach this
+    /// widget as its own events. The width goes into the [`SidebarState`], not into this
+    /// widget, and is not a step in any history — Blender's sidebar width is not either.
+    fn on_pointer_event(
+        &mut self,
+        ctx: &mut masonry::core::EventCtx<'_>,
+        _props: &mut masonry::core::PropertiesMut<'_>,
+        event: &masonry::core::PointerEvent,
+    ) {
+        use masonry::core::PointerEvent;
+        let side = (0..self.slots.len()).find(|&i| self.slots[i].kind == RegionKind::Sidebar);
+        let (Some(side), Some(grip)) = (side, self.grip) else {
+            return;
+        };
+        match event {
+            PointerEvent::Down(down) => {
+                let at = ctx.local_position(down.state.position);
+                if grip.contains(at) {
+                    self.dragging = Some((side, at.x - grip.x0));
+                    ctx.capture_pointer();
+                    ctx.set_handled();
+                }
+            },
+            PointerEvent::Move(update) => {
+                if let Some((i, offset)) = self.dragging {
+                    let at = ctx.local_position(update.current.position);
+                    let width = self.dragged_width(i, at.x, offset, ctx.content_box().width());
+                    if let Some(state) = &self.slots[i].sidebar {
+                        let mut sidebar = state.get();
+                        if sidebar.width != width {
+                            sidebar.width = width;
+                            state.set(sidebar);
+                            ctx.request_layout();
+                        }
+                    }
+                    ctx.set_handled();
+                }
+            },
+            PointerEvent::Up(_) | PointerEvent::Cancel(_) if self.dragging.take().is_some() => {
+                ctx.release_pointer();
+                ctx.set_handled();
+            },
+            _ => {},
+        }
+    }
+
+    /// The resize cursor over the grip and while it is dragged.
+    fn get_cursor(&self, _ctx: &masonry::core::QueryCtx<'_>, pos: Point) -> masonry::core::CursorIcon {
+        if self.dragging.is_some() || self.grip.is_some_and(|grip| grip.contains(pos)) {
+            masonry::core::CursorIcon::EwResize
+        } else {
+            masonry::core::CursorIcon::Default
+        }
     }
 
     fn measure(
@@ -392,9 +555,19 @@ impl Widget for AreaContent {
         // left, which is why the last region is the one that gets to be `Main`. The
         // height is rounded to whole pixels for the reason `split_rect` is: a
         // fractional boundary would make every region count as resized every frame.
+        //
+        // A sidebar is the second axis (§61): below the headers, it takes its width off the
+        // right of the body, the grip between it and the main region, and the main region
+        // takes what is left of the width — rounded too, so a drag of the grip resizes the
+        // two regions once per move and never by a fraction.
+        let flow: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| self.slots[i].kind != RegionKind::Sidebar)
+            .collect();
+        let side = (0..self.slots.len()).find(|&i| self.slots[i].kind == RegionKind::Sidebar);
         let mut y = 0.0;
-        for i in 0..self.slots.len() {
-            let last = i + 1 == self.slots.len();
+        let mut body = None;
+        for (at, &i) in flow.iter().enumerate() {
+            let last = at + 1 == flow.len();
             let remaining = (size.height - y).max(0.0);
             let height = match self.slots[i].kind {
                 RegionKind::Header if !last => (self.slots[i].base_height * self.slots[i].ui_scale)
@@ -402,18 +575,50 @@ impl Widget for AreaContent {
                     .min(remaining),
                 _ => remaining,
             };
-            let region_size = Size::new(size.width, height);
-
-            if self.slots[i].size != Some(region_size) {
-                self.slots[i].size = Some(region_size);
-                self.resizes += 1;
+            if last {
+                body = Some((i, y, height));
+                break;
             }
-
-            let pod = &mut self.slots[i].pod;
-            let chosen = ctx.compute_size(pod, SizeDef::fixed(region_size), region_size.into());
-            ctx.run_layout(pod, chosen);
-            ctx.place_child(pod, Point::new(0.0, y));
+            self.place(ctx, i, Point::new(0.0, y), Size::new(size.width, height));
             y += height;
+        }
+        let Some((main, y, height)) = body else {
+            return;
+        };
+        let shown = side.and_then(|i| {
+            let state = self.slots[i].sidebar.as_ref()?.get();
+            state.shown.then(|| {
+                let width = (state.width * self.slots[i].ui_scale)
+                    .round()
+                    .min((size.width - SIDEBAR_GRIP).max(0.0));
+                (i, width)
+            })
+        });
+        if let Some(i) = side {
+            let stashed = shown.is_none();
+            ctx.set_stashed(&mut self.slots[i].pod, stashed);
+        }
+        match shown {
+            Some((i, width)) => {
+                let main_width = (size.width - width - SIDEBAR_GRIP).max(0.0);
+                self.place(ctx, main, Point::new(0.0, y), Size::new(main_width, height));
+                self.place(
+                    ctx,
+                    i,
+                    Point::new(main_width + SIDEBAR_GRIP, y),
+                    Size::new(width, height),
+                );
+                self.grip = Some(masonry::kurbo::Rect::new(
+                    main_width,
+                    y,
+                    main_width + SIDEBAR_GRIP,
+                    y + height,
+                ));
+            },
+            None => {
+                self.place(ctx, main, Point::new(0.0, y), Size::new(size.width, height));
+                self.grip = None;
+            },
         }
     }
 
@@ -636,5 +841,113 @@ mod tests {
         harness.edit_root_widget(|mut content| AreaContent::set_ui_scale(&mut content, 0, 1000.0));
         let _ = harness.redraw();
         assert_eq!(harness.root_widget().ui_scale(0), Some(8.0));
+    }
+
+    /// A header above, a main region and a sidebar below it, the sidebar shown at 200.
+    fn with_sidebar(shown: bool) -> (TestHarness<AreaContent>, SidebarState) {
+        let state: SidebarState = Rc::new(Cell::new(Sidebar::new(shown, 200.0)));
+        let content = AreaContent::header_and_main(HEADER, scale_reader(), scale_reader())
+            .with_sidebar(scale_reader(), state.clone());
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new(content),
+            PhysicalSize::new(AREA.0, AREA.1),
+        );
+        let _ = harness.redraw();
+        (harness, state)
+    }
+
+    /// The sidebar is the second axis: it takes its width off the right of the body below
+    /// the header, the grip between, and the main region keeps the height it had.
+    #[test]
+    fn a_sidebar_takes_its_width_off_the_main_region_only() {
+        let (mut harness, state) = with_sidebar(true);
+        let body = AREA.1 as f64 - HEADER;
+        assert_eq!(
+            region_size(&harness, 0),
+            Size::new(AREA.0 as f64, HEADER),
+            "the header is whole"
+        );
+        assert_eq!(
+            region_size(&harness, 1),
+            Size::new(AREA.0 as f64 - 200.0 - SIDEBAR_GRIP, body)
+        );
+        assert_eq!(region_size(&harness, 2), Size::new(200.0, body));
+
+        // Hidden: the main region takes the whole width, and the sidebar is stashed, not
+        // dropped — the same widget comes back.
+        let sidebar = harness.root_widget().region_ids()[2];
+        let mut hidden = state.get();
+        hidden.shown = false;
+        state.set(hidden);
+        harness.edit_root_widget(|mut content| AreaContent::refresh(&mut content));
+        let _ = harness.redraw();
+        assert_eq!(region_size(&harness, 1), Size::new(AREA.0 as f64, body));
+        assert!(
+            harness.get_widget_with_id(sidebar).ctx().is_stashed(),
+            "hidden is stashed"
+        );
+        state.set(Sidebar::new(true, 200.0));
+        harness.edit_root_widget(|mut content| AreaContent::refresh(&mut content));
+        let _ = harness.redraw();
+        assert_eq!(
+            harness.root_widget().region_ids()[2],
+            sidebar,
+            "and the same widget is back"
+        );
+        assert!(!harness.get_widget_with_id(sidebar).ctx().is_stashed());
+
+        // The sidebar's own scale widens it, and changes nothing of the main region's but
+        // its width.
+        harness.edit_root_widget(|mut content| AreaContent::set_ui_scale(&mut content, 2, 1.5));
+        let _ = harness.redraw();
+        assert_eq!(region_size(&harness, 2), Size::new(300.0, body));
+        assert_eq!(
+            region_size(&harness, 1).height,
+            body,
+            "the main region's height is untouched"
+        );
+        assert_eq!(seen_scale(&harness, 1), 1.0, "and so is its scale");
+    }
+
+    /// The grip between the regions widens the sidebar under the pointer, in whole pixels —
+    /// one resize of each region per move — writes the width to the state and not only to
+    /// the widget, and stops at the limits.
+    #[test]
+    fn the_grip_widens_the_sidebar_in_whole_pixels_into_its_state() {
+        use masonry::core::CursorIcon;
+        use masonry::ui_events::pointer::PointerButton;
+
+        let (mut harness, state) = with_sidebar(true);
+        // The grip is between x = 396 and 400.
+        let y = 200.0;
+        harness.mouse_move(Point::new(397.5, y));
+        assert_eq!(harness.cursor_icon(), CursorIcon::EwResize, "the grip shows it is one");
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        let before = harness.root_widget().counters().resizes;
+        for x in [390.3, 380.7, 350.2] {
+            harness.mouse_move(Point::new(x, y));
+        }
+        let _ = harness.redraw();
+        let resizes = harness.root_widget().counters().resizes - before;
+        assert!(resizes <= 6, "two regions, three moves: {resizes}");
+        let width = region_size(&harness, 2).width;
+        assert_eq!(width, width.round(), "whole pixels");
+        assert!(
+            (state.get().width - 247.3).abs() < 1e-9,
+            "the state has it: {:?}",
+            state.get()
+        );
+        harness.mouse_move(Point::new(-500.0, y));
+        assert_eq!(
+            state.get().width,
+            SIDEBAR_MAX_WIDTH.min(AREA.0 as f64 + 500.0 - 2.5 - SIDEBAR_GRIP)
+        );
+        harness.mouse_move(Point::new(590.0, y));
+        assert_eq!(state.get().width, SIDEBAR_MIN_WIDTH, "no narrower than the least");
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let after = state.get().width;
+        harness.mouse_move(Point::new(300.0, y));
+        assert_eq!(state.get().width, after, "let go, the pointer moves nothing");
     }
 }

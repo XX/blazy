@@ -83,7 +83,10 @@ use masonry::layout::{AsUnit, LenReq, Length, SizeDef};
 use masonry::peniko::Color;
 use masonry::ui_events::pointer::{PointerButton, PointerUpdate};
 
-pub use crate::region::{AreaContent, CarriesScale, RegionCounters, RegionKind, ScaleCarrier, UiScale, push_ui_scale};
+pub use crate::region::{
+    AreaContent, CarriesScale, RegionCounters, RegionKind, SIDEBAR_GRIP, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    ScaleCarrier, Sidebar, SidebarState, UiScale, push_ui_scale,
+};
 pub use crate::tree::{AreaId, Bar, MAX_AREAS, NodeId, SplitTree, ratio_at};
 pub use crate::workspace::{Workspace, WorkspaceError};
 

@@ -21,10 +21,13 @@
 //! content 0 node-editor
 //! content 1 outliner
 //! maximized 1
+//! sidebar 1 shown 240
 //! ```
 //!
 //! `tree` is a prefix expression — `area <id>` or `split <h|v> <ratio> <expr> <expr>`.
-//! The rest of a `content` line is the application's own name, spaces included.
+//! The rest of a `content` line is the application's own name, spaces included. A
+//! `sidebar` line is an area's sidebar (§61): `shown` or `hidden`, and its width in logical
+//! pixels at scale 1.0. Version 2 added it; a version 1 file, which has none, still reads.
 //!
 //! A file is input, and it is read as input: an area id at or above
 //! [`MAX_AREAS`](crate::MAX_AREAS), or splits nested deeper than that many areas could
@@ -43,11 +46,14 @@
 
 use std::fmt;
 
+use crate::region::Sidebar;
 use crate::tree::{AreaId, SplitTree};
 
 /// The magic word and the version this build reads and writes.
 const MAGIC: &str = "blazy-workspace";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+/// The oldest version this build still reads.
+const OLDEST: u32 = 1;
 
 /// A screen layout as it goes to a file: the tree, and what fills each area.
 ///
@@ -59,6 +65,8 @@ pub struct Workspace {
     tree: SplitTree,
     /// What fills each area, ascending by id and without duplicates.
     contents: Vec<(AreaId, String)>,
+    /// Each area's sidebar, where one was said, ascending by id.
+    sidebars: Vec<(AreaId, Sidebar)>,
 }
 
 /// Why a workspace file could not be read.
@@ -100,7 +108,24 @@ impl Workspace {
         Self {
             tree,
             contents: Vec::new(),
+            sidebars: Vec::new(),
         }
+    }
+
+    /// Says what an area's sidebar is. Replaces whatever was said before.
+    pub fn set_sidebar(&mut self, area: AreaId, sidebar: Sidebar) {
+        match self.sidebars.binary_search_by_key(&area, |(id, _)| *id) {
+            Ok(at) => self.sidebars[at].1 = sidebar,
+            Err(at) => self.sidebars.insert(at, (area, sidebar)),
+        }
+    }
+
+    /// What `area`'s sidebar is, if the file said.
+    pub fn sidebar(&self, area: AreaId) -> Option<Sidebar> {
+        self.sidebars
+            .binary_search_by_key(&area, |(id, _)| *id)
+            .ok()
+            .map(|at| self.sidebars[at].1)
     }
 
     /// Says what fills one area. Replaces whatever was said before.
@@ -169,6 +194,10 @@ impl Workspace {
         if let Some(area) = self.tree.maximized() {
             out.push_str(&format!("maximized {area}\n"));
         }
+        for (area, sidebar) in &self.sidebars {
+            let shown = if sidebar.shown { "shown" } else { "hidden" };
+            out.push_str(&format!("sidebar {area} {shown} {}\n", sidebar.width));
+        }
         out
     }
 
@@ -178,13 +207,19 @@ impl Workspace {
 
         let (_, header) = lines.next().ok_or(WorkspaceError::NotAWorkspace)?;
         let mut header = header.split_whitespace();
-        if header.next() != Some(MAGIC) || header.next().and_then(|v| v.parse::<u32>().ok()) != Some(VERSION) {
+        if header.next() != Some(MAGIC)
+            || !header
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .is_some_and(|v| (OLDEST..=VERSION).contains(&v))
+        {
             return Err(WorkspaceError::NotAWorkspace);
         }
 
         let mut tree: Option<SplitTree> = None;
         let mut contents: Vec<(AreaId, String)> = Vec::new();
         let mut maximized: Option<(usize, AreaId)> = None;
+        let mut sidebars: Vec<(AreaId, Sidebar)> = Vec::new();
 
         for (number, line) in lines {
             if line.is_empty() {
@@ -209,6 +244,24 @@ impl Workspace {
                     let area: AreaId = rest.trim().parse().map_err(|_| malformed)?;
                     maximized = Some((number, area));
                 },
+                "sidebar" => {
+                    let mut words = rest.split_whitespace();
+                    let area: AreaId = words.next().and_then(|w| w.parse().ok()).ok_or(malformed.clone())?;
+                    let shown = match words.next() {
+                        Some("shown") => true,
+                        Some("hidden") => false,
+                        _ => return Err(malformed),
+                    };
+                    let width: f64 = words
+                        .next()
+                        .and_then(|w| w.parse().ok())
+                        .filter(|w: &f64| w.is_finite())
+                        .ok_or(malformed.clone())?;
+                    if words.next().is_some() {
+                        return Err(malformed);
+                    }
+                    sidebars.push((area, Sidebar::new(shown, width)));
+                },
                 _ => return Err(malformed),
             }
         }
@@ -225,6 +278,12 @@ impl Workspace {
             && !workspace.tree.set_maximized(area)
         {
             return Err(WorkspaceError::UnknownArea { area });
+        }
+        for (area, sidebar) in sidebars {
+            if !workspace.tree.holds(area) {
+                return Err(WorkspaceError::UnknownArea { area });
+            }
+            workspace.set_sidebar(area, sidebar);
         }
         Ok(workspace)
     }
@@ -313,6 +372,32 @@ mod tests {
         assert_eq!(laid_out(read.tree()).0, vec![(2, SCREEN)]);
     }
 
+    /// An area's sidebar goes to the file and comes back — shown or hidden, at its width —
+    /// and a version 1 file, written before sidebars, still reads, with none said.
+    #[test]
+    fn a_sidebar_survives_the_file_and_an_older_file_still_reads() {
+        let mut workspace = Workspace::new(SplitTree::balanced(2));
+        workspace.set_sidebar(1, Sidebar::new(true, 310.0));
+        workspace.set_sidebar(0, Sidebar::new(false, 200.0));
+        let text = workspace.write();
+        assert!(text.contains("sidebar 1 shown 310"), "{text}");
+        let read = Workspace::parse(&text).expect("it reads back");
+        assert_eq!(read.sidebar(1), Some(Sidebar::new(true, 310.0)));
+        assert_eq!(read.sidebar(0), Some(Sidebar::new(false, 200.0)));
+
+        let old = Workspace::parse("blazy-workspace 1\ntree area 0\n").expect("version 1 reads");
+        assert_eq!(old.sidebar(0), None);
+        assert_eq!(
+            Workspace::parse("blazy-workspace 2\ntree area 0\nsidebar 0 open 200\n").err(),
+            Some(WorkspaceError::Malformed { line: 3 }),
+            "a sidebar is shown or hidden, and nothing else"
+        );
+        assert_eq!(
+            Workspace::parse("blazy-workspace 2\ntree area 0\nsidebar 4 shown 200\n").err(),
+            Some(WorkspaceError::UnknownArea { area: 4 })
+        );
+    }
+
     #[test]
     fn a_file_this_build_cannot_read_is_refused() {
         assert_eq!(Workspace::parse("").err(), Some(WorkspaceError::NotAWorkspace));
@@ -321,7 +406,7 @@ mod tests {
             Some(WorkspaceError::NotAWorkspace)
         );
         assert_eq!(
-            Workspace::parse("blazy-workspace 2\ntree area 0\n").err(),
+            Workspace::parse("blazy-workspace 3\ntree area 0\n").err(),
             Some(WorkspaceError::NotAWorkspace),
             "a later version is refused rather than misread"
         );

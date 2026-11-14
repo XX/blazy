@@ -92,6 +92,12 @@ pub struct EditorSession<G: NodeGraph> {
     /// The session's rather than the widget's, so that the choice goes with the area into
     /// another window, as the view and the history do (§44).
     pub edge_pan: Option<EdgePan>,
+    /// The area's sidebar: shown or not, and how wide (§61).
+    ///
+    /// The session's, for the reason the view is: an area is built again when it is detached
+    /// or a workspace is read, and what it showed has to come back with it. Shared with the
+    /// area's widget, which reads it in layout and writes the width its grip is dragged to.
+    pub sidebar: blazy_areas::SidebarState,
 }
 
 impl<G: NodeGraph> EditorSession<G> {
@@ -108,6 +114,7 @@ impl<G: NodeGraph> EditorSession<G> {
             view: Affine::IDENTITY,
             editor: None,
             edge_pan: None,
+            sidebar: Rc::default(),
         }
     }
 

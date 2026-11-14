@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+blazy-areas = { workspace = true }
 blazy-canvas = { workspace = true }
 blazy-ops = { workspace = true }
 masonry = { workspace = true }

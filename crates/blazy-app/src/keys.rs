@@ -29,6 +29,9 @@ pub enum ScreenAction {
     SaveWorkspace,
     /// Reads the workspace file back.
     LoadWorkspace,
+    /// Shows or hides the sidebar of the area under the pointer (§61) — Blender's `N`.
+    /// Nothing for an application that gave its areas no sidebar.
+    ToggleSidebar,
 }
 
 /// The keymap context the screen's bindings live in.
@@ -36,7 +39,7 @@ pub const SCREEN_CONTEXT: &str = "screen";
 
 impl ScreenAction {
     /// Every action, in the order the defaults bind them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::SplitHorizontal,
         Self::SplitVertical,
         Self::Join,
@@ -46,6 +49,7 @@ impl ScreenAction {
         Self::Detach,
         Self::SaveWorkspace,
         Self::LoadWorkspace,
+        Self::ToggleSidebar,
     ];
 
     /// The name a keymap file binds this action by.
@@ -60,6 +64,7 @@ impl ScreenAction {
             Self::Detach => "screen.detach",
             Self::SaveWorkspace => "screen.save_workspace",
             Self::LoadWorkspace => "screen.load_workspace",
+            Self::ToggleSidebar => "screen.sidebar",
         }
     }
 
@@ -115,6 +120,9 @@ impl Default for ScreenKeys {
                 (alt("d"), ScreenAction::Detach),
                 (ctrl("s"), ScreenAction::SaveWorkspace),
                 (ctrl("o"), ScreenAction::LoadWorkspace),
+                // Blender's: `N` over an editor. A plain key is safe here — this seat
+                // hears no key while a text field has focus.
+                (Pattern::key("n"), ScreenAction::ToggleSidebar),
             ],
         }
     }

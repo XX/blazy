@@ -656,6 +656,15 @@ which re-files the node and re-measures its links but does not re-choose the rec
 Before the press the cursor is the node widget's to choose, so the edge is lined instead
 (`edge_hint`); `get_cursor` gives the resize cursor only while the editor holds the pointer.
 
+**A sidebar is the second axis, and its state is the session's (§61).** `RegionKind::Sidebar`
+takes width off the right of the body below the headers, with a grip the area itself drags;
+hidden is stashed, not dropped. `Sidebar { shown, width }` lives in `EditorSession::sidebar`
+(a shared cell the widget reads in layout), so it survives detach and a workspace load —
+never keep region state in `AreaContent`. The assembly builds the regions when asked
+(`EditorApp::with_sidebar`), `N` is a screen key, and the workspace file is version 2. With a
+sidebar an area's widget is an `AreaContent`, not the editor: find the editor through the
+session (`editor`) or the main region, as `hello`'s tests do.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

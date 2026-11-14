@@ -26,7 +26,8 @@
 //! undo. A node or a link held at
 //! the edge of an area scrolls the view. `Alt+X` / `Alt+Y` split the area under the
 //! pointer, `Alt+J` joins it with its sibling, `Alt+N` opens another window over the same
-//! graph and `Alt+D` moves the area into one of its own. Click a node's name to rename
+//! graph and `Alt+D` moves the area into one of its own. `N` shows the area's sidebar, and
+//! its left edge widens it. Click a node's name to rename
 //! it — copy, paste and an input method work there — and `Enter` or `Escape` to leave
 //! the field; the other areas show the new name.
 
@@ -434,6 +435,9 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
     // choice rather than a default: without it the gesture carries on past the border and
     // the view stands still.
     .with_edge_pan(EdgePan::default())
+    // A sidebar on every area, `N` to show it, its left edge to widen it. Empty for now: the
+    // properties of the selected node are `issues/26-11-13 properties panel.md`.
+    .with_sidebar(|_area, _session| NewWidget::new(blazy::masonry::widgets::Label::new("Properties (N)")).erased())
 }
 
 impl Graph {
@@ -485,7 +489,7 @@ mod tests {
             TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
         let _ = harness.redraw();
 
-        let areas = harness.root_widget().area_ids();
+        let areas = editor_ids(&harness);
         assert_eq!(areas.len(), 2);
         assert_eq!(
             graph.borrow().views().len(),
@@ -553,6 +557,23 @@ mod tests {
         );
     }
 
+    /// The editor of each area, in area order: the main region of the area's `AreaContent`,
+    /// since every area here has a sidebar beside its editor.
+    fn editor_ids(harness: &TestHarness<blazy::app::EditorScreen<Graph>>) -> Vec<WidgetId> {
+        harness
+            .root_widget()
+            .area_ids()
+            .into_iter()
+            .map(|area| {
+                let widget = harness.get_widget_with_id(area);
+                match widget.downcast::<blazy::areas::AreaContent>() {
+                    Some(content) => content.inner().region_ids()[0],
+                    None => area,
+                }
+            })
+            .collect()
+    }
+
     /// The text field inside node `index` of area `area`, by id.
     fn title_field(
         harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>,
@@ -589,7 +610,7 @@ mod tests {
         let mut harness =
             TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
         let _ = harness.redraw();
-        let areas = harness.root_widget().area_ids();
+        let areas = editor_ids(&harness);
 
         let field = title_field(&mut harness, areas[0], 0);
         harness.focus_on(Some(field));
@@ -627,7 +648,7 @@ mod tests {
         let mut harness =
             TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
         let _ = harness.redraw();
-        let areas = harness.root_widget().area_ids();
+        let areas = editor_ids(&harness);
         graph.borrow_mut().titles[0] = "source".into();
 
         let exec = |harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>, op: &str, props: Props| {
@@ -670,7 +691,7 @@ mod tests {
         let mut harness =
             TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
         let _ = harness.redraw();
-        let areas = harness.root_widget().area_ids();
+        let areas = editor_ids(&harness);
         let field_width = |harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>| {
             let field = title_field(harness, areas[0], 0);
             harness.get_widget_with_id(field).ctx().border_box().width()

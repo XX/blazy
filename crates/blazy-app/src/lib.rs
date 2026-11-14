@@ -45,7 +45,7 @@ mod tests;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use blazy_areas::{AreaId, AreaScreen, SplitTree, Workspace};
+use blazy_areas::{AreaContent, AreaId, AreaScreen, RegionKind, SplitTree, Workspace};
 use blazy_node_editor::{EdgePan, EditorSession, NodeEditor, NodeGraph, SessionHandle, SharedGraph, sync_root};
 use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
@@ -104,6 +104,9 @@ pub type EditorScreen<G> = AreaScreen<SessionHandle<G>>;
 /// What fills one area, given the session it shows.
 type BuildArea<G> = dyn Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget>;
 
+/// What fills one area's sidebar, given the session the area shows.
+type BuildSidebar<G> = dyn Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget>;
+
 /// Makes a session for an area that appears.
 type MakeSession<G> = dyn Fn(&SharedGraph<G>) -> SessionHandle<G>;
 
@@ -139,6 +142,8 @@ pub struct AppCounters {
 pub struct EditorApp<G: NodeGraph> {
     graph: SharedGraph<G>,
     build: Rc<BuildArea<G>>,
+    /// What fills each area's sidebar, when the application gave its areas one (§61).
+    sidebar: Option<Rc<BuildSidebar<G>>>,
     session: Rc<MakeSession<G>>,
     /// Edge pan for every session the application makes, when it asked for it.
     edge_pan: Option<EdgePan>,
@@ -181,6 +186,7 @@ impl<G: NodeGraph> EditorApp<G> {
         Self {
             graph: graph.clone(),
             build: Rc::new(build),
+            sidebar: None,
             session: Rc::new(|graph| EditorSession::new(graph).share()),
             edge_pan: None,
             keys: ScreenKeys::default(),
@@ -271,6 +277,25 @@ impl<G: NodeGraph> EditorApp<G> {
         self
     }
 
+    /// The same application, every area of which has a sidebar on its right, filled by
+    /// `build` (§61).
+    ///
+    /// The assembly builds the regions rather than the application's `build`, because it is
+    /// the one that has to reach them: `N` ([`ScreenAction::ToggleSidebar`]) shows and hides
+    /// the sidebar of the area under the pointer, and the workspace file records it. Each
+    /// area becomes an [`AreaContent`] — what `build` gave as its main region, this beside
+    /// it — and the sidebar's state is the area's session's
+    /// ([`EditorSession::sidebar`](blazy_node_editor::EditorSession::sidebar)), so a detached
+    /// area or a workspace read back shows it as it was.
+    #[must_use]
+    pub fn with_sidebar(
+        mut self,
+        build: impl Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget> + 'static,
+    ) -> Self {
+        self.sidebar = Some(Rc::new(build));
+        self
+    }
+
     /// The same application, writing and reading its workspace at `path`.
     ///
     /// Without one, [`ScreenAction::SaveWorkspace`] and [`ScreenAction::LoadWorkspace`]
@@ -310,6 +335,7 @@ impl<G: NodeGraph> EditorApp<G> {
     /// the session is the one the area had (§44).
     pub fn screen_carrying(&self, tree: SplitTree, carried: Option<SessionHandle<G>>) -> EditorScreen<G> {
         let (graph, build, session) = (self.graph.clone(), self.build.clone(), self.session.clone());
+        let sidebar = self.sidebar.clone();
         let edge_pan = self.edge_pan;
         let mut carried = carried;
         AreaScreen::with_payloads(tree, move |area| {
@@ -323,7 +349,16 @@ impl<G: NodeGraph> EditorApp<G> {
                 }
                 session
             });
-            (build(area, &session), session)
+            let main = build(area, &session);
+            let widget = match &sidebar {
+                Some(panel) => {
+                    let content = AreaContent::new(vec![(RegionKind::Main, 0.0, main)])
+                        .with_sidebar(panel(area, &session), session.borrow().sidebar.clone());
+                    NewWidget::new(content).erased()
+                },
+                None => main,
+            };
+            (widget, session)
         })
     }
 
@@ -473,6 +508,20 @@ impl<G: NodeGraph> EditorApp<G> {
             },
             ScreenAction::SaveWorkspace => self.save(root),
             ScreenAction::LoadWorkspace => self.load(root),
+            ScreenAction::ToggleSidebar => {
+                if self.sidebar.is_none() {
+                    return Handled::No;
+                }
+                on_hovered_area::<G>(root, |screen, area| {
+                    if let Some(session) = screen.widget.payload(area) {
+                        let state = session.borrow().sidebar.clone();
+                        let mut sidebar = state.get();
+                        sidebar.shown = !sidebar.shown;
+                        state.set(sidebar);
+                    }
+                    refresh_area(screen, area);
+                });
+            },
         }
         Handled::Yes
     }
@@ -515,8 +564,14 @@ impl<G: NodeGraph> EditorApp<G> {
             // The tree is the geometry; what fills each area is the application's to
             // say, and here every area is the same kind of editor (§41.5).
             let mut workspace = Workspace::new(screen.widget.tree().clone());
-            for area in screen.widget.tree().areas() {
+            let areas: Vec<AreaId> = screen.widget.tree().areas().collect();
+            for area in areas {
                 workspace.set_content(area, "node-editor");
+                if self.sidebar.is_some()
+                    && let Some(session) = screen.widget.payload(area)
+                {
+                    workspace.set_sidebar(area, session.borrow().sidebar.get());
+                }
             }
             workspace.write()
         });
@@ -540,7 +595,17 @@ impl<G: NodeGraph> EditorApp<G> {
         };
         match Workspace::parse(&text) {
             Ok(workspace) => {
-                with_screen::<G, _>(root, |screen| AreaScreen::set_tree(screen, workspace.tree().clone()));
+                with_screen::<G, _>(root, |screen| {
+                    AreaScreen::set_tree(screen, workspace.tree().clone());
+                    // After the tree: an area the file names may only now exist.
+                    let areas: Vec<AreaId> = screen.widget.tree().areas().collect();
+                    for area in areas {
+                        if let (Some(sidebar), Some(session)) = (workspace.sidebar(area), screen.widget.payload(area)) {
+                            session.borrow().sidebar.set(sidebar);
+                        }
+                        refresh_area(screen, area);
+                    }
+                });
                 tracing::info!(path = %path.display(), "workspace read");
             },
             Err(error) => tracing::warn!(path = %path.display(), "workspace not read: {error}"),
@@ -696,6 +761,18 @@ pub fn detach_area<G: NodeGraph>(
         session.runtime.cancel_all(&mut session.world);
     }
     Some(session)
+}
+
+/// Lays an area's regions out again after its sidebar state changed from outside.
+fn refresh_area<G: NodeGraph>(screen: &mut WidgetMut<'_, EditorScreen<G>>, area: AreaId) {
+    let Some(id) = screen.widget.area_widget(area) else {
+        return;
+    };
+    screen.ctx.mutate_later(id, |mut widget| {
+        if let Some(mut content) = widget.try_downcast::<AreaContent>() {
+            AreaContent::refresh(&mut content);
+        }
+    });
 }
 
 /// Runs `act` on the window's screen.

@@ -345,6 +345,7 @@ dependencies = [
 name = "blazy-node-editor"
 version = "0.1.0"
 dependencies = [
+ "blazy-areas",
  "blazy-canvas",
  "blazy-ops",
  "masonry",
