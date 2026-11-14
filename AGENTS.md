@@ -646,6 +646,16 @@ back for the same undo step; never `add_link` straight from an operator that mak
 user asked for. A test graph that overrides `input_limit` cannot see the default — the
 `blazy-app` `Grid` keeps it. Blender-style multi-input is `issues/multi-input sockets.md`.
 
+**A node is resized by its left or right edge, width only (§60).** `NodeGraph::set_node_rect`
+is required (a resize from the left edge changes the corner too); `width_limits` defaults to
+`None`, a node that does not resize. The edge is a strip `RESIZE_EDGE_PX` wide in *screen*
+pixels inside the hovered node (`EditorWorld::scale`, filled by the driver); a port on the edge
+wins because the canvas picks ports first, and a node under four strips wide on screen has no
+edge. A new rectangle travels as `Edit::NodeResized` and lands in `CanvasLayer::set_child_rect`,
+which re-files the node and re-measures its links but does not re-choose the recorded set.
+Before the press the cursor is the node widget's to choose, so the edge is lined instead
+(`edge_hint`); `get_cursor` gives the resize cursor only while the editor holds the pointer.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

@@ -292,6 +292,13 @@ impl NodeGraph for GraphModel {
         self.set_pos(index, pos);
     }
 
+    /// Every node here has the one size the measurements are made on, and none is resized
+    /// (`width_limits` keeps its default), so only the corner is the model's to write.
+    fn set_node_rect(&mut self, index: usize, rect: Rect) {
+        debug_assert_eq!(rect.size(), NODE_SIZE, "a node of this graph is not resized");
+        self.set_pos(index, rect.origin());
+    }
+
     fn views(&self) -> &Views {
         &self.views
     }

@@ -32,7 +32,7 @@ use masonry::core::keyboard::{Key, Modifiers, NamedKey};
 use masonry::kurbo::{Point, Rect, Size, Vec2};
 use masonry::ui_events::pointer::PointerButton;
 
-use crate::world::{AddStep, Clip, CopyStep, DeleteStep, LinkStep, RelinkStep, SelectStep};
+use crate::world::{AddStep, Clip, CopyStep, DeleteStep, LinkStep, RelinkStep, ResizeStep, SelectStep};
 use crate::{EDGE_PAN, EditorWorld, Link, LinkPreview, MoveRecord, NodeGraph};
 
 /// The keymap context a node canvas's bindings live in.
@@ -942,6 +942,194 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
     }
 }
 
+/// How far inside a node's left or right edge a drag resizes it rather than moving it, in
+/// screen pixels — Blender's `NODE_RESIZE_MARGIN`, a fifth of a widget unit, rounded up.
+pub const RESIZE_EDGE_PX: f64 = 6.0;
+
+/// The edge of a node a resize drags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NodeEdge {
+    /// The left edge: the node's right edge stays put and its corner moves.
+    Left,
+    /// The right edge: the node's corner stays put.
+    Right,
+}
+
+/// The node, and the edge of it, that a drag starting at `at` would resize; `None` where a
+/// drag would move a node, pan the view or pull a link instead.
+///
+/// The strip just inside the left or the right edge of the node under the pointer, a few
+/// screen pixels wide (`RESIZE_EDGE_PX`), as in Blender's `node_get_resize_direction` — and
+/// only for a node the graph lets resize ([`NodeGraph::width_limits`]). A port on the edge
+/// wins: the canvas picks ports before nodes, so over a port the hover is the port. A node
+/// less than four strips wide on screen has no edge apart from its body — the far field, or
+/// a zoom at which it is a sliver — and is moved, not resized.
+pub(crate) fn edge_under<G: NodeGraph>(world: &EditorWorld<G>, at: Point) -> Option<(usize, NodeEdge)> {
+    let Some(CanvasHit::Node { index, .. }) = world.hover else {
+        return None;
+    };
+    world.graph.borrow().width_limits(index)?;
+    let rect = world.node_rect(index);
+    let margin = RESIZE_EDGE_PX / world.scale.max(f64::EPSILON);
+    if rect.width() < 4.0 * margin {
+        return None;
+    }
+    if at.x >= rect.x1 - margin && at.x <= rect.x1 {
+        Some((index, NodeEdge::Right))
+    } else if at.x >= rect.x0 && at.x < rect.x0 + margin {
+        Some((index, NodeEdge::Left))
+    } else {
+        None
+    }
+}
+
+/// Resizes nodes by an edge — Blender's `node.resize`.
+///
+/// Width only, as in Blender, where only a frame's height can be dragged: by the right edge
+/// the corner stays, by the left the right edge does. Every selected node that may resize is
+/// resized together, by the edge the drag started on, each held to its own
+/// [`NodeGraph::width_limits`]; a node dragged by its edge while unselected is selected first,
+/// as `node.move` takes an unselected node. One step in the history (`node.resize`), with the
+/// rectangles before and after. `Escape`, the other button or the runtime cutting the
+/// gesture off (§58) puts every rectangle back and leaves no step.
+///
+/// From a script: the selection, by `dx`, on the right edge — or the left with `left` set.
+#[derive(Default)]
+pub struct ResizeOp {
+    edge: Option<NodeEdge>,
+    /// Where the drag started, in canvas units along x.
+    anchor: f64,
+    /// Each node being resized: its name, its rectangle before, and the widths it may take.
+    nodes: Vec<(usize, Rect, (f64, f64))>,
+}
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for ResizeOp {
+    fn name(&self) -> &'static str {
+        "node.resize"
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        match cx.event() {
+            Some(OpEvent::Drag { pos, .. } | OpEvent::Press { pos, .. }) => edge_under(cx.world(), *pos).is_some(),
+            // A script names its nodes by the selection.
+            _ => !cx.world().selection().is_empty(),
+        }
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let at = match cx.event() {
+            Some(OpEvent::Drag { pos, .. } | OpEvent::Press { pos, .. }) => *pos,
+            _ => cx.world().pointer,
+        };
+        let Some((index, edge)) = edge_under(cx.world(), at) else {
+            return OpResult::Cancelled;
+        };
+        if !cx.world().is_selected(index) {
+            set_selection(cx, BTreeSet::from([index]));
+        }
+        self.start(cx, edge, at.x);
+        OpResult::Running
+    }
+
+    fn exec(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let edge = if cx.props().bool("left", false) {
+            NodeEdge::Left
+        } else {
+            NodeEdge::Right
+        };
+        self.start(cx, edge, 0.0);
+        self.apply(cx, cx.props().float("dx", 0.0));
+        self.commit(cx)
+    }
+
+    fn modal(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let event = cx.event().cloned();
+        match event {
+            Some(OpEvent::Move { .. }) => {
+                let dx = cx.world().pointer.x - self.anchor;
+                self.apply(cx, dx);
+                OpResult::Running
+            },
+            Some(OpEvent::Release {
+                button: PointerButton::Primary,
+                ..
+            }) => self.commit(cx),
+            Some(OpEvent::Key {
+                key: Key::Named(NamedKey::Escape),
+                down: true,
+                ..
+            })
+            | Some(OpEvent::Press {
+                button: PointerButton::Secondary,
+                ..
+            })
+            | None => {
+                self.apply(cx, 0.0);
+                self.nodes.clear();
+                OpResult::Cancelled
+            },
+            _ => OpResult::Running,
+        }
+    }
+}
+
+impl ResizeOp {
+    /// Records what is being resized, by which edge, from where.
+    fn start<G: NodeGraph>(&mut self, cx: &OpCtx<'_, EditorWorld<G>>, edge: NodeEdge, anchor: f64) {
+        self.edge = Some(edge);
+        self.anchor = anchor;
+        let world = cx.world();
+        let graph = world.graph.borrow();
+        self.nodes = world
+            .selection()
+            .into_iter()
+            .filter_map(|index| Some((index, graph.node_rect(index), graph.width_limits(index)?)))
+            .collect();
+    }
+
+    /// Every node at its starting rectangle, widened by `dx` at the edge being dragged.
+    fn apply<G: NodeGraph>(&self, cx: &mut OpCtx<'_, EditorWorld<G>>, dx: f64) {
+        let Some(edge) = self.edge else {
+            return;
+        };
+        for &(index, from, limits) in &self.nodes {
+            let to = resized(from, edge, dx, limits);
+            if cx.world().node_rect(index) != to {
+                cx.world_mut().set_rect(index, to);
+            }
+        }
+    }
+
+    /// Writes the step, if any rectangle changed, and ends.
+    fn commit<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let nodes: Vec<(usize, Rect, Rect)> = std::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(|(index, from, _)| (index, from, cx.world().node_rect(index)))
+            .filter(|&(_, from, to)| from != to)
+            .collect();
+        if nodes.is_empty() {
+            return OpResult::Cancelled;
+        }
+        cx.push_undo(Box::new(ResizeStep { nodes }));
+        OpResult::Finished
+    }
+}
+
+/// `from` resized by `dx` at `edge`, its width held to `limits`.
+fn resized(from: Rect, edge: NodeEdge, dx: f64, (min, max): (f64, f64)) -> Rect {
+    match edge {
+        NodeEdge::Right => {
+            let width = (from.width() + dx).clamp(min, max);
+            Rect::new(from.x0, from.y0, from.x0 + width, from.y1)
+        },
+        NodeEdge::Left => {
+            let width = (from.width() - dx).clamp(min, max);
+            Rect::new(from.x1 - width, from.y0, from.x1, from.y1)
+        },
+    }
+}
+
 /// The links a link drag that starts on port `port` of `side` of node `index` takes off:
 /// the last link into an input, every link out of an output when `detach` asks — and none,
 /// for a drag that starts a new link.
@@ -1233,6 +1421,10 @@ pub fn default_keymap() -> Keymap {
                 "link.drag",
             )
             .with_props(Props::new().with_bool("detach", true).with_bool(EDGE_PAN, true)),
+            // A node's left or right edge resizes it — after the links, as in Blender's
+            // keymap, because a port on the edge wins; before `node.move`, whose poll would
+            // take every press on a node.
+            Binding::new(Pattern::drag(PointerButton::Primary), "node.resize"),
             Binding::new(Pattern::drag(PointerButton::Primary), "node.move")
                 .with_props(Props::new().with_bool(EDGE_PAN, true)),
             Binding::new(Pattern::drag(PointerButton::Primary), "view.pan"),
@@ -1336,6 +1528,7 @@ pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
     runtime.register(SelectOp);
     runtime.register(BoxSelectOp::default());
     runtime.register(MoveOp::default());
+    runtime.register(ResizeOp::default());
     runtime.register(PanOp::default());
     runtime.register(ZoomOp);
     runtime.register(LinkDragOp::default());

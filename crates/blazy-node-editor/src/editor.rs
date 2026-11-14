@@ -38,9 +38,9 @@ use blazy_ops::{OpCounters, OpResult};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::keyboard::{KeyState, Modifiers};
 use masonry::core::{
-    AccessCtx, BrushIndex, ChildrenIds, EventCtx, Handled, Layer, LayerType, LayoutCtx, MeasureCtx, NewWidget,
-    NoAction, PaintCtx, PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, StyleProperty, TextEvent, Update,
-    UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod, render_text,
+    AccessCtx, BrushIndex, ChildrenIds, CursorIcon, EventCtx, Handled, Layer, LayerType, LayoutCtx, MeasureCtx,
+    NewWidget, NoAction, PaintCtx, PointerEvent, PropertiesMut, PropertiesRef, QueryCtx, RegisterCtx, StyleProperty,
+    TextEvent, Update, UpdateCtx, Widget, WidgetId, WidgetMut, WidgetPod, render_text,
 };
 use masonry::dpi::PhysicalPosition;
 use masonry::imaging::Painter;
@@ -243,6 +243,9 @@ pub struct NodeEditor<G: NodeGraph> {
     /// The port under the pointer, when a press and drag from it would start a link drag —
     /// lit up over the canvas, as the canvas lights up the link under the pointer (§59.6).
     port_hint: Option<(usize, PortSide, u16)>,
+    /// The node edge under the pointer a drag would resize the node by — lined over the
+    /// canvas, since the cursor before the press is the node widget's to choose (§60).
+    edge_hint: Option<(usize, crate::ops::NodeEdge)>,
     /// The modifiers held as of the last event, keys included: `Ctrl` pressed with the
     /// pointer standing still changes what a drag from the port under it would do.
     mods: Modifiers,
@@ -294,6 +297,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             menu: None,
             press_hover: None,
             port_hint: None,
+            edge_hint: None,
             mods: Modifiers::empty(),
             hover_stale: false,
             edge: EdgePanState::default(),
@@ -836,6 +840,7 @@ pub(crate) fn apply_edit(canvas: &mut WidgetMut<'_, CanvasLayer>, edit: Edit) {
         Edit::NodeRemoved { index } => {
             CanvasLayer::remove_node(canvas, index);
         },
+        Edit::NodeResized { index, rect } => CanvasLayer::set_child_rect(canvas, index, rect),
         Edit::LinkAdded(link) => {
             if CanvasLayer::link_name(canvas, link).is_none() {
                 CanvasLayer::insert_link(canvas, link);
@@ -1085,14 +1090,30 @@ impl<G: NodeGraph> NodeEditor<G> {
     /// `stale` says the hover cannot be trusted — the release in `dispatch` — and puts the
     /// light out until the next move.
     fn show_port_hint(&mut self, ctx: &mut EventCtx<'_>, stale: bool) {
-        let hint = self.session.as_ref().filter(|_| !stale).and_then(|session| {
-            let session = session.borrow();
-            crate::ops::port_hint(&session.runtime, &session.world, self.mods)
-        });
-        if hint != self.port_hint {
+        let (hint, edge) = self
+            .session
+            .as_ref()
+            .filter(|_| !stale)
+            .map(|session| {
+                let session = session.borrow();
+                let world = &session.world;
+                let idle = session.runtime.modal_depth() == 0;
+                (
+                    crate::ops::port_hint(&session.runtime, world, self.mods),
+                    crate::ops::edge_under(world, world.pointer).filter(|_| idle),
+                )
+            })
+            .unwrap_or_default();
+        if hint != self.port_hint || edge != self.edge_hint {
             self.port_hint = hint;
+            self.edge_hint = edge;
             ctx.request_post_paint();
         }
+    }
+
+    /// The node edge under the pointer a drag would resize the node by, if any (§60).
+    pub fn edge_hint(&self) -> Option<(usize, crate::ops::NodeEdge)> {
+        self.edge_hint
     }
 
     /// The port lit up because a press and drag from it would start a link drag, if any.
@@ -1146,6 +1167,9 @@ impl<G: NodeGraph> NodeEditor<G> {
             if let Some(pos) = event.pos() {
                 session.world.pointer = pos;
                 session.world.pointer_screen = sample.screen;
+                // The view is a uniform scale and a translation (§22), so one coefficient says it.
+                let [a, b, ..] = view.as_coeffs();
+                session.world.scale = a.hypot(b);
             }
             session
                 .runtime
@@ -1320,6 +1344,18 @@ impl<G: NodeGraph> NodeEditor<G> {
             .chain(source)
             .map(|port| (port, self.style.port_hover))
             .chain(target);
+        // The edge a drag would resize a node by: a line down it, in the same colour.
+        if let Some((index, edge)) = self.edge_hint
+            && index < graph.node_count()
+        {
+            let rect = self.view.transform_rect_bbox(graph.node_rect(index));
+            let x = match edge {
+                crate::ops::NodeEdge::Left => rect.x0 + 1.0,
+                crate::ops::NodeEdge::Right => rect.x1 - 1.0,
+            };
+            let line = masonry::kurbo::Line::new((x, rect.y0), (x, rect.y1));
+            painter.stroke(line, &Stroke::new(2.0), self.style.port_hover).draw();
+        }
         let ports = session.world.ports;
         let radius = ports.dot_radius * self.view.as_coeffs()[0];
         for ((index, side, port), colour) in lit.filter(|_| radius > 0.0) {
@@ -1578,8 +1614,25 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         // The pointer has left this editor and everything in it. A `PointerEvent::Leave`
         // has no target and never reaches `on_pointer_event`, so this is the one notice:
         // without it the port the pointer last stood on stayed lit after it had gone.
-        if matches!(event, Update::ChildHoveredChanged(false)) && self.port_hint.take().is_some() {
+        if matches!(event, Update::ChildHoveredChanged(false))
+            && (self.port_hint.take().is_some() | self.edge_hint.take().is_some())
+        {
             ctx.request_post_paint();
+        }
+    }
+
+    /// The resize cursor while a node is being resized: the editor holds the pointer then,
+    /// and Masonry asks the capture target. Before the press the pointer is over the node's
+    /// own widget, which chooses — so there the edge is lined instead (`edge_hint`).
+    fn get_cursor(&self, _ctx: &QueryCtx<'_>, _pos: Point) -> CursorIcon {
+        let resizing = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.borrow().runtime.modal_name() == Some("node.resize"));
+        if resizing || self.edge_hint.is_some() {
+            CursorIcon::EwResize
+        } else {
+            CursorIcon::Default
         }
     }
 

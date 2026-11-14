@@ -39,6 +39,15 @@ pub enum Edit {
     LinkAdded(Link),
     /// A link went.
     LinkRemoved(Link),
+    /// A node was given a new rectangle — resized, and moved with it when the resize was
+    /// from its left edge (§60). Structure rather than a move because a move carries only the
+    /// corner, and every view has to hear the size.
+    NodeResized {
+        /// The node's name.
+        index: usize,
+        /// Its rectangle now, in canvas coordinates.
+        rect: Rect,
+    },
 }
 
 /// What a link drag shows: one curve per link being dragged, and whether the port under
@@ -87,6 +96,12 @@ pub struct EditorWorld<G: NodeGraph> {
     /// the pointer, so an operator that panned in canvas coordinates would chase its
     /// own tail.
     pub pointer_screen: Point,
+    /// Screen pixels per canvas unit in this view, as of the last event.
+    ///
+    /// For an operator whose target is a strip a few *screen* pixels wide — the edge a node
+    /// is resized by (§60) — since canvas units span a factor of 400 across the zoom range
+    /// (§25.2). Filled in by the driver with the pointer; one until then.
+    pub scale: f64,
     /// The rubber band, in canvas coordinates, while a box select is running.
     pub band: Option<Rect>,
     /// Nodes whose position changed and whose views have not been told yet.
@@ -159,6 +174,7 @@ impl<G: NodeGraph> EditorWorld<G> {
             hover: None,
             pointer: Point::ORIGIN,
             pointer_screen: Point::ORIGIN,
+            scale: 1.0,
             band: None,
             moved: Vec::new(),
             pan: Vec2::ZERO,
@@ -187,6 +203,13 @@ impl<G: NodeGraph> EditorWorld<G> {
     /// A node's rectangle, in canvas coordinates.
     pub fn node_rect(&self, index: usize) -> Rect {
         self.graph.borrow().node_rect(index)
+    }
+
+    /// Writes a node's rectangle to the model and records that views must follow.
+    pub fn set_rect(&mut self, index: usize, rect: Rect) {
+        self.graph.borrow_mut().set_node_rect(index, rect);
+        self.edits.push(Edit::NodeResized { index, rect });
+        self.dirty = true;
     }
 
     /// Writes a node's position to the model and records that views must follow.
@@ -675,6 +698,33 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for LinkStep {
 
     fn bytes(&self) -> usize {
         size_of::<Link>()
+    }
+}
+
+/// Nodes given new rectangles in one gesture: each by its name, before and after.
+pub(crate) struct ResizeStep {
+    pub(crate) nodes: Vec<(usize, Rect, Rect)>,
+}
+
+impl<G: NodeGraph> Step<EditorWorld<G>> for ResizeStep {
+    fn name(&self) -> &'static str {
+        "node.resize"
+    }
+
+    fn undo(&mut self, world: &mut EditorWorld<G>) {
+        for &(index, from, _) in &self.nodes {
+            world.set_rect(index, from);
+        }
+    }
+
+    fn redo(&mut self, world: &mut EditorWorld<G>) {
+        for &(index, _, to) in &self.nodes {
+            world.set_rect(index, to);
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.nodes.len() * (size_of::<usize>() + 2 * size_of::<Rect>())
     }
 }
 

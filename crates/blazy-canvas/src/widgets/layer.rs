@@ -369,6 +369,19 @@ impl CanvasLayer {
         content.widget.store_child_pos(index, pos).apply(&mut content.ctx);
     }
 
+    /// Gives a node a new rectangle: a new size, and a new corner with it.
+    ///
+    /// The resize twin of [`move_child`](Self::move_child). The node's widget is laid out
+    /// at the new size on the next layout, its place in the grid follows, and so do the
+    /// curves that end on its ports.
+    pub fn set_child_rect(this: &mut WidgetMut<'_, Self>, index: usize, rect: Rect) {
+        {
+            let mut content = this.ctx.get_mut(&mut this.widget.content);
+            content.widget.store_child_rect(index, rect).apply(&mut content.ctx);
+        }
+        this.ctx.request_layout();
+    }
+
     /// Moves a child from the parent's raw context, without telling the model.
     ///
     /// The seam an operator layer moves nodes through (§38.3). By then the operator

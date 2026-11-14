@@ -63,6 +63,8 @@ const NODES: usize = 12;
 const COLS: usize = 4;
 /// Every node's size: room for the name field and a body below it to drag the node by.
 const NODE: Size = Size::new(140.0, 80.0);
+/// The widths a node may be dragged to by its left or right edge (`node.resize`).
+const NODE_WIDTHS: (f64, f64) = (90.0, 480.0);
 /// Inputs and outputs every node has.
 const PORTS_IN: u16 = 2;
 const PORTS_OUT: u16 = 1;
@@ -128,6 +130,17 @@ impl NodeGraph for Graph {
         if let Some(Some(rect)) = self.nodes.get_mut(index) {
             *rect = Rect::from_origin_size(pos, rect.size());
         }
+    }
+
+    fn set_node_rect(&mut self, index: usize, rect: Rect) {
+        if let Some(Some(held)) = self.nodes.get_mut(index) {
+            *held = rect;
+        }
+    }
+
+    /// Wide enough for a name and the ports' dots, and not so wide as to cover the area.
+    fn width_limits(&self, _index: usize) -> Option<(f64, f64)> {
+        Some(NODE_WIDTHS)
     }
 
     fn views(&self) -> &Views {
@@ -643,5 +656,36 @@ mod tests {
         exec(&mut harness, "ed.undo", Props::new());
         exec(&mut harness, "ed.undo", Props::new());
         assert_eq!(graph.borrow().titles[0], "source");
+    }
+
+    /// A node is widened by its right edge, and its name field with it: the field is laid
+    /// out across the node, so a longer name has room.
+    #[test]
+    fn a_node_dragged_by_its_right_edge_widens_and_its_name_field_with_it() {
+        use blazy::masonry::kurbo::Point;
+        use blazy::masonry::ui_events::pointer::PointerButton;
+
+        let graph = Graph::grid();
+        let screen = app(&graph).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
+        let _ = harness.redraw();
+        let areas = harness.root_widget().area_ids();
+        let field_width = |harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>| {
+            let field = title_field(harness, areas[0], 0);
+            harness.get_widget_with_id(field).ctx().border_box().width()
+        };
+        let before = field_width(&mut harness);
+
+        // Node 0 is at (40, 40), 140 wide: its right edge is x = 180, its output (180, 60).
+        harness.mouse_move(Point::new(177.0, 100.0));
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        for x in [190.0, 210.0, 237.0] {
+            harness.mouse_move(Point::new(x, 100.0));
+        }
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+        assert_eq!(graph.borrow().node_rect(0).width(), 200.0, "60 wider");
+        assert_eq!(field_width(&mut harness), before + 60.0, "and the name field too");
     }
 }

@@ -38,6 +38,8 @@ struct Row {
     refuses: Option<u32>,
     /// How many links an input holds, when not the default one.
     holds: Option<usize>,
+    /// The widths a node may be resized to; `None`, the default, for none.
+    widths: Option<(f64, f64)>,
 }
 
 impl NodeGraph for Row {
@@ -53,6 +55,16 @@ impl NodeGraph for Row {
         if let Some(rect) = self.rects[index] {
             self.rects[index] = Some(Rect::from_origin_size(pos, rect.size()));
         }
+    }
+
+    fn set_node_rect(&mut self, index: usize, rect: Rect) {
+        if self.rects[index].is_some() {
+            self.rects[index] = Some(rect);
+        }
+    }
+
+    fn width_limits(&self, _index: usize) -> Option<(f64, f64)> {
+        self.widths
     }
 
     fn views(&self) -> &Views {
@@ -2293,6 +2305,22 @@ mod cut_off {
                 },
                 false,
             ),
+            "node.resize" => (
+                |runtime, world| {
+                    world.graph.borrow_mut().widths = Some((40.0, 400.0));
+                    // Just inside node 0's right edge, at x = 100.
+                    let at = Point::new(97.0, 45.0);
+                    world.pointer = at;
+                    world.hover = Some(CanvasHit::Node {
+                        index: 0,
+                        pos: Point::ORIGIN,
+                    });
+                    send(runtime, world, &drag(PointerButton::Primary, at));
+                    move_to(runtime, world, Point::new(180.0, 45.0));
+                    assert_ne!(world.node_rect(0).width(), 100.0, "the node is wider");
+                },
+                false,
+            ),
             "node.duplicate" => (
                 |runtime, world| {
                     key(runtime, world, "d", Modifiers::SHIFT);
@@ -2396,6 +2424,287 @@ mod cut_off {
                 assert_eq!(runtime.history().depth(), depth, "{name} wrote a step");
             }
         }
-        assert_eq!(modal, 6, "every modal operator was reached, `link.drag` twice");
+        assert_eq!(modal, 7, "every modal operator was reached, `link.drag` twice");
     }
+}
+
+// --- MARK: RESIZE (`issues/26-11-12 node resize.md`)
+
+mod resize {
+    use std::collections::BTreeSet;
+
+    use blazy_canvas::CanvasHit;
+    use blazy_ops::event::OpEvent;
+    use blazy_ops::keymap::{Props, Scope};
+    use blazy_ops::runtime::{OpRuntime, Seat};
+    use masonry::core::keyboard::{Key, Modifiers, NamedKey};
+    use masonry::kurbo::{Point, Rect};
+    use masonry::ui_events::pointer::PointerButton;
+
+    use super::Row;
+    use super::copies::{linked, state};
+    use crate::ops::CANVAS_SCOPE;
+    use crate::{EditorWorld, NodeGraph};
+
+    type Runtime = OpRuntime<EditorWorld<Row>>;
+
+    fn send(runtime: &mut Runtime, world: &mut EditorWorld<Row>, event: &OpEvent) {
+        let _ = runtime.dispatch(world, event, Scope(&CANVAS_SCOPE), Seat::Tree);
+    }
+
+    /// A drag that begins at `at` over node `index`, as the canvas would report the node.
+    fn drag_on(runtime: &mut Runtime, world: &mut EditorWorld<Row>, index: usize, at: Point) {
+        world.pointer = at;
+        world.hover = Some(CanvasHit::Node {
+            index,
+            pos: world.node_rect(index).origin(),
+        });
+        let event = OpEvent::Drag {
+            button: PointerButton::Primary,
+            pos: at,
+            screen: at,
+            mods: Modifiers::empty(),
+        };
+        send(runtime, world, &event);
+    }
+
+    fn move_x(runtime: &mut Runtime, world: &mut EditorWorld<Row>, x: f64) {
+        world.pointer = Point::new(x, world.pointer.y);
+        let event = OpEvent::Move {
+            pos: world.pointer,
+            mods: Modifiers::empty(),
+        };
+        send(runtime, world, &event);
+    }
+
+    fn let_go(runtime: &mut Runtime, world: &mut EditorWorld<Row>) {
+        let event = OpEvent::Release {
+            button: PointerButton::Primary,
+            pos: world.pointer,
+            mods: Modifiers::empty(),
+        };
+        send(runtime, world, &event);
+    }
+
+    /// Node `index`'s rectangle.
+    fn rect(world: &EditorWorld<Row>, index: usize) -> Rect {
+        world.node_rect(index)
+    }
+
+    /// A graph of four nodes, 100 wide at x = 0, 150, 300, 450, whose nodes resize to
+    /// between 60 and 300, with nodes 0 and 1 selected.
+    fn resizable() -> (super::SharedGraph<Row>, Runtime, EditorWorld<Row>) {
+        let (graph, runtime, world) = linked();
+        graph.borrow_mut().widths = Some((60.0, 300.0));
+        (graph, runtime, world)
+    }
+
+    /// The right edge of a node widens it from where it stands; every selected node goes
+    /// with it, and one undo puts them all back.
+    #[test]
+    fn a_node_dragged_by_its_right_edge_is_wider_and_the_selection_with_it() {
+        let (graph, mut runtime, mut world) = resizable();
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+
+        drag_on(&mut runtime, &mut world, 0, Point::new(97.0, 40.0));
+        assert_eq!(runtime.modal_name(), Some("node.resize"));
+        move_x(&mut runtime, &mut world, 147.0);
+        assert_eq!(
+            rect(&world, 0),
+            Rect::new(0.0, 0.0, 150.0, 60.0),
+            "50 wider, from its corner"
+        );
+        assert_eq!(
+            rect(&world, 1),
+            Rect::new(150.0, 0.0, 300.0, 60.0),
+            "node 1 is selected too"
+        );
+        assert_eq!(rect(&world, 2).width(), 100.0, "node 2 is not");
+        move_x(&mut runtime, &mut world, 900.0);
+        assert_eq!(rect(&world, 0).width(), 300.0, "no wider than the graph's 300");
+        move_x(&mut runtime, &mut world, 147.0);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(runtime.modal_depth(), 0);
+        assert_eq!(runtime.history().depth(), depth + 1, "one step");
+        let after = state(&graph);
+
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("node.resize"));
+        assert_eq!(state(&graph), before, "undo puts both back");
+        assert_eq!(runtime.history_mut().redo(&mut world), Some("node.resize"));
+        assert_eq!(state(&graph), after);
+    }
+
+    /// The left edge keeps the right edge where it is and moves the corner; both edges
+    /// stop at the graph's limits.
+    #[test]
+    fn the_left_edge_moves_the_corner_and_the_limits_hold() {
+        let (_graph, mut runtime, mut world) = resizable();
+        world.select(BTreeSet::from([2]));
+        drag_on(&mut runtime, &mut world, 2, Point::new(302.0, 40.0));
+        move_x(&mut runtime, &mut world, 252.0);
+        assert_eq!(rect(&world, 2), Rect::new(250.0, 0.0, 400.0, 60.0), "wider to the left");
+        move_x(&mut runtime, &mut world, -500.0);
+        assert_eq!(rect(&world, 2), Rect::new(100.0, 0.0, 400.0, 60.0), "no wider than 300");
+        move_x(&mut runtime, &mut world, 900.0);
+        assert_eq!(
+            rect(&world, 2),
+            Rect::new(340.0, 0.0, 400.0, 60.0),
+            "no narrower than 60"
+        );
+        let_go(&mut runtime, &mut world);
+    }
+
+    /// An unselected node dragged by its edge is selected and resized alone, as `node.move`
+    /// takes an unselected node.
+    #[test]
+    fn an_unselected_node_is_selected_and_resized_alone() {
+        let (_graph, mut runtime, mut world) = resizable();
+        drag_on(&mut runtime, &mut world, 3, Point::new(548.0, 40.0));
+        move_x(&mut runtime, &mut world, 568.0);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(world.selection(), BTreeSet::from([3]));
+        assert_eq!(rect(&world, 3).width(), 120.0);
+        assert_eq!(rect(&world, 0).width(), 100.0, "the old selection is not resized");
+    }
+
+    /// Where there is no edge to resize by, the drag is the node's: in the middle of it, on
+    /// a node the graph does not resize, and on a node too narrow on screen for an edge apart
+    /// from its body — the far field.
+    #[test]
+    fn without_an_edge_the_drag_moves_the_node() {
+        let (graph, mut runtime, mut world) = resizable();
+        drag_on(&mut runtime, &mut world, 0, Point::new(50.0, 40.0));
+        assert_eq!(runtime.modal_name(), Some("node.move"), "the middle of a node");
+        runtime.cancel_all(&mut world);
+
+        world.scale = 0.02;
+        drag_on(&mut runtime, &mut world, 0, Point::new(97.0, 40.0));
+        assert_eq!(runtime.modal_name(), Some("node.move"), "a sliver of a node on screen");
+        runtime.cancel_all(&mut world);
+        world.scale = 1.0;
+
+        graph.borrow_mut().widths = None;
+        drag_on(&mut runtime, &mut world, 0, Point::new(97.0, 40.0));
+        assert_eq!(runtime.modal_name(), Some("node.move"), "a node that does not resize");
+        runtime.cancel_all(&mut world);
+    }
+
+    /// `Escape` puts every rectangle back and writes no step, and so does a resize let go
+    /// where it started; from a script, `dx` and `left`.
+    #[test]
+    fn escape_or_no_change_writes_nothing_and_a_script_resizes() {
+        let (graph, mut runtime, mut world) = resizable();
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+        drag_on(&mut runtime, &mut world, 0, Point::new(97.0, 40.0));
+        move_x(&mut runtime, &mut world, 200.0);
+        let escape = OpEvent::Key {
+            key: Key::Named(NamedKey::Escape),
+            mods: Modifiers::empty(),
+            down: true,
+        };
+        send(&mut runtime, &mut world, &escape);
+        assert_eq!(state(&graph), before, "Escape puts them back");
+
+        drag_on(&mut runtime, &mut world, 0, Point::new(97.0, 40.0));
+        move_x(&mut runtime, &mut world, 120.0);
+        move_x(&mut runtime, &mut world, 97.0);
+        let_go(&mut runtime, &mut world);
+        assert_eq!(runtime.history().depth(), depth, "neither wrote a step");
+
+        let left = Props::new().with_float("dx", -30.0).with_bool("left", true);
+        assert_eq!(
+            runtime.exec(&mut world, "node.resize", &left),
+            blazy_ops::OpResult::Finished
+        );
+        assert_eq!(rect(&world, 0), Rect::new(-30.0, 0.0, 100.0, 60.0));
+        assert_eq!(graph.borrow().node_rect(1), Rect::new(120.0, 0.0, 250.0, 60.0));
+    }
+}
+
+/// With a real pointer: the strip just inside a node's right edge is lit and resizes the
+/// node — its widget is laid out at the new width, under the resize cursor while it runs —
+/// and a port on that edge still wins over it.
+#[test]
+fn a_node_edge_under_the_pointer_resizes_the_node() {
+    use masonry::core::CursorIcon;
+    use masonry::ui_events::pointer::PointerButton;
+
+    use crate::ops::NodeEdge;
+
+    let graph = row(3);
+    graph.borrow_mut().widths = Some((60.0, 300.0));
+    let session = crate::EditorSession::new(&graph).share();
+    let geometry = {
+        let graph = graph.clone();
+        move |index: usize| {
+            let rect = graph.borrow().node_rect(index);
+            Some((rect.origin(), rect.size()))
+        }
+    };
+    let source = |index: usize, _detail| NewWidget::new(Label::new(format!("node {index}"))).erased();
+    let dots = blazy_canvas::PortLayout {
+        dot_radius: 4.0,
+        ..Default::default()
+    };
+    let canvas = CanvasLayer::new(3, geometry, source).with_ports(dots);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(NodeEditor::with_session(canvas, session.clone())),
+        PhysicalSize::new(800, 400),
+    );
+    let _ = harness.redraw();
+    let edge = |harness: &TestHarness<NodeEditor<Row>>| harness.root_widget().edge_hint();
+    let width_of_0 = |harness: &mut TestHarness<NodeEditor<Row>>| {
+        let id = harness.edit_root_widget(|mut editor| {
+            NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::live_children(&mut canvas)
+                    .into_iter()
+                    .find(|&(index, _)| index == 0)
+                    .map(|(_, id)| id)
+            })
+        });
+        harness
+            .get_widget_with_id(id.expect("node 0 has a widget"))
+            .ctx()
+            .border_box()
+            .width()
+    };
+
+    // Node 0's output port is the middle of its right edge, (100, 30).
+    harness.mouse_move(Point::new(97.0, 30.0));
+    assert_eq!(edge(&harness), None, "on the port, the port wins");
+    harness.mouse_move(Point::new(97.0, 50.0));
+    assert_eq!(edge(&harness), Some((0, NodeEdge::Right)), "below it, the edge is lit");
+    harness.mouse_move(Point::new(50.0, 50.0));
+    assert_eq!(edge(&harness), None, "in the middle, nothing");
+
+    harness.mouse_move(Point::new(97.0, 50.0));
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    for x in [110.0, 130.0, 147.0] {
+        harness.mouse_move(Point::new(x, 50.0));
+    }
+    assert_eq!(
+        harness.cursor_icon(),
+        CursorIcon::EwResize,
+        "the resize cursor while it runs"
+    );
+    harness.mouse_button_release(Some(PointerButton::Primary));
+    let _ = harness.redraw();
+    assert_eq!(graph.borrow().node_rect(0).width(), 150.0);
+    assert_eq!(
+        width_of_0(&mut harness),
+        150.0,
+        "and the node's widget is laid out at it"
+    );
+    assert!(
+        matches!(
+            harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |mut canvas| {
+                CanvasLayer::hit_test(&mut canvas, Point::new(150.0, 30.0))
+            })),
+            Some(blazy_canvas::CanvasHit::Port { index: 0, .. })
+        ),
+        "its output port went with the edge"
+    );
 }

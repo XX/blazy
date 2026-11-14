@@ -67,6 +67,17 @@ impl NodeGraph for Grid {
         }
     }
 
+    fn set_node_rect(&mut self, index: usize, rect: Rect) {
+        if let Some(Some(held)) = self.rects.get_mut(index) {
+            *held = rect;
+        }
+    }
+
+    /// Resizable, so the two-area test can resize: a little narrower and much wider.
+    fn width_limits(&self, _index: usize) -> Option<(f64, f64)> {
+        Some((60.0, 400.0))
+    }
+
     fn views(&self) -> &Views {
         &self.views
     }
@@ -1244,6 +1255,43 @@ fn an_input_holds_one_link_unless_the_graph_says_otherwise() {
         assert!(
             !has_link(&mut root, area, Link::new(0, 1)),
             "and not the one it replaced"
+        );
+    }
+}
+
+/// A node resized by its edge in one area is resized in the other in the same frame, and its
+/// ports — so the ends of its links — went with the edge in both.
+#[test]
+fn a_node_resized_in_one_area_is_resized_in_the_other() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph);
+    let mut root = window(&app, 2);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+
+    // Node 1 is at (180, 20), 120 wide: its right edge is x = 300, its output port (300, 50).
+    let mut at = |kind, x: f64, root: &mut RenderRoot| pointer(&mut app, &mut cx, key, root, kind, Point::new(x, 30.0));
+    at("move", 297.0, &mut root);
+    at("down", 297.0, &mut root);
+    for x in [310.0, 330.0, 347.0] {
+        at("drag", x, &mut root);
+    }
+    at("up", 347.0, &mut root);
+    assert_eq!(
+        graph.borrow().node_rect(1),
+        Rect::new(180.0, 20.0, 350.0, 80.0),
+        "50 wider"
+    );
+    for area in 0..2 {
+        let port = edit_editor(&mut root, area, |editor| {
+            NodeEditor::with_canvas(editor, |mut canvas| {
+                CanvasLayer::hit_test(&mut canvas, Point::new(350.0, 50.0))
+            })
+        });
+        assert!(
+            matches!(port, Some(blazy_canvas::CanvasHit::Port { index: 1, .. })),
+            "area {area}: the output port is on the new edge: {port:?}"
         );
     }
 }

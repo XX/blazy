@@ -551,15 +551,7 @@ impl CanvasContent {
     /// the cull saw nothing to build and the node was counted and drawn nowhere.
     fn insert_node(&mut self, index: usize, pos: Point, size: Size) -> Invalidate {
         if self.live_slot(index).is_some() {
-            if self.slots[index].size == size {
-                return self.store_child_pos(index, pos);
-            }
-            self.slots[index].size = size;
-            self.index
-                .insert(index, Rect::from_origin_size(self.slots[index].pos, size));
-            self.structure_changed();
-            let _ = self.store_child_pos(index, pos);
-            return Invalidate::LayoutAndPaint;
+            return self.store_child_rect(index, Rect::from_origin_size(pos, size));
         }
         if self.slots.len() <= index {
             self.slots.resize_with(index + 1, || EMPTY_SLOT);
@@ -1057,6 +1049,39 @@ impl CanvasContent {
         self.slots[index].built = None;
         self.detail_dirty = true;
         Invalidate::Layout
+    }
+
+    /// Records a new rectangle for a node: its size, and its corner with it.
+    ///
+    /// A resize is a move that also changes the box (§60): the node is re-filed in the grid
+    /// — whose query slack follows the widest node — and the curves that end on it are
+    /// re-measured, because a port's place is a function of the rectangle
+    /// (`PortLayout::position`). Not a structural change: the links stay the links, so the
+    /// recorded set is not re-chosen, which a resize dragged over many frames would otherwise
+    /// pay on every one of them (§24.3).
+    fn store_child_rect(&mut self, index: usize, rect: Rect) -> Invalidate {
+        let Some(slot) = self.live_slot(index) else {
+            return Invalidate::Nothing;
+        };
+        if slot.size == rect.size() {
+            return self.store_child_pos(index, rect.origin());
+        }
+        let slot = &mut self.slots[index];
+        slot.pos = rect.origin();
+        slot.size = rect.size();
+        self.index.insert(index, rect);
+        let slots = &self.slots;
+        let ports = &self.ports;
+        self.links.node_moved(index, |link| {
+            match (slots.get(link.from as usize), slots.get(link.to as usize)) {
+                (Some(from), Some(to)) if from.alive && to.alive => link_bounds(link, from, to, ports),
+                _ => Rect::ZERO,
+            }
+        });
+        if self.far.active {
+            self.far.region = None;
+        }
+        Invalidate::LayoutAndPaint
     }
 
     /// Records a new canvas-space position for a node.

@@ -81,6 +81,29 @@ pub trait NodeGraph: 'static {
     /// Moves node `index` so that its top-left corner is at `pos`.
     fn set_node_pos(&mut self, index: usize, pos: Point);
 
+    /// Gives node `index` the rectangle `rect`: a new size, and a new corner when a node is
+    /// resized from its left edge (`node.resize`, §60).
+    ///
+    /// Required, like everything here that writes what a node is: a default that moved the
+    /// node and dropped the size would compile, pass every test that counts nodes, and leave
+    /// two views disagreeing about how wide a node is (§42). A graph whose nodes do not
+    /// resize still writes the rectangle — whether they may is
+    /// [`width_limits`](Self::width_limits).
+    fn set_node_rect(&mut self, index: usize, rect: Rect);
+
+    /// The least and the greatest width node `index` may be resized to, in canvas units, or
+    /// `None` for a node that is not resized at all.
+    ///
+    /// Blender's `minwidth`/`maxwidth` of a node type. Defaulted to `None`: a node keeps the
+    /// size it was given, which is what the editor did before this question existed, and an
+    /// edge that does nothing when dragged is not a silent failure — it is simply not an
+    /// edge (no cursor, no resize, `node.move` takes the drag). Only width, as in Blender,
+    /// where only a frame's height can be dragged.
+    fn width_limits(&self, index: usize) -> Option<(f64, f64)> {
+        let _ = index;
+        None
+    }
+
     /// The canvases showing this graph, and what each of them has not been told yet.
     ///
     /// Where the other views of a moved node are found in the same frame (§30), and where
