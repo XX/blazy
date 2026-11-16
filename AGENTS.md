@@ -690,9 +690,15 @@ configs stay open because they are built with `..Default::default()`.
 for a graph with kinds and falls through to plain `node.add` otherwise. The kind travels as
 `Props::with_text("kind", …)` — the only string property, quoted in a keymap file — and an
 unknown kind is refused in `poll`. A node the editor adds is recorded at the rectangle the
-*model* gave it, not the one asked for. Choosing a menu entry in a window of two areas spills
-past an event's rewrite passes (`issues/26-11-20 menu entry pass budget.md`): until that is
-fixed, a harness test runs the entry's operator through `NodeEditor::exec` instead of clicking.
+*model* gave it, not the one asked for.
+
+**An event has four rewrite passes, and a node inserted from a mutate pass is built in it
+(§65).** `CanvasLayer::insert_node` runs the cull at once when the node lands in the view of the
+last layout, instead of leaving the build to the next layout's cull (one pass later). That pass
+was what a menu entry in a window of two areas lacked. A test of a multi-view path must use node
+sources that register with `Views` (`NodeSource::attached`) — without them there are no peers,
+and a pass budget problem stays invisible. Masonry counts no passes; the harness's "Loop
+detected" is the only gauge, so an improvement no test can see is not taken.
 
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the

@@ -982,6 +982,7 @@ mod tests {
     /// size every node starts at.
     #[test]
     fn the_add_menu_adds_the_kind_chosen_in_both_areas() {
+        use blazy::masonry::ui_events::pointer::PointerButton;
         use blazy::node_editor::{MenuLayer, NodeEditor};
         use blazy::ops::keymap::Props;
 
@@ -1029,17 +1030,12 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
         assert_eq!(entries.len(), 4, "one entry per kind");
-        // What the fourth entry runs, run as a script runs it. Clicking it is what a user
-        // does, and in a window of two areas that click spills past the event's rewrite
-        // passes — the harness calls it a loop (`issues/26-11-20 menu entry pass budget.md`).
-        let _ = entries;
-        harness.edit_widget_with_id(editors[0], |mut widget| {
-            NodeEditor::<Calc>::exec(
-                &mut widget.downcast(),
-                "node.add",
-                &Props::new().with_text("kind", "show"),
-            )
-        });
+        // Unchecked: the harness looks for a widget under the pointer in the base layer only,
+        // and a menu is a layer of its own. A click, which in a window of two areas used to
+        // spill past the event's rewrite passes (§65).
+        harness.mouse_move_to_unchecked(entries[3]);
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_button_release(Some(PointerButton::Primary));
         pull(&mut harness, &graph);
 
         assert_eq!(shows(&graph), 2, "a display was added");

@@ -619,6 +619,19 @@ impl CanvasLayer {
             let mut content = this.ctx.get_mut(&mut this.widget.content);
             let invalidate = content.widget.insert_node(index, pos, size);
             invalidate.apply(&mut content.ctx);
+            // A node that lands in view is built now, while there is a `WidgetMut` to build
+            // it with, rather than by the cull of the next layout — which can only queue it
+            // for the mutate after, one rewrite pass later. That pass was what an operator
+            // run from a menu, in a window of two areas, did not have (§65). The cull runs
+            // against the view of the last layout, as it would in the next one; a canvas not
+            // laid out yet has nothing in view and leaves it to that layout.
+            let rect = Rect::from_origin_size(pos, size);
+            if content.widget.readable.is_some() && content.widget.live_rect.overlaps(rect) {
+                content.widget.cull();
+                if content.widget.pending.is_some() {
+                    CanvasContent::apply_pending(&mut content);
+                }
+            }
         }
         this.ctx.request_layout();
     }

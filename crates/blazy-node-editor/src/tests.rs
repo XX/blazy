@@ -2967,3 +2967,102 @@ mod kinds {
         assert_eq!(runtime.history().depth(), depth);
     }
 }
+
+/// A menu entry that adds a node, in a window where a second editor shows the graph,
+/// finishes within the event: the harness panics when an event's rewrite passes run out,
+/// and the second view has built the node and put the selection on it before any redraw
+/// (`issues/26-11-20 menu entry pass budget.md`, §65).
+#[test]
+fn a_menu_entry_reaches_a_second_view_within_the_event() {
+    use std::rc::Rc;
+
+    use blazy_areas::{AreaContent, RegionKind, Sidebar};
+    use masonry::ui_events::pointer::PointerButton;
+
+    use crate::{MenuLayer, SELECTED, ViewToken};
+
+    /// Text fields that register their canvas as a view — what an application's nodes do.
+    struct Fields(SharedGraph<Row>, Option<ViewToken>);
+    impl blazy_canvas::NodeSource for Fields {
+        fn build(&mut self, index: usize, _detail: blazy_canvas::Detail) -> NewWidget<dyn masonry::core::Widget> {
+            NewWidget::new(masonry::widgets::TextInput::new(&format!("node {index}"))).erased()
+        }
+
+        fn attached(&mut self, canvas: masonry::core::WidgetId) {
+            self.1 = Some(self.0.borrow().views().attach(canvas));
+        }
+    }
+    let graph = row(3);
+    let editor = |graph: &SharedGraph<Row>| {
+        let geometry = {
+            let graph = graph.clone();
+            move |index: usize| {
+                let rect = graph.borrow().node_rect(index);
+                Some((rect.origin(), rect.size()))
+            }
+        };
+        let canvas = CanvasLayer::new(3, geometry, Fields(graph.clone(), None));
+        NewWidget::new(NodeEditor::with_session(
+            canvas,
+            crate::EditorSession::new(graph).share(),
+        ))
+    };
+    let (first, second) = (editor(&graph), editor(&graph));
+    let first_id = first.id();
+    let sidebar = Rc::new(std::cell::Cell::new(Sidebar::new(true, 480.0)));
+    let content =
+        AreaContent::new(vec![(RegionKind::Main, 0.0, first.erased())]).with_sidebar(second.erased(), sidebar);
+    let mut harness = TestHarness::create_with_size(
+        default_property_set(),
+        NewWidget::new(content),
+        PhysicalSize::new(1000, 400),
+    );
+    let _ = harness.redraw();
+    assert_eq!(graph.borrow().views().len(), 2, "two views of one graph");
+
+    harness.mouse_move(Point::new(300.0, 300.0));
+    harness.edit_widget_with_id(first_id, |mut widget| {
+        NodeEditor::<Row>::exec(
+            &mut widget.downcast(),
+            crate::ops::NODE_MENU,
+            &blazy_ops::keymap::Props::new(),
+        )
+    });
+    let _ = harness.redraw();
+    let menu = harness
+        .get_widget_with_id(first_id)
+        .downcast::<NodeEditor<Row>>()
+        .expect("the editor")
+        .inner()
+        .open_menu()
+        .expect("the menu is open");
+    let add = harness
+        .get_widget_with_id(menu)
+        .downcast::<MenuLayer<Row>>()
+        .expect("a menu")
+        .inner()
+        .entries()
+        .find(|(_, op)| *op == "node.add")
+        .expect("Add node")
+        .0;
+    // Unchecked: the harness looks for a widget under the pointer in the base layer only.
+    harness.mouse_move_to_unchecked(add);
+    harness.mouse_button_press(Some(PointerButton::Primary));
+    harness.mouse_button_release(Some(PointerButton::Primary));
+
+    let added = graph.borrow().node_count() - 1;
+    assert_eq!(added, 3, "a node was added");
+    for canvas in graph.borrow().views().ids() {
+        let (built, selected) = harness.edit_widget_with_id(canvas, |mut widget| {
+            let mut canvas = widget.downcast::<CanvasLayer>();
+            let built = CanvasLayer::live_children(&mut canvas)
+                .iter()
+                .any(|&(index, _)| index == added);
+            (built, CanvasLayer::node_has_class(&mut canvas, added, SELECTED))
+        });
+        assert!(
+            built && selected,
+            "view {canvas:?}: built {built}, selected {selected}, in the event"
+        );
+    }
+}
