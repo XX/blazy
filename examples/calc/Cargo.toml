@@ -1,0 +1,20 @@
+[package]
+name = "calc"
+description = "A second application on blazy, written against the facade only: an arithmetic node graph."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# One dependency, as for `hello`: what this application cannot reach through `blazy` is a
+# finding of `rnd/architecture.md` §63, not something to import past the facade.
+[dependencies]
+blazy = { workspace = true }
+
+[dev-dependencies]
+blazy = { workspace = true, features = ["testing"] }

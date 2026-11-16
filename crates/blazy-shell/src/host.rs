@@ -16,6 +16,7 @@ use crate::backend::{Backend, BackendError};
 use crate::compose::{Composition, Hole};
 
 /// What one composed and rasterised frame consists of.
+#[non_exhaustive]
 pub struct Frame {
     /// The pixels, at physical size.
     pub image: RgbaImage,

@@ -11,6 +11,7 @@ use crate::links::{Link, PortSide};
 /// painted in (§25.3): a pointer that disagrees with the picture is worse than one
 /// that is imprecise.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum CanvasHit {
     /// A node, with the canvas-space position of its top-left corner.
     Node {

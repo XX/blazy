@@ -33,6 +33,12 @@ toolchain = "stable"
 args = ["run", "-p", "hello", "--profile", "${PROFILE}", "--", "${@}"]
 dependencies = ["choose-profile"]
 
+[tasks.run-calc]
+command = "cargo"
+toolchain = "stable"
+args = ["run", "-p", "calc", "--profile", "${PROFILE}", "--", "${@}"]
+dependencies = ["choose-profile"]
+
 
 [tasks.fmt-check]
 command = "cargo"

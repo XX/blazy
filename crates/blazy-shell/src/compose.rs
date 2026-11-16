@@ -38,6 +38,7 @@ pub struct Hole {
 
 /// One plan, composed.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct Composition {
     /// Everything Masonry drew, in physical window coordinates.
     pub scene: Scene,

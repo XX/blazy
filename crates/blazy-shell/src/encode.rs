@@ -21,6 +21,7 @@ use masonry::kurbo::Rect;
 
 /// What one composed scene amounts to once vello has encoded it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Encoded {
     /// Draw objects: one per command the rasteriser has to set up.
     pub objects: usize,

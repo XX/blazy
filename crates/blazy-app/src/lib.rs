@@ -104,6 +104,9 @@ pub type EditorScreen<G> = AreaScreen<SessionHandle<G>>;
 /// What fills one area, given the session it shows.
 type BuildArea<G> = dyn Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget>;
 
+/// What an application writes beside the workspace when it is saved.
+type SaveGraph<G> = dyn Fn(&SharedGraph<G>);
+
 /// What fills one area's sidebar, given the session the area shows.
 type BuildSidebar<G> = dyn Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget>;
 
@@ -149,6 +152,10 @@ pub struct EditorApp<G: NodeGraph> {
     edge_pan: Option<EdgePan>,
     keys: ScreenKeys,
     workspace: Option<PathBuf>,
+    /// What the application writes beside the workspace when it is saved — its graph (§63).
+    on_save: Option<Rc<SaveGraph<G>>>,
+    /// Whether the workspace file has been read at startup yet.
+    restored: bool,
     layers: bool,
     /// The tree a new window opens with.
     tree: SplitTree,
@@ -191,6 +198,8 @@ impl<G: NodeGraph> EditorApp<G> {
             edge_pan: None,
             keys: ScreenKeys::default(),
             workspace: None,
+            on_save: None,
+            restored: false,
             layers: true,
             tree: SplitTree::balanced(1),
             title: defaults.title,
@@ -299,10 +308,24 @@ impl<G: NodeGraph> EditorApp<G> {
     /// The same application, writing and reading its workspace at `path`.
     ///
     /// Without one, [`ScreenAction::SaveWorkspace`] and [`ScreenAction::LoadWorkspace`]
-    /// do nothing.
+    /// do nothing. If the file is there when the first window opens, it is read then: the
+    /// screen comes back as it was left, which is what the file is for (§63).
     #[must_use]
     pub fn with_workspace(mut self, path: impl Into<PathBuf>) -> Self {
         self.workspace = Some(path.into());
+        self
+    }
+
+    /// Runs `save` whenever the workspace is saved ([`ScreenAction::SaveWorkspace`]), after
+    /// the workspace file is written.
+    ///
+    /// Where an application writes its graph: the graph's format is the application's
+    /// (§42.4), and `Ctrl+S` saving the screen but not the document was the first thing a
+    /// second application had to work around (§63). Nothing is written without a
+    /// workspace path, as nothing is saved then.
+    #[must_use]
+    pub fn on_save(mut self, save: impl Fn(&SharedGraph<G>) + 'static) -> Self {
+        self.on_save = Some(Rc::new(save));
         self
     }
 
@@ -579,6 +602,9 @@ impl<G: NodeGraph> EditorApp<G> {
             Ok(()) => tracing::info!(path = %path.display(), "workspace written"),
             Err(error) => tracing::warn!(path = %path.display(), "workspace not written: {error}"),
         }
+        if let Some(save) = &self.on_save {
+            save(&self.graph);
+        }
     }
 
     fn load(&self, root: &mut RenderRoot) {
@@ -619,6 +645,13 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
     /// Each new window comes back here, so the count walks down to zero through the same
     /// path a key takes, rather than through a loop of its own.
     fn started(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
+        // The first window brings the screen back as the workspace file left it.
+        if !self.restored {
+            self.restored = true;
+            if self.workspace.as_ref().is_some_and(|path| path.exists()) {
+                self.load(root);
+            }
+        }
         self.windows.push(window);
         self.counters.windows_opened += 1;
         self.route_keys(window, root);

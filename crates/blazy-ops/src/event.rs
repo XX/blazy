@@ -19,6 +19,7 @@ use masonry::ui_events::pointer::PointerButton;
 /// order of magnitude in how far they travel before the user meant to travel (§39.2).
 /// Masonry carries this on every pointer event, so a driver has it for free.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Device {
     /// A mouse, or anything the platform reports as one.
     #[default]
@@ -66,6 +67,7 @@ impl Sample {
 
 /// A pointer or key event, in the form the keymap matches and an operator receives.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum OpEvent {
     /// A pointer button went down.
     Press {

@@ -41,6 +41,7 @@ cargo make test             # cargo test --workspace
 cargo make run-node-canvas  # Phase 0 window
 cargo make run-area-screen  # Phase 0.5/0.6 window
 cargo make run-hello        # the smallest application, through the facade only
+cargo make run-calc         # the second application: an arithmetic graph saved to a file
 
 cargo make bench-canvas     # Phase 0 measurements and criteria
 cargo make bench-areas      # Phase 0.5/0.6 measurements and criteria
@@ -85,6 +86,7 @@ fewer numbers, and a fast inner loop.
 | `examples/node-canvas` | Phase 0 experiment: 5000 nodes, measurements, criteria. |
 | `examples/area-screen` | Phase 0.5/0.6 experiment: tiled screen, regions, criteria. |
 | `examples/hello` | The smallest application: a node editor over its own graph, in areas and windows, one dependency. |
+| `examples/calc` | The second application, through the facade only: typed nodes, a graph file, the workspace restored at start (§63). |
 
 Each experiment is a **library plus a thin binary plus a bench target**, not one binary
 (`examples/hello` measures nothing and is a binary alone).
@@ -674,6 +676,14 @@ its content from the graph and selection, and **records the panel's own edits wi
 goes through operators (`NodeEditor::exec`), so it is undoable. Panel layouts are made of
 `Bar::column`/`Bar` carriers, not stock `Flex`/`Grid`, whose children cannot be reached to
 carry the scale.
+
+**`examples/calc` is the second application, written through the facade only (§63).** Keep
+it that way: anything it cannot reach through `blazy` is a finding, not an import. It saves its
+graph through `EditorApp::on_save`, and `with_workspace` reads the workspace when the first
+window opens. Open findings, in order: typed `node.add`, a system clipboard for nodes, reloading
+a graph live, accessors instead of `EditorSession`/`EditorWorld` public fields. Results the
+library produces (`CanvasHit`, `OpEvent`, `Device`, shell frames) are `#[non_exhaustive]`;
+configs stay open because they are built with `..Default::default()`.
 
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
