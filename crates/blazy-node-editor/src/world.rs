@@ -221,17 +221,34 @@ impl<G: NodeGraph> EditorWorld<G> {
     /// Adds a node at `rect` and returns the name the model gave it.
     pub fn add_node(&mut self, rect: Rect) -> usize {
         let index = self.graph.borrow_mut().insert_node(rect);
-        self.edits.push(Edit::NodeAdded { index, rect });
-        self.dirty = true;
+        self.added(index);
         index
+    }
+
+    /// Adds a node of kind `kind` at `rect` and returns its name; `None` for a kind the
+    /// graph does not have (§64).
+    pub fn add_kind(&mut self, rect: Rect, kind: &str) -> Option<usize> {
+        let index = self.graph.borrow_mut().insert_kind(rect, kind)?;
+        self.added(index);
+        Some(index)
     }
 
     /// Adds a node at `rect` holding `content` — a copy — and returns its name.
     pub fn add_copy(&mut self, rect: Rect, content: G::Content) -> usize {
         let index = self.graph.borrow_mut().insert_copy(rect, content);
+        self.added(index);
+        index
+    }
+
+    /// Records a node the model just added, at the rectangle the *model* gave it.
+    ///
+    /// Not the one asked for: a graph may size a node by what it is (`calc` does), and the
+    /// views told the asked-for rectangle showed the node at another size than the model
+    /// held — every view, until the node was moved (§64).
+    fn added(&mut self, index: usize) {
+        let rect = self.graph.borrow().node_rect(index);
         self.edits.push(Edit::NodeAdded { index, rect });
         self.dirty = true;
-        index
     }
 
     /// Puts a node back under its own name, holding what it held, with the links it had.

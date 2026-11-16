@@ -130,6 +130,29 @@ pub trait NodeGraph: 'static {
     /// for areas (§41.2), for the same reason.
     fn insert_node(&mut self, rect: Rect) -> usize;
 
+    /// The kinds of node this graph can add by name — Blender's `Shift+A` menu (§64).
+    ///
+    /// Defaulted to none: a graph whose nodes are all one thing (`hello`) has nothing to
+    /// choose between, and `node.add` without a kind goes on calling
+    /// [`insert_node`](Self::insert_node). A graph that names kinds gets an `Add` menu
+    /// listing them, and each entry runs `node.add` with `kind` set to the kind's name.
+    fn node_kinds(&self) -> Vec<NodeKind> {
+        Vec::new()
+    }
+
+    /// Adds a node of kind `kind` at `rect`, and hands back its name; `None` for a kind the
+    /// graph does not have.
+    ///
+    /// Named as [`insert_node`](Self::insert_node) names. The graph may give the node a
+    /// size of its own — the editor asks for the rectangle back. Defaulted to `None`, which
+    /// is visible rather than silent: a graph that lists kinds and forgets this gets an
+    /// `Add` menu that adds nothing and says so (`node.add` refuses, and a warning names
+    /// the kind), not nodes of the wrong kind.
+    fn insert_kind(&mut self, rect: Rect, kind: &str) -> Option<usize> {
+        let _ = (rect, kind);
+        None
+    }
+
     /// Puts a node back under the name it had, holding `content`, for undo and redo.
     ///
     /// Separate from [`insert_node`](Self::insert_node) rather than a lucky consequence
@@ -224,3 +247,24 @@ pub trait NodeGraph: 'static {
 /// thread, and a change has to be visible to the next build of a node immediately, not
 /// one frame later.
 pub type SharedGraph<G> = Rc<RefCell<G>>;
+
+/// A kind of node a graph can add: its name, as a binding and a keymap file say it, and
+/// what a menu says for it.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct NodeKind {
+    /// The name `node.add` is given in `kind` — one word, as a keymap file writes it.
+    pub name: blazy_ops::keymap::Name,
+    /// What the `Add` menu says.
+    pub label: blazy_ops::keymap::Name,
+}
+
+impl NodeKind {
+    /// A kind called `name`, shown as `label`.
+    pub fn new(name: impl Into<blazy_ops::keymap::Name>, label: impl Into<blazy_ops::keymap::Name>) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+        }
+    }
+}

@@ -40,7 +40,14 @@ struct Row {
     holds: Option<usize>,
     /// The widths a node may be resized to; `None`, the default, for none.
     widths: Option<(f64, f64)>,
+    /// Whether it names kinds: `ten` holds 10, `wide` holds 20 at a size of its own.
+    kinds: bool,
+    /// Whether it names kinds it then cannot make — the default `insert_kind`.
+    forgets_kinds: bool,
 }
+
+/// What `Row`'s `wide` kind is sized to, whatever is asked: the graph decides (§64).
+const WIDE: Size = Size::new(300.0, 50.0);
 
 impl NodeGraph for Row {
     fn node_count(&self) -> usize {
@@ -65,6 +72,24 @@ impl NodeGraph for Row {
 
     fn width_limits(&self, _index: usize) -> Option<(f64, f64)> {
         self.widths
+    }
+
+    fn node_kinds(&self) -> Vec<crate::NodeKind> {
+        if !self.kinds {
+            return Vec::new();
+        }
+        vec![crate::NodeKind::new("ten", "Ten"), crate::NodeKind::new("wide", "Wide")]
+    }
+
+    fn insert_kind(&mut self, rect: Rect, kind: &str) -> Option<usize> {
+        if self.forgets_kinds {
+            return None;
+        }
+        match kind {
+            "ten" => Some(self.insert_copy(rect, 10)),
+            "wide" => Some(self.insert_copy(Rect::from_origin_size(rect.origin(), WIDE), 20)),
+            _ => None,
+        }
     }
 
     fn views(&self) -> &Views {
@@ -2372,8 +2397,8 @@ mod cut_off {
                     ),
                 ]);
             },
-            "node.select" | "view.zoom" | "menu.node" | "node.add" | "node.delete" | "node.copy" | "node.paste"
-            | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
+            "node.select" | "view.zoom" | "menu.node" | "menu.add" | "node.add" | "node.delete" | "node.copy"
+            | "node.paste" | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
             other => panic!("`{other}` is not classified: modal or not, put it in `start`"),
         }])
     }
@@ -2823,4 +2848,122 @@ fn a_panel_follows_the_selection_in_its_window_and_in_another() {
         1,
         "but the far panel is owed it"
     );
+}
+
+// --- MARK: ADD BY KIND (`issues/26-11-15 typed node add.md`)
+
+mod kinds {
+    use blazy_ops::OpResult;
+    use blazy_ops::event::OpEvent;
+    use blazy_ops::keymap::{Props, Scope};
+    use blazy_ops::runtime::{OpRuntime, Seat};
+    use masonry::core::keyboard::{Key, Modifiers};
+    use masonry::kurbo::{Point, Rect};
+
+    use super::copies::{linked, state};
+    use super::{Row, WIDE};
+    use crate::ops::CANVAS_SCOPE;
+    use crate::world::Edit;
+    use crate::{EditorWorld, NodeGraph};
+
+    type Runtime = OpRuntime<EditorWorld<Row>>;
+
+    fn shift_a(runtime: &mut Runtime, world: &mut EditorWorld<Row>) {
+        let event = OpEvent::Key {
+            key: Key::Character("a".into()),
+            mods: Modifiers::SHIFT,
+            down: true,
+        };
+        let _ = runtime.dispatch(world, &event, Scope(&CANVAS_SCOPE), Seat::Tree);
+    }
+
+    /// For a graph that names kinds, `Shift+A` opens a menu of them, each entry `node.add`
+    /// with its kind; for one that names none it adds a node at once, as it did.
+    #[test]
+    fn shift_a_opens_the_kinds_or_adds_straight_away() {
+        let (graph, mut runtime, mut world) = linked();
+        let nodes = graph.borrow().node_count();
+        shift_a(&mut runtime, &mut world);
+        assert!(world.menu.take().is_none(), "no kinds, no menu");
+        assert_eq!(
+            graph.borrow().rects.iter().flatten().count(),
+            nodes + 1,
+            "a node at once"
+        );
+
+        graph.borrow_mut().kinds = true;
+        shift_a(&mut runtime, &mut world);
+        let menu = world.menu.take().expect("the Add menu");
+        assert_eq!(menu.title, "Add");
+        let entries: Vec<(&str, &str, Option<&str>)> = menu
+            .items
+            .iter()
+            .map(|item| (item.label.as_ref(), item.op.as_ref(), item.props.text("kind")))
+            .collect();
+        assert_eq!(entries, vec![
+            ("Ten", "node.add", Some("ten")),
+            ("Wide", "node.add", Some("wide"))
+        ]);
+        assert_eq!(
+            graph.borrow().rects.iter().flatten().count(),
+            nodes + 1,
+            "and nothing added yet"
+        );
+    }
+
+    /// An entry adds a node of its kind, at the size the graph gave it — the views are told
+    /// that size, not the one asked for — in one step that undo and redo bring back as the
+    /// kind it was. A kind the graph does not list is refused.
+    #[test]
+    fn a_kind_adds_a_node_of_that_kind_at_the_graphs_size() {
+        let (graph, mut runtime, mut world) = linked();
+        graph.borrow_mut().kinds = true;
+        world.pointer = Point::new(500.0, 300.0);
+        let before = state(&graph);
+        world.edits.clear();
+
+        let wide = Props::new().with_text("kind", "wide");
+        assert_eq!(runtime.exec(&mut world, "node.add", &wide), OpResult::Finished);
+        let index = *world.selection().iter().next().expect("the new node is selected");
+        assert_eq!(graph.borrow().content(index), 20, "of its kind");
+        let rect = graph.borrow().node_rect(index);
+        assert_eq!(
+            rect,
+            Rect::from_origin_size((500.0, 300.0), WIDE),
+            "at the graph's size"
+        );
+        assert!(
+            world.edits.contains(&Edit::NodeAdded { index, rect }),
+            "the views are told the graph's rectangle: {:?}",
+            world.edits
+        );
+        let after = state(&graph);
+
+        assert_eq!(runtime.history_mut().undo(&mut world), Some("node.add"));
+        assert_eq!(state(&graph), before);
+        assert_eq!(runtime.history_mut().redo(&mut world), Some("node.add"));
+        assert_eq!(state(&graph), after, "back as the kind it was, at its size");
+
+        let nosuch = Props::new().with_text("kind", "cube");
+        assert_eq!(
+            runtime.poll(&mut world, "node.add", &nosuch),
+            Some(false),
+            "an unknown kind is refused"
+        );
+    }
+
+    /// A graph that lists kinds and cannot make them adds nothing and writes no step,
+    /// rather than a node of another kind.
+    #[test]
+    fn a_kind_the_graph_cannot_make_adds_nothing() {
+        let (graph, mut runtime, mut world) = linked();
+        graph.borrow_mut().kinds = true;
+        graph.borrow_mut().forgets_kinds = true;
+        let before = state(&graph);
+        let depth = runtime.history().depth();
+        let ten = Props::new().with_text("kind", "ten");
+        assert_eq!(runtime.exec(&mut world, "node.add", &ten), OpResult::Cancelled);
+        assert_eq!(state(&graph), before);
+        assert_eq!(runtime.history().depth(), depth);
+    }
 }

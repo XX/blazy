@@ -32,10 +32,13 @@ pub type Name = Cow<'static, str>;
 
 /// One property value.
 ///
-/// Three cases, because they are the three an operator has needed so far and a value
-/// type is easier to widen than to narrow. Strings are deliberately absent: the first
-/// one will want an enum, and an enum written as a string is a bug waiting for a typo.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Four cases. Text came last and for one reason (§64): the kind of node `node.add` adds
+/// belongs to the *application's* graph, so the library has no enum to write it as, and a
+/// keymap file has to say it — `node.add kind="add"`. The typo the old note here warned of
+/// is caught where the name meets the graph: an operator whose text names nothing refuses
+/// in its poll, so the binding does nothing and the menu shows the entry refused.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// A flag, e.g. `extend`.
     Bool(bool),
@@ -43,6 +46,8 @@ pub enum Value {
     Int(i64),
     /// A distance or a fraction, e.g. `dx`.
     Float(f64),
+    /// A name, e.g. the `kind` of node to add.
+    Text(Name),
 }
 
 /// An operator's arguments, as data.
@@ -79,10 +84,17 @@ impl Props {
         self
     }
 
+    /// The same properties, with a name set.
+    #[must_use]
+    pub fn with_text(mut self, name: impl Into<Name>, value: impl Into<Name>) -> Self {
+        self.0.push((name.into(), Value::Text(value.into())));
+        self
+    }
+
     /// The value of `name`, or `default` if the binding did not set it.
     pub fn bool(&self, name: &str, default: bool) -> bool {
         match self.get(name) {
-            Some(Value::Bool(value)) => value,
+            Some(Value::Bool(value)) => *value,
             _ => default,
         }
     }
@@ -90,8 +102,19 @@ impl Props {
     /// As [`bool`](Self::bool), for an integer property.
     pub fn int(&self, name: &str, default: i64) -> i64 {
         match self.get(name) {
-            Some(Value::Int(value)) => value,
+            Some(Value::Int(value)) => *value,
             _ => default,
+        }
+    }
+
+    /// The name `name` is set to, or `None` if the binding did not set it.
+    ///
+    /// No default: a name the binding did not give is a different thing from any name it
+    /// could have given, and the operator says what it does then.
+    pub fn text(&self, name: &str) -> Option<&str> {
+        match self.get(name) {
+            Some(Value::Text(value)) => Some(value),
+            _ => None,
         }
     }
 
@@ -101,8 +124,8 @@ impl Props {
     /// a hand-written keymap will say and refusing it teaches nothing.
     pub fn float(&self, name: &str, default: f64) -> f64 {
         match self.get(name) {
-            Some(Value::Float(value)) => value,
-            Some(Value::Int(value)) => value as f64,
+            Some(Value::Float(value)) => *value,
+            Some(Value::Int(value)) => *value as f64,
             _ => default,
         }
     }
@@ -120,8 +143,8 @@ impl Props {
     }
 
     /// Every property, in the order it was set.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.0.iter().map(|(name, value)| (name.as_ref(), *value))
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.0.iter().map(|(name, value)| (name.as_ref(), value))
     }
 
     /// Whether any property is set.
@@ -129,8 +152,8 @@ impl Props {
         self.0.is_empty()
     }
 
-    fn get(&self, name: &str) -> Option<Value> {
-        self.0.iter().find(|(key, _)| key == name).map(|(_, value)| *value)
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.0.iter().find(|(key, _)| key == name).map(|(_, value)| value)
     }
 }
 

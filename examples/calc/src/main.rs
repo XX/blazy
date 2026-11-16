@@ -11,8 +11,7 @@
 //! cargo make run-calc my.graph   # or a graph of your own, with my.workspace beside it
 //! ```
 //!
-//! `Shift+D` duplicates a node, which is how a node of a given kind is added: `Shift+A`
-//! adds a number, because the editor's `node.add` cannot say which kind (§63, finding 4).
+//! `Shift+A` opens the `Add` menu of the four kinds, from the graph's own list (§64).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -35,7 +34,8 @@ use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRad
 use blazy::masonry::theme::default_property_set;
 use blazy::masonry::widgets::{Label as StockLabel, TextAction, TextInput};
 use blazy::node_editor::{
-    Change, EdgePan, GraphPanel, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken, Views,
+    Change, EdgePan, GraphPanel, NodeGraph, NodeKind, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken,
+    Views,
 };
 use blazy::shell::window::{Error, WindowConfig};
 use blazy::widgets::{Bar, Label, Metrics};
@@ -340,12 +340,41 @@ impl NodeGraph for Calc {
         &self.views
     }
 
-    /// `Shift+A` adds a number: the editor cannot say which kind (§63, finding 4).
+    /// A number: what `node.add` without a kind adds — from a script, say. `Shift+A` and the
+    /// menu go through [`insert_kind`](Self::insert_kind).
     fn insert_node(&mut self, rect: Rect) -> usize {
         self.take_name(Slot {
             rect: Rect::from_origin_size(rect.origin(), NODE),
             kind: Kind::Number(0.0),
         })
+    }
+
+    /// The four kinds, by the names the graph file writes them under.
+    fn node_kinds(&self) -> Vec<NodeKind> {
+        [
+            ("number", "Number"),
+            ("add", "Add"),
+            ("multiply", "Multiply"),
+            ("show", "Show"),
+        ]
+        .into_iter()
+        .map(|(name, label)| NodeKind::new(name, label))
+        .collect()
+    }
+
+    /// A node of the kind named, at the one size every node starts at.
+    fn insert_kind(&mut self, rect: Rect, kind: &str) -> Option<usize> {
+        let kind = match kind {
+            "number" => Kind::Number(0.0),
+            "add" => Kind::Add,
+            "multiply" => Kind::Multiply,
+            "show" => Kind::Show,
+            _ => return None,
+        };
+        Some(self.take_name(Slot {
+            rect: Rect::from_origin_size(rect.origin(), NODE),
+            kind,
+        }))
     }
 
     fn restore_node(&mut self, index: usize, rect: Rect, kind: Kind) {
@@ -947,5 +976,91 @@ mod tests {
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("workspace"));
+    }
+
+    /// `Shift+A`'s menu lists the four kinds; `Show` adds a display, seen in both areas at the
+    /// size every node starts at.
+    #[test]
+    fn the_add_menu_adds_the_kind_chosen_in_both_areas() {
+        use blazy::node_editor::{MenuLayer, NodeEditor};
+        use blazy::ops::keymap::Props;
+
+        let graph = Rc::new(RefCell::new(Calc::sample()));
+        let file = std::env::temp_dir().join(format!("calc-add-{}.graph", std::process::id()));
+        let screen = app(&graph, &file).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1200, 600));
+        let _ = harness.redraw();
+        let editors: Vec<WidgetId> = (0..2)
+            .map(|area| {
+                let session = harness.root_widget().payload(area).expect("a session").clone();
+                session.borrow().editor.expect("an editor")
+            })
+            .collect();
+        let shows = |graph: &SharedGraph<Calc>| {
+            graph
+                .borrow()
+                .nodes
+                .iter()
+                .flatten()
+                .filter(|slot| slot.kind == Kind::Show)
+                .count()
+        };
+        assert_eq!(shows(&graph), 1);
+
+        harness.mouse_move(Point::new(300.0, 450.0));
+        harness.edit_widget_with_id(editors[0], |mut widget| {
+            NodeEditor::<Calc>::exec(&mut widget.downcast(), blazy::node_editor::ops::ADD_MENU, &Props::new())
+        });
+        let _ = harness.redraw();
+        let menu = harness
+            .get_widget_with_id(editors[0])
+            .downcast::<NodeEditor<Calc>>()
+            .expect("the editor")
+            .inner()
+            .open_menu()
+            .expect("the Add menu is open");
+        let entries: Vec<WidgetId> = harness
+            .get_widget_with_id(menu)
+            .downcast::<MenuLayer<Calc>>()
+            .expect("a menu")
+            .inner()
+            .entries()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(entries.len(), 4, "one entry per kind");
+        // What the fourth entry runs, run as a script runs it. Clicking it is what a user
+        // does, and in a window of two areas that click spills past the event's rewrite
+        // passes — the harness calls it a loop (`issues/26-11-20 menu entry pass budget.md`).
+        let _ = entries;
+        harness.edit_widget_with_id(editors[0], |mut widget| {
+            NodeEditor::<Calc>::exec(
+                &mut widget.downcast(),
+                "node.add",
+                &Props::new().with_text("kind", "show"),
+            )
+        });
+        pull(&mut harness, &graph);
+
+        assert_eq!(shows(&graph), 2, "a display was added");
+        let added = graph
+            .borrow()
+            .nodes
+            .iter()
+            .rposition(|slot| slot.is_some_and(|s| s.kind == Kind::Show));
+        let added = added.expect("there");
+        assert_eq!(
+            graph.borrow().node_rect(added).size(),
+            NODE,
+            "at the size every node starts at"
+        );
+        let views = graph.borrow().views().ids();
+        assert_eq!(views.len(), 2);
+        for canvas in views {
+            let live = harness.edit_widget_with_id(canvas, |mut widget| {
+                CanvasLayer::live_children(&mut widget.downcast::<CanvasLayer>())
+            });
+            assert!(live.iter().any(|&(index, _)| index == added), "both areas show it");
+        }
     }
 }

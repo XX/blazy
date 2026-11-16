@@ -20,7 +20,8 @@
 //! button (`primary`, `secondary`, `middle`, `x1`, `x2`, `eraser`, `b7`…`b32`), `key` and
 //! `key-up` take a key as the W3C names it (`g`, `Escape`, `ArrowLeft`; a whitespace
 //! character as `U+0020`), and `scroll` takes nothing. Properties are `name=value`, where a
-//! value is `true`, `false`, a whole number or a number with a point in it.
+//! value is `true`, `false`, a whole number, a number with a point in it, or a name in quotes
+//! (`kind="add"`) — one word, no spaces inside.
 //!
 //! # One format, two uses
 //!
@@ -391,11 +392,21 @@ fn write_key(key: &Key) -> String {
 }
 
 fn parse_value(word: &str) -> Result<Value, &'static str> {
+    // A name is quoted, so that a mistyped `true` is an error rather than a name. It is
+    // one word, like everything on the line: no spaces and no quotes inside.
+    if let Some(text) = word.strip_prefix('"') {
+        return match text.strip_suffix('"') {
+            Some(text) if !text.is_empty() && !text.contains('"') => Ok(Value::Text(text.to_owned().into())),
+            _ => Err("a name is one word in quotes"),
+        };
+    }
     match word {
         "true" => Ok(Value::Bool(true)),
         "false" => Ok(Value::Bool(false)),
         _ if word.contains(['.', 'e', 'E']) => {
-            let value: f64 = word.parse().map_err(|_| "a value is true, false or a number")?;
+            let value: f64 = word
+                .parse()
+                .map_err(|_| "a value is true, false, a number or a name in quotes")?;
             if value.is_finite() {
                 Ok(Value::Float(value))
             } else {
@@ -405,12 +416,13 @@ fn parse_value(word: &str) -> Result<Value, &'static str> {
         _ => word
             .parse()
             .map(Value::Int)
-            .map_err(|_| "a value is true, false or a number"),
+            .map_err(|_| "a value is true, false, a number or a name in quotes"),
     }
 }
 
-fn write_value(value: Value) -> String {
+fn write_value(value: &Value) -> String {
     match value {
+        Value::Text(text) => format!("\"{text}\""),
         Value::Bool(flag) => flag.to_string(),
         Value::Int(number) => number.to_string(),
         // `{:?}` keeps the point on a whole number — `3.0`, not `3` — which is what tells
@@ -436,6 +448,8 @@ mod tests {
                 .with_props(Props::new().with_bool("extend", true).with_float("weight", 3.0)),
                 Binding::new(Pattern::key("x"), "node.delete").with_props(Props::new().with_int("count", -2)),
                 Binding::new(Pattern::named(NamedKey::Escape), "op.cancel"),
+                Binding::new(Pattern::key("a").with_mods(Modifiers::SHIFT), "node.add")
+                    .with_props(Props::new().with_text("kind", "math.add")),
                 Binding::new(Pattern::new(Trigger::KeyUp(Key::Character(" ".into()))), "view.release"),
                 Binding::new(Pattern::scroll().with_mods(Modifiers::CONTROL), "view.zoom"),
                 Binding::new(
@@ -503,6 +517,10 @@ mod tests {
             "bind wiggle:primary node.move",
             "bind key:x node.delete count=many",
             "bind key:x node.delete count",
+            "bind key:a node.add kind=add",
+            "bind key:a node.add kind=\"\"",
+            "bind key:a node.add kind=\"add",
+            "bind key:a node.add kind=\"a\"b\"",
             "bind key:x node.delete dx=1e999",
             "unbind key:x node.delete extra=1",
             "thresholds drag_mouse=fast",

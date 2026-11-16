@@ -565,13 +565,27 @@ fn zoom<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, origin: Point, factor:
 ///
 /// The size is [`EditorWorld::new_node_size`] unless the binding says otherwise, and the
 /// place is the pointer unless it does: a menu entry and a script both run the same
-/// operator, and neither has a pointer to mean anything by (§11).
+/// operator, and neither has a pointer to mean anything by (§11). With `kind` set — a
+/// name from [`NodeGraph::node_kinds`] — the node is of that kind
+/// ([`NodeGraph::insert_kind`]); a kind the graph does not list is refused in the poll, so
+/// a mistyped binding does nothing and a menu shows it refused (§64).
 #[derive(Default)]
 pub struct AddNodeOp;
 
 impl<G: NodeGraph> Operator<EditorWorld<G>> for AddNodeOp {
     fn name(&self) -> &'static str {
         "node.add"
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        cx.props().text("kind").is_none_or(|kind| {
+            cx.world()
+                .graph
+                .borrow()
+                .node_kinds()
+                .iter()
+                .any(|known| known.name == kind)
+        })
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
@@ -582,9 +596,22 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddNodeOp {
             cx.props().float("width", default.width),
             cx.props().float("height", default.height),
         );
-        let rect = Rect::from_origin_size(origin, size);
+        let asked = Rect::from_origin_size(origin, size);
         let selection = cx.world().selection();
-        let index = cx.world_mut().add_node(rect);
+        let index = match cx.props().text("kind").map(str::to_owned) {
+            Some(kind) => match cx.world_mut().add_kind(asked, &kind) {
+                Some(index) => index,
+                None => {
+                    // Listed but not made: the graph's `insert_kind` is missing or refused.
+                    tracing::warn!(kind, "the graph lists this kind and did not add a node of it");
+                    return OpResult::Cancelled;
+                },
+            },
+            None => cx.world_mut().add_node(asked),
+        };
+        // The rectangle the model gave the node, for the step: undo and redo put it back as
+        // the model made it.
+        let rect = cx.world().node_rect(index);
         let content = cx.world().graph.borrow().content(index);
         // Selected here rather than through `set_selection`, because that records a step
         // of its own and this is one action: see `AddStep`.
@@ -1457,6 +1484,9 @@ pub fn default_keymap() -> Keymap {
             // Structure (§43). `X` is two bindings on one key and the polls tell them
             // apart, exactly as the mouse buttons do: a link under the pointer goes
             // first, because pointing at something is how a gesture names its target.
+            // The `Add` menu first, for a graph that names its kinds; a graph that names none
+            // refuses it, and the same key adds a node straight away.
+            Binding::new(Pattern::key("a").with_mods(Modifiers::SHIFT), ADD_MENU),
             Binding::new(Pattern::key("a").with_mods(Modifiers::SHIFT), "node.add"),
             Binding::new(Pattern::key("x"), "link.delete"),
             Binding::new(Pattern::key("x"), "node.delete"),
@@ -1488,13 +1518,45 @@ pub fn default_keymap() -> Keymap {
 /// The operator that opens [`node_menu`].
 pub const NODE_MENU: &str = "menu.node";
 
+/// The operator that opens the `Add` menu: one entry per kind the graph lists.
+pub const ADD_MENU: &str = "menu.add";
+
+/// Opens the `Add` menu — Blender's `Shift+A` — built from the graph's
+/// [`NodeGraph::node_kinds`] when it opens, so a graph whose kinds change shows the ones it
+/// has. Refused for a graph with no kinds, which lets `Shift+A` fall through to a plain
+/// `node.add` as it always did (§64).
+#[derive(Default)]
+pub struct AddMenuOp;
+
+impl<G: NodeGraph> Operator<EditorWorld<G>> for AddMenuOp {
+    fn name(&self) -> &'static str {
+        ADD_MENU
+    }
+
+    fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
+        !cx.world().graph.borrow().node_kinds().is_empty()
+    }
+
+    fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
+        let kinds = cx.world().graph.borrow().node_kinds();
+        let menu = kinds.into_iter().fold(crate::Menu::new("Add"), |menu, kind| {
+            menu.with(kind.label, "node.add", Props::new().with_text("kind", kind.name))
+        });
+        cx.world_mut().menu = Some(menu);
+        OpResult::Finished
+    }
+}
+
 /// The editor's menu: what can be done to the graph and the view from where the pointer is.
 ///
 /// Every entry is an operator the keymap also binds, with the properties it binds it with,
 /// so the menu shows each one's shortcut — and teaches it.
 pub fn node_menu() -> crate::Menu {
     crate::Menu::new("Node")
+        // For a graph that names kinds, the second opens the list; for one that does not,
+        // it is shown refused and the first does it.
         .with("Add node", "node.add", Props::new())
+        .with("Add", ADD_MENU, Props::new())
         .with("Delete", "node.delete", Props::new())
         // The binding's properties, so the entry shows `Shift+D`: a menu runs `exec`, which
         // grabs nothing and ignores `edge_pan`, and the copies stay where they were made.
@@ -1533,6 +1595,7 @@ pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
     runtime.register(ZoomOp);
     runtime.register(LinkDragOp::default());
     runtime.register(crate::MenuOp::new(NODE_MENU, node_menu()));
+    runtime.register(AddMenuOp);
     runtime.register(AddNodeOp);
     runtime.register(DeleteNodeOp);
     runtime.register(DuplicateOp::<G::Content>::default());
