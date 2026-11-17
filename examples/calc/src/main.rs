@@ -23,8 +23,8 @@ use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, DefaultProperties, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction,
-    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId,
-    WidgetPod,
+    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Update, UpdateCtx,
+    Widget, WidgetId, WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, Point, Rect, Size};
@@ -32,7 +32,7 @@ use blazy::masonry::layout::{LenDef, LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
 use blazy::masonry::theme::default_property_set;
-use blazy::masonry::widgets::{Label as StockLabel, TextAction, TextInput};
+use blazy::masonry::widgets::{Label as StockLabel, TextAction, TextArea, TextInput};
 use blazy::node_editor::{
     Change, EdgePan, GraphPanel, NodeGraph, NodeKind, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken,
     Views,
@@ -525,6 +525,12 @@ impl NodeSource for Nodes {
 /// One widget for both places, told apart by the view its edits are recorded past: the
 /// canvas the node is in, or the panel. What follows from the value — every computed node
 /// — is recorded for every view.
+///
+/// Text that is not a number — an emptied field, half a minus sign — leaves the model as it
+/// was, and when the field loses focus it shows the model's value again: otherwise the area
+/// it was edited in showed an empty field while every other area showed the number, and
+/// nothing would ever have brought them back together. Blender drops an edit it cannot read
+/// in the same way.
 struct NumberField {
     input: WidgetPod<TextInput>,
     graph: SharedGraph<Calc>,
@@ -567,6 +573,24 @@ impl Widget for NumberField {
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
         ctx.run_layout(&mut self.input, size);
         ctx.place_child(&mut self.input, Point::ORIGIN);
+    }
+
+    /// Focus left the field: if what it says is not the model's value, it says the value again.
+    fn update(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
+        if matches!(event, Update::ChildFocusChanged(false)) {
+            ctx.mutate_self_later(|mut widget| {
+                let mut field = widget.downcast::<Self>();
+                let Some(Kind::Number(value)) = field.widget.graph.borrow().kind(field.widget.index) else {
+                    return;
+                };
+                let mut input = field.ctx.get_mut(&mut field.widget.input);
+                let mut text = TextInput::text_mut(&mut input);
+                let shows = text.widget.text().to_string();
+                if shows.trim().parse::<f64>().ok() != Some(value) {
+                    TextArea::reset_text(&mut text, &format!("{value}"));
+                }
+            });
+        }
     }
 
     fn on_action(
@@ -817,7 +841,6 @@ mod tests {
     use blazy::app::EditorScreen;
     use blazy::masonry::dpi::PhysicalSize;
     use blazy::masonry::testing::TestHarness;
-    use blazy::masonry::widgets::TextArea;
     use blazy::node_editor::sync_canvas;
 
     use super::*;
@@ -1105,5 +1128,64 @@ mod tests {
             });
             assert!(live.iter().any(|&(index, _)| index == added), "both areas show it");
         }
+    }
+
+    /// A field emptied — or left with anything that is not a number — and then left shows
+    /// the value again, the one the model kept and every other area shows: the edit that
+    /// could not be read is dropped, as Blender drops it.
+    #[test]
+    fn a_field_left_without_a_number_shows_the_value_again() {
+        use blazy::masonry::core::TextEvent;
+        use blazy::masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Location, Modifiers, NamedKey};
+
+        let graph = Rc::new(RefCell::new(Calc::sample()));
+        let file = std::env::temp_dir().join(format!("calc-empty-{}.graph", std::process::id()));
+        let screen = app(&graph, &file).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1200, 600));
+        let _ = harness.redraw();
+        let areas = harness.root_widget().area_ids();
+        let text_of = |harness: &TestHarness<EditorScreen<Calc>>, field: WidgetId| -> String {
+            let widget = harness.get_widget_with_id(field);
+            widget
+                .downcast::<TextArea<true>>()
+                .expect("a text field")
+                .inner()
+                .text()
+                .into_iter()
+                .collect()
+        };
+
+        // Node 0's field, "2", emptied whichever side of it the caret is.
+        let field = fields(&harness, areas[0])[0];
+        assert_eq!(text_of(&harness, field), "2");
+        harness.focus_on(Some(field));
+        for key in [NamedKey::Backspace, NamedKey::Delete] {
+            for state in [KeyState::Down, KeyState::Up] {
+                let _ = harness.process_text_event(TextEvent::Keyboard(KeyboardEvent {
+                    state,
+                    key: Key::Named(key),
+                    code: Code::Unidentified,
+                    location: Location::Standard,
+                    modifiers: Modifiers::empty(),
+                    repeat: false,
+                    is_composing: false,
+                }));
+            }
+        }
+        pull(&mut harness, &graph);
+        assert_eq!(text_of(&harness, field), "", "emptied");
+        assert_eq!(
+            graph.borrow().content(0),
+            Kind::Number(2.0),
+            "the model keeps its number"
+        );
+
+        harness.focus_on(None);
+        pull(&mut harness, &graph);
+        let field = fields(&harness, areas[0])[0];
+        assert_eq!(text_of(&harness, field), "2", "left, it shows the value again");
+        let other = fields(&harness, areas[1])[0];
+        assert_eq!(text_of(&harness, other), "2", "the value the other area shows");
     }
 }
