@@ -225,6 +225,44 @@ pub trait NodeGraph: 'static {
     /// What node `index` holds.
     fn content(&self, index: usize) -> Self::Content;
 
+    /// The name of the format [`content_text`](Self::content_text) writes — one word, such as
+    /// `calc` — or `None` for content with no text form (§66).
+    ///
+    /// It goes into the first line of a copy on the system clipboard (`blazy-nodes 1 calc`),
+    /// and a copy is read only by a graph that names the same format. Without it the header
+    /// named the library and not the application, and a copy from one application on blazy
+    /// passed the header of any other: `hello`, which takes any text as a title, pasted a
+    /// `calc` copy as nodes called `number 2`. Two applications that name one format exchange
+    /// copies on purpose. Defaulted to `None` with `content_text`; a graph that writes content
+    /// text and names no format is a debug assertion, not a copy that silently stays home.
+    fn content_format(&self) -> Option<&str> {
+        None
+    }
+
+    /// `content` as text, for a copy that has to leave the process — the system clipboard
+    /// (§66); `None` for content that has no text form. Read back only by a graph whose
+    /// [`content_format`](Self::content_format) is the same.
+    ///
+    /// The format is the application's, and only it can read it back
+    /// ([`content_from_text`](Self::content_from_text)); the library wraps it with the
+    /// rectangles and links of the copy and escapes it onto one line, so any text will do.
+    /// Defaulted to `None`: a copy then stays in the process, as it did before the question
+    /// existed — what it costs is the copy reaching another process, not the copy.
+    fn content_text(&self, content: &Self::Content) -> Option<String> {
+        let _ = content;
+        None
+    }
+
+    /// Reads what [`content_text`](Self::content_text) wrote; `None` for text that is not
+    /// one — a paste of something else, or of a copy from an application with another format.
+    ///
+    /// The text is input from outside the process: read it as such, without trusting sizes or
+    /// numbers in it.
+    fn content_from_text(&self, text: &str) -> Option<Self::Content> {
+        let _ = text;
+        None
+    }
+
     /// Adds a node at `rect` holding `content`, and hands back the name it got — a copy,
     /// for duplicate and paste.
     ///

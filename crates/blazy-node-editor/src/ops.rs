@@ -687,15 +687,30 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for CopyOp {
         let selection = cx.world().selection();
         let graph = cx.world().graph.borrow();
         let clip = Clip::of(&*graph, &selection);
-        graph.views().set_clip(Rc::new(clip));
+        // As text too, for the driver to put on the system clipboard, when the graph can
+        // write its content (§66).
+        let text = clip.to_text(&*graph);
+        graph.views().set_clip(Rc::new(clip), text);
         OpResult::Finished
     }
 }
 
 /// The graph's clipboard, if it holds a copy of this graph's nodes.
+///
+/// A copy from another process, offered by the driver from the system clipboard, becomes
+/// the clipboard first (§66); offered text that is not a copy this graph reads is dropped,
+/// and this process's own copy is what is pasted.
 fn clip<G: NodeGraph>(world: &EditorWorld<G>) -> Option<Rc<Clip<G::Content>>> {
-    let clip = world.graph.borrow().views().clip()?;
-    clip.downcast().ok()
+    let graph = world.graph.borrow();
+    let views = graph.views();
+    if let Some(text) = views.take_offered()
+        && let Some(copy) = Clip::from_text(&*graph, &text)
+    {
+        views.set_clip(Rc::new(copy), Some(text));
+        // Already on the system clipboard: it came from there.
+        let _ = views.take_outbound_clip();
+    }
+    views.clip()?.downcast().ok()
 }
 
 /// Pastes the graph's clipboard, centred on the pointer — Blender's

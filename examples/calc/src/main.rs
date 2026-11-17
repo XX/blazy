@@ -72,6 +72,28 @@ impl Kind {
         Ports { inputs, outputs }
     }
 
+    /// The kind as the graph file writes it — `number 2.5`, `add` — and as a copy on the
+    /// system clipboard does (§66).
+    fn text(self) -> String {
+        match self {
+            Self::Number(value) => format!("number {value}"),
+            other => other.name().to_owned(),
+        }
+    }
+
+    /// Reads what [`text`](Self::text) wrote.
+    fn parse(text: &str) -> Option<Self> {
+        let mut words = text.split_whitespace();
+        let kind = match words.next()? {
+            "number" => Self::Number(words.next()?.parse::<f64>().ok().filter(|value| value.is_finite())?),
+            "add" => Self::Add,
+            "multiply" => Self::Multiply,
+            "show" => Self::Show,
+            _ => return None,
+        };
+        words.next().is_none().then_some(kind)
+    }
+
     /// Whether what it shows follows from its inputs, so a change upstream changes it.
     fn computed(self) -> bool {
         !matches!(self, Self::Number(_))
@@ -429,6 +451,18 @@ impl NodeGraph for Calc {
 
     fn content(&self, index: usize) -> Kind {
         self.kind(index).unwrap_or(Kind::Number(0.0))
+    }
+
+    fn content_format(&self) -> Option<&str> {
+        Some("calc")
+    }
+
+    fn content_text(&self, kind: &Kind) -> Option<String> {
+        Some(kind.text())
+    }
+
+    fn content_from_text(&self, text: &str) -> Option<Kind> {
+        Kind::parse(text)
     }
 
     fn insert_copy(&mut self, rect: Rect, kind: Kind) -> usize {
@@ -818,6 +852,19 @@ mod tests {
         assert_eq!(read.free, vec![1], "the hole is a name to hand out again");
         assert_eq!(Calc::read("something else"), Err(1));
         assert_eq!(Calc::read("calc-graph 1\nnode 0 cube 0 0 1 1\n"), Err(2));
+    }
+
+    /// A kind goes to the system clipboard's text and back, and nothing else reads as one.
+    #[test]
+    fn a_kind_survives_the_clipboard_text() {
+        let calc = Calc::sample();
+        for kind in [Kind::Number(-2.5), Kind::Add, Kind::Multiply, Kind::Show] {
+            let text = calc.content_text(&kind).expect("every kind has a text");
+            assert_eq!(calc.content_from_text(&text), Some(kind), "{text}");
+        }
+        for bad in ["", "cube", "number", "number NaN", "add 3"] {
+            assert_eq!(calc.content_from_text(bad), None, "{bad:?}");
+        }
     }
 
     impl PartialEq for Calc {

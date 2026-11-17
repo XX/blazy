@@ -700,6 +700,14 @@ sources that register with `Views` (`NodeSource::attached`) — without them the
 and a pass budget problem stays invisible. Masonry counts no passes; the harness's "Loop
 detected" is the only gauge, so an improvement no test can see is not taken.
 
+**A node copy leaves the process through the driver, as text (§66).** The graph writes its
+content (`NodeGraph::content_text` / `content_from_text`, default "no text form": the copy stays
+in-process) under a one-word `content_format` that the header carries (`blazy-nodes 1 calc`),
+so a copy is read only by a graph of the same format; the library reads it as input. `node.copy` leaves
+the text in `Views` and `EditorApp::settled` writes it to `ShellCtx::clipboard`; before a key
+the area's keymap binds to `node.paste`, `text_event` reads the clipboard and offers it. Its
+own text is recognised, a foreign copy is adopted, anything else leaves the in-process copy.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

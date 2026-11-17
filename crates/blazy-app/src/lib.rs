@@ -680,6 +680,12 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         // The keys follow the pointer from area to area, decided after the event like
         // everything else here: the event is what moved the pointer.
         self.route_keys(window, root);
+        // A copy made in this event goes to the system clipboard, where another process —
+        // or this one, after a restart — can paste it (§66). The driver's to do: the
+        // clipboard is the host's, and an operator never sees the host.
+        if let Some(text) = self.graph.borrow().views().take_outbound_clip() {
+            cx.clipboard().write(text);
+        }
         for window in self.windows_to_wake() {
             self.counters.wakes += 1;
             cx.request_redraw(window);
@@ -752,10 +758,46 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         if text_input_focused(root) {
             return Handled::No;
         }
+        // A key the area's keymap runs `node.paste` on: what the system clipboard holds is
+        // offered first, so a copy from another process is what is pasted (§66). Read only
+        // here, on that key — reading the clipboard on every key would ask the platform for
+        // it on every key.
+        if self.would_paste(root, event)
+            && let Some(text) = cx.clipboard().read()
+        {
+            self.graph.borrow().views().offer_clip_text(text);
+        }
         match self.keys.action_for(event) {
             Some(action) => self.perform(cx, root, action),
             None => Handled::No,
         }
+    }
+}
+
+impl<G: NodeGraph> EditorApp<G> {
+    /// Whether `event` is a key the keymap of the area the keys go to runs `node.paste` on.
+    fn would_paste(&self, root: &mut RenderRoot, event: &TextEvent) -> bool {
+        let TextEvent::Keyboard(key) = event else {
+            return false;
+        };
+        if !key.state.is_down() {
+            return false;
+        }
+        let event = blazy_ops::event::OpEvent::from_keyboard(key);
+        let screen = root.get_layer_root(0);
+        let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
+            return false;
+        };
+        let area = screen.hovered_area().or_else(|| screen.tree().areas().next());
+        area.and_then(|area| screen.payload(area)).is_some_and(|session| {
+            let scope = blazy_ops::keymap::Scope(&blazy_node_editor::ops::CANVAS_SCOPE);
+            session
+                .borrow()
+                .runtime
+                .keymap()
+                .matches(scope, &event)
+                .any(|binding| binding.op == "node.paste")
+        })
     }
 }
 

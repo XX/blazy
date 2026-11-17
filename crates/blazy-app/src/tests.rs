@@ -131,6 +131,19 @@ impl NodeGraph for Grid {
 
     fn content(&self, _index: usize) {}
 
+    fn content_format(&self) -> Option<&str> {
+        Some("grid")
+    }
+
+    /// Nothing to say, said as nothing: a copy still goes to the system clipboard (§66).
+    fn content_text(&self, _content: &()) -> Option<String> {
+        Some(String::new())
+    }
+
+    fn content_from_text(&self, text: &str) -> Option<()> {
+        text.is_empty().then_some(())
+    }
+
     fn insert_copy(&mut self, rect: Rect, (): ()) -> usize {
         self.insert_node(rect)
     }
@@ -1394,4 +1407,72 @@ fn edit_editor_in_area(root: &mut RenderRoot, area: usize) -> WidgetId {
         let session = screen.widget.payload(area).expect("a session").clone();
         session.borrow().editor.expect("an editor in the tree")
     })
+}
+
+/// `Ctrl+C` in one application puts the copy on the system clipboard; `Ctrl+V` in another —
+/// another process, with a graph of its own — pastes it, link included. Something else on
+/// the clipboard pastes this process's own copy, and the field keeps its `Ctrl+V`.
+#[test]
+fn a_copy_crosses_to_another_process_through_the_system_clipboard() {
+    // The first process: copy nodes 0 and 1, linked.
+    let graph = Grid::new(8);
+    let mut first = app(&graph);
+    let mut root = window(&first, 1);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    first.started(&mut cx, key, &mut root);
+    pointer(&mut first, &mut cx, key, &mut root, "move", Point::new(100.0, 100.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "link.add", &Props::new().with_int("from", 0).with_int("to", 1));
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 0));
+        NodeEditor::exec(
+            editor,
+            "node.select",
+            &Props::new().with_int("index", 1).with_bool("extend", true),
+        );
+    });
+    chord(&mut first, &mut cx, key, &mut root, "c", Modifiers::CONTROL);
+    let text = cx.clipboard().read().expect("the copy is on the system clipboard");
+    assert!(text.starts_with("blazy-nodes 1 grid\n"), "{text}");
+
+    // The second: its own graph, and a system clipboard holding what the first copied.
+    let other = Grid::new(4);
+    let mut other_app = app(&other);
+    let mut other_root = window(&other_app, 1);
+    let mut other_cx = ShellCtx::new().with_clipboard(Box::new(blazy_shell::text::MemoryClipboard::holding(text)));
+    let other_key = other_cx.name_window();
+    other_app.started(&mut other_cx, other_key, &mut other_root);
+    pointer(
+        &mut other_app,
+        &mut other_cx,
+        other_key,
+        &mut other_root,
+        "move",
+        Point::new(700.0, 500.0),
+    );
+    chord(
+        &mut other_app,
+        &mut other_cx,
+        other_key,
+        &mut other_root,
+        "v",
+        Modifiers::CONTROL,
+    );
+    assert_eq!(other.borrow().node_count(), 6, "the two nodes of the other process");
+    assert!(
+        other.borrow().links.contains(&Link::new(4, 5)),
+        "with the link between them"
+    );
+
+    // A sentence on the clipboard: the copy this process has — the one it just pasted.
+    other_cx = other_cx.with_clipboard(Box::new(blazy_shell::text::MemoryClipboard::holding("a sentence")));
+    chord(
+        &mut other_app,
+        &mut other_cx,
+        other_key,
+        &mut other_root,
+        "v",
+        Modifiers::CONTROL,
+    );
+    assert_eq!(other.borrow().node_count(), 8, "this process's copy, pasted again");
 }

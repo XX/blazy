@@ -215,6 +215,21 @@ impl NodeGraph for Graph {
         self.titles.get(index).cloned().unwrap_or_default()
     }
 
+    /// A copy of `hello`'s nodes is read by `hello` alone: any text is a title, so the name
+    /// is what keeps another application's copy from becoming nodes named after its lines.
+    fn content_format(&self) -> Option<&str> {
+        Some("hello-title")
+    }
+
+    /// The title is its own text: a copy goes to the system clipboard as it is.
+    fn content_text(&self, title: &String) -> Option<String> {
+        Some(title.clone())
+    }
+
+    fn content_from_text(&self, text: &str) -> Option<String> {
+        Some(text.to_owned())
+    }
+
     fn insert_copy(&mut self, rect: Rect, title: String) -> usize {
         let index = self.insert_node(rect);
         self.titles[index] = title;
@@ -1018,5 +1033,30 @@ mod tests {
         });
         pull(&mut harness, &graph);
         assert_eq!(graph.borrow().node_rect(0).x0, 40.0, "and undo put it back");
+    }
+
+    /// A copy from another application on blazy is not `hello`'s to read, though any text
+    /// would make a title: its format name keeps it out. A copy in `hello`'s format is read.
+    #[test]
+    fn a_copy_in_another_applications_format_is_not_pasted() {
+        use blazy::node_editor::{EditorWorld, ops};
+
+        let graph = Graph::grid();
+        let mut world = EditorWorld::new(&graph);
+        let mut runtime = ops::runtime::<Graph>();
+        let calc = "blazy-nodes 1 calc\nnode 40 40 150 90 number 2\nnode 260 60 150 90 add\nlink 0 0 1 0\n";
+        graph.borrow().views().offer_clip_text(calc.into());
+        assert_eq!(
+            runtime.poll(&mut world, "node.paste", &Props::new()),
+            Some(false),
+            "nothing to paste: the calc copy is refused and no copy is in the process"
+        );
+        let ours = "blazy-nodes 1 hello-title\nnode 40 40 140 80 pasted\n";
+        graph.borrow().views().offer_clip_text(ours.into());
+        let nodes = graph.borrow().nodes.iter().flatten().count();
+        let _ = runtime.exec(&mut world, "node.paste", &Props::new());
+        assert_eq!(graph.borrow().nodes.iter().flatten().count(), nodes + 1);
+        let pasted = graph.borrow().nodes.len() - 1;
+        assert_eq!(graph.borrow().titles[pasted], "pasted");
     }
 }

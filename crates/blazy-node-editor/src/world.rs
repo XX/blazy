@@ -611,7 +611,106 @@ pub(crate) struct Clip<C> {
     pub(crate) links: Vec<Link>,
 }
 
+/// The first words of a copy as text, and the version this build reads and writes; the
+/// graph's content format follows on the same line.
+const CLIP_FORMAT: &str = "blazy-nodes 1";
+/// The most nodes a copy as text is read with: a clipboard is input from another process.
+const CLIP_MAX_NODES: usize = 10_000;
+
 impl<C: Clone + 'static> Clip<C> {
+    /// The copy as text, for the system clipboard: `None` if any node's content has no
+    /// text form (§66).
+    ///
+    /// ```text
+    /// blazy-nodes 1 <content format>
+    /// node <x> <y> <width> <height> <content, escaped>
+    /// link <from> <from port> <to> <to port>
+    /// ```
+    ///
+    /// Nodes by position, as the copy names them; links by those positions. The content is
+    /// the graph's own text with `\` and line breaks escaped, so it stays on its line.
+    pub(crate) fn to_text<G: NodeGraph<Content = C>>(&self, graph: &G) -> Option<String> {
+        let Some(format) = graph
+            .content_format()
+            .filter(|f| !f.is_empty() && !f.contains(char::is_whitespace))
+        else {
+            let written = self
+                .nodes
+                .first()
+                .is_some_and(|(_, content)| graph.content_text(content).is_some());
+            debug_assert!(
+                !written,
+                "the graph writes content text but names no format (one word): §66"
+            );
+            if written {
+                tracing::warn!("the graph writes content text but names no format; the copy stays in the process");
+            }
+            return None;
+        };
+        let mut out = format!("{CLIP_FORMAT} {format}\n");
+        for (rect, content) in &self.nodes {
+            let text = graph.content_text(content)?;
+            let text = text.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r");
+            out.push_str(&format!(
+                "node {} {} {} {} {text}\n",
+                rect.x0,
+                rect.y0,
+                rect.width(),
+                rect.height()
+            ));
+        }
+        for link in &self.links {
+            out.push_str(&format!(
+                "link {} {} {} {}\n",
+                link.from, link.from_port, link.to, link.to_port
+            ));
+        }
+        Some(out)
+    }
+
+    /// Reads what [`to_text`](Self::to_text) wrote; `None` for anything else.
+    ///
+    /// Read as input: at most [`CLIP_MAX_NODES`] nodes, finite rectangles with a size, links
+    /// between nodes the text holds, and contents the graph reads back.
+    pub(crate) fn from_text<G: NodeGraph<Content = C>>(graph: &G, text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        // A copy is read only in the format it was written in: the library's version, and the
+        // application's content.
+        let format = graph.content_format()?;
+        if lines.next()?.trim_end().strip_prefix(CLIP_FORMAT)?.strip_prefix(' ')? != format {
+            return None;
+        }
+        let (mut nodes, mut links) = (Vec::new(), Vec::new());
+        for line in lines.filter(|line| !line.trim().is_empty()) {
+            if let Some(rest) = line.strip_prefix("node ") {
+                let mut words = rest.splitn(5, ' ');
+                let mut number = || words.next()?.parse::<f64>().ok().filter(|v| v.is_finite());
+                let (x, y, width, height) = (number()?, number()?, number()?, number()?);
+                if width <= 0.0 || height <= 0.0 || nodes.len() >= CLIP_MAX_NODES {
+                    return None;
+                }
+                let content = graph.content_from_text(&unescape(words.next().unwrap_or(""))?)?;
+                nodes.push((Rect::from_origin_size((x, y), (width, height)), content));
+            } else {
+                let rest = line.strip_prefix("link ")?;
+                let mut words = rest.split(' ').map(|word| word.parse::<u32>().ok());
+                let (from, from_port, to, to_port) = (words.next()??, words.next()??, words.next()??, words.next()??);
+                if words.next().is_some() || from as usize >= nodes.len() || to as usize >= nodes.len() {
+                    return None;
+                }
+                links.push(Link::between(
+                    from as usize,
+                    u16::try_from(from_port).ok()?,
+                    to as usize,
+                    u16::try_from(to_port).ok()?,
+                ));
+            }
+        }
+        // A link may name a node the text gives later only if it is written later, and the
+        // writer writes every node first; a reader that allowed otherwise would check twice.
+        Some(Self { nodes, links })
+    }
+
     /// Copies `nodes` out of `graph`, in name order.
     pub(crate) fn of<G: NodeGraph<Content = C>>(graph: &G, nodes: &BTreeSet<usize>) -> Self {
         let positions: BTreeMap<usize, usize> = nodes.iter().enumerate().map(|(at, &index)| (index, at)).collect();
@@ -743,6 +842,25 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for ResizeStep {
     fn bytes(&self) -> usize {
         self.nodes.len() * (size_of::<usize>() + 2 * size_of::<Rect>())
     }
+}
+
+/// Undoes the escaping [`Clip::to_text`] does; `None` for an escape it never writes.
+fn unescape(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(match chars.next()? {
+            '\\' => '\\',
+            'n' => '\n',
+            'r' => '\r',
+            _ => return None,
+        });
+    }
+    Some(out)
 }
 
 /// Links taken off and put on in one gesture: a link dragged off an input onto another

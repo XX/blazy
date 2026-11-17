@@ -119,6 +119,14 @@ struct Ledger {
     /// registry. Per graph rather than per process, which is narrower than Blender's
     /// (§57.5).
     clip: Option<Rc<dyn Any>>,
+    /// The copy as text, when the graph can write it — what went to the system clipboard,
+    /// so that the same text coming back is known for this copy (§66).
+    clip_text: Option<String>,
+    /// The copy's text, not yet handed to the system clipboard.
+    outbound: Option<String>,
+    /// Text the system clipboard held when a paste was about to run, and that is not this
+    /// process's copy: a copy from another process, or something else entirely.
+    offered: Option<String>,
     /// Widgets that show the graph without being a canvas — a properties panel (§62) — and
     /// whether each is owed a refresh, with the function that refreshes it.
     ///
@@ -292,8 +300,37 @@ impl Views {
     }
 
     /// Puts a copy on the graph's clipboard, in place of whatever was there.
-    pub(crate) fn set_clip(&self, clip: Rc<dyn Any>) {
-        self.0.borrow_mut().clip = Some(clip);
+    pub(crate) fn set_clip(&self, clip: Rc<dyn Any>, text: Option<String>) {
+        let mut ledger = self.0.borrow_mut();
+        ledger.clip = Some(clip);
+        ledger.outbound.clone_from(&text);
+        ledger.clip_text = text;
+        ledger.offered = None;
+    }
+
+    /// The text of the last copy, for the system clipboard, once (§66).
+    ///
+    /// What a driver takes after an event — it is the one with the clipboard
+    /// (`ShellCtx::clipboard`), which an operator never sees. `None` when nothing was copied
+    /// since, or the graph's content has no text form.
+    pub fn take_outbound_clip(&self) -> Option<String> {
+        self.0.borrow_mut().outbound.take()
+    }
+
+    /// Offers what the system clipboard holds, before a paste runs (§66).
+    ///
+    /// The text of this process's own copy is recognised and changes nothing — the copy in
+    /// the process is the exact one. Anything else is kept for `node.paste` to read: a copy
+    /// from another process becomes the clipboard, and text that is not a copy is dropped,
+    /// leaving this process's copy to paste.
+    pub fn offer_clip_text(&self, text: String) {
+        let mut ledger = self.0.borrow_mut();
+        ledger.offered = (ledger.clip_text.as_ref() != Some(&text)).then_some(text);
+    }
+
+    /// The offered text, taken: what `node.paste` reads once.
+    pub(crate) fn take_offered(&self) -> Option<String> {
+        self.0.borrow_mut().offered.take()
     }
 
     /// What is on the graph's clipboard.

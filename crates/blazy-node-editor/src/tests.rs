@@ -44,6 +44,10 @@ struct Row {
     kinds: bool,
     /// Whether it names kinds it then cannot make — the default `insert_kind`.
     forgets_kinds: bool,
+    /// Whether its content has a text form, for the system clipboard (§66).
+    textual: bool,
+    /// Whether it writes content text and forgets to name the format.
+    formatless: bool,
 }
 
 /// What `Row`'s `wide` kind is sized to, whatever is asked: the graph decides (§64).
@@ -155,6 +159,18 @@ impl NodeGraph for Row {
 
     fn content(&self, index: usize) -> u32 {
         self.values[index]
+    }
+
+    fn content_format(&self) -> Option<&str> {
+        (self.textual && !self.formatless).then_some("row")
+    }
+
+    fn content_text(&self, value: &u32) -> Option<String> {
+        self.textual.then(|| format!("value\n{value}"))
+    }
+
+    fn content_from_text(&self, text: &str) -> Option<u32> {
+        text.strip_prefix("value\n")?.parse().ok()
     }
 
     fn insert_copy(&mut self, rect: Rect, value: u32) -> usize {
@@ -3064,5 +3080,160 @@ fn a_menu_entry_reaches_a_second_view_within_the_event() {
             built && selected,
             "view {canvas:?}: built {built}, selected {selected}, in the event"
         );
+    }
+}
+
+// --- MARK: SYSTEM CLIPBOARD (`issues/26-11-16 node clipboard across processes.md`)
+
+mod system_clipboard {
+    use std::collections::BTreeSet;
+
+    use blazy_ops::OpResult;
+    use blazy_ops::keymap::Props;
+    use masonry::kurbo::{Point, Rect};
+
+    use super::copies::{linked, state};
+    use crate::NodeGraph;
+    use crate::world::Clip;
+
+    /// A copy goes to text and back as itself — rectangles, contents with a line break in
+    /// them, the link between the copied nodes — and text that is not one reads as nothing.
+    #[test]
+    fn a_copy_survives_its_text_and_anything_else_is_nothing() {
+        let (graph, _runtime, _world) = linked();
+        graph.borrow_mut().textual = true;
+        graph.borrow_mut().values[1] = 7;
+        let copy = Clip::of(&*graph.borrow(), &BTreeSet::from([0, 1]));
+        let text = copy.to_text(&*graph.borrow()).expect("the graph writes its content");
+        assert!(
+            text.starts_with("blazy-nodes 1 row\n"),
+            "the library's version, the graph's format: {text}"
+        );
+        assert!(
+            text.contains("value\\n7"),
+            "the line break is escaped onto the line: {text}"
+        );
+        let read = Clip::from_text(&*graph.borrow(), &text).expect("it reads back");
+        assert_eq!(read.nodes, copy.nodes);
+        assert_eq!(read.links, copy.links);
+        assert_eq!(read.links.len(), 1, "the link 0 -> 1 came with it");
+
+        let header = "blazy-nodes 1 row\n";
+        for bad in [
+            "hello, world".to_owned(),
+            "blazy-nodes 2 row\n".to_owned(),
+            // Another application's copy, and one that names no format: the header is what
+            // keeps a graph from reading text in a format it only happens to accept.
+            "blazy-nodes 1 calc\nnode 0 0 10 10 value\\n1\n".to_owned(),
+            "blazy-nodes 1\nnode 0 0 10 10 value\\n1\n".to_owned(),
+            format!("{header}node 0 0 10\n"),
+            format!("{header}node 0 0 0 10 value\\n1\n"),
+            format!("{header}node NaN 0 10 10 value\\n1\n"),
+            format!("{header}node 0 0 10 10 something else\n"),
+            format!("{header}node 0 0 10 10 value\\q1\n"),
+            format!("{header}node 0 0 10 10 value\\n1\nlink 0 0 1 0\n"),
+            format!("{header}wobble\n"),
+        ] {
+            assert!(Clip::from_text(&*graph.borrow(), &bad).is_none(), "{bad:?} was read");
+        }
+        let many = format!("{header}{}", "node 0 0 10 10 value\\n1\n".repeat(10_001));
+        assert!(
+            Clip::from_text(&*graph.borrow(), &many).is_none(),
+            "no more nodes than the bound"
+        );
+
+        graph.borrow_mut().textual = false;
+        assert!(copy.to_text(&*graph.borrow()).is_none(), "no text form, no text");
+    }
+
+    /// A graph that writes content text and names no format is told so, loudly, rather than
+    /// having its copies stay in the process without a word.
+    #[test]
+    #[should_panic(expected = "names no format")]
+    fn content_text_without_a_format_is_an_assertion() {
+        let (graph, _runtime, _world) = linked();
+        graph.borrow_mut().textual = true;
+        graph.borrow_mut().formatless = true;
+        let copy = Clip::of(&*graph.borrow(), &BTreeSet::from([0]));
+        let _ = copy.to_text(&*graph.borrow());
+    }
+
+    /// `node.copy` leaves the text for the driver once, and only for a graph with a text
+    /// form; its own text offered back changes nothing.
+    #[test]
+    fn a_copy_leaves_its_text_for_the_driver_once() {
+        let (graph, mut runtime, mut world) = linked();
+        assert_eq!(runtime.exec(&mut world, "node.copy", &Props::new()), OpResult::Finished);
+        assert_eq!(
+            graph.borrow().views().take_outbound_clip(),
+            None,
+            "no text form, nothing out"
+        );
+
+        graph.borrow_mut().textual = true;
+        let _ = runtime.exec(&mut world, "node.copy", &Props::new());
+        let text = graph.borrow().views().take_outbound_clip().expect("the copy's text");
+        assert_eq!(graph.borrow().views().take_outbound_clip(), None, "once");
+        graph.borrow().views().offer_clip_text(text);
+        assert_eq!(graph.borrow().views().take_offered(), None, "its own text is this copy");
+    }
+
+    /// A copy from another process, offered from the system clipboard, is what is pasted —
+    /// nodes, contents and the link between them, in one step; offered text that is not a
+    /// copy leaves this process's copy to paste.
+    #[test]
+    fn a_copy_from_another_process_is_pasted() {
+        let (other, mut other_runtime, mut other_world) = linked();
+        other.borrow_mut().textual = true;
+        other.borrow_mut().values[0] = 40;
+        other.borrow_mut().values[1] = 41;
+        other_world.select(BTreeSet::from([0, 1]));
+        let _ = other_runtime.exec(&mut other_world, "node.copy", &Props::new());
+        let text = other.borrow().views().take_outbound_clip().expect("written");
+
+        let (graph, mut runtime, mut world) = linked();
+        graph.borrow_mut().textual = true;
+        world.select(BTreeSet::from([2]));
+        let _ = runtime.exec(&mut world, "node.copy", &Props::new());
+        let _ = graph.borrow().views().take_outbound_clip();
+        let before = graph.borrow().node_count();
+        let depth = runtime.history().depth();
+
+        graph.borrow().views().offer_clip_text(text);
+        let at = Props::new().with_float("x", 900.0).with_float("y", 500.0);
+        assert_eq!(runtime.exec(&mut world, "node.paste", &at), OpResult::Finished);
+        assert_eq!(graph.borrow().node_count(), before + 2, "the other process's two nodes");
+        let pasted: Vec<usize> = world.selection().into_iter().collect();
+        let values: Vec<u32> = pasted.iter().map(|&i| graph.borrow().content(i)).collect();
+        assert_eq!(values, vec![40, 41], "with what they held");
+        assert!(
+            graph
+                .borrow()
+                .links_of(pasted[0])
+                .iter()
+                .any(|l| l.to as usize == pasted[1]),
+            "and the link between them"
+        );
+        assert_eq!(runtime.history().depth(), depth + 1, "one step");
+        let rects: Vec<Rect> = pasted.iter().map(|&i| graph.borrow().node_rect(i)).collect();
+        assert_eq!(
+            rects[0].union(rects[1]).center(),
+            Point::new(900.0, 500.0),
+            "centred where asked"
+        );
+
+        // Something that is not a copy: this process's copy — now the other one's — again.
+        let after = state(&graph);
+        graph
+            .borrow()
+            .views()
+            .offer_clip_text("a sentence copied from a browser".into());
+        assert_eq!(runtime.exec(&mut world, "node.paste", &at), OpResult::Finished);
+        assert_eq!(
+            graph.borrow().node_count(),
+            before + 4,
+            "the copy in the process, pasted again"
+        );
+        assert_ne!(state(&graph), after);
     }
 }
