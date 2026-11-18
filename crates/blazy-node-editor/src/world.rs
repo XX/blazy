@@ -35,6 +35,12 @@ pub enum Edit {
         /// The name that is now free.
         index: usize,
     },
+    /// What a node holds changed — an edit undone or redone (§67). Every view builds the node
+    /// again from the model.
+    ContentChanged {
+        /// The node's name.
+        index: usize,
+    },
     /// A link appeared.
     LinkAdded(Link),
     /// A link went.
@@ -203,6 +209,13 @@ impl<G: NodeGraph> EditorWorld<G> {
     /// A node's rectangle, in canvas coordinates.
     pub fn node_rect(&self, index: usize) -> Rect {
         self.graph.borrow().node_rect(index)
+    }
+
+    /// Writes what node `index` holds to the model and records that views must follow (§67).
+    pub fn set_content(&mut self, index: usize, content: G::Content) {
+        self.graph.borrow_mut().set_content(index, content);
+        self.edits.push(Edit::ContentChanged { index });
+        self.dirty = true;
     }
 
     /// Writes a node's rectangle to the model and records that views must follow.
@@ -814,6 +827,31 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for LinkStep {
 
     fn bytes(&self) -> usize {
         size_of::<Link>()
+    }
+}
+
+/// An edit of what a node holds, made in its widget or a panel: before and after (§67).
+pub(crate) struct ContentStep<C> {
+    pub(crate) index: usize,
+    pub(crate) before: C,
+    pub(crate) after: C,
+}
+
+impl<G: NodeGraph> Step<EditorWorld<G>> for ContentStep<G::Content> {
+    fn name(&self) -> &'static str {
+        "node.edit"
+    }
+
+    fn undo(&mut self, world: &mut EditorWorld<G>) {
+        world.set_content(self.index, self.before.clone());
+    }
+
+    fn redo(&mut self, world: &mut EditorWorld<G>) {
+        world.set_content(self.index, self.after.clone());
+    }
+
+    fn bytes(&self) -> usize {
+        size_of::<usize>() + 2 * size_of::<G::Content>()
     }
 }
 

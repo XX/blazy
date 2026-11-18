@@ -44,8 +44,8 @@ use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, DefaultProperties, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction,
-    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId,
-    WidgetMut, WidgetPod,
+    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Update, UpdateCtx,
+    Widget, WidgetId, WidgetMut, WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, Shape, Size};
@@ -55,8 +55,8 @@ use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRad
 use blazy::masonry::theme::default_property_set;
 use blazy::masonry::widgets::{Button, ButtonPress, TextAction, TextInput};
 use blazy::node_editor::{
-    Change, EdgePan, GraphPanel, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SharedGraph,
-    ViewToken, Views,
+    Change, EdgePan, GraphPanel, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SessionHandle,
+    SharedGraph, ViewToken, Views,
 };
 use blazy::ops::keymap::Props;
 use blazy::shell::window::{Error, WindowConfig};
@@ -215,6 +215,12 @@ impl NodeGraph for Graph {
         self.titles.get(index).cloned().unwrap_or_default()
     }
 
+    fn set_content(&mut self, index: usize, title: String) {
+        if let Some(held) = self.titles.get_mut(index) {
+            *held = title;
+        }
+    }
+
     /// A copy of `hello`'s nodes is read by `hello` alone: any text is a title, so the name
     /// is what keeps another application's copy from becoming nodes named after its lines.
     fn content_format(&self) -> Option<&str> {
@@ -251,6 +257,45 @@ impl NodeGraph for Graph {
 struct Nodes {
     graph: SharedGraph<Graph>,
     view: Option<ViewToken>,
+    /// The area's session, whose history a rename is recorded in.
+    session: SessionHandle<Graph>,
+}
+
+/// One rename in progress: the title it began from, and the history it ends in (§67).
+///
+/// The field writes every key into the model, so the other areas follow as it is typed;
+/// the history gets one step when the edit ends — the field left, `Enter` — as Blender
+/// writes one, not one per key.
+struct TitleEdit {
+    session: SessionHandle<Graph>,
+    before: Option<String>,
+}
+
+impl TitleEdit {
+    fn new(session: &SessionHandle<Graph>) -> Self {
+        Self {
+            session: session.clone(),
+            before: None,
+        }
+    }
+
+    /// Called before a key's text goes into the model: the first one remembers the title.
+    fn began(&mut self, graph: &Graph, index: usize) {
+        if self.before.is_none() {
+            self.before = Some(graph.titles.get(index).cloned().unwrap_or_default());
+        }
+    }
+
+    /// The edit ended: one step, if it changed anything.
+    fn finished(&mut self, graph: &SharedGraph<Graph>, index: usize) {
+        let Some(before) = self.before.take() else {
+            return;
+        };
+        let after = graph.borrow().titles.get(index).cloned().unwrap_or_default();
+        if before != after {
+            self.session.borrow_mut().record_content(index, before, after);
+        }
+    }
 }
 
 /// The title a node starts with.
@@ -274,6 +319,7 @@ impl NodeSource for Nodes {
             graph: self.graph.clone(),
             index,
             canvas: self.view.as_ref().map(ViewToken::canvas),
+            edit: TitleEdit::new(&self.session),
         })
         .erased()
     }
@@ -315,6 +361,7 @@ struct Node {
     index: usize,
     /// The canvas this node is in, so an edit is recorded for the others only.
     canvas: Option<WidgetId>,
+    edit: TitleEdit,
 }
 
 impl Widget for Node {
@@ -365,6 +412,7 @@ impl Widget for Node {
         match action {
             TextAction::Changed(text) => {
                 let graph = &mut *self.graph.borrow_mut();
+                self.edit.began(graph, self.index);
                 if let Some(title) = graph.titles.get_mut(self.index) {
                     title.clone_from(text);
                 }
@@ -377,6 +425,13 @@ impl Widget for Node {
             TextAction::Entered(_) | TextAction::Cancelled => ctx.resign_focus(),
         }
         ctx.set_handled();
+    }
+
+    /// The field was left — a click elsewhere, `Enter`, `Escape`: the rename is one step.
+    fn update(&mut self, _ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
+        if matches!(event, Update::ChildFocusChanged(false)) {
+            self.edit.finished(&self.graph, self.index);
+        }
     }
 
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
@@ -412,8 +467,9 @@ fn properties_of(
     graph: &SharedGraph<Graph>,
     selection: &std::collections::BTreeSet<usize>,
     panel: WidgetId,
-    editor: Option<WidgetId>,
+    session: &SessionHandle<Graph>,
 ) -> NewWidget<dyn Widget> {
+    let editor = session.borrow().editor;
     let row = |bar: Bar| NewWidget::new(bar).with_props(ScaleCarrier::of::<Bar>()).erased();
     let caption = |text: String| NewWidget::new(Label::new(text)).erased();
     let metrics = Metrics {
@@ -477,6 +533,7 @@ fn properties_of(
         index,
         panel,
         editor,
+        edit: TitleEdit::new(session),
         nudges: [(left_id, -NUDGE), (right_id, NUDGE)],
     })
     .with_props(ScaleCarrier::of::<Properties>())
@@ -497,6 +554,8 @@ struct Properties {
     panel: WidgetId,
     /// The editor of the area, which runs the move.
     editor: Option<WidgetId>,
+    /// The rename in progress, recorded in the area's history like one made in the node.
+    edit: TitleEdit,
     /// Each arrow, and how far it moves the node along x.
     nudges: [(WidgetId, f64); 2],
 }
@@ -543,6 +602,7 @@ impl Widget for Properties {
             match action {
                 TextAction::Changed(text) => {
                     let graph = &mut *self.graph.borrow_mut();
+                    self.edit.began(graph, self.index);
                     if let Some(title) = graph.titles.get_mut(self.index) {
                         title.clone_from(text);
                     }
@@ -563,6 +623,13 @@ impl Widget for Properties {
                 let _ = NodeEditor::<Graph>::exec(&mut widget.downcast(), "node.move", &props);
             });
             ctx.set_handled();
+        }
+    }
+
+    /// The name field was left: the rename is one step, in this area's history.
+    fn update(&mut self, _ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
+        if matches!(event, Update::ChildFocusChanged(false)) {
+            self.edit.finished(&self.graph, self.index);
         }
     }
 
@@ -621,7 +688,11 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
             let graph = graph.clone();
             move |index: usize| graph.borrow().node_rect_of(index)
         };
-        let nodes = Nodes { graph, view: None };
+        let nodes = Nodes {
+            graph,
+            view: None,
+            session: session.clone(),
+        };
         let canvas = CanvasLayer::new(names, geometry, nodes)
             .with_links(links)
             .with_ports(PORT_LAYOUT);
@@ -643,8 +714,7 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
         let session = session.clone();
         let graph = session.borrow().world.graph.clone();
         let panel = GraphPanel::new(&graph, move |graph, selection, panel| {
-            let editor = session.borrow().editor;
-            properties_of(graph, selection, panel, editor)
+            properties_of(graph, selection, panel, &session)
         });
         NewWidget::new(panel)
             .with_props(ScaleCarrier::of::<GraphPanel<Graph>>())
@@ -1058,5 +1128,92 @@ mod tests {
         assert_eq!(graph.borrow().nodes.iter().flatten().count(), nodes + 1);
         let pasted = graph.borrow().nodes.len() - 1;
         assert_eq!(graph.borrow().titles[pasted], "pasted");
+    }
+
+    /// Five keys in a node's name are one step in the area's history, ended by leaving the
+    /// field; undo brings the old name back in both areas and in the panel, redo the new one.
+    /// A rename in the panel goes into the same history.
+    #[test]
+    fn a_rename_is_one_step_and_undo_brings_the_name_back_everywhere() {
+        use blazy::masonry::ui_events::pointer::PointerButton;
+
+        let graph = Graph::grid();
+        let screen = app(&graph).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1000, 600));
+        let _ = harness.redraw();
+        let area_widgets = harness.root_widget().area_ids();
+        for (area, &id) in area_widgets.iter().enumerate() {
+            let session = harness.root_widget().payload(area).expect("a session").clone();
+            session.borrow().sidebar.set(blazy::areas::Sidebar::new(true, 240.0));
+            harness.edit_widget_with_id(id, |mut widget| {
+                blazy::areas::AreaContent::refresh(&mut widget.downcast::<blazy::areas::AreaContent>());
+            });
+        }
+        let _ = harness.redraw();
+        let editors = editor_ids(&harness);
+        let session = harness.root_widget().payload(0).expect("a session").clone();
+        let depth = || session.borrow().runtime.history().depth();
+        let panel_field = |harness: &TestHarness<blazy::app::EditorScreen<Graph>>, area: usize| {
+            let content = harness.get_widget_with_id(area_widgets[area]);
+            let panel = content
+                .downcast::<blazy::areas::AreaContent>()
+                .expect("an area with regions")
+                .inner()
+                .region_ids()[1];
+            find_all::<TextArea<true>>(harness, panel)
+        };
+        let undo = |harness: &mut TestHarness<blazy::app::EditorScreen<Graph>>, op: &str| {
+            harness.edit_widget_with_id(editors[0], |mut widget| {
+                NodeEditor::<Graph>::exec(&mut widget.downcast(), op, &Props::new())
+            });
+            pull(harness, &graph);
+        };
+
+        // Select node 0, so the panels show it.
+        harness.mouse_move(Point::new(100.0, 108.0));
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_button_release(Some(PointerButton::Primary));
+        let _ = harness.redraw();
+        let before = depth();
+
+        let field = title_field(&mut harness, editors[0], 0);
+        harness.focus_on(Some(field));
+        harness.keyboard_type_chars("abcde");
+        pull(&mut harness, &graph);
+        assert_eq!(depth(), before, "nothing yet: the edit has not ended");
+        harness.focus_on(None);
+        pull(&mut harness, &graph);
+        assert_eq!(depth(), before + 1, "five keys, one step");
+        let renamed = graph.borrow().titles[0].clone();
+        assert_ne!(renamed, "node 0");
+
+        undo(&mut harness, "ed.undo");
+        assert_eq!(graph.borrow().titles[0], "node 0", "undo: the model");
+        for (area, &editor) in editors.iter().enumerate() {
+            let field = title_field(&mut harness, editor, 0);
+            assert_eq!(text_of(&harness, field), "node 0", "area {area}'s node");
+            let panel = panel_field(&harness, area)[0];
+            assert_eq!(text_of(&harness, panel), "node 0", "area {area}'s panel");
+        }
+        undo(&mut harness, "ed.redo");
+        assert_eq!(graph.borrow().titles[0], renamed, "redo: the new name again");
+        let other = title_field(&mut harness, editors[1], 0);
+        assert_eq!(text_of(&harness, other), renamed);
+
+        // The panel's field, in the same area: the same history.
+        let panel = panel_field(&harness, 0)[0];
+        harness.focus_on(Some(panel));
+        harness.keyboard_type_chars("!");
+        pull(&mut harness, &graph);
+        harness.focus_on(None);
+        pull(&mut harness, &graph);
+        assert_eq!(
+            depth(),
+            before + 2,
+            "the panel's rename is a step of this area's history"
+        );
+        undo(&mut harness, "ed.undo");
+        assert_eq!(graph.borrow().titles[0], renamed, "and undone there");
     }
 }

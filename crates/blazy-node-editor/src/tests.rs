@@ -161,6 +161,10 @@ impl NodeGraph for Row {
         self.values[index]
     }
 
+    fn set_content(&mut self, index: usize, value: u32) {
+        self.values[index] = value;
+    }
+
     fn content_format(&self) -> Option<&str> {
         (self.textual && !self.formatless).then_some("row")
     }
@@ -3236,4 +3240,34 @@ mod system_clipboard {
         );
         assert_ne!(state(&graph), after);
     }
+}
+
+// --- MARK: CONTENT EDIT UNDO (`issues/26-11-17 content edit undo.md`)
+
+/// An edit made past the operators and recorded in the session is one step: undo puts the
+/// content back into the model and tells every view, and redo puts the edit back.
+#[test]
+fn a_recorded_content_edit_is_undone_into_the_model_and_the_views() {
+    use crate::world::Edit;
+
+    let graph = row(3);
+    let mut session = crate::EditorSession::new(&graph);
+    // What a field does: the model first, as it is typed.
+    graph.borrow_mut().values[1] = 99;
+    let depth = session.runtime.history().depth();
+    session.record_content(1, 0, 99);
+    assert_eq!(session.runtime.history().depth(), depth + 1, "one step");
+
+    let crate::EditorSession { runtime, world, .. } = &mut session;
+    assert_eq!(runtime.history_mut().undo(world), Some("node.edit"));
+    assert_eq!(graph.borrow().content(1), 0, "the model holds what it held");
+    assert!(
+        world.edits.contains(&Edit::ContentChanged { index: 1 }),
+        "and every view is told: {:?}",
+        world.edits
+    );
+    world.edits.clear();
+    assert_eq!(runtime.history_mut().redo(world), Some("node.edit"));
+    assert_eq!(graph.borrow().content(1), 99);
+    assert!(world.edits.contains(&Edit::ContentChanged { index: 1 }));
 }

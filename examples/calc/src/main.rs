@@ -34,8 +34,8 @@ use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRad
 use blazy::masonry::theme::default_property_set;
 use blazy::masonry::widgets::{Label as StockLabel, TextAction, TextArea, TextInput};
 use blazy::node_editor::{
-    Change, EdgePan, GraphPanel, NodeGraph, NodeKind, OverlayStyle, SELECTED, SelectionOutline, SharedGraph, ViewToken,
-    Views,
+    Change, EdgePan, GraphPanel, NodeGraph, NodeKind, OverlayStyle, SELECTED, SelectionOutline, SessionHandle,
+    SharedGraph, ViewToken, Views,
 };
 use blazy::shell::window::{Error, WindowConfig};
 use blazy::widgets::{Bar, Label, Metrics};
@@ -453,6 +453,14 @@ impl NodeGraph for Calc {
         self.kind(index).unwrap_or(Kind::Number(0.0))
     }
 
+    /// A kind put back by undo or redo: what follows from it changes too.
+    fn set_content(&mut self, index: usize, kind: Kind) {
+        if let Some(Some(slot)) = self.nodes.get_mut(index) {
+            slot.kind = kind;
+            self.values_changed();
+        }
+    }
+
     fn content_format(&self) -> Option<&str> {
         Some("calc")
     }
@@ -487,6 +495,8 @@ fn shown(value: Option<f64>) -> String {
 struct Nodes {
     graph: SharedGraph<Calc>,
     view: Option<ViewToken>,
+    /// The area's session, whose history an edit of a number is recorded in.
+    session: SessionHandle<Calc>,
 }
 
 impl NodeSource for Nodes {
@@ -496,6 +506,7 @@ impl NodeSource for Nodes {
         let body = match kind {
             Kind::Number(value) => NewWidget::new(NumberField::new(
                 &self.graph,
+                &self.session,
                 index,
                 value,
                 self.view.as_ref().map(ViewToken::canvas),
@@ -537,15 +548,27 @@ struct NumberField {
     index: usize,
     /// The view that shows the edit already, and must not be rebuilt under the caret.
     past: Option<WidgetId>,
+    /// The area's session: an edit ends as one step in its history (§67).
+    session: SessionHandle<Calc>,
+    /// The kind the node held when the edit began; `None` while nothing is being edited.
+    before: Option<Kind>,
 }
 
 impl NumberField {
-    fn new(graph: &SharedGraph<Calc>, index: usize, value: f64, past: Option<WidgetId>) -> Self {
+    fn new(
+        graph: &SharedGraph<Calc>,
+        session: &SessionHandle<Calc>,
+        index: usize,
+        value: f64,
+        past: Option<WidgetId>,
+    ) -> Self {
         Self {
             input: WidgetPod::new(TextInput::new(&format!("{value}"))),
             graph: graph.clone(),
             index,
             past,
+            session: session.clone(),
+            before: None,
         }
     }
 }
@@ -575,9 +598,16 @@ impl Widget for NumberField {
         ctx.place_child(&mut self.input, Point::ORIGIN);
     }
 
-    /// Focus left the field: if what it says is not the model's value, it says the value again.
+    /// Focus left the field: the edit is one step in the area's history, if it changed the
+    /// value; and if what the field says is not the model's value, it says the value again.
     fn update(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
         if matches!(event, Update::ChildFocusChanged(false)) {
+            if let Some(before) = self.before.take() {
+                let after = self.graph.borrow().content(self.index);
+                if before != after {
+                    self.session.borrow_mut().record_content(self.index, before, after);
+                }
+            }
             ctx.mutate_self_later(|mut widget| {
                 let mut field = widget.downcast::<Self>();
                 let Some(Kind::Number(value)) = field.widget.graph.borrow().kind(field.widget.index) else {
@@ -611,6 +641,8 @@ impl Widget for NumberField {
                     && let Some(Some(slot)) = graph.nodes.get_mut(self.index)
                     && value.is_finite()
                 {
+                    // The first change of an edit remembers what it changes from.
+                    self.before.get_or_insert(slot.kind);
                     slot.kind = Kind::Number(value);
                     let change = Change::Contents { index: self.index };
                     match self.past {
@@ -704,7 +736,12 @@ impl Widget for CalcNode {
 }
 
 /// What the panel shows: the selected node's kind, value and place.
-fn panel_of(graph: &SharedGraph<Calc>, selection: &BTreeSet<usize>, panel: WidgetId) -> NewWidget<dyn Widget> {
+fn panel_of(
+    graph: &SharedGraph<Calc>,
+    session: &SessionHandle<Calc>,
+    selection: &BTreeSet<usize>,
+    panel: WidgetId,
+) -> NewWidget<dyn Widget> {
     let metrics = Metrics {
         padding: 4.0,
         gap: 6.0,
@@ -723,7 +760,9 @@ fn panel_of(graph: &SharedGraph<Calc>, selection: &BTreeSet<usize>, panel: Widge
         [index] if calc.slot(index).is_some() => {
             let kind = calc.content(index);
             let value = match kind {
-                Kind::Number(value) => NewWidget::new(NumberField::new(graph, index, value, Some(panel))).erased(),
+                Kind::Number(value) => {
+                    NewWidget::new(NumberField::new(graph, session, index, value, Some(panel))).erased()
+                },
                 _ => caption(shown(calc.value(index))),
             };
             let rect = calc.node_rect(index);
@@ -783,7 +822,12 @@ fn app(graph: &SharedGraph<Calc>, file: &Path) -> EditorApp<Calc> {
             let graph = graph.clone();
             move |index: usize| graph.borrow().node_rect_of(index)
         };
-        let canvas = CanvasLayer::new(names, geometry, Nodes { graph, view: None })
+        let nodes = Nodes {
+            graph,
+            view: None,
+            session: session.clone(),
+        };
+        let canvas = CanvasLayer::new(names, geometry, nodes)
             .with_links(links)
             .with_ports(PORT_LAYOUT);
         let style = OverlayStyle {
@@ -795,7 +839,11 @@ fn app(graph: &SharedGraph<Calc>, file: &Path) -> EditorApp<Calc> {
     .with_edge_pan(EdgePan::default())
     .with_sidebar(|_area, session| {
         let graph = session.borrow().world.graph.clone();
-        NewWidget::new(GraphPanel::new(&graph, panel_of))
+        let session = session.clone();
+        let panel = GraphPanel::new(&graph, move |graph, selection, panel| {
+            panel_of(graph, &session, selection, panel)
+        });
+        NewWidget::new(panel)
             .with_props(ScaleCarrier::of::<GraphPanel<Calc>>())
             .erased()
     })
@@ -1187,5 +1235,49 @@ mod tests {
         assert_eq!(text_of(&harness, field), "2", "left, it shows the value again");
         let other = fields(&harness, areas[1])[0];
         assert_eq!(text_of(&harness, other), "2", "the value the other area shows");
+    }
+
+    /// A number typed and left is one step; undo brings the old number back, and with it
+    /// what follows from it — the display, in both areas.
+    #[test]
+    fn a_typed_number_is_one_step_and_undo_recomputes_the_display() {
+        use blazy::node_editor::NodeEditor;
+        use blazy::ops::keymap::Props;
+
+        let graph = Rc::new(RefCell::new(Calc::sample()));
+        let file = std::env::temp_dir().join(format!("calc-undo-{}.graph", std::process::id()));
+        let screen = app(&graph, &file).screen(SplitTree::balanced(2));
+        let mut harness =
+            TestHarness::create_with_size(properties(), NewWidget::new(screen), PhysicalSize::new(1200, 600));
+        let _ = harness.redraw();
+        let areas = harness.root_widget().area_ids();
+        let session = harness.root_widget().payload(0).expect("a session").clone();
+        let editor = session.borrow().editor.expect("an editor");
+        let before = session.borrow().runtime.history().depth();
+
+        let field = fields(&harness, areas[0])[0];
+        harness.focus_on(Some(field));
+        harness.keyboard_type_chars("12");
+        pull(&mut harness, &graph);
+        harness.focus_on(None);
+        pull(&mut harness, &graph);
+        assert_eq!(
+            session.borrow().runtime.history().depth(),
+            before + 1,
+            "two keys, one step"
+        );
+        assert_ne!(graph.borrow().content(0), Kind::Number(2.0));
+
+        harness.edit_widget_with_id(editor, |mut widget| {
+            NodeEditor::<Calc>::exec(&mut widget.downcast(), "ed.undo", &Props::new())
+        });
+        pull(&mut harness, &graph);
+        assert_eq!(graph.borrow().content(0), Kind::Number(2.0), "the number it was");
+        for &area in &areas {
+            assert!(
+                captions(&harness, area).contains(&"15".to_owned()),
+                "(2 + 3) × 3 again in {area:?}"
+            );
+        }
     }
 }

@@ -708,6 +708,16 @@ the text in `Views` and `EditorApp::settled` writes it to `ShellCtx::clipboard`;
 the area's keymap binds to `node.paste`, `text_event` reads the clipboard and offers it. Its
 own text is recognised, a foreign copy is adopted, anything else leaves the in-process copy.
 
+**An edit made in a node's widget or a panel is one undo step, recorded when the edit ends
+(§67).** `NodeGraph::set_content` is required. The field writes the model on every key, as
+before; it remembers the value at the first key and calls
+`EditorSession::record_content(index, before, after)` when focus leaves it
+(`Update::ChildFocusChanged(false)`), only if the value changed. Undo goes through
+`EditorWorld::set_content`, which records `Edit::ContentChanged`, so every view rebuilds the
+node. Widgets that edit content therefore hold their area's session (`build`, `with_sidebar`).
+When backing files up in a shell script, name the copies by path, not by `basename`: `hello`
+and `calc` are both `main.rs`.
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

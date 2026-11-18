@@ -101,6 +101,20 @@ pub struct EditorSession<G: NodeGraph> {
 }
 
 impl<G: NodeGraph> EditorSession<G> {
+    /// Records an edit of node `index`'s content, made past the operators — in the node's
+    /// widget or a panel — as one step in this area's history (§67).
+    ///
+    /// The edit is already in the model; this only makes it undoable. Call it once per edit,
+    /// when it is finished — a field left, `Enter` — with what the node held before the edit
+    /// began and what it holds now, not once per key: Blender writes a step when a field's
+    /// edit ends, and five keys are one rename. Undo puts `before` back into the model and
+    /// into every view of the graph; redo, `after`.
+    pub fn record_content(&mut self, index: usize, before: G::Content, after: G::Content) {
+        self.runtime
+            .history_mut()
+            .push(Box::new(crate::world::ContentStep { index, before, after }));
+    }
+
     /// A session over `graph`, with [`ops::runtime`](crate::ops::runtime)'s operators.
     pub fn new(graph: &SharedGraph<G>) -> Self {
         Self::with_runtime(graph, crate::ops::runtime())
@@ -854,6 +868,9 @@ pub(crate) fn apply_edit(canvas: &mut WidgetMut<'_, CanvasLayer>, edit: Edit) {
             CanvasLayer::remove_node(canvas, index);
         },
         Edit::NodeResized { index, rect } => CanvasLayer::set_child_rect(canvas, index, rect),
+        Edit::ContentChanged { index } => {
+            CanvasLayer::refresh_node(canvas, index);
+        },
         Edit::LinkAdded(link) => {
             if CanvasLayer::link_name(canvas, link).is_none() {
                 CanvasLayer::insert_link(canvas, link);

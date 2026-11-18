@@ -385,6 +385,16 @@ impl NodeGraph for GraphModel {
         self.node(index)
     }
 
+    /// The node's state put back, where it stands now: its place is the canvas's to say.
+    fn set_content(&mut self, index: usize, content: NodeState) {
+        if let Some(Some(node)) = self.nodes.get_mut(index) {
+            *node = NodeState {
+                pos: node.pos,
+                ..content
+            };
+        }
+    }
+
     fn insert_copy(&mut self, rect: Rect, content: NodeState) -> usize {
         let index = self.insert_node(rect);
         self.nodes[index] = Some(NodeState {

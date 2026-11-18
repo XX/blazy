@@ -131,6 +131,8 @@ impl NodeGraph for Grid {
 
     fn content(&self, _index: usize) {}
 
+    fn set_content(&mut self, _index: usize, _content: ()) {}
+
     fn content_format(&self) -> Option<&str> {
         Some("grid")
     }

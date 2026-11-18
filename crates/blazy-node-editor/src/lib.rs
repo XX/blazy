@@ -225,6 +225,15 @@ pub trait NodeGraph: 'static {
     /// What node `index` holds.
     fn content(&self, index: usize) -> Self::Content;
 
+    /// Puts `content` into node `index`, for undo and redo of an edit made in a node's
+    /// widget or a panel (§67).
+    ///
+    /// Required, like everything here that writes what a node is (§42): a default that did
+    /// nothing would compile, and `Ctrl+Z` after renaming a node would quietly undo whatever
+    /// came before the rename instead — which is what it did before this existed. The
+    /// editor records the change for every view itself; the graph only stores.
+    fn set_content(&mut self, index: usize, content: Self::Content);
+
     /// The name of the format [`content_text`](Self::content_text) writes — one word, such as
     /// `calc` — or `None` for content with no text form (§66).
     ///
