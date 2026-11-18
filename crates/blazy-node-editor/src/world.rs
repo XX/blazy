@@ -16,7 +16,7 @@ pub const DEFAULT_NODE_SIZE: Size = Size::new(160.0, 96.0);
 
 /// A change to the shape of the graph, on its way from the model into the views.
 ///
-/// The counterpart of [`EditorWorld::moved`] for structure rather than geometry: an
+/// The counterpart of the moved nodes ([`EditorWorld::take_moved`]) for structure rather than geometry: an
 /// operator writes the model and leaves this behind, and the driver carries it into its
 /// own canvas and into the graph's other views (§30). Nothing here is a widget, and that
 /// is the rule the whole crate is built on (§38.3).
@@ -79,10 +79,10 @@ pub struct LinkPreview {
 ///
 /// Deliberately not a widget in sight: the model, the selection, where the pointer is
 /// and what it is over. A driver fills the last two in before it dispatches, and reads
-/// [`moved`](Self::moved) afterwards.
+/// the moved nodes ([`take_moved`](Self::take_moved)) afterwards.
 pub struct EditorWorld<G: NodeGraph> {
     /// The graph. The source of truth, shared with every view of it (§30).
-    pub graph: SharedGraph<G>,
+    pub(crate) graph: SharedGraph<G>,
     /// The selection as it was before the first change the driver has not announced yet.
     ///
     /// The selection itself is the graph's ([`Views::selection`](crate::Views::selection)):
@@ -93,85 +93,157 @@ pub struct EditorWorld<G: NodeGraph> {
     /// The context an operator polls against, and the reason a press picks as well as
     /// a move (§38.3): a driver holding an `EventCtx` cannot hit-test a child, so the
     /// canvas publishes what it found and the driver reads it.
-    pub hover: Option<CanvasHit>,
+    pub(crate) hover: Option<CanvasHit>,
     /// Pointer position, in canvas coordinates.
-    pub pointer: Point,
+    pub(crate) pointer: Point,
     /// Pointer position in the driver's own coordinates.
     ///
     /// Both, because they are not interchangeable during a pan: the view moves under
     /// the pointer, so an operator that panned in canvas coordinates would chase its
     /// own tail.
-    pub pointer_screen: Point,
+    pub(crate) pointer_screen: Point,
     /// Screen pixels per canvas unit in this view, as of the last event.
     ///
     /// For an operator whose target is a strip a few *screen* pixels wide — the edge a node
     /// is resized by (§60) — since canvas units span a factor of 400 across the zoom range
     /// (§25.2). Filled in by the driver with the pointer; one until then.
-    pub scale: f64,
+    pub(crate) scale: f64,
     /// The rubber band, in canvas coordinates, while a box select is running.
-    pub band: Option<Rect>,
+    pub(crate) band: Option<Rect>,
     /// Nodes whose position changed and whose views have not been told yet.
     ///
     /// Drained by the driver. Duplicates are allowed and expected — a drag pushes the
     /// same index every frame — because deduplicating costs more than moving a child
     /// twice would.
-    pub moved: Vec<usize>,
+    pub(crate) moved: Vec<usize>,
     /// View movement the driver has not applied yet, in screen units.
     ///
     /// The view is not model state and not the operator's to touch, so it leaves here
     /// the same way a moved node does — as something for the driver to carry in.
-    pub pan: Vec2,
+    pub(crate) pan: Vec2,
     /// View zooms the driver has not applied yet: the point to zoom about, in the
     /// driver's own (screen) units, and the factor.
     ///
     /// The zoom twin of [`pan`](Self::pan), and kept as a list rather than a product
     /// because two zooms about two points are not one zoom about either.
-    pub zoom: Vec<(Point, f64)>,
+    pub(crate) zoom: Vec<(Point, f64)>,
     /// A menu an operator asked to open, for the driver to put on screen at the pointer.
     ///
     /// Left here rather than opened by the operator, for the reason everything here is:
     /// an operator never touches a widget, and a menu on screen is one (§38.3).
-    pub menu: Option<crate::Menu>,
+    pub(crate) menu: Option<crate::Menu>,
     /// The links being dragged, for the driver to draw over the canvas.
-    pub link_preview: Option<LinkPreview>,
+    pub(crate) link_preview: Option<LinkPreview>,
     /// Where the canvas puts its ports, for an operator that has to know where a port is
     /// without the pointer on it — the far end of a link taken off an input.
     ///
     /// The canvas's rule (§52), copied in by the editor when it is built over a canvas
     /// (`NodeEditor::with_session`); the default puts every port at the middle of its edge,
     /// as the canvas's own default does.
-    pub ports: PortLayout,
+    pub(crate) ports: PortLayout,
     /// Whether the running operator needs to know what is under the pointer on every move.
     ///
     /// While an operator holds the pointer the canvas below sees no events and publishes no
     /// hover; the driver picks for it instead — and only while this asks, so a node drag,
     /// which needs no hover, does not pay a pick per move.
-    pub track_hover: bool,
+    pub(crate) track_hover: bool,
     /// Set when something changed that only affects pixels.
-    pub dirty: bool,
+    pub(crate) dirty: bool,
     /// Changes to the shape of the graph the views have not been told about yet.
     ///
-    /// Drained by the driver, exactly like [`moved`](Self::moved). Structure is not
+    /// Drained by the driver, exactly like the moved nodes. Structure is not
     /// geometry: a canvas chooses what it draws for a *region* and re-chooses it when
     /// the view leaves that region, so an edit nobody announces is an edit no view ever
     /// notices (§28.4, §43).
-    pub edits: Vec<Edit>,
+    pub(crate) edits: Vec<Edit>,
     /// The size a new node is given, unless an operator is told another one.
     ///
     /// The canvas holds each node's rectangle and the model decides what a node *is*;
     /// between the two there is nobody to ask how big a node the user just asked for
     /// should be, so it is a setting rather than a guess.
-    pub new_node_size: Size,
+    pub(crate) new_node_size: Size,
     /// How a finished move becomes an undo step. [`journal`] unless replaced.
     ///
     /// A seam rather than a fixed choice because §38.4 measured the alternative — a
     /// snapshot of the whole graph per step — against the journal, and the measurement
     /// has to stay reproducible. The snapshot needs to know what a node *is*, which
     /// only the application does, so the application supplies it.
-    pub record_move: MoveRecorder<G>,
+    pub(crate) record_move: MoveRecorder<G>,
 }
 
 impl<G: NodeGraph> EditorWorld<G> {
+    /// The graph the operators act on (§68).
+    pub fn graph(&self) -> &SharedGraph<G> {
+        &self.graph
+    }
+
+    /// What is under the pointer, as the canvas last picked it.
+    pub fn hover(&self) -> Option<CanvasHit> {
+        self.hover
+    }
+
+    /// Where the pointer is, in canvas coordinates.
+    pub fn pointer(&self) -> Point {
+        self.pointer
+    }
+
+    /// Where the pointer is, in the editor's own coordinates — screen pixels.
+    pub fn pointer_screen(&self) -> Point {
+        self.pointer_screen
+    }
+
+    /// Screen pixels per canvas unit, as of the last event.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Where the canvas puts ports.
+    pub fn ports(&self) -> PortLayout {
+        self.ports
+    }
+
+    /// The rubber band of a box select, while one runs.
+    pub fn band(&self) -> Option<Rect> {
+        self.band
+    }
+
+    /// The links a link drag is drawing, while one runs.
+    pub fn link_preview(&self) -> Option<&LinkPreview> {
+        self.link_preview.as_ref()
+    }
+
+    /// How big a node `node.add` makes when the binding does not say.
+    pub fn new_node_size(&self) -> Size {
+        self.new_node_size
+    }
+
+    /// Sets how big a node `node.add` makes.
+    pub fn set_new_node_size(&mut self, size: Size) {
+        self.new_node_size = size;
+    }
+
+    /// Sets what is under the pointer and where it is — what the editor does before each
+    /// event, for a driver of its own (a test, a benchmark, a host seat) that picks for
+    /// itself.
+    pub fn set_pointer(&mut self, hover: Option<CanvasHit>, pos: Point) {
+        self.hover = hover;
+        self.pointer = pos;
+    }
+
+    /// Records that nodes moved past the operators' own setters — a step that put a whole
+    /// snapshot back — so that the views follow.
+    pub fn note_moved(&mut self, indices: impl IntoIterator<Item = usize>) {
+        self.moved.extend(indices);
+        self.dirty = true;
+    }
+
+    /// The nodes moved since the last time, taken — for a driver of its own that carries
+    /// the moves into its canvas, as the editor does after each event.
+    pub fn take_moved(&mut self) -> Vec<usize> {
+        self.dirty = false;
+        std::mem::take(&mut self.moved)
+    }
+
     /// A world over `graph`, with nothing selected and moves journalled.
     pub fn new(graph: &SharedGraph<G>) -> Self {
         Self {
@@ -403,7 +475,8 @@ pub struct MoveRecord {
     pub to: Vec<Point>,
 }
 
-/// Turns a finished move into an undo step. See [`EditorWorld::record_move`].
+/// Turns a finished move into an undo step. See
+/// [`NodeEditor::set_move_recorder`](crate::NodeEditor::set_move_recorder).
 ///
 /// Called once per move, when it is confirmed, with the graph already in its final
 /// state — so a recorder that wants the whole graph can read it from the world.

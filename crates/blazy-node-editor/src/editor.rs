@@ -20,7 +20,7 @@
 //!   (`RenderRoot::set_focus_fallback`), because a keymap has to hear the keys no focused widget claimed.
 //!
 //! Everything an operator does lands in the model. What comes back out is
-//! [`EditorWorld::moved`], and carrying that into this canvas and into the *other*
+//! which nodes moved ([`EditorWorld::take_moved`]), and carrying that into this canvas and into the *other*
 //! views of the same graph is this driver's job — §30's fan-out, moved from the
 //! canvas's own drag handler to here.
 
@@ -33,7 +33,7 @@ use std::rc::Rc;
 use blazy_canvas::{CanvasHit, CanvasLayer, CanvasStats, PortSide, wheel_pixels};
 use blazy_ops::event::{Device, OpEvent, Sample};
 use blazy_ops::keymap::{Props, Scope};
-use blazy_ops::runtime::{OpRuntime, Seat};
+use blazy_ops::runtime::{Dispatch, OpRuntime, Seat};
 use blazy_ops::{OpCounters, OpResult};
 use masonry::accesskit::{Node as AccessNode, Role};
 use masonry::core::keyboard::{KeyState, Modifiers};
@@ -69,14 +69,14 @@ use crate::{Change, EDGE_PAN, Edit, EditorWorld, MoveRecorder, NodeGraph, Shared
 /// (§38.4).
 pub struct EditorSession<G: NodeGraph> {
     /// Everything the operators may touch, selection included.
-    pub world: EditorWorld<G>,
+    pub(crate) world: EditorWorld<G>,
     /// The operators, their keymap, the modal stack and the undo history.
-    pub runtime: OpRuntime<EditorWorld<G>>,
+    pub(crate) runtime: OpRuntime<EditorWorld<G>>,
     /// Where the canvas is looking, mirrored from it on every layout.
     ///
     /// The canvas owns the view while it exists (§22 keeps it out of layout, so nothing
     /// else may drive it); this is the copy that outlives it.
-    pub view: Affine,
+    pub(crate) view: Affine,
     /// The editor widget showing this session, once it is in a tree.
     ///
     /// For a driver that has to send it keys: Masonry hands a key to the focused widget
@@ -84,23 +84,78 @@ pub struct EditorSession<G: NodeGraph> {
     /// several areas the driver points the fallback at the editor under the pointer —
     /// and an area knows its session, not its widgets. Recorded by the editor itself when
     /// it is added, and overwritten by the next one when the area is rebuilt elsewhere.
-    pub editor: Option<WidgetId>,
+    pub(crate) editor: Option<WidgetId>,
     /// How the view scrolls at the edge of the area during a gesture, or `None` for not at
     /// all — the default, which leaves a gesture carrying on past the border while the
     /// view stands still. A binding still has to ask for it ([`EDGE_PAN`](crate::EDGE_PAN)).
     ///
     /// The session's rather than the widget's, so that the choice goes with the area into
     /// another window, as the view and the history do (§44).
-    pub edge_pan: Option<EdgePan>,
+    pub(crate) edge_pan: Option<EdgePan>,
     /// The area's sidebar: shown or not, and how wide (§61).
     ///
     /// The session's, for the reason the view is: an area is built again when it is detached
     /// or a workspace is read, and what it showed has to come back with it. Shared with the
     /// area's widget, which reads it in layout and writes the width its grip is dragged to.
-    pub sidebar: blazy_areas::SidebarState,
+    pub(crate) sidebar: blazy_areas::SidebarState,
 }
 
 impl<G: NodeGraph> EditorSession<G> {
+    /// The world the area's operators act on (§68): the graph, the pointer, the selection.
+    pub fn world(&self) -> &EditorWorld<G> {
+        &self.world
+    }
+
+    /// The graph the area shows.
+    pub fn graph(&self) -> &SharedGraph<G> {
+        &self.world.graph
+    }
+
+    /// The area's operators, keymap and history — to read: what is bound, how deep the
+    /// history is, whether a gesture is running. Changing them goes through the session's
+    /// own methods or the editor (`NodeEditor::exec`).
+    pub fn runtime(&self) -> &OpRuntime<EditorWorld<G>> {
+        &self.runtime
+    }
+
+    /// The area's view: pan and zoom, which the session keeps across a detach (§44).
+    pub fn view(&self) -> Affine {
+        self.view
+    }
+
+    /// The editor widget showing the session, once it is in a tree — what a driver sends
+    /// keys to and a panel runs operators in.
+    pub fn editor(&self) -> Option<WidgetId> {
+        self.editor
+    }
+
+    /// Edge pan for gestures held at the area's border, if the application asked for it.
+    pub fn edge_pan(&self) -> Option<EdgePan> {
+        self.edge_pan
+    }
+
+    /// Asks for edge pan, or turns it off.
+    pub fn set_edge_pan(&mut self, edge_pan: Option<EdgePan>) {
+        self.edge_pan = edge_pan;
+    }
+
+    /// The area's sidebar: a shared cell, read by the area's widget in its layout (§61).
+    pub fn sidebar(&self) -> &blazy_areas::SidebarState {
+        &self.sidebar
+    }
+
+    /// Hands `event` to the runtime against this session's world, as the editor does —
+    /// for a driver of its own: a test, a benchmark, a host seat.
+    pub fn dispatch(&mut self, event: &OpEvent, scope: Scope<'_>, seat: Seat) -> Dispatch {
+        self.runtime.dispatch(&mut self.world, event, scope, seat)
+    }
+
+    /// Ends whatever gesture is running, cleaning up after it (§58) — what a detach and a
+    /// lost window focus do.
+    pub fn cancel_all(&mut self) {
+        self.runtime.cancel_all(&mut self.world);
+    }
+
     /// Records an edit of node `index`'s content, made past the operators — in the node's
     /// widget or a panel — as one step in this area's history (§67).
     ///
@@ -638,7 +693,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         this.widget.menu = None;
     }
 
-    /// Sets how a finished move becomes an undo step. See [`EditorWorld::record_move`].
+    /// Sets how a finished move becomes an undo step. The recorder is the world's, used when `node.move` ends.
     pub fn set_move_recorder(this: &mut WidgetMut<'_, Self>, recorder: MoveRecorder<G>) {
         if let Some(session) = this.widget.session.as_ref() {
             session.borrow_mut().world.record_move = recorder;

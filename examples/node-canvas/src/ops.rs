@@ -49,7 +49,7 @@ pub fn set_undo_mode(editor: &mut WidgetMut<'_, NodeEditor>, mode: UndoMode) {
 /// moment and the same work as when this lived inside the operator, so §38.4's numbers
 /// still measure what they measured.
 fn snapshot(world: &EditorWorld, record: MoveRecord) -> Box<dyn Step<EditorWorld>> {
-    let after = world.graph.borrow().snapshot();
+    let after = world.graph().borrow().snapshot();
     let mut before = after.clone();
     for (&index, &pos) in record.nodes.iter().zip(&record.from) {
         if let Some(node) = before[index].as_mut() {
@@ -87,13 +87,13 @@ impl Step<EditorWorld> for SnapshotStep {
 /// Puts a whole snapshot back, and tells the views about every node that moved.
 fn restore(world: &mut EditorWorld, nodes: &[Option<NodeState>]) {
     let changed: Vec<usize> = {
-        let graph = world.graph.borrow();
+        let graph = world.graph().borrow();
         (0..nodes.len().min(graph.names()))
             .filter(|&index| graph.try_node(index).map(|node| node.pos) != nodes[index].map(|node| node.pos))
             .collect()
     };
-    world.graph.borrow_mut().restore(nodes);
-    world.moved.extend(changed);
+    world.graph().borrow_mut().restore(nodes);
+    world.note_moved(changed);
 }
 
 /// A runtime with the node editor's operators registered and its keymap in force.

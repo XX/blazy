@@ -508,8 +508,8 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
 
     // Select the node first, so the grab has something to move. Through the same
     // runtime: the host seat is a driver like any other.
-    world.hover = probe(&mut harness, at, &mut probes);
-    world.pointer = at;
+    let hover = probe(&mut harness, at, &mut probes);
+    world.set_pointer(hover, at);
     runtime.exec(&mut world, "node.select", &Props::new().with_int("index", index as i64));
     apply(&mut harness, &mut world, &mut probes);
 
@@ -518,8 +518,8 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
     for _ in 0..repeats {
         // The key that starts the grab. A host seat has no focus to consult, which is
         // its other half: it decides for itself that this key is the keymap's.
-        world.pointer = at;
-        world.hover = probe(&mut harness, at, &mut probes);
+        let hover = probe(&mut harness, at, &mut probes);
+        world.set_pointer(hover, at);
         let key_event = blazy::ops::event::OpEvent::Key {
             key: Key::Character("g".into()),
             mods: Modifiers::empty(),
@@ -538,8 +538,8 @@ fn host_seat_row(count: usize, repeats: usize) -> OpsRow {
             let pos = at + Vec2::new(step as f64 * 3.0, 0.0);
             // Every event: probe for the context, then decide. What the tree never
             // gets is the point — a consumed event is not forwarded at all.
-            world.hover = probe(&mut harness, pos, &mut probes);
-            world.pointer = pos;
+            let hover = probe(&mut harness, pos, &mut probes);
+            world.set_pointer(hover, pos);
             let moved = blazy::ops::event::OpEvent::Move {
                 pos,
                 mods: Modifiers::empty(),
@@ -624,15 +624,14 @@ fn probe(harness: &mut TestHarness<NodeEditor>, pos: Point, probes: &mut usize) 
 
 /// Carries what the operators changed into the tree, from outside it.
 fn apply(harness: &mut TestHarness<NodeEditor>, world: &mut EditorWorld, probes: &mut usize) {
-    if world.moved.is_empty() {
-        world.dirty = false;
+    let mut moved = world.take_moved();
+    if moved.is_empty() {
         return;
     }
-    let mut moved = std::mem::take(&mut world.moved);
     moved.sort_unstable();
     moved.dedup();
     let positions: Vec<(usize, Point)> = {
-        let graph = world.graph.borrow();
+        let graph = world.graph().borrow();
         moved.iter().map(|&index| (index, graph.node(index).pos)).collect()
     };
     *probes += 1;

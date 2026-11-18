@@ -838,7 +838,7 @@ fn app(graph: &SharedGraph<Calc>, file: &Path) -> EditorApp<Calc> {
     })
     .with_edge_pan(EdgePan::default())
     .with_sidebar(|_area, session| {
-        let graph = session.borrow().world.graph.clone();
+        let graph = session.borrow().graph().clone();
         let session = session.clone();
         let panel = GraphPanel::new(&graph, move |graph, selection, panel| {
             panel_of(graph, &session, selection, panel)
@@ -1057,7 +1057,7 @@ mod tests {
             root.edit_base_layer(|mut widget| {
                 let screen = widget.downcast::<EditorScreen<Calc>>();
                 let session = screen.widget.payload(1).expect("two areas").clone();
-                session.borrow().sidebar.get()
+                session.borrow().sidebar().get()
             })
         };
 
@@ -1072,7 +1072,7 @@ mod tests {
         root.edit_base_layer(|mut widget| {
             let screen = widget.downcast::<EditorScreen<Calc>>();
             let session = screen.widget.payload(1).expect("two areas").clone();
-            session.borrow().sidebar.set(blazy::areas::Sidebar::new(true, 300.0));
+            session.borrow().sidebar().set(blazy::areas::Sidebar::new(true, 300.0));
         });
         let _ = first.perform(&mut cx, &mut root, ScreenAction::SaveWorkspace);
 
@@ -1113,7 +1113,7 @@ mod tests {
         let editors: Vec<WidgetId> = (0..2)
             .map(|area| {
                 let session = harness.root_widget().payload(area).expect("a session").clone();
-                session.borrow().editor.expect("an editor")
+                session.borrow().editor().expect("an editor")
             })
             .collect();
         let shows = |graph: &SharedGraph<Calc>| {
@@ -1252,8 +1252,8 @@ mod tests {
         let _ = harness.redraw();
         let areas = harness.root_widget().area_ids();
         let session = harness.root_widget().payload(0).expect("a session").clone();
-        let editor = session.borrow().editor.expect("an editor");
-        let before = session.borrow().runtime.history().depth();
+        let editor = session.borrow().editor().expect("an editor");
+        let before = session.borrow().runtime().history().depth();
 
         let field = fields(&harness, areas[0])[0];
         harness.focus_on(Some(field));
@@ -1262,7 +1262,7 @@ mod tests {
         harness.focus_on(None);
         pull(&mut harness, &graph);
         assert_eq!(
-            session.borrow().runtime.history().depth(),
+            session.borrow().runtime().history().depth(),
             before + 1,
             "two keys, one step"
         );

@@ -368,7 +368,7 @@ impl<G: NodeGraph> EditorApp<G> {
             let session = carried.take().unwrap_or_else(|| {
                 let session = session(&graph);
                 if edge_pan.is_some() {
-                    session.borrow_mut().edge_pan = edge_pan;
+                    session.borrow_mut().set_edge_pan(edge_pan);
                 }
                 session
             });
@@ -376,7 +376,7 @@ impl<G: NodeGraph> EditorApp<G> {
             let widget = match &sidebar {
                 Some(panel) => {
                     let content = AreaContent::new(vec![(RegionKind::Main, 0.0, main)])
-                        .with_sidebar(panel(area, &session), session.borrow().sidebar.clone());
+                        .with_sidebar(panel(area, &session), session.borrow().sidebar().clone());
                     NewWidget::new(content).erased()
                 },
                 None => main,
@@ -459,7 +459,7 @@ impl<G: NodeGraph> EditorApp<G> {
             // operator — so `Escape` over the next area still reaches the one it ends.
             let area = screen.hovered_area().or_else(|| screen.tree().areas().next());
             area.and_then(|area| screen.payload(area))
-                .and_then(|session| session.borrow().editor)
+                .and_then(|session| session.borrow().editor())
         };
         let Some(target) = target else {
             return;
@@ -537,7 +537,7 @@ impl<G: NodeGraph> EditorApp<G> {
                 }
                 on_hovered_area::<G>(root, |screen, area| {
                     if let Some(session) = screen.widget.payload(area) {
-                        let state = session.borrow().sidebar.clone();
+                        let state = session.borrow().sidebar().clone();
                         let mut sidebar = state.get();
                         sidebar.shown = !sidebar.shown;
                         state.set(sidebar);
@@ -593,7 +593,7 @@ impl<G: NodeGraph> EditorApp<G> {
                 if self.sidebar.is_some()
                     && let Some(session) = screen.widget.payload(area)
                 {
-                    workspace.set_sidebar(area, session.borrow().sidebar.get());
+                    workspace.set_sidebar(area, session.borrow().sidebar().get());
                 }
             }
             workspace.write()
@@ -627,7 +627,7 @@ impl<G: NodeGraph> EditorApp<G> {
                     let areas: Vec<AreaId> = screen.widget.tree().areas().collect();
                     for area in areas {
                         if let (Some(sidebar), Some(session)) = (workspace.sidebar(area), screen.widget.payload(area)) {
-                            session.borrow().sidebar.set(sidebar);
+                            session.borrow().sidebar().set(sidebar);
                         }
                         refresh_area(screen, area);
                     }
@@ -793,7 +793,7 @@ impl<G: NodeGraph> EditorApp<G> {
             let scope = blazy_ops::keymap::Scope(&blazy_node_editor::ops::CANVAS_SCOPE);
             session
                 .borrow()
-                .runtime
+                .runtime()
                 .keymap()
                 .matches(scope, &event)
                 .any(|binding| binding.op == "node.paste")
@@ -810,8 +810,8 @@ fn modal_editor<G: NodeGraph>(screen: &WidgetRef<'_, EditorScreen<G>>) -> Option
         .filter_map(|area| screen.payload(area))
         .find_map(|session| {
             let session = session.borrow();
-            if session.runtime.modal_depth() > 0 {
-                session.editor
+            if session.runtime().modal_depth() > 0 {
+                session.editor()
             } else {
                 None
             }
@@ -833,7 +833,7 @@ pub fn detach_area<G: NodeGraph>(
     let session = EditorScreen::<G>::detach(screen, area)?;
     {
         let session = &mut *session.borrow_mut();
-        session.runtime.cancel_all(&mut session.world);
+        session.cancel_all();
     }
     Some(session)
 }

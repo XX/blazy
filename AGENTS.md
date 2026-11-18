@@ -681,7 +681,7 @@ carry the scale.
 it that way: anything it cannot reach through `blazy` is a finding, not an import. It saves its
 graph through `EditorApp::on_save`, and `with_workspace` reads the workspace when the first
 window opens. Open findings, in order: typed `node.add`, a system clipboard for nodes, reloading
-a graph live, accessors instead of `EditorSession`/`EditorWorld` public fields. Results the
+a graph live. Results the
 library produces (`CanvasHit`, `OpEvent`, `Device`, shell frames) are `#[non_exhaustive]`;
 configs stay open because they are built with `..Default::default()`.
 
@@ -717,6 +717,13 @@ before; it remembers the value at the first key and calls
 node. Widgets that edit content therefore hold their area's session (`build`, `with_sidebar`).
 When backing files up in a shell script, name the copies by path, not by `basename`: `hello`
 and `calc` are both `main.rs`.
+
+**`EditorSession` and `EditorWorld` have no public fields (§68).** Outside the crate read them
+through methods (`graph()`, `editor()`, `sidebar()`, `runtime()`, `world().pointer()`…) and act
+through named calls (`dispatch`, `cancel_all`, `set_pointer`, `note_moved`, `take_moved`,
+`record_content`). Inside the crate the fields are `pub(crate)`, so editor tests set `hover` and
+`pointer` directly. A new field stays `pub(crate)` unless something outside needs it, and then
+it gets a method. `Detail` is exhaustive on purpose: a new level must break `NodeSource::build`.
 
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the

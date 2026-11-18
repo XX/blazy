@@ -246,6 +246,7 @@ impl OpEvent {
 
 /// What kind of event a binding fires on.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Trigger {
     /// A button going down.
     Press(PointerButton),

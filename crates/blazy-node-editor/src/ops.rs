@@ -8,7 +8,7 @@
 //! events instead of whatever is under the pointer.
 //!
 //! **Nothing here touches a widget.** An operator changes the graph — the truth, by
-//! §30 — and records in [`EditorWorld::moved`] which nodes a view has to follow. The
+//! §30 — and records in the world which nodes ([`EditorWorld::take_moved`]) a view has to follow. The
 //! driver ([`NodeEditor`](crate::NodeEditor)) carries that into the canvas afterwards.
 //! That separation is what makes [`Operator::exec`] worth having: the same operators
 //! run in a test with no widget tree at all, so "the key and the script do the same
@@ -424,7 +424,7 @@ impl MoveOp {
 ///
 /// An operator that changes no model state at all, which is why it is here: the view is
 /// the widget's, and an operator may not touch a widget (§38.3). So it leaves the
-/// movement in [`EditorWorld::pan`] and the driver carries it into the canvas, exactly
+/// movement in the world and the driver carries it into the canvas, exactly
 /// as it carries a moved node. In screen units, because the view moves under the
 /// pointer while this runs.
 ///

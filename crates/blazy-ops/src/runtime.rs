@@ -27,6 +27,7 @@ use crate::{OpCounters, OpResult, Operator};
 /// them can keep an event from the widget tree, and only the other two know what the
 /// event is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Seat {
     /// From the host, in front of `RenderRoot::handle_pointer_event`.
     ///
@@ -63,6 +64,7 @@ impl Seat {
 
 /// What a driver should do with the event it just offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Feed {
     /// The runtime took it. A pre-tree driver keeps it from the widget tree; a driver
     /// inside the tree marks it handled.
@@ -102,6 +104,7 @@ struct LastClick {
 
 /// What the runtime did with an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Dispatch {
     /// An operator took it. The driver should mark the event handled.
     Consumed,

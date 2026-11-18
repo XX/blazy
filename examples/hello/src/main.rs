@@ -469,7 +469,7 @@ fn properties_of(
     panel: WidgetId,
     session: &SessionHandle<Graph>,
 ) -> NewWidget<dyn Widget> {
-    let editor = session.borrow().editor;
+    let editor = session.borrow().editor();
     let row = |bar: Bar| NewWidget::new(bar).with_props(ScaleCarrier::of::<Bar>()).erased();
     let caption = |text: String| NewWidget::new(Label::new(text)).erased();
     let metrics = Metrics {
@@ -712,7 +712,7 @@ fn app(graph: &SharedGraph<Graph>) -> EditorApp<Graph> {
     // the selected node.
     .with_sidebar(|_area, session| {
         let session = session.clone();
-        let graph = session.borrow().world.graph.clone();
+        let graph = session.borrow().graph().clone();
         let panel = GraphPanel::new(&graph, move |graph, selection, panel| {
             properties_of(graph, selection, panel, &session)
         });
@@ -1037,7 +1037,7 @@ mod tests {
         let area_widgets = harness.root_widget().area_ids();
         for (area, &id) in area_widgets.iter().enumerate() {
             let session = harness.root_widget().payload(area).expect("a session").clone();
-            session.borrow().sidebar.set(blazy::areas::Sidebar::new(true, 240.0));
+            session.borrow().sidebar().set(blazy::areas::Sidebar::new(true, 240.0));
             harness.edit_widget_with_id(id, |mut widget| {
                 blazy::areas::AreaContent::refresh(&mut widget.downcast::<blazy::areas::AreaContent>());
             });
@@ -1145,7 +1145,7 @@ mod tests {
         let area_widgets = harness.root_widget().area_ids();
         for (area, &id) in area_widgets.iter().enumerate() {
             let session = harness.root_widget().payload(area).expect("a session").clone();
-            session.borrow().sidebar.set(blazy::areas::Sidebar::new(true, 240.0));
+            session.borrow().sidebar().set(blazy::areas::Sidebar::new(true, 240.0));
             harness.edit_widget_with_id(id, |mut widget| {
                 blazy::areas::AreaContent::refresh(&mut widget.downcast::<blazy::areas::AreaContent>());
             });
@@ -1153,7 +1153,7 @@ mod tests {
         let _ = harness.redraw();
         let editors = editor_ids(&harness);
         let session = harness.root_widget().payload(0).expect("a session").clone();
-        let depth = || session.borrow().runtime.history().depth();
+        let depth = || session.borrow().runtime().history().depth();
         let panel_field = |harness: &TestHarness<blazy::app::EditorScreen<Graph>>, area: usize| {
             let content = harness.get_widget_with_id(area_widgets[area]);
             let panel = content

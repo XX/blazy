@@ -564,8 +564,7 @@ pub(crate) fn detach_row(areas: usize, nodes: usize) -> DetachRow {
         .expect("every area carries its session");
     {
         let running = &mut *running.borrow_mut();
-        running.runtime.dispatch(
-            &mut running.world,
+        running.dispatch(
             &OpEvent::Key {
                 key: Key::Character("g".into()),
                 mods: Modifiers::empty(),
@@ -574,7 +573,7 @@ pub(crate) fn detach_row(areas: usize, nodes: usize) -> DetachRow {
             Scope(&CANVAS_SCOPE),
             Seat::Tree,
         );
-        assert!(running.runtime.modal_depth() > 0, "a grab is running");
+        assert!(running.runtime().modal_depth() > 0, "a grab is running");
     }
 
     let clock = Instant::now();
@@ -584,7 +583,7 @@ pub(crate) fn detach_row(areas: usize, nodes: usize) -> DetachRow {
     let ms = clock.elapsed().as_secs_f64() * 1000.0;
     let _ = screen.redraw();
 
-    let still_running = session.borrow().runtime.modal_depth();
+    let still_running = session.borrow().runtime().modal_depth();
     let detached = ScreenSpec::new(1, nodes)
         .with_ops(true)
         .over_with(&graph, Some(session));

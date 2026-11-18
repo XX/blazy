@@ -72,6 +72,7 @@ const NEAREST_ACCURACY: f64 = 0.001;
 
 /// What counts as being on the shape.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum HitMode {
     /// Inside the filled area.
     ///

@@ -91,6 +91,7 @@ use crate::runtime::OpCtx;
 /// and `PassThrough` is how a modal operator says "this one is not mine" without
 /// giving up its place on the stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OpResult {
     /// The operator is modal: it stays on the stack and gets the following events.
     Running,

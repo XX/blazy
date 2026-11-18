@@ -546,7 +546,7 @@ fn one_file_overrides_the_editor_and_the_screen() {
     // And the editors of this application run with the same file in force.
     let screen = app.screen(SplitTree::balanced(1));
     let session = screen.payload(0).expect("an area carries a session").clone();
-    let keymap = session.borrow().runtime.keymap().clone();
+    let keymap = session.borrow().runtime().keymap().clone();
     let event = OpEvent::Key {
         key: Key::Character("d".into()),
         mods: Modifiers::empty(),
@@ -1066,7 +1066,7 @@ fn a_copy_pastes_in_another_area_and_reaches_another_window() {
     assert_eq!(graph.borrow().node_count(), 10, "the other area pasted");
     assert!(graph.borrow().links.contains(&Link::new(8, 9)), "with the link between");
     let at = edit_editor(&mut root, 1, |editor| {
-        editor.widget.session().expect("a session").borrow().world.pointer
+        editor.widget.session().expect("a session").borrow().world().pointer()
     });
     let pasted = graph.borrow().node_rect(8).union(graph.borrow().node_rect(9));
     assert_eq!(pasted.center(), at, "at the pointer of the area that pasted");
@@ -1329,7 +1329,7 @@ fn n_shows_the_sidebar_of_the_area_under_the_pointer_and_it_outlives_the_area() 
         root.edit_base_layer(|mut widget| {
             let screen = widget.downcast::<EditorScreen<Grid>>();
             let session = screen.widget.payload(area).expect("a session").clone();
-            session.borrow().sidebar.get()
+            session.borrow().sidebar().get()
         })
     };
     let builds = |root: &mut RenderRoot| {
@@ -1407,7 +1407,7 @@ fn edit_editor_in_area(root: &mut RenderRoot, area: usize) -> WidgetId {
     root.edit_base_layer(|mut widget| {
         let screen = widget.downcast::<EditorScreen<Grid>>();
         let session = screen.widget.payload(area).expect("a session").clone();
-        session.borrow().editor.expect("an editor in the tree")
+        session.borrow().editor().expect("an editor in the tree")
     })
 }
 
