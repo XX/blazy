@@ -725,6 +725,14 @@ through named calls (`dispatch`, `cancel_all`, `set_pointer`, `note_moved`, `tak
 `pointer` directly. A new field stays `pub(crate)` unless something outside needs it, and then
 it gets a method. `Detail` is exhaustive on purpose: a new level must break `NodeSource::build`.
 
+**A graph replaced while running starts every view over (§69).** `EditorApp::on_load`
+cancels the window's gestures *before* the hook (a cancel after would write old positions into
+the new graph), the hook replaces the graph's contents and must move the old `Views` into the
+new graph, then `Views::graph_replaced` owes every view `Change::Reset` (delivered only by
+`sync_canvas`, which has the links), clears selection/stacking/clip and bumps the generation;
+each editor clears its history when its layout sees a new generation. `CanvasLayer` keeps its
+geometry callback for `reset`. `NodeGraph::names()` is the name count (holes included).
+
 **A far-field link has to be visible to be worth drawing (§53).** Link width is in canvas
 units (§31.3), so at an overview zoom of 0.02 a link was 0.04 px wide: no 16x16 block of the
 frame showed any, while drawing them cost three quarters of a CPU frame. The far field now

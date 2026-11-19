@@ -283,6 +283,10 @@ impl NodeGraph for GraphModel {
         self.len()
     }
 
+    fn names(&self) -> usize {
+        GraphModel::names(self)
+    }
+
     fn node_rect(&self, index: usize) -> Rect {
         let pos = self.try_node(index).map_or(Point::ORIGIN, |node| node.pos);
         Rect::from_origin_size(pos, NODE_SIZE)

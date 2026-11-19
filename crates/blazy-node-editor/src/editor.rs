@@ -312,6 +312,9 @@ pub struct NodeEditor<G: NodeGraph> {
     /// selection touches the nodes that changed and no others — a box select of a
     /// thousand nodes and one more click should cost one class, not a thousand.
     shown: BTreeSet<usize>,
+    /// The graph's generation this editor last saw: a newer one means the graph was
+    /// replaced as a whole, and the history is started over (§69).
+    generation: u64,
     /// The menu this editor opened and has not seen closed, by its layer's root.
     menu: Option<WidgetId>,
     /// What the pointer was over when the press now held was made.
@@ -370,6 +373,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             hud_next: String::new(),
             hud_layout: None,
             shown: BTreeSet::new(),
+            generation: 0,
             menu: None,
             press_hover: None,
             port_hint: None,
@@ -1749,6 +1753,20 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     }
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
+        // The graph was replaced as a whole since this editor last looked (§69): its
+        // history names nodes of a graph that is gone, and the classes it set went with the
+        // node widgets the canvas dropped. Here, because a reset reaches the canvas from the
+        // window's pull, and the canvas's layout is this editor's too.
+        if let Some(session) = self.session.clone() {
+            let generation = session.borrow().world.graph.borrow().views().generation();
+            if generation != self.generation {
+                self.generation = generation;
+                let session = &mut *session.borrow_mut();
+                session.runtime.cancel_all(&mut session.world);
+                session.runtime.history_mut().clear();
+                self.shown.clear();
+            }
+        }
         let canvas_size = ctx.compute_size(&mut self.canvas, SizeDef::fixed(size), size.into());
         ctx.run_layout(&mut self.canvas, canvas_size);
         ctx.place_child(&mut self.canvas, Point::ORIGIN);

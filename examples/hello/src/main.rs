@@ -127,6 +127,10 @@ impl NodeGraph for Graph {
         self.nodes.iter().flatten().count()
     }
 
+    fn names(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn node_rect(&self, index: usize) -> Rect {
         self.nodes.get(index).copied().flatten().unwrap_or_default()
     }

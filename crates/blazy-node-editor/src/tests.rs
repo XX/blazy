@@ -58,6 +58,10 @@ impl NodeGraph for Row {
         self.rects.iter().flatten().count()
     }
 
+    fn names(&self) -> usize {
+        self.rects.len()
+    }
+
     fn node_rect(&self, index: usize) -> Rect {
         self.rects[index].unwrap_or_default()
     }

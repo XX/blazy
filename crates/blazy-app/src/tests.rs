@@ -57,6 +57,10 @@ impl NodeGraph for Grid {
         self.rects.iter().flatten().count()
     }
 
+    fn names(&self) -> usize {
+        self.rects.len()
+    }
+
     fn node_rect(&self, index: usize) -> Rect {
         self.rects.get(index).copied().flatten().unwrap_or_default()
     }
@@ -1477,4 +1481,121 @@ fn a_copy_crosses_to_another_process_through_the_system_clipboard() {
         Modifiers::CONTROL,
     );
     assert_eq!(other.borrow().node_count(), 8, "this process's copy, pasted again");
+}
+
+/// `Ctrl+O` with an `on_load` replaces the graph while the application runs: both areas of
+/// the window start over from the new graph at once, a second window when it next draws;
+/// the selection and every area's history are gone, and a gesture running in the window was
+/// ended first.
+#[test]
+fn a_graph_read_while_running_replaces_every_view_and_starts_the_history_over() {
+    let graph = Grid::new(8);
+    let mut app = app(&graph).on_load(|grid: &mut Grid| {
+        // Three nodes and a link, read "from a file"; the registry stays.
+        let mut fresh = Grid {
+            rects: (0..3)
+                .map(|i| Some(Rect::from_origin_size((20.0 + i as f64 * 200.0, 300.0), NODE)))
+                .collect(),
+            links: vec![Link::new(0, 1)],
+            ..Grid::default()
+        };
+        std::mem::swap(&mut fresh.views, &mut grid.views);
+        *grid = fresh;
+        true
+    });
+    let mut root = window(&app, 2);
+    let mut other = window(&app, 1);
+    let mut cx = ShellCtx::new();
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+
+    // History and a selection in the first area, and a grab running in it that has moved
+    // node 1 — a name the new graph has too.
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(100.0, 100.0));
+    edit_editor(&mut root, 0, |editor| {
+        NodeEditor::exec(editor, "link.add", &Props::new().with_int("from", 2).with_int("to", 3));
+        NodeEditor::exec(editor, "node.select", &Props::new().with_int("index", 1));
+    });
+    chord(&mut app, &mut cx, key, &mut root, "g", Modifiers::empty());
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(150.0, 130.0));
+    assert_ne!(
+        graph.borrow().node_rect(1).origin(),
+        Point::new(180.0, 20.0),
+        "node 1 is being moved"
+    );
+    // A node widget of the old graph, to see it leave the tree.
+    let old_widget = edit_editor(&mut root, 0, |editor| {
+        NodeEditor::with_canvas(editor, |mut canvas| {
+            CanvasLayer::live_children(&mut canvas)
+                .into_iter()
+                .find(|&(index, _)| index == 5)
+                .map(|(_, id)| id)
+        })
+    })
+    .expect("node 5 has a widget");
+    let session = root.edit_base_layer(|mut widget| {
+        widget
+            .downcast::<EditorScreen<Grid>>()
+            .widget
+            .payload(0)
+            .expect("a session")
+            .clone()
+    });
+    assert!(session.borrow().runtime().modal_depth() > 0, "a grab is running");
+    assert!(session.borrow().runtime().history().depth() > 0);
+
+    app.perform(&mut cx, &mut root, crate::ScreenAction::LoadWorkspace);
+    let _ = root.redraw();
+    assert_eq!(graph.borrow().rects.len(), 3, "the graph is the one read");
+    assert_eq!(session.borrow().runtime().modal_depth(), 0, "the grab was ended");
+    assert_eq!(
+        graph.borrow().node_rect(1).origin(),
+        Point::new(220.0, 300.0),
+        "ended before the graph was replaced: cancelled after, it put the old node 1's place on the new one"
+    );
+    assert!(
+        root.get_widget(old_widget).is_none(),
+        "the old graph's node widgets left the tree"
+    );
+    assert_eq!(
+        session.borrow().runtime().history().depth(),
+        0,
+        "the history starts over"
+    );
+    assert!(
+        graph.borrow().views().selection().is_empty(),
+        "the selection was the old graph's"
+    );
+    for area in 0..2 {
+        assert_eq!(shown(&mut root, area), 3, "area {area} shows the new graph");
+        let live = with_widget(&mut root, area);
+        assert!(
+            live.iter().all(|&index| index < 3),
+            "area {area}: no widget of the old graph: {live:?}"
+        );
+        let link = edit_editor(&mut root, area, |editor| {
+            NodeEditor::with_canvas(editor, |mut canvas| {
+                CanvasLayer::link_name(&mut canvas, Link::new(0, 1))
+            })
+        });
+        assert!(link.is_some(), "area {area} draws the new graph's link");
+    }
+
+    // The other window, when it draws.
+    assert!(
+        graph.borrow().views().has_pending(),
+        "the other window is owed the new graph"
+    );
+    app.pull(&mut other);
+    let _ = other.redraw();
+    assert_eq!(shown(&mut other, 0), 3, "the second window shows it too");
+    let other_session = other.edit_base_layer(|mut widget| {
+        widget
+            .downcast::<EditorScreen<Grid>>()
+            .widget
+            .payload(0)
+            .expect("a session")
+            .clone()
+    });
+    assert_eq!(other_session.borrow().runtime().history().depth(), 0);
 }

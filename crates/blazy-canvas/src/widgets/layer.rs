@@ -82,6 +82,9 @@ pub struct CanvasLayer {
     peers: Vec<WidgetId>,
     /// Links handed to [`CanvasLayer::with_links`] before the canvas was in a tree.
     pending_links: Option<Vec<Link>>,
+    /// Where each node is, by name — kept from [`new`](Self::new) for a
+    /// [`reset`](Self::reset), which reads the whole graph again (§69).
+    geometry: Box<dyn FnMut(usize) -> Option<(Point, Size)>>,
     link_style: LinkStyle,
     ports: PortLayout,
 }
@@ -101,23 +104,11 @@ impl CanvasLayer {
     /// names in a saved selection would mean different nodes in different views.
     pub fn new(
         count: usize,
-        mut geometry: impl FnMut(usize) -> Option<(Point, Size)>,
+        geometry: impl FnMut(usize) -> Option<(Point, Size)> + 'static,
         source: impl NodeSource,
     ) -> Self {
-        let slots = (0..count)
-            .map(|i| match geometry(i) {
-                Some((pos, size)) => Slot {
-                    alive: true,
-                    pos,
-                    size,
-                    pod: None,
-                    built: None,
-                    classes: Vec::new(),
-                    raised: 0,
-                },
-                None => EMPTY_SLOT,
-            })
-            .collect();
+        let mut geometry: Box<dyn FnMut(usize) -> Option<(Point, Size)>> = Box::new(geometry);
+        let slots = slots_of(count, &mut geometry);
         Self {
             content: WidgetPod::new(CanvasContent::new(slots, Box::new(source))),
             view: Affine::IDENTITY,
@@ -141,7 +132,24 @@ impl CanvasLayer {
             pending_links: None,
             link_style: LinkStyle::default(),
             ports: PortLayout::default(),
+            geometry,
         }
+    }
+
+    /// Starts over from the graph: `count` names, each where the geometry callback says
+    /// now, and `links` — what [`new`](Self::new) and [`with_links`](Self::with_links) did,
+    /// for a graph replaced as a whole (a file read while the application runs, §69).
+    ///
+    /// Every node widget leaves the tree and the ones in view are built again from the
+    /// source; classes and the stacking order go with them, because they were the old
+    /// graph's. The view — pan and zoom — stays: it is the user's, not the graph's.
+    pub fn reset(this: &mut WidgetMut<'_, Self>, count: usize, links: Vec<Link>) {
+        let slots = slots_of(count, &mut this.widget.geometry);
+        {
+            let mut content = this.ctx.get_mut(&mut this.widget.content);
+            CanvasContent::reset(&mut content, slots, links);
+        }
+        this.ctx.request_layout();
     }
 
     /// Adds edges between nodes.
@@ -1121,4 +1129,22 @@ impl Widget for CanvasLayer {
     }
 
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
+}
+
+/// A slot per name, from where the geometry callback says each node is.
+fn slots_of(count: usize, geometry: &mut dyn FnMut(usize) -> Option<(Point, Size)>) -> Vec<Slot> {
+    (0..count)
+        .map(|i| match geometry(i) {
+            Some((pos, size)) => Slot {
+                alive: true,
+                pos,
+                size,
+                pod: None,
+                built: None,
+                classes: Vec::new(),
+                raised: 0,
+            },
+            None => EMPTY_SLOT,
+        })
+        .collect()
 }

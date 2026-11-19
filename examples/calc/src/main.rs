@@ -11,6 +11,8 @@
 //! cargo make run-calc my.graph   # or a graph of your own, with my.workspace beside it
 //! ```
 //!
+//! `Ctrl+S` writes both files; `Ctrl+O` reads both back while the application runs.
+//!
 //! `Shift+A` opens the `Add` menu of the four kinds, from the graph's own list (§64).
 
 use std::collections::BTreeSet;
@@ -812,6 +814,7 @@ fn properties() -> DefaultProperties {
 fn app(graph: &SharedGraph<Calc>, file: &Path) -> EditorApp<Calc> {
     let graph_of_areas = graph.clone();
     let file_to_save = file.to_path_buf();
+    let file_to_load = file.to_path_buf();
     EditorApp::new(graph, move |_area, session| {
         let graph = graph_of_areas.clone();
         let (names, links) = {
@@ -854,6 +857,24 @@ fn app(graph: &SharedGraph<Calc>, file: &Path) -> EditorApp<Calc> {
             Err(error) => eprintln!("{}: {error}", file_to_save.display()),
         },
     )
+    // `Ctrl+O` reads the graph back from its file while the application runs (§69).
+    .on_load(move |calc| {
+        let read = std::fs::read_to_string(&file_to_load)
+            .map_err(|error| error.to_string())
+            .and_then(|text| Calc::read(&text).map_err(|line| format!("line {line} could not be read")));
+        match read {
+            Ok(mut fresh) => {
+                // The registry stays: every canvas over the graph is registered in it.
+                std::mem::swap(&mut fresh.views, &mut calc.views);
+                *calc = fresh;
+                true
+            },
+            Err(error) => {
+                eprintln!("{}: {error}", file_to_load.display());
+                false
+            },
+        }
+    })
 }
 
 /// The graph in `file`, or the sample if there is none yet.
@@ -1279,5 +1300,55 @@ mod tests {
                 "(2 + 3) × 3 again in {area:?}"
             );
         }
+    }
+
+    /// `Ctrl+S`, a change, `Ctrl+O`: the graph saved is the graph again, in the running
+    /// application — and a file that does not read leaves the graph as it is.
+    #[test]
+    fn ctrl_o_reads_the_saved_graph_back_while_running() {
+        use blazy::app::ScreenAction;
+        use blazy::masonry::app::{RenderRoot, RenderRootOptions, WindowSizePolicy};
+        use blazy::shell::window::{ShellCtx, ShellDriver};
+
+        let file = std::env::temp_dir().join(format!("calc-reload-{}.graph", std::process::id()));
+        let graph = Rc::new(RefCell::new(Calc::sample()));
+        let mut running = app(&graph, &file);
+        let mut root = RenderRoot::new(
+            NewWidget::new(running.screen(SplitTree::balanced(2))).erased(),
+            |_signal| {},
+            RenderRootOptions {
+                default_properties: std::sync::Arc::new(properties()),
+                use_system_fonts: false,
+                size_policy: WindowSizePolicy::User,
+                size: PhysicalSize::new(1200, 600),
+                scale_factor: 1.0,
+                test_font: None,
+            },
+        );
+        let _ = root.redraw();
+        let mut cx = ShellCtx::new();
+        let key = cx.name_window();
+        running.started(&mut cx, key, &mut root);
+
+        let _ = running.perform(&mut cx, &mut root, ScreenAction::SaveWorkspace);
+        let saved = graph.borrow().write();
+        let _ = graph.borrow_mut().remove_node(4);
+        assert_ne!(graph.borrow().write(), saved);
+
+        let _ = running.perform(&mut cx, &mut root, ScreenAction::LoadWorkspace);
+        let _ = root.redraw();
+        assert_eq!(graph.borrow().write(), saved, "the graph saved, back");
+        assert_eq!(graph.borrow().views().len(), 2, "both views still registered with it");
+
+        std::fs::write(&file, "not a graph").expect("a temporary file");
+        let _ = running.perform(&mut cx, &mut root, ScreenAction::LoadWorkspace);
+        assert_eq!(
+            graph.borrow().write(),
+            saved,
+            "a file that does not read changes nothing"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("workspace"));
     }
 }

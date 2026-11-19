@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use blazy_canvas::CanvasLayer;
+use blazy_canvas::{CanvasLayer, Link};
 use masonry::core::{WidgetId, WidgetMut};
 use masonry::kurbo::Point;
 
@@ -52,6 +52,13 @@ pub enum Change {
     /// graph's, as in Blender — kept per area, a node dragged in one area moved in the
     /// other while a different node there looked selected.
     Selection,
+    /// The graph was replaced as a whole — a file read while the application runs (§69):
+    /// the view starts over with `count` names and the links the registry kept with the
+    /// change ([`Views::graph_replaced`]).
+    Reset {
+        /// How many names the new graph uses.
+        count: usize,
+    },
 }
 
 /// What a graph's views have been through, summed over the registry's life.
@@ -134,6 +141,12 @@ struct Ledger {
     /// model, so all it needs to know is *that* something changed, and many changes before
     /// a frame cost one refresh.
     watchers: Vec<(WidgetId, bool, Refresh)>,
+    /// How many times the graph has been replaced as a whole; an editor that has seen fewer
+    /// starts its history over (§69).
+    generation: u64,
+    /// The links of the graph as it was when it was last replaced, for the views that start
+    /// over from it.
+    replacement: Option<Rc<[Link]>>,
 }
 
 /// What brings a watcher up to date, given its `WidgetMut`. A function rather than a
@@ -328,6 +341,60 @@ impl Views {
         ledger.offered = (ledger.clip_text.as_ref() != Some(&text)).then_some(text);
     }
 
+    /// Says that the graph was replaced as a whole — read from a file while the application
+    /// runs — and that every view has to start over from it (§69).
+    ///
+    /// What belonged to the old graph goes: the selection and the stacking order (names in
+    /// the new graph mean other nodes), the copy in the process and anything on its way to
+    /// the system clipboard, and everything the views were still owed — a view now owes one
+    /// thing, [`Change::Reset`]. Every watcher is owed a refresh. Each editor starts its
+    /// history over when it sees the new [`generation`](Self::generation), as Blender's Open
+    /// does: steps name nodes of a graph that is gone.
+    ///
+    /// Call with the graph already replaced, after the gestures over it were cancelled.
+    pub fn graph_replaced<G: crate::NodeGraph>(&self, graph: &G) {
+        let count = graph.names();
+        let links: Vec<Link> = (0..count)
+            .flat_map(|index| {
+                graph
+                    .links_of(index)
+                    .into_iter()
+                    .filter(move |l| l.from as usize == index)
+            })
+            .collect();
+        let mut ledger = self.0.borrow_mut();
+        ledger.selection.clear();
+        ledger.stacking.clear();
+        ledger.clip = None;
+        ledger.clip_text = None;
+        ledger.outbound = None;
+        ledger.offered = None;
+        ledger.generation += 1;
+        ledger.replacement = Some(links.into());
+        for (_, owed) in &mut ledger.views {
+            owed.clear();
+            owed.push(Change::Reset { count });
+        }
+        for (_, owed, _) in &mut ledger.watchers {
+            *owed = true;
+        }
+    }
+
+    /// How many times the graph has been replaced as a whole.
+    pub fn generation(&self) -> u64 {
+        self.0.borrow().generation
+    }
+
+    /// The links a view that starts over is given.
+    fn replacement(&self) -> Vec<Link> {
+        self.0
+            .borrow()
+            .replacement
+            .as_deref()
+            .map(<[Link]>::to_vec)
+            .unwrap_or_default()
+    }
+
     /// The offered text, taken: what `node.paste` reads once.
     pub(crate) fn take_offered(&self) -> Option<String> {
         self.0.borrow_mut().offered.take()
@@ -516,7 +583,12 @@ impl Drop for WatchToken {
 pub fn sync_canvas(canvas: &mut WidgetMut<'_, CanvasLayer>, views: &Views) -> usize {
     let changes = views.take(canvas.ctx.widget_id());
     for &change in &changes {
-        apply(canvas, change);
+        match change {
+            // Only the pull carries a reset: it is the one path with the registry at hand,
+            // and a replaced graph reaches every window through it (§69).
+            Change::Reset { count } => CanvasLayer::reset(canvas, count, views.replacement()),
+            change => apply(canvas, change),
+        }
     }
     changes.len()
 }
@@ -571,5 +643,8 @@ pub(crate) fn apply(canvas: &mut WidgetMut<'_, CanvasLayer>, change: Change) {
         // travels up to it: an editor re-reads the selection after its layout. A layout of
         // the canvas per click, never per frame.
         Change::Selection => canvas.ctx.request_layout(),
+        Change::Reset { .. } => {
+            debug_assert!(false, "a reset is delivered by `sync_canvas`, which has the links");
+        },
     }
 }

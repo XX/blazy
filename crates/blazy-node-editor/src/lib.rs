@@ -77,6 +77,17 @@ pub trait NodeGraph: 'static {
     /// How many nodes the graph holds.
     fn node_count(&self) -> usize;
 
+    /// How many names the graph uses: one past the highest, holes a removal left included —
+    /// what a canvas is built over (`CanvasLayer::new`), and what a view that starts over
+    /// from a replaced graph is given (§69).
+    ///
+    /// Defaulted to [`node_count`](Self::node_count), which is the answer for a graph with no
+    /// holes; a graph that frees names answers its own, or the nodes past the count would be
+    /// missing from every view that starts over.
+    fn names(&self) -> usize {
+        self.node_count()
+    }
+
     /// Where node `index` is, in canvas coordinates.
     fn node_rect(&self, index: usize) -> Rect;
 

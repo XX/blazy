@@ -918,6 +918,31 @@ impl CanvasContent {
     /// Runs in the mutate pass, which is where adding and removing children is
     /// legal. The mutate pass runs before the layout pass inside the rewrite loop,
     /// so a node entering the view is built, laid out and painted in the same frame.
+    /// Takes every node widget out and starts over with `slots` and `links` (§69).
+    fn reset(this: &mut WidgetMut<'_, Self>, slots: Vec<Slot>, links: Vec<Link>) {
+        for slot in &mut this.widget.slots {
+            if let Some(pod) = slot.pod.take() {
+                this.ctx.remove_child(pod);
+            }
+        }
+        let content = &mut *this.widget;
+        content.index = SpatialIndex::build(slots.iter().map(|s| Rect::from_origin_size(s.pos, s.size)));
+        content.alive_nodes = slots.iter().filter(|slot| slot.alive).count();
+        content.links = LinkLayer::new(links, slots.len());
+        content.slots = slots;
+        content.live.clear();
+        content.order.clear();
+        content.fresh.clear();
+        content.active = None;
+        content.hovered = None;
+        content.pending = None;
+        content.pending_stale = false;
+        content.structure_changed();
+        this.ctx.children_changed();
+        this.ctx.request_layout();
+        this.ctx.request_paint_only();
+    }
+
     fn apply_pending(this: &mut WidgetMut<'_, Self>) {
         let Some(desired) = this.widget.pending.take() else {
             return;

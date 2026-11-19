@@ -107,6 +107,9 @@ type BuildArea<G> = dyn Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget>;
 /// What an application writes beside the workspace when it is saved.
 type SaveGraph<G> = dyn Fn(&SharedGraph<G>);
 
+/// What an application reads into its graph when the workspace is read; `true` if it did.
+type LoadGraph<G> = dyn Fn(&mut G) -> bool;
+
 /// What fills one area's sidebar, given the session the area shows.
 type BuildSidebar<G> = dyn Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget>;
 
@@ -154,6 +157,8 @@ pub struct EditorApp<G: NodeGraph> {
     workspace: Option<PathBuf>,
     /// What the application writes beside the workspace when it is saved — its graph (§63).
     on_save: Option<Rc<SaveGraph<G>>>,
+    /// What replaces the graph when the workspace is read — its file (§69).
+    on_load: Option<Rc<LoadGraph<G>>>,
     /// Whether the workspace file has been read at startup yet.
     restored: bool,
     layers: bool,
@@ -199,6 +204,7 @@ impl<G: NodeGraph> EditorApp<G> {
             keys: ScreenKeys::default(),
             workspace: None,
             on_save: None,
+            on_load: None,
             restored: false,
             layers: true,
             tree: SplitTree::balanced(1),
@@ -326,6 +332,26 @@ impl<G: NodeGraph> EditorApp<G> {
     #[must_use]
     pub fn on_save(mut self, save: impl Fn(&SharedGraph<G>) + 'static) -> Self {
         self.on_save = Some(Rc::new(save));
+        self
+    }
+
+    /// Runs `load` whenever the workspace is read ([`ScreenAction::LoadWorkspace`], `Ctrl+O`),
+    /// before the screen is: the application reads its graph's file and replaces the
+    /// graph's contents, and answers whether it did (§69).
+    ///
+    /// **Replace the contents, keep the registry.** The graph's [`Views`](blazy_node_editor::Views)
+    /// is what every canvas over the graph is registered in; a graph built afresh carries an
+    /// empty one, and putting it in place of the old would leave every view registered
+    /// nowhere. Move the old registry into the new graph before swapping them.
+    ///
+    /// The rest is the library's: the gestures running in the window are cancelled before
+    /// the hook runs, and after it every view in every window starts over from the new
+    /// graph, the selection and the copy in the process go, and every area's history starts
+    /// over — as Blender's Open does. Not called at startup: a graph read before the first
+    /// window is just the graph the application starts with.
+    #[must_use]
+    pub fn on_load(mut self, load: impl Fn(&mut G) -> bool + 'static) -> Self {
+        self.on_load = Some(Rc::new(load));
         self
     }
 
@@ -607,7 +633,42 @@ impl<G: NodeGraph> EditorApp<G> {
         }
     }
 
-    fn load(&self, root: &mut RenderRoot) {
+    /// Replaces the graph through the application's `on_load`, if it has one and it reads.
+    fn reload_graph(&mut self, root: &mut RenderRoot) {
+        let Some(load) = self.on_load.clone() else {
+            return;
+        };
+        // A gesture holds names of the graph about to go; it ends first, cleaning up (§58).
+        // Gestures in other windows end when their editors see the new generation.
+        with_screen::<G, _>(root, |screen| {
+            let areas: Vec<AreaId> = screen.widget.tree().areas().collect();
+            for area in areas {
+                if let Some(session) = screen.widget.payload(area) {
+                    session.borrow_mut().cancel_all();
+                }
+            }
+        });
+        let replaced = load(&mut self.graph.borrow_mut());
+        if !replaced {
+            return;
+        }
+        {
+            let graph = self.graph.borrow();
+            graph.views().graph_replaced(&*graph);
+        }
+        // This window starts over now; the others when they next draw (§44.3).
+        self.pull(root);
+        tracing::info!("graph read");
+    }
+
+    /// `Ctrl+O`: the graph, through the application, then the screen.
+    fn load(&mut self, root: &mut RenderRoot) {
+        self.reload_graph(root);
+        self.load_workspace(root);
+    }
+
+    /// The screen alone, from the workspace file — what the first window does at startup.
+    fn load_workspace(&self, root: &mut RenderRoot) {
         let Some(path) = &self.workspace else {
             tracing::info!("no workspace file to read from");
             return;
@@ -649,7 +710,7 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         if !self.restored {
             self.restored = true;
             if self.workspace.as_ref().is_some_and(|path| path.exists()) {
-                self.load(root);
+                self.load_workspace(root);
             }
         }
         self.windows.push(window);
