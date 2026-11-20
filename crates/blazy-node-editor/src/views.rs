@@ -147,6 +147,9 @@ struct Ledger {
     /// The links of the graph as it was when it was last replaced, for the views that start
     /// over from it.
     replacement: Option<Rc<[Link]>>,
+    /// The graph's one history, which every session over it keeps (§70) — a
+    /// `SharedHistory` of the editor's world, behind `Any` for the reason `clip` is.
+    history: Option<Rc<dyn Any>>,
 }
 
 /// What brings a watcher up to date, given its `WidgetMut`. A function rather than a
@@ -380,6 +383,19 @@ impl Views {
         }
     }
 
+    /// The graph's history, if a session over it has made one.
+    pub(crate) fn history<W: 'static>(&self) -> Option<blazy_ops::runtime::SharedHistory<W>> {
+        let history = self.0.borrow().history.clone()?;
+        history
+            .downcast::<std::cell::RefCell<blazy_ops::undo::UndoStack<W>>>()
+            .ok()
+    }
+
+    /// Makes `history` the graph's.
+    pub(crate) fn set_history<W: 'static>(&self, history: blazy_ops::runtime::SharedHistory<W>) {
+        self.0.borrow_mut().history = Some(history);
+    }
+
     /// How many times the graph has been replaced as a whole.
     pub fn generation(&self) -> u64 {
         self.0.borrow().generation
@@ -493,14 +509,42 @@ impl Ledger {
             self.selection.remove(&index);
         }
         for (id, owed) in &mut self.views {
-            if Some(*id) != origin {
-                owed.push(change);
-                self.counters.noted += 1;
+            if Some(*id) == origin {
+                continue;
             }
+            // A move replaces the move of the same node already owed (§70): a view in a
+            // window that is not drawing — minimised, covered — was owed one `Moved` per
+            // frame per node of every drag elsewhere, without bound. Only the last place
+            // matters, and the order of moves among themselves does not — but a move must not
+            // jump back over an edit of the structure, which may have removed and given the
+            // name out again, so the search stops at the last one.
+            if let Change::Moved { index, .. } = change
+                && let Some(slot) = owed
+                    .iter_mut()
+                    .rev()
+                    .take_while(|owed| !matches!(owed, Change::Structure(_) | Change::Reset { .. }))
+                    .find(|owed| matches!(owed, Change::Moved { index: i, .. } if *i == index))
+            {
+                *slot = change;
+                continue;
+            }
+            owed.push(change);
+            self.counters.noted += 1;
         }
-        for (id, owed, _) in &mut self.watchers {
-            if Some(*id) != origin {
-                *owed = true;
+        // A watcher shows the selection, so a change it cannot show leaves it alone (§70):
+        // every frame of a drag of a node it does not show rebuilt every panel of the graph.
+        let concerns_the_shown = match change {
+            Change::Moved { index, .. } | Change::Structure(Edit::NodeResized { index, .. }) => {
+                self.selection.contains(&index)
+            },
+            Change::Raised { .. } => false,
+            _ => true,
+        };
+        if concerns_the_shown {
+            for (id, owed, _) in &mut self.watchers {
+                if Some(*id) != origin {
+                    *owed = true;
+                }
             }
         }
     }

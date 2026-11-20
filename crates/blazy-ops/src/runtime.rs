@@ -10,7 +10,9 @@
 //! [`Seat`] is how a driver says where an event came from, and it is what turns "the
 //! modal operator got the events" from an assertion into [`OpCounters::tree_first`].
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use masonry::core::keyboard::Modifiers;
 use masonry::kurbo::Point;
@@ -187,6 +189,9 @@ struct Modal {
     props: Props,
 }
 
+/// A history several runtimes keep together — the areas over one graph (§70).
+pub type SharedHistory<W> = Rc<RefCell<UndoStack<W>>>;
+
 /// The registry, the keymap, the modal stack and the history.
 pub struct OpRuntime<W> {
     ops: Vec<Option<Box<dyn Operator<W>>>>,
@@ -200,7 +205,9 @@ pub struct OpRuntime<W> {
     by_name: HashMap<&'static str, usize>,
     keymap: Keymap,
     stack: Vec<Modal>,
-    undo: UndoStack<W>,
+    /// The history, in a cell another runtime may share (§70): runtimes over one document —
+    /// the areas over one graph — keep one history, as Blender keeps one per file.
+    undo: SharedHistory<W>,
     counters: OpCounters,
     /// A press whose meaning is not decided yet (§39.3).
     pending: Option<Pending>,
@@ -222,7 +229,7 @@ impl<W> OpRuntime<W> {
             by_name: HashMap::new(),
             keymap,
             stack: Vec::new(),
-            undo: UndoStack::new(),
+            undo: Rc::new(RefCell::new(UndoStack::new())),
             counters: OpCounters::default(),
             pending: None,
             last_click: None,
@@ -272,13 +279,26 @@ impl<W> OpRuntime<W> {
     }
 
     /// The history, so an application can show its depth.
-    pub fn history(&self) -> &UndoStack<W> {
-        &self.undo
+    ///
+    /// Borrowed from its cell: do not hold the borrow across a dispatch.
+    pub fn history(&self) -> std::cell::Ref<'_, UndoStack<W>> {
+        self.undo.borrow()
     }
 
-    /// The history, to set a ceiling on it.
-    pub fn history_mut(&mut self) -> &mut UndoStack<W> {
-        &mut self.undo
+    /// The history, to set a ceiling on it, or to undo from outside an operator.
+    pub fn history_mut(&mut self) -> std::cell::RefMut<'_, UndoStack<W>> {
+        self.undo.borrow_mut()
+    }
+
+    /// The history cell, to share with another runtime over the same document (§70).
+    pub fn shared_history(&self) -> SharedHistory<W> {
+        self.undo.clone()
+    }
+
+    /// Keeps the history in `history` from now on — the cell of another runtime over the
+    /// same document. What this runtime had recorded is dropped.
+    pub fn share_history(&mut self, history: SharedHistory<W>) {
+        self.undo = history;
     }
 
     /// How many modal operators are running.
@@ -518,12 +538,13 @@ impl<W> OpRuntime<W> {
         let mut holds = false;
         for &at in &candidates {
             let op = self.ops[at].take().expect("an operator is not running twice");
+            let mut undo = self.undo.borrow_mut();
             let cx = OpCtx {
                 world,
                 event: Some(press),
                 props: &empty,
                 scope: scope.0,
-                undo: &mut self.undo,
+                undo: &mut undo,
             };
             self.counters.polled += 1;
             let allowed = op.poll(&cx);
@@ -633,12 +654,13 @@ impl<W> OpRuntime<W> {
     pub fn poll(&mut self, world: &mut W, name: &str, props: &Props) -> Option<bool> {
         let at = self.index_of(name)?;
         let op = self.ops[at].as_ref()?;
+        let mut undo = self.undo.borrow_mut();
         let cx = OpCtx {
             world,
             event: None,
             props,
             scope: &[],
-            undo: &mut self.undo,
+            undo: &mut undo,
         };
         self.counters.polled += 1;
         Some(op.poll(&cx))
@@ -656,12 +678,13 @@ impl<W> OpRuntime<W> {
         while let Some(modal) = self.stack.pop() {
             let props = modal.props;
             let mut op = self.ops[modal.op].take().expect("an operator is not running twice");
+            let mut undo = self.undo.borrow_mut();
             let mut cx = OpCtx {
                 world,
                 event: None,
                 props: &props,
                 scope: &[],
-                undo: &mut self.undo,
+                undo: &mut undo,
             };
             // Whatever it answers, it is off the stack: this is the caller saying the
             // gesture is over, not the operator being asked whether it would like to
@@ -684,12 +707,13 @@ impl<W> OpRuntime<W> {
         self.counters.modal_events += 1;
 
         let mut op = self.ops[at].take().expect("an operator is not running twice");
+        let mut undo = self.undo.borrow_mut();
         let mut cx = OpCtx {
             world,
             event: Some(event),
             props: &modal.props,
             scope: scope.0,
-            undo: &mut self.undo,
+            undo: &mut undo,
         };
         let result = op.modal(&mut cx);
         self.ops[at] = Some(op);
@@ -738,12 +762,13 @@ impl<W> OpRuntime<W> {
         path: Path,
     ) -> Option<OpResult> {
         let mut op = self.ops[at].take().expect("an operator is not running twice");
+        let mut undo = self.undo.borrow_mut();
         let mut cx = OpCtx {
             world,
             event,
             props,
             scope: scope.0,
-            undo: &mut self.undo,
+            undo: &mut undo,
         };
 
         self.counters.polled += 1;

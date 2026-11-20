@@ -44,8 +44,8 @@ use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
     AccessCtx, ActionCtx, ChildrenIds, DefaultProperties, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction,
-    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Update, UpdateCtx,
-    Widget, WidgetId, WidgetMut, WidgetPod,
+    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId,
+    WidgetMut, WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, BezPath, Point, Rect, Shape, Size};
@@ -53,10 +53,10 @@ use blazy::masonry::layout::{LenDef, LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
 use blazy::masonry::theme::default_property_set;
-use blazy::masonry::widgets::{Button, ButtonPress, TextAction, TextInput};
+use blazy::masonry::widgets::{Button, ButtonPress};
 use blazy::node_editor::{
-    Change, EdgePan, GraphPanel, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline, SessionHandle,
-    SharedGraph, ViewToken, Views,
+    ContentField, ContentText, EdgePan, GraphPanel, NodeEditor, NodeGraph, OverlayStyle, SELECTED, SelectionOutline,
+    SessionHandle, SharedGraph, ViewToken, Views,
 };
 use blazy::ops::keymap::Props;
 use blazy::shell::window::{Error, WindowConfig};
@@ -122,6 +122,25 @@ impl Graph {
     }
 }
 
+/// `hello`'s text form: a title as it is. Read by `hello` alone: any text is a title, so the
+/// format's name is what keeps another application's copy from becoming nodes named after
+/// its lines.
+struct TitleText;
+
+impl ContentText<String> for TitleText {
+    fn format(&self) -> &str {
+        "hello-title"
+    }
+
+    fn write(&self, title: &String) -> String {
+        title.clone()
+    }
+
+    fn read(&self, text: &str) -> Option<String> {
+        Some(text.to_owned())
+    }
+}
+
 impl NodeGraph for Graph {
     fn node_count(&self) -> usize {
         self.nodes.iter().flatten().count()
@@ -133,12 +152,6 @@ impl NodeGraph for Graph {
 
     fn node_rect(&self, index: usize) -> Rect {
         self.nodes.get(index).copied().flatten().unwrap_or_default()
-    }
-
-    fn set_node_pos(&mut self, index: usize, pos: Point) {
-        if let Some(Some(rect)) = self.nodes.get_mut(index) {
-            *rect = Rect::from_origin_size(pos, rect.size());
-        }
     }
 
     fn set_node_rect(&mut self, index: usize, rect: Rect) {
@@ -225,19 +238,9 @@ impl NodeGraph for Graph {
         }
     }
 
-    /// A copy of `hello`'s nodes is read by `hello` alone: any text is a title, so the name
-    /// is what keeps another application's copy from becoming nodes named after its lines.
-    fn content_format(&self) -> Option<&str> {
-        Some("hello-title")
-    }
-
     /// The title is its own text: a copy goes to the system clipboard as it is.
-    fn content_text(&self, title: &String) -> Option<String> {
-        Some(title.clone())
-    }
-
-    fn content_from_text(&self, text: &str) -> Option<String> {
-        Some(text.to_owned())
+    fn text_form(&self) -> Option<&dyn ContentText<String>> {
+        Some(&TitleText)
     }
 
     fn insert_copy(&mut self, rect: Rect, title: String) -> usize {
@@ -265,41 +268,17 @@ struct Nodes {
     session: SessionHandle<Graph>,
 }
 
-/// One rename in progress: the title it began from, and the history it ends in (§67).
-///
-/// The field writes every key into the model, so the other areas follow as it is typed;
-/// the history gets one step when the edit ends — the field left, `Enter` — as Blender
-/// writes one, not one per key.
-struct TitleEdit {
-    session: SessionHandle<Graph>,
-    before: Option<String>,
-}
-
-impl TitleEdit {
-    fn new(session: &SessionHandle<Graph>) -> Self {
-        Self {
-            session: session.clone(),
-            before: None,
-        }
-    }
-
-    /// Called before a key's text goes into the model: the first one remembers the title.
-    fn began(&mut self, graph: &Graph, index: usize) {
-        if self.before.is_none() {
-            self.before = Some(graph.titles.get(index).cloned().unwrap_or_default());
-        }
-    }
-
-    /// The edit ended: one step, if it changed anything.
-    fn finished(&mut self, graph: &SharedGraph<Graph>, index: usize) {
-        let Some(before) = self.before.take() else {
-            return;
-        };
-        let after = graph.borrow().titles.get(index).cloned().unwrap_or_default();
-        if before != after {
-            self.session.borrow_mut().record_content(index, before, after);
-        }
-    }
+/// A field over node `index`'s title: every key into the model, one step in the history
+/// when the edit ends, recorded past `past` — the library's `ContentField` (§70).
+fn title_field(
+    graph: &SharedGraph<Graph>,
+    session: &SessionHandle<Graph>,
+    index: usize,
+    past: Option<WidgetId>,
+) -> ContentField<Graph> {
+    ContentField::new(graph, session, index, past, String::clone, |_, text| {
+        Some(text.to_owned())
+    })
 }
 
 /// The title a node starts with.
@@ -317,13 +296,9 @@ impl NodeSource for Nodes {
     /// A title field in a box. Everything the box looks like — selected or not — is in
     /// [`properties`]: the node does not know what a selection is.
     fn build(&mut self, index: usize, _detail: Detail) -> NewWidget<dyn Widget> {
-        let title = self.graph.borrow().titles.get(index).cloned().unwrap_or_default();
+        let canvas = self.view.as_ref().map(ViewToken::canvas);
         NewWidget::new(Node {
-            title: WidgetPod::new(TextInput::new(&title)),
-            graph: self.graph.clone(),
-            index,
-            canvas: self.view.as_ref().map(ViewToken::canvas),
-            edit: TitleEdit::new(&self.session),
+            title: WidgetPod::new(title_field(&self.graph, &self.session, index, canvas)),
         })
         .erased()
     }
@@ -357,15 +332,11 @@ impl NodeSource for Nodes {
 /// the corner it leaves unpainted shows them (§50.8). The box is Masonry's: it paints
 /// the background and the border of any widget from its properties.
 ///
-/// The field is a stock `TextInput`, which is the point of having one: it is what needs
-/// the host's clipboard and input method (`issues/ime and clipboard in the host.md`).
+/// The field is the library's `ContentField` over a stock `TextInput`, which is the point
+/// of having one: it is what needs the host's clipboard and input method
+/// (`issues/ime and clipboard in the host.md`).
 struct Node {
-    title: WidgetPod<TextInput>,
-    graph: SharedGraph<Graph>,
-    index: usize,
-    /// The canvas this node is in, so an edit is recorded for the others only.
-    canvas: Option<WidgetId>,
-    edit: TitleEdit,
+    title: WidgetPod<ContentField<Graph>>,
 }
 
 impl Widget for Node {
@@ -396,46 +367,6 @@ impl Widget for Node {
         let title = ctx.compute_size(&mut self.title, auto, size.into());
         ctx.run_layout(&mut self.title, title);
         ctx.place_child(&mut self.title, Point::ORIGIN);
-    }
-
-    /// An edit of the title goes into the model, and is recorded for the other views.
-    ///
-    /// For the others only: this field shows the edit already, and a change owed to its
-    /// own canvas would rebuild the node — and the field — under the cursor on every key
-    /// (§47). `Enter` and `Escape` leave the field, so the keys are the editor's again.
-    fn on_action(
-        &mut self,
-        ctx: &mut ActionCtx<'_>,
-        _props: &mut PropertiesMut<'_>,
-        action: &ErasedAction,
-        _source: WidgetId,
-    ) {
-        let Some(action) = action.downcast_ref::<TextAction>() else {
-            return;
-        };
-        match action {
-            TextAction::Changed(text) => {
-                let graph = &mut *self.graph.borrow_mut();
-                self.edit.began(graph, self.index);
-                if let Some(title) = graph.titles.get_mut(self.index) {
-                    title.clone_from(text);
-                }
-                let change = Change::Contents { index: self.index };
-                match self.canvas {
-                    Some(canvas) => graph.views().note_except(canvas, change),
-                    None => graph.views().note(change),
-                }
-            },
-            TextAction::Entered(_) | TextAction::Cancelled => ctx.resign_focus(),
-        }
-        ctx.set_handled();
-    }
-
-    /// The field was left — a click elsewhere, `Enter`, `Escape`: the rename is one step.
-    fn update(&mut self, _ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
-        if matches!(event, Update::ChildFocusChanged(false)) {
-            self.edit.finished(&self.graph, self.index);
-        }
     }
 
     fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
@@ -495,14 +426,8 @@ fn properties_of(
         column = column.with(row(Bar::new(metrics).with(caption(word.into()), metrics)), metrics);
         return NewWidget::new(column).with_props(ScaleCarrier::of::<Bar>()).erased();
     };
-    let (title, rect) = {
-        let graph = graph.borrow();
-        (
-            graph.titles.get(index).cloned().unwrap_or_default(),
-            graph.node_rect(index),
-        )
-    };
-    let name = NewWidget::new(TextInput::new(&title));
+    let rect = graph.borrow().node_rect(index);
+    let name = NewWidget::new(title_field(graph, session, index, Some(panel)));
     let left = NewWidget::new(Button::with_text("<"));
     let right = NewWidget::new(Button::with_text(">"));
     let (left_id, right_id) = (left.id(), right.id());
@@ -533,11 +458,7 @@ fn properties_of(
             .with_props(ScaleCarrier::of::<Bar>())
             .erased()
             .to_pod(),
-        graph: graph.clone(),
-        index,
-        panel,
         editor,
-        edit: TitleEdit::new(session),
         nudges: [(left_id, -NUDGE), (right_id, NUDGE)],
     })
     .with_props(ScaleCarrier::of::<Properties>())
@@ -552,14 +473,8 @@ fn properties_of(
 /// `node.move`: a step in the history, which `Ctrl+Z` undoes, and in every view.
 struct Properties {
     content: WidgetPod<dyn Widget>,
-    graph: SharedGraph<Graph>,
-    index: usize,
-    /// The `GraphPanel` this is the content of: the id the name's edits are recorded past.
-    panel: WidgetId,
     /// The editor of the area, which runs the move.
     editor: Option<WidgetId>,
-    /// The rename in progress, recorded in the area's history like one made in the node.
-    edit: TitleEdit,
     /// Each arrow, and how far it moves the node along x.
     nudges: [(WidgetId, f64); 2],
 }
@@ -600,24 +515,9 @@ impl Widget for Properties {
         action: &ErasedAction,
         source: WidgetId,
     ) {
-        // The one text field is the name. Its action comes from the text area inside the
-        // `TextInput`, not from the input itself, so it is told by its type and not its id.
-        if let Some(action) = action.downcast_ref::<TextAction>() {
-            match action {
-                TextAction::Changed(text) => {
-                    let graph = &mut *self.graph.borrow_mut();
-                    self.edit.began(graph, self.index);
-                    if let Some(title) = graph.titles.get_mut(self.index) {
-                        title.clone_from(text);
-                    }
-                    graph
-                        .views()
-                        .note_except(self.panel, Change::Contents { index: self.index });
-                },
-                TextAction::Entered(_) | TextAction::Cancelled => ctx.resign_focus(),
-            }
-            ctx.set_handled();
-        } else if action.downcast_ref::<ButtonPress>().is_some()
+        // The name is a `ContentField`, which handles its own actions; what reaches here
+        // is the arrows.
+        if action.downcast_ref::<ButtonPress>().is_some()
             && let Some(&(_, dx)) = self.nudges.iter().find(|(id, _)| *id == source)
             && let Some(editor) = self.editor
         {
@@ -627,13 +527,6 @@ impl Widget for Properties {
                 let _ = NodeEditor::<Graph>::exec(&mut widget.downcast(), "node.move", &props);
             });
             ctx.set_handled();
-        }
-    }
-
-    /// The name field was left: the rename is one step, in this area's history.
-    fn update(&mut self, _ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
-        if matches!(event, Update::ChildFocusChanged(false)) {
-            self.edit.finished(&self.graph, self.index);
         }
     }
 
@@ -758,7 +651,7 @@ fn main() -> Result<(), Error> {
 mod tests {
     use blazy::masonry::dpi::PhysicalSize;
     use blazy::masonry::testing::TestHarness;
-    use blazy::masonry::widgets::TextArea;
+    use blazy::masonry::widgets::{TextArea, TextInput};
     use blazy::node_editor::sync_canvas;
     use blazy::ops::keymap::Props;
 
@@ -872,7 +765,8 @@ mod tests {
                 let mut id = None;
                 CanvasLayer::update_child(&mut canvas, index, |mut node| {
                     let mut node = node.downcast::<Node>();
-                    let mut input = node.ctx.get_mut(&mut node.widget.title);
+                    let mut field = node.ctx.get_mut(&mut node.widget.title);
+                    let mut input = ContentField::input_mut(&mut field);
                     id = Some(TextInput::text_mut(&mut input).ctx.widget_id());
                 });
                 id.expect("the node is on screen")

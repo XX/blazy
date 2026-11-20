@@ -52,6 +52,23 @@ impl Grid {
     }
 }
 
+/// `Grid`'s text form: the empty content, as the empty text.
+struct GridText;
+
+impl blazy_node_editor::ContentText<()> for GridText {
+    fn format(&self) -> &str {
+        "grid"
+    }
+
+    fn write(&self, _content: &()) -> String {
+        String::new()
+    }
+
+    fn read(&self, text: &str) -> Option<()> {
+        text.is_empty().then_some(())
+    }
+}
+
 impl NodeGraph for Grid {
     fn node_count(&self) -> usize {
         self.rects.iter().flatten().count()
@@ -63,12 +80,6 @@ impl NodeGraph for Grid {
 
     fn node_rect(&self, index: usize) -> Rect {
         self.rects.get(index).copied().flatten().unwrap_or_default()
-    }
-
-    fn set_node_pos(&mut self, index: usize, pos: Point) {
-        if let Some(Some(rect)) = self.rects.get_mut(index) {
-            *rect = Rect::from_origin_size(pos, rect.size());
-        }
     }
 
     fn set_node_rect(&mut self, index: usize, rect: Rect) {
@@ -137,17 +148,9 @@ impl NodeGraph for Grid {
 
     fn set_content(&mut self, _index: usize, _content: ()) {}
 
-    fn content_format(&self) -> Option<&str> {
-        Some("grid")
-    }
-
     /// Nothing to say, said as nothing: a copy still goes to the system clipboard (§66).
-    fn content_text(&self, _content: &()) -> Option<String> {
-        Some(String::new())
-    }
-
-    fn content_from_text(&self, text: &str) -> Option<()> {
-        text.is_empty().then_some(())
+    fn text_form(&self) -> Option<&dyn blazy_node_editor::ContentText<()>> {
+        Some(&GridText)
     }
 
     fn insert_copy(&mut self, rect: Rect, (): ()) -> usize {
@@ -1079,11 +1082,14 @@ fn a_copy_pastes_in_another_area_and_reaches_another_window() {
         (10, 10),
         "both areas show it in the same frame"
     );
+    // One history, the graph's (§70): the link and the selection made in area 0 and the
+    // paste made in area 1 are four steps of it, seen alike from both areas.
     assert_eq!(
         edit_editor(&mut root, 1, |editor| editor.widget.history_depth()),
-        1,
-        "one step, in the history of the area that pasted"
+        4,
+        "the paste is a step of the graph's one history"
     );
+    assert_eq!(edit_editor(&mut root, 0, |editor| editor.widget.history_depth()), 4);
 
     // What the window does before it draws: it collects what its views are owed, and the
     // area that did not paste is owed the insertions it was already pushed. Counting nodes

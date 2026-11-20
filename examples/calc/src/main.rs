@@ -24,9 +24,8 @@ use blazy::areas::{ScaleCarrier, SplitTree};
 use blazy::canvas::{CanvasLayer, Detail, Link, NodeSource, PortLayout, Ports};
 use blazy::masonry::accesskit::{Node as AccessNode, Role};
 use blazy::masonry::core::{
-    AccessCtx, ActionCtx, ChildrenIds, DefaultProperties, ErasedAction, LayoutCtx, MeasureCtx, NewWidget, NoAction,
-    PaintCtx, PropertiesMut, PropertiesRef, PropertySet, PropertyStack, RegisterCtx, Selector, Update, UpdateCtx,
-    Widget, WidgetId, WidgetPod,
+    AccessCtx, ChildrenIds, DefaultProperties, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PropertiesRef,
+    PropertySet, PropertyStack, RegisterCtx, Selector, Widget, WidgetId, WidgetPod,
 };
 use blazy::masonry::imaging::Painter;
 use blazy::masonry::kurbo::{Axis, Point, Rect, Size};
@@ -34,10 +33,10 @@ use blazy::masonry::layout::{LenDef, LenReq, Length, SizeDef};
 use blazy::masonry::peniko::Color;
 use blazy::masonry::properties::{Background, BorderColor, BorderWidth, CornerRadius, Padding};
 use blazy::masonry::theme::default_property_set;
-use blazy::masonry::widgets::{Label as StockLabel, TextAction, TextArea, TextInput};
+use blazy::masonry::widgets::Label as StockLabel;
 use blazy::node_editor::{
-    Change, EdgePan, GraphPanel, NodeGraph, NodeKind, OverlayStyle, SELECTED, SelectionOutline, SessionHandle,
-    SharedGraph, ViewToken, Views,
+    Change, ContentField, ContentText, EdgePan, GraphPanel, NodeGraph, NodeKind, OverlayStyle, SELECTED,
+    SelectionOutline, SessionHandle, SharedGraph, ViewToken, Views,
 };
 use blazy::shell::window::{Error, WindowConfig};
 use blazy::widgets::{Bar, Label, Metrics};
@@ -333,6 +332,23 @@ impl Calc {
     }
 }
 
+/// `calc`'s text form: a kind as the graph file writes it — `number 2.5`, `add`.
+struct KindText;
+
+impl ContentText<Kind> for KindText {
+    fn format(&self) -> &str {
+        "calc"
+    }
+
+    fn write(&self, kind: &Kind) -> String {
+        kind.text()
+    }
+
+    fn read(&self, text: &str) -> Option<Kind> {
+        Kind::parse(text)
+    }
+}
+
 impl NodeGraph for Calc {
     type Content = Kind;
 
@@ -342,12 +358,6 @@ impl NodeGraph for Calc {
 
     fn node_rect(&self, index: usize) -> Rect {
         self.slot(index).map_or(Rect::ZERO, |slot| slot.rect)
-    }
-
-    fn set_node_pos(&mut self, index: usize, pos: Point) {
-        if let Some(Some(slot)) = self.nodes.get_mut(index) {
-            slot.rect = Rect::from_origin_size(pos, slot.rect.size());
-        }
     }
 
     fn set_node_rect(&mut self, index: usize, rect: Rect) {
@@ -463,16 +473,9 @@ impl NodeGraph for Calc {
         }
     }
 
-    fn content_format(&self) -> Option<&str> {
-        Some("calc")
-    }
-
-    fn content_text(&self, kind: &Kind) -> Option<String> {
-        Some(kind.text())
-    }
-
-    fn content_from_text(&self, text: &str) -> Option<Kind> {
-        Kind::parse(text)
+    /// A kind as the graph file writes it (§66).
+    fn text_form(&self) -> Option<&dyn ContentText<Kind>> {
+        Some(&KindText)
     }
 
     fn insert_copy(&mut self, rect: Rect, kind: Kind) -> usize {
@@ -506,11 +509,10 @@ impl NodeSource for Nodes {
         let graph = self.graph.borrow();
         let kind = graph.content(index);
         let body = match kind {
-            Kind::Number(value) => NewWidget::new(NumberField::new(
+            Kind::Number(_) => NewWidget::new(number_field(
                 &self.graph,
                 &self.session,
                 index,
-                value,
                 self.view.as_ref().map(ViewToken::canvas),
             ))
             .erased(),
@@ -533,147 +535,29 @@ impl NodeSource for Nodes {
     }
 }
 
-/// A field that edits a number node's value — in the node, and in the panel.
-///
-/// One widget for both places, told apart by the view its edits are recorded past: the
-/// canvas the node is in, or the panel. What follows from the value — every computed node
-/// — is recorded for every view.
-///
-/// Text that is not a number — an emptied field, half a minus sign — leaves the model as it
-/// was, and when the field loses focus it shows the model's value again: otherwise the area
-/// it was edited in showed an empty field while every other area showed the number, and
-/// nothing would ever have brought them back together. Blender drops an edit it cannot read
-/// in the same way.
-struct NumberField {
-    input: WidgetPod<TextInput>,
-    graph: SharedGraph<Calc>,
+/// A field over a number node's value — in the node and in the panel: the library's
+/// `ContentField` (§70), which writes the model on every key, makes one step of an edit when
+/// the field is left, and shows the value again if what was typed is not a number.
+fn number_field(
+    graph: &SharedGraph<Calc>,
+    session: &SessionHandle<Calc>,
     index: usize,
-    /// The view that shows the edit already, and must not be rebuilt under the caret.
     past: Option<WidgetId>,
-    /// The area's session: an edit ends as one step in its history (§67).
-    session: SessionHandle<Calc>,
-    /// The kind the node held when the edit began; `None` while nothing is being edited.
-    before: Option<Kind>,
-}
-
-impl NumberField {
-    fn new(
-        graph: &SharedGraph<Calc>,
-        session: &SessionHandle<Calc>,
-        index: usize,
-        value: f64,
-        past: Option<WidgetId>,
-    ) -> Self {
-        Self {
-            input: WidgetPod::new(TextInput::new(&format!("{value}"))),
-            graph: graph.clone(),
-            index,
-            past,
-            session: session.clone(),
-            before: None,
-        }
-    }
-}
-
-impl Widget for NumberField {
-    type Action = NoAction;
-
-    fn measure(
-        &mut self,
-        ctx: &mut MeasureCtx<'_>,
-        _props: &PropertiesRef<'_>,
-        axis: Axis,
-        len_req: LenReq,
-        cross_length: Option<Length>,
-    ) -> Length {
-        let def = match len_req {
-            LenReq::FitContent(space) => LenDef::Fixed(space),
-            LenReq::MinContent => LenDef::MinContent,
-            LenReq::MaxContent => LenDef::MaxContent,
-        };
-        let context = blazy::masonry::layout::LayoutSize::default();
-        ctx.compute_length(&mut self.input, def, context, axis, cross_length)
-    }
-
-    fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
-        ctx.run_layout(&mut self.input, size);
-        ctx.place_child(&mut self.input, Point::ORIGIN);
-    }
-
-    /// Focus left the field: the edit is one step in the area's history, if it changed the
-    /// value; and if what the field says is not the model's value, it says the value again.
-    fn update(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, event: &Update) {
-        if matches!(event, Update::ChildFocusChanged(false)) {
-            if let Some(before) = self.before.take() {
-                let after = self.graph.borrow().content(self.index);
-                if before != after {
-                    self.session.borrow_mut().record_content(self.index, before, after);
-                }
-            }
-            ctx.mutate_self_later(|mut widget| {
-                let mut field = widget.downcast::<Self>();
-                let Some(Kind::Number(value)) = field.widget.graph.borrow().kind(field.widget.index) else {
-                    return;
-                };
-                let mut input = field.ctx.get_mut(&mut field.widget.input);
-                let mut text = TextInput::text_mut(&mut input);
-                let shows = text.widget.text().to_string();
-                if shows.trim().parse::<f64>().ok() != Some(value) {
-                    TextArea::reset_text(&mut text, &format!("{value}"));
-                }
-            });
-        }
-    }
-
-    fn on_action(
-        &mut self,
-        ctx: &mut ActionCtx<'_>,
-        _props: &mut PropertiesMut<'_>,
-        action: &ErasedAction,
-        _source: WidgetId,
-    ) {
-        let Some(action) = action.downcast_ref::<TextAction>() else {
-            return;
-        };
-        match action {
-            TextAction::Changed(text) => {
-                let graph = &mut *self.graph.borrow_mut();
-                // Half-typed text that is not a number yet leaves the value as it was.
-                if let Ok(value) = text.trim().parse::<f64>()
-                    && let Some(Some(slot)) = graph.nodes.get_mut(self.index)
-                    && value.is_finite()
-                {
-                    // The first change of an edit remembers what it changes from.
-                    self.before.get_or_insert(slot.kind);
-                    slot.kind = Kind::Number(value);
-                    let change = Change::Contents { index: self.index };
-                    match self.past {
-                        Some(view) => graph.views.note_except(view, change),
-                        None => graph.views.note(change),
-                    }
-                    graph.values_changed();
-                }
-            },
-            TextAction::Entered(_) | TextAction::Cancelled => ctx.resign_focus(),
-        }
-        ctx.set_handled();
-    }
-
-    fn paint(&mut self, _ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {}
-
-    fn register_children(&mut self, ctx: &mut RegisterCtx<'_>) {
-        ctx.register_child(&mut self.input);
-    }
-
-    fn children_ids(&self) -> ChildrenIds {
-        ChildrenIds::from_slice(&[self.input.id()])
-    }
-
-    fn accessibility_role(&self) -> Role {
-        Role::GenericContainer
-    }
-
-    fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
+) -> ContentField<Calc> {
+    let show = |kind: &Kind| match kind {
+        Kind::Number(value) => format!("{value}"),
+        other => other.text(),
+    };
+    let edit = |kind: &Kind, text: &str| match kind {
+        Kind::Number(_) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Kind::Number),
+        _ => None,
+    };
+    ContentField::new(graph, session, index, past, show, edit)
 }
 
 /// A node: its kind across the top, its value below, its ports' dots on its edges.
@@ -762,9 +646,7 @@ fn panel_of(
         [index] if calc.slot(index).is_some() => {
             let kind = calc.content(index);
             let value = match kind {
-                Kind::Number(value) => {
-                    NewWidget::new(NumberField::new(graph, session, index, value, Some(panel))).erased()
-                },
+                Kind::Number(_) => NewWidget::new(number_field(graph, session, index, Some(panel))).erased(),
                 _ => caption(shown(calc.value(index))),
             };
             let rect = calc.node_rect(index);
@@ -910,6 +792,7 @@ mod tests {
     use blazy::app::EditorScreen;
     use blazy::masonry::dpi::PhysicalSize;
     use blazy::masonry::testing::TestHarness;
+    use blazy::masonry::widgets::TextArea;
     use blazy::node_editor::sync_canvas;
 
     use super::*;
@@ -951,11 +834,12 @@ mod tests {
     fn a_kind_survives_the_clipboard_text() {
         let calc = Calc::sample();
         for kind in [Kind::Number(-2.5), Kind::Add, Kind::Multiply, Kind::Show] {
-            let text = calc.content_text(&kind).expect("every kind has a text");
-            assert_eq!(calc.content_from_text(&text), Some(kind), "{text}");
+            let form = calc.text_form().expect("calc has a text form");
+            let text = form.write(&kind);
+            assert_eq!(form.read(&text), Some(kind), "{text}");
         }
         for bad in ["", "cube", "number", "number NaN", "add 3"] {
-            assert_eq!(calc.content_from_text(bad), None, "{bad:?}");
+            assert_eq!(calc.text_form().and_then(|form| form.read(bad)), None, "{bad:?}");
         }
     }
 

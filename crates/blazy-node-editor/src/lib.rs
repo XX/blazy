@@ -37,6 +37,7 @@
 
 mod edge_pan;
 mod editor;
+mod field;
 mod menu;
 pub mod ops;
 mod panel;
@@ -54,6 +55,7 @@ use masonry::kurbo::{Point, Rect};
 
 pub use crate::edge_pan::{EDGE_PAN, EdgePan, EdgePanCounters};
 pub use crate::editor::{EditorSession, NodeEditor, OverlayStyle, SelectionOutline, SessionHandle};
+pub use crate::field::ContentField;
 pub use crate::menu::{Menu, MenuItem, MenuLayer, MenuOp};
 pub use crate::panel::{BuildPanel, GraphPanel, PanelCounters};
 pub use crate::views::{Change, Refresh, ViewCounters, ViewToken, Views, WatchToken, sync_canvas, sync_root};
@@ -92,7 +94,14 @@ pub trait NodeGraph: 'static {
     fn node_rect(&self, index: usize) -> Rect;
 
     /// Moves node `index` so that its top-left corner is at `pos`.
-    fn set_node_pos(&mut self, index: usize, pos: Point);
+    ///
+    /// Defaulted through [`set_node_rect`](Self::set_node_rect), keeping the size (§70): a move
+    /// is a rectangle with the same size, and one writer of geometry is one place to get it
+    /// wrong. A graph whose positions live apart from its sizes overrides it.
+    fn set_node_pos(&mut self, index: usize, pos: Point) {
+        let size = self.node_rect(index).size();
+        self.set_node_rect(index, Rect::from_origin_size(pos, size));
+    }
 
     /// Gives node `index` the rectangle `rect`: a new size, and a new corner when a node is
     /// resized from its left edge (`node.resize`, §60).
@@ -245,41 +254,13 @@ pub trait NodeGraph: 'static {
     /// editor records the change for every view itself; the graph only stores.
     fn set_content(&mut self, index: usize, content: Self::Content);
 
-    /// The name of the format [`content_text`](Self::content_text) writes — one word, such as
-    /// `calc` — or `None` for content with no text form (§66).
+    /// The text form of the graph's content, for a copy that leaves the process — the system
+    /// clipboard (§66) — or `None` for content with none: a copy then stays in the process.
     ///
-    /// It goes into the first line of a copy on the system clipboard (`blazy-nodes 1 calc`),
-    /// and a copy is read only by a graph that names the same format. Without it the header
-    /// named the library and not the application, and a copy from one application on blazy
-    /// passed the header of any other: `hello`, which takes any text as a title, pasted a
-    /// `calc` copy as nodes called `number 2`. Two applications that name one format exchange
-    /// copies on purpose. Defaulted to `None` with `content_text`; a graph that writes content
-    /// text and names no format is a debug assertion, not a copy that silently stays home.
-    fn content_format(&self) -> Option<&str> {
-        None
-    }
-
-    /// `content` as text, for a copy that has to leave the process — the system clipboard
-    /// (§66); `None` for content that has no text form. Read back only by a graph whose
-    /// [`content_format`](Self::content_format) is the same.
-    ///
-    /// The format is the application's, and only it can read it back
-    /// ([`content_from_text`](Self::content_from_text)); the library wraps it with the
-    /// rectangles and links of the copy and escapes it onto one line, so any text will do.
-    /// Defaulted to `None`: a copy then stays in the process, as it did before the question
-    /// existed — what it costs is the copy reaching another process, not the copy.
-    fn content_text(&self, content: &Self::Content) -> Option<String> {
-        let _ = content;
-        None
-    }
-
-    /// Reads what [`content_text`](Self::content_text) wrote; `None` for text that is not
-    /// one — a paste of something else, or of a copy from an application with another format.
-    ///
-    /// The text is input from outside the process: read it as such, without trusting sizes or
-    /// numbers in it.
-    fn content_from_text(&self, text: &str) -> Option<Self::Content> {
-        let _ = text;
+    /// One answer for the three things a text form is — a format name, a writer, a reader —
+    /// so that a graph has all of them or none (§70). Three methods with defaults let a graph
+    /// write content and forget the format name, which was a debug panic on `Ctrl+C`.
+    fn text_form(&self) -> Option<&dyn ContentText<Self::Content>> {
         None
     }
 
@@ -305,6 +286,26 @@ pub trait NodeGraph: 'static {
 /// thread, and a change has to be visible to the next build of a node immediately, not
 /// one frame later.
 pub type SharedGraph<G> = Rc<RefCell<G>>;
+
+/// How a graph's node content goes to text and back, for the system clipboard (§66, §70).
+///
+/// The format is the application's, and only it can read it back; the library wraps it with
+/// the rectangles and links of the copy (`blazy-nodes 1 <format>`) and escapes it onto one
+/// line, so any text will do. A copy is read only by a graph whose format has the same name.
+pub trait ContentText<C> {
+    /// The format's name: one word, such as `calc`. Two applications that name one format
+    /// exchange copies on purpose; a copy in another format is not read — without the name,
+    /// `hello`, which takes any text as a title, pasted a `calc` copy as nodes called
+    /// `number 2`.
+    fn format(&self) -> &str;
+
+    /// `content` as text.
+    fn write(&self, content: &C) -> String;
+
+    /// Reads what [`write`](Self::write) wrote; `None` for text that is not one. The text is
+    /// input from outside the process: read it as such.
+    fn read(&self, text: &str) -> Option<C>;
+}
 
 /// A kind of node a graph can add: its name, as a binding and a keymap file say it, and
 /// what a menu says for it.

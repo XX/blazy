@@ -716,26 +716,16 @@ impl<C: Clone + 'static> Clip<C> {
     /// Nodes by position, as the copy names them; links by those positions. The content is
     /// the graph's own text with `\` and line breaks escaped, so it stays on its line.
     pub(crate) fn to_text<G: NodeGraph<Content = C>>(&self, graph: &G) -> Option<String> {
-        let Some(format) = graph
-            .content_format()
-            .filter(|f| !f.is_empty() && !f.contains(char::is_whitespace))
-        else {
-            let written = self
-                .nodes
-                .first()
-                .is_some_and(|(_, content)| graph.content_text(content).is_some());
-            debug_assert!(
-                !written,
-                "the graph writes content text but names no format (one word): §66"
-            );
-            if written {
-                tracing::warn!("the graph writes content text but names no format; the copy stays in the process");
-            }
+        let form = graph.text_form()?;
+        let format = form.format();
+        if format.is_empty() || format.contains(char::is_whitespace) {
+            // A format name the header cannot carry: the copy stays in the process, and says why.
+            tracing::warn!(format, "a content format is one word; the copy stays in the process");
             return None;
-        };
+        }
         let mut out = format!("{CLIP_FORMAT} {format}\n");
         for (rect, content) in &self.nodes {
-            let text = graph.content_text(content)?;
+            let text = form.write(content);
             let text = text.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r");
             out.push_str(&format!(
                 "node {} {} {} {} {text}\n",
@@ -762,7 +752,8 @@ impl<C: Clone + 'static> Clip<C> {
         let mut lines = text.lines();
         // A copy is read only in the format it was written in: the library's version, and the
         // application's content.
-        let format = graph.content_format()?;
+        let form = graph.text_form()?;
+        let format = form.format();
         if lines.next()?.trim_end().strip_prefix(CLIP_FORMAT)?.strip_prefix(' ')? != format {
             return None;
         }
@@ -775,7 +766,7 @@ impl<C: Clone + 'static> Clip<C> {
                 if width <= 0.0 || height <= 0.0 || nodes.len() >= CLIP_MAX_NODES {
                     return None;
                 }
-                let content = graph.content_from_text(&unescape(words.next().unwrap_or(""))?)?;
+                let content = form.read(&unescape(words.next().unwrap_or(""))?)?;
                 nodes.push((Rect::from_origin_size((x, y), (width, height)), content));
             } else {
                 let rest = line.strip_prefix("link ")?;

@@ -176,7 +176,16 @@ impl<G: NodeGraph> EditorSession<G> {
     }
 
     /// The same, with a runtime of the caller's own: another keymap, more operators.
-    pub fn with_runtime(graph: &SharedGraph<G>, runtime: OpRuntime<EditorWorld<G>>) -> Self {
+    ///
+    /// Every session over one graph keeps **one history**, the graph's (§70): an edit made
+    /// in any area clears what any area could redo, as Blender keeps one history per file.
+    /// Per area, a redo in one could put a node under a name another area had taken since.
+    pub fn with_runtime(graph: &SharedGraph<G>, mut runtime: OpRuntime<EditorWorld<G>>) -> Self {
+        let views = graph.borrow().views().clone();
+        match views.history::<EditorWorld<G>>() {
+            Some(history) => runtime.share_history(history),
+            None => views.set_history(runtime.shared_history()),
+        }
         Self {
             world: EditorWorld::new(graph),
             runtime,

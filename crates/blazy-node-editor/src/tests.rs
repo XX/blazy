@@ -46,8 +46,23 @@ struct Row {
     forgets_kinds: bool,
     /// Whether its content has a text form, for the system clipboard (§66).
     textual: bool,
-    /// Whether it writes content text and forgets to name the format.
-    formatless: bool,
+}
+
+/// `Row`'s text form: a value after a line break, so the escaping is exercised (§66).
+struct RowText;
+
+impl crate::ContentText<u32> for RowText {
+    fn format(&self) -> &str {
+        "row"
+    }
+
+    fn write(&self, value: &u32) -> String {
+        format!("value\n{value}")
+    }
+
+    fn read(&self, text: &str) -> Option<u32> {
+        text.strip_prefix("value\n")?.parse().ok()
+    }
 }
 
 /// What `Row`'s `wide` kind is sized to, whatever is asked: the graph decides (§64).
@@ -64,12 +79,6 @@ impl NodeGraph for Row {
 
     fn node_rect(&self, index: usize) -> Rect {
         self.rects[index].unwrap_or_default()
-    }
-
-    fn set_node_pos(&mut self, index: usize, pos: Point) {
-        if let Some(rect) = self.rects[index] {
-            self.rects[index] = Some(Rect::from_origin_size(pos, rect.size()));
-        }
     }
 
     fn set_node_rect(&mut self, index: usize, rect: Rect) {
@@ -169,16 +178,8 @@ impl NodeGraph for Row {
         self.values[index] = value;
     }
 
-    fn content_format(&self) -> Option<&str> {
-        (self.textual && !self.formatless).then_some("row")
-    }
-
-    fn content_text(&self, value: &u32) -> Option<String> {
-        self.textual.then(|| format!("value\n{value}"))
-    }
-
-    fn content_from_text(&self, text: &str) -> Option<u32> {
-        text.strip_prefix("value\n")?.parse().ok()
+    fn text_form(&self) -> Option<&dyn crate::ContentText<u32>> {
+        self.textual.then_some(&RowText as &dyn crate::ContentText<u32>)
     }
 
     fn insert_copy(&mut self, rect: Rect, value: u32) -> usize {
@@ -3154,18 +3155,6 @@ mod system_clipboard {
         assert!(copy.to_text(&*graph.borrow()).is_none(), "no text form, no text");
     }
 
-    /// A graph that writes content text and names no format is told so, loudly, rather than
-    /// having its copies stay in the process without a word.
-    #[test]
-    #[should_panic(expected = "names no format")]
-    fn content_text_without_a_format_is_an_assertion() {
-        let (graph, _runtime, _world) = linked();
-        graph.borrow_mut().textual = true;
-        graph.borrow_mut().formatless = true;
-        let copy = Clip::of(&*graph.borrow(), &BTreeSet::from([0]));
-        let _ = copy.to_text(&*graph.borrow());
-    }
-
     /// `node.copy` leaves the text for the driver once, and only for a graph with a text
     /// form; its own text offered back changes nothing.
     #[test]
@@ -3274,4 +3263,127 @@ fn a_recorded_content_edit_is_undone_into_the_model_and_the_views() {
     assert_eq!(runtime.history_mut().redo(world), Some("node.edit"));
     assert_eq!(graph.borrow().content(1), 99);
     assert!(world.edits.contains(&Edit::ContentChanged { index: 1 }));
+}
+
+// --- MARK: ONE HISTORY PER GRAPH (`issues/26-11-21 review fixes.md`)
+
+/// Two areas over one graph keep one history: an area that adds a node after another undid
+/// one clears the redo, so the redo can no longer put a node under the name the second took.
+/// Per area, it did — `restore_node` wrote the first area's node over the second's.
+#[test]
+fn a_redo_in_one_area_cannot_overwrite_what_another_area_made() {
+    use blazy_ops::keymap::Props;
+
+    let graph = row(3);
+    let mut a = crate::EditorSession::new(&graph);
+    let mut b = crate::EditorSession::new(&graph);
+    let at = |x: f64| Props::new().with_float("x", x).with_float("y", 300.0);
+
+    let crate::EditorSession { runtime, world, .. } = &mut a;
+    let _ = runtime.exec(world, "node.add", &at(10.0));
+    let first = graph.borrow().rects.len() - 1;
+    assert_eq!(runtime.history_mut().undo(world), Some("node.add"));
+
+    let crate::EditorSession { runtime, world, .. } = &mut b;
+    let _ = runtime.exec(world, "node.add", &at(700.0));
+    let taken = graph.borrow().node_rect(first);
+    assert_eq!(taken.x0, 700.0, "the second area's node took the freed name");
+
+    let crate::EditorSession { runtime, world, .. } = &mut a;
+    assert_eq!(
+        runtime.history_mut().redo(world),
+        None,
+        "nothing to redo: a newer step came after"
+    );
+    assert_eq!(
+        graph.borrow().node_rect(first),
+        taken,
+        "the second area's node is untouched"
+    );
+    assert_eq!(
+        a.runtime().history().depth(),
+        b.runtime().history().depth(),
+        "one history"
+    );
+}
+
+/// What a view is owed does not grow with the frames of a drag elsewhere: a move replaces
+/// the move of the same node — but never jumps back over an edit of the structure.
+#[test]
+fn a_view_owes_one_move_per_node_however_long_the_drag() {
+    use crate::Change;
+    use crate::world::Edit;
+
+    let views = crate::Views::new();
+    let id = || NewWidget::new(Label::new("")).id();
+    let (here, away) = (id(), id());
+    let _a = views.attach(here);
+    let _b = views.attach(away);
+    for frame in 0..1000 {
+        let pos = Point::new(frame as f64, 0.0);
+        views.note_except(here, Change::Moved { index: 3, pos });
+        views.note_except(here, Change::Moved { index: 4, pos });
+    }
+    let owed = views.take(away);
+    assert_eq!(owed.len(), 2, "one per node, not one per frame: {}", owed.len());
+    assert!(
+        owed.contains(&Change::Moved {
+            index: 3,
+            pos: Point::new(999.0, 0.0)
+        }),
+        "the last place"
+    );
+
+    let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
+    views.note_except(here, Change::Moved {
+        index: 3,
+        pos: Point::new(1.0, 0.0),
+    });
+    views.note_except(here, Change::Structure(Edit::NodeRemoved { index: 3 }));
+    views.note_except(here, Change::Structure(Edit::NodeAdded { index: 3, rect }));
+    views.note_except(here, Change::Moved {
+        index: 3,
+        pos: Point::new(2.0, 0.0),
+    });
+    let owed = views.take(away);
+    assert_eq!(owed.len(), 4, "the move after the new node stays after it: {owed:?}");
+    assert_eq!(owed[3], Change::Moved {
+        index: 3,
+        pos: Point::new(2.0, 0.0)
+    });
+}
+
+/// A panel is owed a refresh for what it can show — the selection, content, structure, a
+/// move of a selected node — and not for every frame of a drag of a node it does not show.
+#[test]
+fn a_panel_is_not_owed_the_moves_of_nodes_it_does_not_show() {
+    use std::collections::BTreeSet;
+
+    use crate::Change;
+
+    let views = crate::Views::new();
+    let id = || NewWidget::new(Label::new("")).id();
+    let (canvas, panel) = (id(), id());
+    let _view = views.attach(canvas);
+    let _watch = views.watch(panel, |_| {});
+    views.note_except(canvas, Change::Moved {
+        index: 2,
+        pos: Point::new(5.0, 0.0),
+    });
+    assert!(views.owed_watchers().is_empty(), "a move of a node nobody selected");
+
+    let _ = views.replace_selection(BTreeSet::from([2]));
+    views.refreshed(panel);
+    views.note_except(canvas, Change::Moved {
+        index: 2,
+        pos: Point::new(6.0, 0.0),
+    });
+    assert_eq!(views.owed_watchers().len(), 1, "a move of the node it shows");
+    views.refreshed(panel);
+    views.note_except(canvas, Change::Contents { index: 7 });
+    assert_eq!(
+        views.owed_watchers().len(),
+        1,
+        "content: calc's display depends on other nodes"
+    );
 }
