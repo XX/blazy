@@ -37,7 +37,7 @@ blazy-shell = { path = "crates/blazy-shell", default-features = false }
 node-canvas = { path = "examples/node-canvas" }
 # Pinned to a commit rather than to the branch, like every other move of this pin: an update
 # is a deliberate step that CI judges, not a side effect.
-masonry = { git = "https://github.com/XX/xilem.git", rev = "88250dc02f0e6b89cb2689d923b46ad5a742de26", default-features = false }
+masonry = { git = "https://github.com/XX/xilem.git", rev = "a1036fb52d52b1500c04cb7a970ea71e8bd75587", default-features = false }
 winit = "0.30"
 softbuffer = "0.4"
 tracing = "0.1"

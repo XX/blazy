@@ -828,7 +828,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1649,7 +1649,7 @@ dependencies = [
 [[package]]
 name = "linebender_include_doc_path"
 version = "0.1.0"
-source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
+source = "git+https://github.com/XX/xilem.git?rev=a1036fb52d52b1500c04cb7a970ea71e8bd75587#a1036fb52d52b1500c04cb7a970ea71e8bd75587"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1709,7 +1709,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "masonry"
 version = "0.4.0"
-source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
+source = "git+https://github.com/XX/xilem.git?rev=a1036fb52d52b1500c04cb7a970ea71e8bd75587#a1036fb52d52b1500c04cb7a970ea71e8bd75587"
 dependencies = [
  "accesskit",
  "linebender_include_doc_path",
@@ -1724,7 +1724,7 @@ dependencies = [
 [[package]]
 name = "masonry_core"
 version = "0.4.0"
-source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
+source = "git+https://github.com/XX/xilem.git?rev=a1036fb52d52b1500c04cb7a970ea71e8bd75587#a1036fb52d52b1500c04cb7a970ea71e8bd75587"
 dependencies = [
  "accesskit",
  "anymap3",
@@ -1751,7 +1751,7 @@ dependencies = [
 [[package]]
 name = "masonry_testing"
 version = "0.4.0"
-source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
+source = "git+https://github.com/XX/xilem.git?rev=a1036fb52d52b1500c04cb7a970ea71e8bd75587#a1036fb52d52b1500c04cb7a970ea71e8bd75587"
 dependencies = [
  "accesskit_consumer",
  "image",
@@ -2723,7 +2723,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3389,7 +3389,7 @@ dependencies = [
 [[package]]
 name = "tree_arena"
 version = "0.2.0"
-source = "git+https://github.com/XX/xilem.git?rev=88250dc02f0e6b89cb2689d923b46ad5a742de26#88250dc02f0e6b89cb2689d923b46ad5a742de26"
+source = "git+https://github.com/XX/xilem.git?rev=a1036fb52d52b1500c04cb7a970ea71e8bd75587#a1036fb52d52b1500c04cb7a970ea71e8bd75587"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -4041,7 +4041,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

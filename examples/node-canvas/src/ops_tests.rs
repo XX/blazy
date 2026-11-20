@@ -251,14 +251,14 @@ fn a_pan_on_a_scaled_display_moves_by_what_the_pointer_did() {
     let root = harness.root_id();
     harness.set_focus_fallback(Some(root));
 
-    // The harness takes *physical* positions, and at scale 2 they are twice the logical
-    // ones the canvas answers hit tests in — so the gesture is driven in physical
-    // coordinates and expected to move the view by half of what it travelled.
+    // The harness takes *logical* positions and sends the window physical ones, twice
+    // as large at scale 2 (upstream #1854; before it took physical ones). The pointer
+    // travels 40 by 30 logical pixels — 80 by 60 physical — and the view has to move by
+    // the logical travel, not by the physical one.
     let from = empty_spot(&mut harness);
-    let physical = |p: Point| Point::new(p.x * 2.0, p.y * 2.0);
-    harness.mouse_move(physical(from));
+    harness.mouse_move(from);
     harness.mouse_button_press(Some(PointerButton::Primary));
-    harness.mouse_move(physical(from) + Vec2::new(80.0, 60.0));
+    harness.mouse_move(from + Vec2::new(40.0, 30.0));
     harness.mouse_button_release(Some(PointerButton::Primary));
     let _ = harness.redraw();
 
