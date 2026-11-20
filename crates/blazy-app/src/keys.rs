@@ -1,78 +1,9 @@
 //! What the screen does on a key, as data.
 
-use blazy_ops::event::{OpEvent, Pattern};
+pub use blazy_node_editor::{SCREEN_CONTEXT, ScreenAction};
+use blazy_ops::event::Pattern;
 use blazy_ops::keymap::{Binding, Keymap};
-use masonry::core::TextEvent;
 use masonry::core::keyboard::Modifiers;
-
-/// An operation on the screen or on the area under the pointer (§41, §44).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ScreenAction {
-    /// Splits the area under the pointer into two, side by side.
-    SplitHorizontal,
-    /// Splits the area under the pointer into two, one above the other.
-    SplitVertical,
-    /// Joins the area under the pointer with its sibling; the one under the pointer
-    /// survives. Nothing happens when the sibling is a split rather than an area (§41.1).
-    Join,
-    /// Swaps the area under the pointer with its sibling (§41.4).
-    Swap,
-    /// Shows the area under the pointer alone, or brings the screen back (§41.3).
-    ToggleMaximize,
-    /// Opens another window over the same graph (§44).
-    NewWindow,
-    /// Moves the area under the pointer into a window of its own, with its view, its
-    /// selection and its history (§44).
-    Detach,
-    /// Writes the workspace file.
-    SaveWorkspace,
-    /// Reads the workspace file back.
-    LoadWorkspace,
-    /// Shows or hides the sidebar of the area under the pointer (§61) — Blender's `N`.
-    /// Nothing for an application that gave its areas no sidebar.
-    ToggleSidebar,
-}
-
-/// The keymap context the screen's bindings live in.
-pub const SCREEN_CONTEXT: &str = "screen";
-
-impl ScreenAction {
-    /// Every action, in the order the defaults bind them.
-    pub const ALL: [Self; 10] = [
-        Self::SplitHorizontal,
-        Self::SplitVertical,
-        Self::Join,
-        Self::Swap,
-        Self::ToggleMaximize,
-        Self::NewWindow,
-        Self::Detach,
-        Self::SaveWorkspace,
-        Self::LoadWorkspace,
-        Self::ToggleSidebar,
-    ];
-
-    /// The name a keymap file binds this action by.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::SplitHorizontal => "screen.split_horizontal",
-            Self::SplitVertical => "screen.split_vertical",
-            Self::Join => "screen.join",
-            Self::Swap => "screen.swap",
-            Self::ToggleMaximize => "screen.maximize",
-            Self::NewWindow => "screen.new_window",
-            Self::Detach => "screen.detach",
-            Self::SaveWorkspace => "screen.save_workspace",
-            Self::LoadWorkspace => "screen.load_workspace",
-            Self::ToggleSidebar => "screen.sidebar",
-        }
-    }
-
-    /// The action a keymap file names, if it names one.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|action| action.name() == name)
-    }
-}
 
 /// A screen binding names an action this build does not have.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,18 +17,14 @@ impl std::fmt::Display for UnknownScreenAction {
 
 impl std::error::Error for UnknownScreenAction {}
 
-/// Which keys do what to the screen.
+/// Which keys do what to the screen: the [`SCREEN_CONTEXT`] section of a keymap, as data.
 ///
-/// Data rather than a `match`, so that an application can rebind them — the reason
-/// §11 gives for a keymap at all. They are not operators of `blazy-ops` yet: an operation
-/// on the screen needs the screen's widget, and an operator never touches a widget
-/// (§38.3); making them operators is a question of its own.
-///
-/// **They are offered an event before the tree is**, from the seat in front of it
-/// (§38.2), so a key bound here is a key no editor will ever hear. The defaults all hold a
-/// modifier the editor's own keymap does not use, and a test holds them to that; the
-/// window this crate replaced bound plain `X` to a split and made `node.delete`
-/// unreachable.
+/// The actions are operators now (§71): each area's runtime runs them from this section
+/// like any other binding, after the editor's own sections, and the driver does what they
+/// ask. This type is what an application rebinds them with. The defaults hold a modifier the
+/// editor's own keymap does not use — and a test holds them to that — except `N`, which the
+/// editor's keymap leaves free; the window this crate replaced bound plain `X` to a split
+/// and made `node.delete` unreachable.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenKeys {
     /// The bindings, tried in order; the first match wins.
@@ -170,17 +97,5 @@ impl ScreenKeys {
             })
             .collect::<Result<_, _>>()?;
         Ok(Self { bindings })
-    }
-
-    /// What `event` asks the screen to do, if anything.
-    pub fn action_for(&self, event: &TextEvent) -> Option<ScreenAction> {
-        let TextEvent::Keyboard(key) = event else {
-            return None;
-        };
-        let event = OpEvent::from_keyboard(key);
-        self.bindings
-            .iter()
-            .find(|(pattern, _)| pattern.matches(&event))
-            .map(|(_, action)| *action)
     }
 }

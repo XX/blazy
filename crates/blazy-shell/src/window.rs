@@ -51,7 +51,7 @@
 //! the window. Nor are the clipboard and the input method, which
 //! [`text`](crate::text) handles.
 
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -187,6 +187,9 @@ pub struct NewWindow {
     pub root: NewWidget<dyn Widget>,
 }
 
+/// The process's clipboard, shared: what [`ShellCtx::shared_clipboard`] hands out.
+pub type SharedClipboard = Rc<RefCell<Box<dyn Clipboard>>>;
+
 /// What a driver may ask the shell for.
 ///
 /// Passed to every method that could reasonably want a second window — which is every
@@ -196,8 +199,9 @@ pub struct NewWindow {
 pub struct ShellCtx {
     requests: Vec<ShellRequest>,
     next: u64,
-    /// The process's clipboard: one for every window, as the platform has one.
-    clipboard: Box<dyn Clipboard>,
+    /// The process's clipboard: one for every window, as the platform has one — in a cell a
+    /// driver can hand on to whatever copies past the text widgets (§71).
+    clipboard: SharedClipboard,
     text: TextCounters,
 }
 
@@ -217,7 +221,7 @@ impl ShellCtx {
         Self {
             requests: Vec::new(),
             next: 0,
-            clipboard: Box::new(MemoryClipboard::default()),
+            clipboard: Rc::new(RefCell::new(Box::new(MemoryClipboard::default()))),
             text: TextCounters::default(),
         }
     }
@@ -225,16 +229,23 @@ impl ShellCtx {
     /// The same context, copying to and pasting from `clipboard`.
     #[must_use]
     pub fn with_clipboard(mut self, clipboard: Box<dyn Clipboard>) -> Self {
-        self.clipboard = clipboard;
+        self.clipboard = Rc::new(RefCell::new(clipboard));
         self
     }
 
     /// The clipboard text widgets copy to and paste from.
     ///
     /// Here rather than in the shell's loop because a driver may want it too: anything an
-    /// application copies past the text widgets goes on the same clipboard.
-    pub fn clipboard(&mut self) -> &mut dyn Clipboard {
-        self.clipboard.as_mut()
+    /// application copies past the text widgets goes on the same clipboard. Borrowed from its
+    /// cell: do not hold it across an event.
+    pub fn clipboard(&mut self) -> RefMut<'_, Box<dyn Clipboard>> {
+        self.clipboard.borrow_mut()
+    }
+
+    /// The clipboard's cell, for a driver to hand to what copies outside the text widgets —
+    /// a node editor's operators, from a key, a menu or a script alike (§71).
+    pub fn shared_clipboard(&self) -> SharedClipboard {
+        self.clipboard.clone()
     }
 
     /// What the host has done with text so far.

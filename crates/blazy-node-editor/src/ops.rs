@@ -40,10 +40,11 @@ pub const CANVAS_CONTEXT: &str = "canvas";
 
 /// The context chain of an event over the canvas, innermost first.
 ///
-/// Two levels rather than §11's four: a node editor knows it is inside a window and
-/// nothing about the areas and regions an application may put around it. The shape is
-/// the point: the canvas shadows the window, and the window still catches undo.
-pub const CANVAS_SCOPE: [&str; 2] = [CANVAS_CONTEXT, "window"];
+/// Three levels rather than §11's four: the canvas, the window, and the screen around it
+/// (§71). The shape is the point: the canvas shadows the window, the window still catches
+/// undo, and the screen's operations — split, detach, save — come last, so a key bound by
+/// the editor and by the screen is the editor's.
+pub const CANVAS_SCOPE: [&str; 3] = [CANVAS_CONTEXT, "window", crate::SCREEN_CONTEXT];
 
 /// Selects the node under the pointer.
 #[derive(Default)]
@@ -690,7 +691,16 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for CopyOp {
         // As text too, for the driver to put on the system clipboard, when the graph can
         // write its content (§66).
         let text = clip.to_text(&*graph);
+        // Onto the system clipboard here, when a driver handed one over (§71) — from a key,
+        // a menu or a script alike. Without one, the text waits in the registry for a driver
+        // of its own (`Views::take_outbound_clip`).
+        if let (Some(clipboard), Some(text)) = (cx.world().clipboard(), text.clone()) {
+            clipboard.write(text);
+        }
         graph.views().set_clip(Rc::new(clip), text);
+        if cx.world().clipboard().is_some() {
+            let _ = graph.views().take_outbound_clip();
+        }
         OpResult::Finished
     }
 }
@@ -701,6 +711,11 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for CopyOp {
 /// the clipboard first (§66); offered text that is not a copy this graph reads is dropped,
 /// and this process's own copy is what is pasted.
 fn clip<G: NodeGraph>(world: &EditorWorld<G>) -> Option<Rc<Clip<G::Content>>> {
+    // What the system clipboard holds is offered first, when a driver handed it over: a copy
+    // from another process is pasted from a key, a menu or a script alike (§71).
+    if let Some(text) = world.clipboard().and_then(crate::SystemClipboard::read) {
+        world.graph.borrow().views().offer_clip_text(text);
+    }
     let graph = world.graph.borrow();
     let views = graph.views();
     if let Some(text) = views.take_offered()
@@ -1533,6 +1548,30 @@ pub fn default_keymap() -> Keymap {
 /// The operator that opens [`node_menu`].
 pub const NODE_MENU: &str = "menu.node";
 
+/// The operator that opens [`screen_menu`].
+pub const SCREEN_MENU: &str = "menu.screen";
+
+/// The screen's operations, as a menu (§71): each refused — and shown refused — where a
+/// driver keeps no screen, or where the area cannot do it.
+pub fn screen_menu() -> crate::Menu {
+    use crate::ScreenAction;
+    crate::Menu::new("Screen")
+        .with("Split side by side", ScreenAction::SplitHorizontal.name(), Props::new())
+        .with(
+            "Split one above the other",
+            ScreenAction::SplitVertical.name(),
+            Props::new(),
+        )
+        .with("Join with neighbour", ScreenAction::Join.name(), Props::new())
+        .with("Swap with neighbour", ScreenAction::Swap.name(), Props::new())
+        .with("Maximize", ScreenAction::ToggleMaximize.name(), Props::new())
+        .with("Detach into a window", ScreenAction::Detach.name(), Props::new())
+        .with("New window", ScreenAction::NewWindow.name(), Props::new())
+        .with("Sidebar", ScreenAction::ToggleSidebar.name(), Props::new())
+        .with("Save", ScreenAction::SaveWorkspace.name(), Props::new())
+        .with("Open", ScreenAction::LoadWorkspace.name(), Props::new())
+}
+
 /// The operator that opens the `Add` menu: one entry per kind the graph lists.
 pub const ADD_MENU: &str = "menu.add";
 
@@ -1586,6 +1625,9 @@ pub fn node_menu() -> crate::Menu {
             "view.zoom",
             Props::new().with_float("factor", 1.0 / ZoomOp::STEP),
         )
+        // The screen's operations (§71) in a menu of their own: nine more entries here would
+        // not fit a window, and a menu does not scroll yet (§57.4).
+        .with("Screen", SCREEN_MENU, Props::new())
         .with("Undo", "ed.undo", Props::new())
         .with("Redo", "ed.redo", Props::new())
 }
@@ -1611,6 +1653,10 @@ pub fn runtime_with<G: NodeGraph>(keymap: Keymap) -> OpRuntime<EditorWorld<G>> {
     runtime.register(LinkDragOp::default());
     runtime.register(crate::MenuOp::new(NODE_MENU, node_menu()));
     runtime.register(AddMenuOp);
+    runtime.register(crate::MenuOp::new(SCREEN_MENU, screen_menu()));
+    for action in crate::ScreenAction::ALL {
+        runtime.register(crate::ScreenOp::new(action));
+    }
     runtime.register(AddNodeOp);
     runtime.register(DeleteNodeOp);
     runtime.register(DuplicateOp::<G::Content>::default());

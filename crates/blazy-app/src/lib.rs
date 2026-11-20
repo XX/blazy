@@ -17,8 +17,8 @@
 //!
 //! * every area is its own layer, so an idle area keeps its pixels (§36);
 //! * a window collects what another window changed before it draws, and is woken only when something is owed (§44.3);
-//! * the screen's operations — split, join, swap, maximize, detach, another window, the workspace file — run on keys
-//!   that are data ([`ScreenKeys`]);
+//! * the screen's operations — split, join, swap, maximize, detach, another window, the workspace file — are operators
+//!   in every area's keymap, bound by data ([`ScreenKeys`]) and done by the driver (§71);
 //! * a detached area takes its view, its selection and its history with it, and leaves nothing modal behind (§44).
 //!
 //! ```no_run
@@ -46,11 +46,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use blazy_areas::{AreaContent, AreaId, AreaScreen, RegionKind, SplitTree, Workspace};
-use blazy_node_editor::{EdgePan, EditorSession, NodeEditor, NodeGraph, SessionHandle, SharedGraph, sync_root};
+use blazy_node_editor::{
+    EdgePan, EditorSession, NodeEditor, NodeGraph, ScreenState, SessionHandle, SharedGraph, SystemClipboard, sync_root,
+};
 use blazy_ops::keymap::{Keymap, KeymapError};
 use blazy_shell::Backend;
-use blazy_shell::text::text_input_focused;
-use blazy_shell::window::{Error, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
+use blazy_shell::window::{Error, SharedClipboard, ShellCtx, ShellDriver, WindowConfig, WindowKey, run};
 use masonry::app::RenderRoot;
 use masonry::core::{
     DefaultProperties, Handled, NewWidget, PointerEvent, TextEvent, Widget, WidgetId, WidgetMut, WidgetRef,
@@ -153,7 +154,8 @@ pub struct EditorApp<G: NodeGraph> {
     session: Rc<MakeSession<G>>,
     /// Edge pan for every session the application makes, when it asked for it.
     edge_pan: Option<EdgePan>,
-    keys: ScreenKeys,
+    /// The process's clipboard, once the first window is up — handed to every area's world.
+    clipboard: Option<SharedClipboard>,
     workspace: Option<PathBuf>,
     /// What the application writes beside the workspace when it is saved — its graph (§63).
     on_save: Option<Rc<SaveGraph<G>>>,
@@ -199,9 +201,12 @@ impl<G: NodeGraph> EditorApp<G> {
             graph: graph.clone(),
             build: Rc::new(build),
             sidebar: None,
-            session: Rc::new(|graph| EditorSession::new(graph).share()),
+            // The editor's operators and the screen's, with both sections of the keymap.
+            session: Rc::new(|graph| {
+                EditorSession::with_runtime(graph, blazy_node_editor::ops::runtime_with(default_keymap())).share()
+            }),
             edge_pan: None,
-            keys: ScreenKeys::default(),
+            clipboard: None,
             workspace: None,
             on_save: None,
             on_load: None,
@@ -247,7 +252,10 @@ impl<G: NodeGraph> EditorApp<G> {
     /// The same application, with other bindings for the screen's operations.
     #[must_use]
     pub fn with_keys(mut self, keys: ScreenKeys) -> Self {
-        self.keys = keys;
+        let keymap = blazy_node_editor::ops::default_keymap().with(SCREEN_CONTEXT, keys.bindings());
+        self.session = Rc::new(move |graph| {
+            EditorSession::with_runtime(graph, blazy_node_editor::ops::runtime_with(keymap.clone())).share()
+        });
         self
     }
 
@@ -260,7 +268,9 @@ impl<G: NodeGraph> EditorApp<G> {
     ///
     /// When the screen section names an action there is none of.
     pub fn with_keymap(mut self, keymap: Keymap) -> Result<Self, UnknownScreenAction> {
-        self.keys = ScreenKeys::from_keymap(&keymap)?;
+        // Checked, not kept: a screen binding that names no action is refused rather than
+        // left to do nothing (§45). The bindings themselves go with the keymap.
+        let _ = ScreenKeys::from_keymap(&keymap)?;
         self.session = Rc::new(move |graph| {
             EditorSession::with_runtime(graph, blazy_node_editor::ops::runtime_with(keymap.clone())).share()
         });
@@ -500,18 +510,32 @@ impl<G: NodeGraph> EditorApp<G> {
         }
     }
 
-    /// Does what `action` asks, in the window `root` belongs to.
+    /// Does what `action` asks, in the window `root` belongs to, to the area under the pointer.
     ///
-    /// Public for a test or a menu, which have an action rather than a key.
+    /// For a test or a script on the driver's side; a key or a menu entry runs the action's
+    /// operator, whose request the driver does after the event ([`settled`](ShellDriver::settled)).
     pub fn perform(&mut self, cx: &mut ShellCtx, root: &mut RenderRoot, action: ScreenAction) -> Handled {
+        self.perform_in(cx, root, None, action)
+    }
+
+    /// Does what `action` asks to `area` — the area whose operator asked — or to the area under
+    /// the pointer for `None`.
+    fn perform_in(
+        &mut self,
+        cx: &mut ShellCtx,
+        root: &mut RenderRoot,
+        area: Option<AreaId>,
+        action: ScreenAction,
+    ) -> Handled {
+        let target = area;
         match action {
-            ScreenAction::SplitHorizontal => on_hovered_area::<G>(root, |screen, area| {
+            ScreenAction::SplitHorizontal => on_area::<G>(root, target, |screen, area| {
                 AreaScreen::split(screen, area, Axis::Horizontal, 0.5);
             }),
-            ScreenAction::SplitVertical => on_hovered_area::<G>(root, |screen, area| {
+            ScreenAction::SplitVertical => on_area::<G>(root, target, |screen, area| {
                 AreaScreen::split(screen, area, Axis::Vertical, 0.5);
             }),
-            ScreenAction::Join => on_hovered_area::<G>(root, |screen, area| {
+            ScreenAction::Join => on_area::<G>(root, target, |screen, area| {
                 // The survivor is the one under the pointer, as in Blender. An area
                 // whose sibling is a split has no partner: that is what a binary tree can
                 // express, and §41.1 counts what it costs.
@@ -523,7 +547,7 @@ impl<G: NodeGraph> EditorApp<G> {
                 }
             }),
             ScreenAction::Swap => {
-                on_hovered_area::<G>(root, |screen, area| match screen.widget.tree().joinable(area) {
+                on_area::<G>(root, target, |screen, area| match screen.widget.tree().joinable(area) {
                     Some(sibling) => {
                         AreaScreen::swap(screen, area, sibling);
                     },
@@ -536,7 +560,7 @@ impl<G: NodeGraph> EditorApp<G> {
                         AreaScreen::restore(screen);
                     },
                     None => {
-                        if let Some(area) = screen.widget.hovered_area() {
+                        if let Some(area) = target.or_else(|| screen.widget.hovered_area()) {
                             AreaScreen::maximize(screen, area);
                         }
                     },
@@ -545,7 +569,7 @@ impl<G: NodeGraph> EditorApp<G> {
             ScreenAction::NewWindow => self.open_window(cx, None),
             ScreenAction::Detach => {
                 let taken = with_screen::<G, _>(root, |screen| {
-                    let area = screen.widget.hovered_area()?;
+                    let area = target.or_else(|| screen.widget.hovered_area())?;
                     detach_area(screen, area)
                 });
                 match taken {
@@ -561,7 +585,7 @@ impl<G: NodeGraph> EditorApp<G> {
                 if self.sidebar.is_none() {
                     return Handled::No;
                 }
-                on_hovered_area::<G>(root, |screen, area| {
+                on_area::<G>(root, target, |screen, area| {
                     if let Some(session) = screen.widget.payload(area) {
                         let state = session.borrow().sidebar().clone();
                         let mut sidebar = state.get();
@@ -570,6 +594,11 @@ impl<G: NodeGraph> EditorApp<G> {
                     }
                     refresh_area(screen, area);
                 });
+            },
+            // An action a later editor crate added and this driver does not know yet.
+            _ => {
+                tracing::warn!(?action, "a screen action this driver does not do");
+                return Handled::No;
             },
         }
         Handled::Yes
@@ -715,7 +744,12 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         }
         self.windows.push(window);
         self.counters.windows_opened += 1;
+        // The one clipboard of the process, which the editors' copy and paste reach (§71).
+        if self.clipboard.is_none() {
+            self.clipboard = Some(cx.shared_clipboard());
+        }
         self.route_keys(window, root);
+        self.sync_screen(root);
         if self.remaining > 0 {
             self.remaining -= 1;
             self.open_window(cx, None);
@@ -740,13 +774,11 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
     fn settled(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
         // The keys follow the pointer from area to area, decided after the event like
         // everything else here: the event is what moved the pointer.
+        // What the screen's operators asked for in this event — from a key, a menu or a
+        // script alike — the driver does now: the screen is not theirs to touch (§38.3, §71).
+        self.do_screen_requests(cx, root);
         self.route_keys(window, root);
-        // A copy made in this event goes to the system clipboard, where another process —
-        // or this one, after a restart — can paste it (§66). The driver's to do: the
-        // clipboard is the host's, and an operator never sees the host.
-        if let Some(text) = self.graph.borrow().views().take_outbound_clip() {
-            cx.clipboard().write(text);
-        }
+        self.sync_screen(root);
         for window in self.windows_to_wake() {
             self.counters.wakes += 1;
             cx.request_redraw(window);
@@ -816,49 +848,72 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         root: &mut RenderRoot,
         event: &TextEvent,
     ) -> Handled {
-        if text_input_focused(root) {
-            return Handled::No;
-        }
-        // A key the area's keymap runs `node.paste` on: what the system clipboard holds is
-        // offered first, so a copy from another process is what is pasted (§66). Read only
-        // here, on that key — reading the clipboard on every key would ask the platform for
-        // it on every key.
-        if self.would_paste(root, event)
-            && let Some(text) = cx.clipboard().read()
-        {
-            self.graph.borrow().views().offer_clip_text(text);
-        }
-        match self.keys.action_for(event) {
-            Some(action) => self.perform(cx, root, action),
-            None => Handled::No,
-        }
+        let _ = (cx, event);
+        // The keys are the editors' — the screen's operations are operators in their keymap
+        // (§71), and a text field with focus keeps them (§56). What this seat still does is
+        // the snapshot the operators poll on.
+        self.sync_screen(root);
+        Handled::No
     }
 }
 
 impl<G: NodeGraph> EditorApp<G> {
-    /// Whether `event` is a key the keymap of the area the keys go to runs `node.paste` on.
-    fn would_paste(&self, root: &mut RenderRoot, event: &TextEvent) -> bool {
-        let TextEvent::Keyboard(key) = event else {
-            return false;
-        };
-        if !key.state.is_down() {
-            return false;
-        }
-        let event = blazy_ops::event::OpEvent::from_keyboard(key);
+    /// Gives every area's world of this window the snapshot of the screen its operators poll
+    /// on, and the system clipboard (§71).
+    fn sync_screen(&mut self, root: &mut RenderRoot) {
+        let (workspace, sidebar, clipboard) =
+            (self.workspace.is_some(), self.sidebar.is_some(), self.clipboard.clone());
         let screen = root.get_layer_root(0);
         let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
-            return false;
+            return;
         };
-        let area = screen.hovered_area().or_else(|| screen.tree().areas().next());
-        area.and_then(|area| screen.payload(area)).is_some_and(|session| {
-            let scope = blazy_ops::keymap::Scope(&blazy_node_editor::ops::CANVAS_SCOPE);
-            session
-                .borrow()
-                .runtime()
-                .keymap()
-                .matches(scope, &event)
-                .any(|binding| binding.op == "node.paste")
-        })
+        let areas: Vec<AreaId> = screen.tree().areas().collect();
+        for &area in &areas {
+            let Some(session) = screen.payload(area) else {
+                continue;
+            };
+            let state = ScreenState {
+                driven: true,
+                joinable: screen.tree().joinable(area).is_some(),
+                areas: areas.len(),
+                workspace,
+                sidebar,
+            };
+            let mut session = session.borrow_mut();
+            let world = session.world_mut();
+            world.set_screen(state);
+            if world.clipboard().is_none()
+                && let Some(clipboard) = &clipboard
+            {
+                let (read, write) = (clipboard.clone(), clipboard.clone());
+                world.set_clipboard(Some(SystemClipboard::new(
+                    move || read.borrow_mut().read(),
+                    move |text| write.borrow_mut().write(text),
+                )));
+            }
+        }
+    }
+
+    /// Does what the screen's operators asked in this window's areas during the event.
+    fn do_screen_requests(&mut self, cx: &mut ShellCtx, root: &mut RenderRoot) {
+        let requests: Vec<(AreaId, ScreenAction)> = {
+            let screen = root.get_layer_root(0);
+            let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
+                return;
+            };
+            screen
+                .tree()
+                .areas()
+                .filter_map(|area| screen.payload(area).map(|session| (area, session.clone())))
+                .flat_map(|(area, session)| {
+                    let taken = session.borrow_mut().world_mut().take_screen_requests();
+                    taken.into_iter().map(move |action| (area, action))
+                })
+                .collect()
+        };
+        for (area, action) in requests {
+            let _ = self.perform_in(cx, root, Some(area), action);
+        }
     }
 }
 
@@ -919,10 +974,14 @@ fn with_screen<G: NodeGraph, R>(
     root.edit_base_layer(|mut widget| act(&mut widget.downcast::<EditorScreen<G>>()))
 }
 
-/// Runs `act` on the screen and the area under the pointer, if there is one.
-fn on_hovered_area<G: NodeGraph>(root: &mut RenderRoot, act: impl FnOnce(&mut WidgetMut<'_, EditorScreen<G>>, AreaId)) {
+/// Runs `act` on the screen and `area`, or the area under the pointer for `None`.
+fn on_area<G: NodeGraph>(
+    root: &mut RenderRoot,
+    area: Option<AreaId>,
+    act: impl FnOnce(&mut WidgetMut<'_, EditorScreen<G>>, AreaId),
+) {
     with_screen::<G, _>(root, |screen| {
-        if let Some(area) = screen.widget.hovered_area() {
+        if let Some(area) = area.or_else(|| screen.widget.hovered_area()) {
             act(screen, area);
         }
     });

@@ -169,6 +169,12 @@ pub struct EditorWorld<G: NodeGraph> {
     /// has to stay reproducible. The snapshot needs to know what a node *is*, which
     /// only the application does, so the application supplies it.
     pub(crate) record_move: MoveRecorder<G>,
+    /// The screen around this world's area, as the driver last saw it (§71).
+    pub(crate) screen: crate::ScreenState,
+    /// What the screen's operators asked the driver to do, in order.
+    pub(crate) screen_requests: Vec<crate::ScreenAction>,
+    /// The system clipboard, if a driver handed it over (§71).
+    pub(crate) clipboard: Option<crate::SystemClipboard>,
 }
 
 impl<G: NodeGraph> EditorWorld<G> {
@@ -230,6 +236,37 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.pointer = pos;
     }
 
+    /// The screen around this world's area, as the driver last saw it (§71).
+    pub fn screen(&self) -> crate::ScreenState {
+        self.screen
+    }
+
+    /// Sets the snapshot of the screen the screen's operators poll on — the driver's to keep,
+    /// before every event.
+    pub fn set_screen(&mut self, screen: crate::ScreenState) {
+        self.screen = screen;
+    }
+
+    /// Asks the driver to do `action` to the screen, after the event.
+    pub fn request_screen(&mut self, action: crate::ScreenAction) {
+        self.screen_requests.push(action);
+    }
+
+    /// What the screen's operators asked for since the last time, taken — the driver's.
+    pub fn take_screen_requests(&mut self) -> Vec<crate::ScreenAction> {
+        std::mem::take(&mut self.screen_requests)
+    }
+
+    /// The system clipboard, if a driver handed it over.
+    pub fn clipboard(&self) -> Option<&crate::SystemClipboard> {
+        self.clipboard.as_ref()
+    }
+
+    /// Hands the system clipboard over, for `node.copy` and `node.paste` (§71).
+    pub fn set_clipboard(&mut self, clipboard: Option<crate::SystemClipboard>) {
+        self.clipboard = clipboard;
+    }
+
     /// Records that nodes moved past the operators' own setters — a step that put a whole
     /// snapshot back — so that the views follow.
     pub fn note_moved(&mut self, indices: impl IntoIterator<Item = usize>) {
@@ -265,6 +302,9 @@ impl<G: NodeGraph> EditorWorld<G> {
             edits: Vec::new(),
             new_node_size: DEFAULT_NODE_SIZE,
             record_move: journal::<G>,
+            screen: crate::ScreenState::default(),
+            screen_requests: Vec::new(),
+            clipboard: None,
         }
     }
 

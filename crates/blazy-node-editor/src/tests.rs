@@ -2422,8 +2422,10 @@ mod cut_off {
                     ),
                 ]);
             },
-            "node.select" | "view.zoom" | "menu.node" | "menu.add" | "node.add" | "node.delete" | "node.copy"
-            | "node.paste" | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
+            "node.select" | "view.zoom" | "menu.node" | "menu.add" | "menu.screen" | "node.add" | "node.delete"
+            | "node.copy" | "node.paste" | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
+            // The screen's operations ask the driver and end: none of them is modal (§71).
+            other if other.starts_with("screen.") => return None,
             other => panic!("`{other}` is not classified: modal or not, put it in `start`"),
         }])
     }

@@ -106,6 +106,12 @@ impl<G: NodeGraph> EditorSession<G> {
         &self.world
     }
 
+    /// The world, for a driver to keep what it hands its operators — the screen's snapshot
+    /// and the system clipboard (§71) — and to take what they asked of it.
+    pub fn world_mut(&mut self) -> &mut EditorWorld<G> {
+        &mut self.world
+    }
+
     /// The graph the area shows.
     pub fn graph(&self) -> &SharedGraph<G> {
         &self.world.graph

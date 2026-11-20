@@ -35,10 +35,8 @@ blazy-widgets = { path = "crates/blazy-widgets" }
 # defaults, which is how the examples get it.
 blazy-shell = { path = "crates/blazy-shell", default-features = false }
 node-canvas = { path = "examples/node-canvas" }
-# Our fork, not upstream: branch `dev` of `XX/xilem`, which is `linebender/xilem` at `271a27a`
-# plus our own commits — so far one, the return flag on `Layer::capture_pointer_event`
-# (architecture §17 item 4, §39.1). Pinned to a commit rather than to the branch, like every
-# other move of this pin: an update is a deliberate step that CI judges, not a side effect.
+# Pinned to a commit rather than to the branch, like every other move of this pin: an update
+# is a deliberate step that CI judges, not a side effect.
 masonry = { git = "https://github.com/XX/xilem.git", rev = "88250dc02f0e6b89cb2689d923b46ad5a742de26", default-features = false }
 winit = "0.30"
 softbuffer = "0.4"

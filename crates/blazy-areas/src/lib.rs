@@ -74,8 +74,8 @@ mod workspace;
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
-    AccessCtx, ChildrenIds, EventCtx, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PointerEvent,
-    PropertiesMut, PropertiesRef, RegisterCtx, Widget, WidgetId, WidgetMut, WidgetPod,
+    AccessCtx, ChildrenIds, CursorIcon, EventCtx, LayoutCtx, MeasureCtx, NewWidget, NoAction, PaintCtx, PointerEvent,
+    PropertiesMut, PropertiesRef, QueryCtx, RegisterCtx, Widget, WidgetId, WidgetMut, WidgetPod,
 };
 use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, Point, Rect, Size};
@@ -558,6 +558,20 @@ impl<P: 'static> Widget for AreaScreen<P> {
         }
     }
 
+    /// Over a splitter, and while one is dragged, the cursor says which way it moves: left
+    /// and right for areas side by side, up and down for areas one above the other.
+    ///
+    /// Asked of this widget where no area covers the pointer — the bars sit in the gaps
+    /// between areas — and while a drag holds the pointer, wherever it is.
+    fn get_cursor(&self, _ctx: &QueryCtx<'_>, pos: Point) -> CursorIcon {
+        let split = self.drag.or_else(|| self.bar_at(pos));
+        match split.and_then(|split| self.bars.iter().find(|bar| bar.split == split)) {
+            Some(bar) if bar.axis == Axis::Horizontal => CursorIcon::EwResize,
+            Some(_) => CursorIcon::NsResize,
+            None => CursorIcon::Default,
+        }
+    }
+
     fn measure(
         &mut self,
         _ctx: &mut MeasureCtx<'_>,
@@ -699,6 +713,47 @@ mod tests {
         );
         let _ = harness.redraw();
         (harness, token)
+    }
+
+    /// Over a splitter the cursor says which way it moves — left and right between areas
+    /// side by side, up and down between areas one above the other — and stays so for the
+    /// whole drag; over an area it is the area's.
+    #[test]
+    fn a_splitter_under_the_pointer_shows_which_way_it_moves() {
+        use masonry::core::CursorIcon;
+
+        let mut harness = harness(3);
+        let bars: Vec<Bar> = harness.root_widget().bars().to_vec();
+        let side = bars
+            .iter()
+            .find(|bar| bar.axis == Axis::Horizontal)
+            .expect("a side-by-side split");
+        let stacked = bars
+            .iter()
+            .find(|bar| bar.axis == Axis::Vertical)
+            .expect("a stacked split");
+
+        harness.mouse_move(side.rect.center());
+        assert_eq!(
+            harness.cursor_icon(),
+            CursorIcon::EwResize,
+            "between areas side by side"
+        );
+        harness.mouse_move(stacked.rect.center());
+        assert_eq!(
+            harness.cursor_icon(),
+            CursorIcon::NsResize,
+            "between areas one above the other"
+        );
+
+        harness.mouse_move(side.rect.center());
+        harness.mouse_button_press(Some(PointerButton::Primary));
+        harness.mouse_move(side.rect.center() + masonry::kurbo::Vec2::new(-40.0, 0.0));
+        assert_eq!(harness.cursor_icon(), CursorIcon::EwResize, "the whole drag");
+        harness.mouse_button_release(Some(PointerButton::Primary));
+
+        harness.mouse_move(Point::new(5.0, 5.0));
+        assert_eq!(harness.cursor_icon(), CursorIcon::Default, "over an area");
     }
 
     /// Decision 1a: what an area carries beside its widget lives and dies with the area.

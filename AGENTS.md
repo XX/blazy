@@ -107,12 +107,15 @@ with the application (§26).
 - Edits made in widgets: `ContentField` — model on each key, one undo step when the field is
   left, unreadable text restored (§67, §70).
 - Typed add: `node_kinds` + `insert_kind`, `node.add kind="…"` (text property) (§64).
-- Node copy to the system clipboard: `text_form()` → `blazy-nodes 1 <format>`, driver writes
-  after the event and reads before a `node.paste` key (§66).
+- Node copy to the system clipboard: `text_form()` → `blazy-nodes 1 <format>`; `node.copy` and
+  `node.paste` use the world's `SystemClipboard` (§66, §71).
 - Graph reload: `EditorApp::on_load` — cancel gestures first, keep the `Views` registry, then
   `graph_replaced` → `Change::Reset` (§69). Save: `on_save`; workspace read at first window.
 - `EditorSession`/`EditorWorld` have no public fields; use methods (§68). `Detail` stays
   exhaustive on purpose.
+- Screen actions are operators `screen.*` in every area's runtime, section `screen` last in
+  `CANVAS_SCOPE`; they push a request (`request_screen`), `EditorApp::settled` performs it;
+  they poll on a `ScreenState` the driver keeps; the system clipboard is in the world (§71).
 
 ## Upstream
 

@@ -433,26 +433,29 @@ fn the_default_screen_keys_shadow_no_editor_binding() {
     }
 }
 
-/// A key reaches the action it is bound to, with its modifiers exactly.
+/// A key reaches the screen's operator it is bound to, with its modifiers exactly — in the
+/// editors' keymap, after the editor's own sections (§71).
 #[test]
 fn a_bound_key_names_its_action_and_an_unbound_one_nothing() {
-    let keys = ScreenKeys::default();
-    let event = |name: &str, mods: Modifiers| {
-        masonry::core::TextEvent::Keyboard(KeyboardEvent {
-            state: KeyState::Down,
+    let keymap = crate::default_keymap();
+    let first = |name: &str, mods: Modifiers| {
+        let event = OpEvent::Key {
             key: Key::Character(name.into()),
-            code: Code::Unidentified,
-            modifiers: mods,
-            ..KeyboardEvent::default()
-        })
+            mods,
+            down: true,
+        };
+        keymap
+            .matches(Scope(&CANVAS_SCOPE), &event)
+            .next()
+            .map(|binding| binding.op.to_string())
     };
     assert_eq!(
-        keys.action_for(&event("x", Modifiers::ALT)),
-        Some(ScreenAction::SplitHorizontal)
+        first("x", Modifiers::ALT).as_deref(),
+        Some(ScreenAction::SplitHorizontal.name())
     );
-    assert_eq!(
-        keys.action_for(&event("x", Modifiers::empty())),
-        None,
+    assert_ne!(
+        first("x", Modifiers::empty()).as_deref(),
+        Some(ScreenAction::SplitHorizontal.name()),
         "plain X is the editor's"
     );
 }
@@ -531,24 +534,26 @@ fn one_file_overrides_the_editor_and_the_screen() {
     let app = app(&graph).with_keymap_overrides(&path).expect("the overrides read");
     let _ = std::fs::remove_file(&path);
 
-    let key = |name: &str, mods: Modifiers| {
-        masonry::core::TextEvent::Keyboard(KeyboardEvent {
-            state: KeyState::Down,
+    // The screen's bindings are the editors' keymap now (§71): the overrides are in force there.
+    let overridden = app.screen(SplitTree::balanced(1));
+    let session = overridden.payload(0).expect("an area carries a session").clone();
+    let keymap = session.borrow().runtime().keymap().clone();
+    let first = |name: &str, mods: Modifiers| {
+        let event = OpEvent::Key {
             key: Key::Character(name.into()),
-            code: Code::Unidentified,
-            modifiers: mods,
-            ..KeyboardEvent::default()
-        })
+            mods,
+            down: true,
+        };
+        keymap
+            .matches(Scope(&CANVAS_SCOPE), &event)
+            .next()
+            .map(|binding| binding.op.to_string())
     };
     assert_eq!(
-        app.keys.action_for(&key("h", Modifiers::CONTROL | Modifiers::ALT)),
-        Some(ScreenAction::SplitHorizontal)
+        first("h", Modifiers::CONTROL | Modifiers::ALT).as_deref(),
+        Some(ScreenAction::SplitHorizontal.name())
     );
-    assert_eq!(
-        app.keys.action_for(&key("x", Modifiers::ALT)),
-        None,
-        "the old binding is gone"
-    );
+    assert_eq!(first("x", Modifiers::ALT), None, "the old binding is gone");
 
     // And the editors of this application run with the same file in force.
     let screen = app.screen(SplitTree::balanced(1));
@@ -992,6 +997,8 @@ fn a_screen_key_typed_into_a_text_field_is_text() {
 
     assert!(root.focus_on(Some(field)));
     let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, alt_x());
+    // After the event, as the loop does: the screen's operators ask, the driver does (§71).
+    app.settled(&mut cx, key, &mut root);
     let _ = root.redraw();
     assert_eq!(areas(&mut root), 1, "the key went to the field, not to the screen");
     let text: String = {
@@ -1001,8 +1008,24 @@ fn a_screen_key_typed_into_a_text_field_is_text() {
     };
     assert!(text.ends_with('x'), "{text:?}");
 
+    // A key the field does not type bubbles to the editor: the screen's operator is refused
+    // while a text field has the keys (§56, §71).
+    let ctrl_space = masonry::core::TextEvent::Keyboard(KeyboardEvent {
+        state: KeyState::Down,
+        key: Key::Character(" ".into()),
+        code: Code::Unidentified,
+        modifiers: Modifiers::CONTROL,
+        ..KeyboardEvent::default()
+    });
+    let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, ctrl_space);
+    app.settled(&mut cx, key, &mut root);
+    let maximized =
+        root.edit_base_layer(|mut widget| widget.downcast::<EditorScreen<Grid>>().widget.tree().maximized());
+    assert_eq!(maximized, None, "Ctrl+Space in a field maximizes nothing");
+
     assert!(root.focus_on(None));
     let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, alt_x());
+    app.settled(&mut cx, key, &mut root);
     let _ = root.redraw();
     assert_eq!(areas(&mut root), 2, "outside a field the same key splits");
 }
@@ -1604,4 +1627,77 @@ fn a_graph_read_while_running_replaces_every_view_and_starts_the_history_over() 
             .clone()
     });
     assert_eq!(other_session.borrow().runtime().history().depth(), 0);
+}
+
+/// The screen's operations are operators (§71): run by name — what a menu entry does — they
+/// ask the driver, which does it after the event; refused where the area cannot do them;
+/// `node.paste` reads the system clipboard and `screen.load_workspace` reads the graph back
+/// the same way from a menu as from a key.
+#[test]
+fn screen_operations_run_from_a_menu_as_from_a_key() {
+    use blazy_shell::text::MemoryClipboard;
+
+    let graph = Grid::new(4);
+    let path = std::env::temp_dir().join(format!("blazy-ops-{}.workspace", std::process::id()));
+    let mut app = app(&graph).with_workspace(&path).on_load(|grid: &mut Grid| {
+        let mut fresh = Grid {
+            rects: vec![Some(Rect::from_origin_size((20.0, 20.0), NODE))],
+            ..Grid::default()
+        };
+        std::mem::swap(&mut fresh.views, &mut grid.views);
+        *grid = fresh;
+        true
+    });
+    let mut root = window(&app, 1);
+    // What another process copied: one node.
+    let copy = "blazy-nodes 1 grid\nnode 300 300 120 60 \n".to_owned();
+    let mut cx = ShellCtx::new().with_clipboard(Box::new(MemoryClipboard::holding(copy)));
+    let key = cx.name_window();
+    app.started(&mut cx, key, &mut root);
+    pointer(&mut app, &mut cx, key, &mut root, "move", Point::new(300.0, 300.0));
+    let run = |app: &mut EditorApp<Grid>, cx: &mut ShellCtx, root: &mut RenderRoot, op: &str| {
+        let result = edit_editor(root, 0, |editor| NodeEditor::exec(editor, op, &Props::new()));
+        app.settled(cx, key, root);
+        let _ = root.redraw();
+        result
+    };
+    let poll = |root: &mut RenderRoot, op: &str| {
+        let session = root.edit_base_layer(|mut widget| {
+            widget
+                .downcast::<EditorScreen<Grid>>()
+                .widget
+                .payload(0)
+                .expect("a session")
+                .clone()
+        });
+        let screen = session.borrow().world().screen();
+        screen.allows(ScreenAction::from_name(op).expect("a screen action"))
+    };
+
+    assert!(
+        !poll(&mut root, ScreenAction::Join.name()),
+        "one area: nothing to join, shown refused"
+    );
+    assert!(
+        !poll(&mut root, ScreenAction::Detach.name()),
+        "the last area does not detach"
+    );
+    let _ = run(&mut app, &mut cx, &mut root, ScreenAction::SplitHorizontal.name());
+    assert_eq!(editors(&mut root).len(), 2, "split from the menu");
+    assert!(poll(&mut root, ScreenAction::Join.name()), "two areas: join is offered");
+
+    let _ = run(&mut app, &mut cx, &mut root, "node.paste");
+    assert_eq!(
+        graph.borrow().node_count(),
+        5,
+        "pasted from the system clipboard, not from a key"
+    );
+
+    let _ = run(&mut app, &mut cx, &mut root, ScreenAction::LoadWorkspace.name());
+    assert_eq!(
+        graph.borrow().rects.len(),
+        1,
+        "opened from the menu: the graph read back"
+    );
+    let _ = std::fs::remove_file(&path);
 }

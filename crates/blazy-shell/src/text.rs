@@ -209,7 +209,8 @@ pub(crate) fn paste_or_key(cx: &mut ShellCtx, root: &RenderRoot, event: TextEven
     if key.state != KeyState::Down {
         return None;
     }
-    match cx.clipboard().read() {
+    let read = cx.clipboard().read();
+    match read {
         Some(text) => {
             cx.text_counters_mut().pastes += 1;
             Some(TextEvent::ClipboardPaste(text))
