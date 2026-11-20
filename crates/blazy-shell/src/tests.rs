@@ -121,7 +121,7 @@ impl Widget for Counting {
 /// One frame the way the window loop runs one: animation first, then draw.
 ///
 /// The animation step is not decoration. An external widget keeps its declaration
-/// alive by repainting (§26.1), and repainting is what its animation frame asks for,
+/// alive by repainting, and repainting is what its animation frame asks for,
 /// so a host that never runs one loses every hole after the first frame — which is
 /// what `a_declaration_without_a_repaint_is_lost` shows from the other side.
 fn frame<W: Widget>(harness: &mut TestHarness<W>, host: &mut Host, size: Size) -> crate::Frame {
@@ -138,7 +138,7 @@ fn harness<W: Widget>(widget: W) -> TestHarness<W> {
     )
 }
 
-/// The requirement of §4.3 and §14, end to end: a widget says the host draws here,
+/// External content, end to end: a widget says the host draws here,
 /// and the host is told where.
 #[test]
 fn an_external_widget_reaches_the_host_as_a_hole() {
@@ -152,7 +152,7 @@ fn an_external_widget_reaches_the_host_as_a_hole() {
     assert_eq!(frame.holes[0].widget_id, harness.root_id());
 }
 
-/// And it keeps reaching it: the declaration lives one paint (§26.1), which is why
+/// And it keeps reaching it: the declaration lives one paint, which is why
 /// [`ExternalContent`] keeps painting.
 #[test]
 fn the_hole_survives_frames_in_which_nothing_changes() {
@@ -290,7 +290,7 @@ impl Widget for PartialCover {
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut Node) {}
 }
 
-/// §9's third multiplier, held to the same line as the other two: the device scale
+/// The third multiplier (device scale), held to the same line as the other two: the device scale
 /// belongs to composition. Going through the host changes the pixels and nothing
 /// else; going through the render root's own rescale is what a relayout looks like.
 #[test]
@@ -327,7 +327,7 @@ fn the_device_scale_does_not_reach_layout() {
 /// The frame path that keeps the frame on the GPU, checked where there is one.
 ///
 /// Skipped rather than failed on a machine with no usable device: whether a runner has
-/// a GPU is a fact about the runner, and §27.5 says what that costs in coverage.
+/// a GPU is a fact about the runner, and costs coverage.
 #[cfg(feature = "vello")]
 #[test]
 fn the_gpu_path_draws_without_touching_main_memory() {
@@ -352,10 +352,10 @@ fn the_gpu_path_draws_without_touching_main_memory() {
     assert_eq!(counters.frames, 4);
     assert_eq!(counters.cpu_bytes, 0, "the frame went through main memory");
     assert_eq!(counters.readbacks, 0, "the frame was copied back from the GPU");
-    assert_eq!(frames.holes().len(), 1, "holes survive the GPU path (§4.3)");
+    assert_eq!(frames.holes().len(), 1, "holes survive the GPU path");
 }
 
-/// The instrument a benchmark checks its own GPU timings with (§32.4).
+/// The instrument a benchmark checks its own GPU timings with.
 ///
 /// Two claims, and the raster table leans on both: what comes back is the frame that
 /// was drawn, and reading it back is *counted* — the zero in
@@ -423,7 +423,7 @@ fn the_gpu_texture_follows_the_device_scale() {
     assert_eq!(frames.texture().width(), 400, "the texture was reallocated");
 }
 
-/// The trap of §26.1, on the mode per-area caching is built out of (§36.1).
+/// The paint-mode reset, on the mode per-area caching is built out of.
 ///
 /// `PaintLayerMode::IsolatedScene` lives exactly one paint, like `External` — the paint
 /// pass sets every widget's mode back to `Inline` before deciding whether to paint it at
@@ -449,7 +449,7 @@ fn an_isolated_layer_lasts_one_paint() {
     assert_eq!(paints.get(), before, "the clean frame did not paint it");
 }
 
-/// The host seat: what a driver in front of `RenderRoot` can do (§39.5).
+/// The host seat: what a driver in front of `RenderRoot` can do.
 ///
 /// Behind `window` because `ShellDriver` is: the seat is the window loop's.
 #[cfg(feature = "window")]
@@ -677,7 +677,7 @@ fn a_window_the_shell_did_not_open_can_be_named() {
 /// The cause of a failure has to survive the trip to the caller.
 ///
 /// A library that wraps somebody else's error and drops it makes every downstream
-/// `anyhow` chain end at our variant name (§15.1). Cheap to keep, invisible to lose,
+/// `anyhow` chain end at our variant name. Cheap to keep, invisible to lose,
 /// so it is pinned here rather than trusted.
 #[cfg(feature = "window")]
 #[test]

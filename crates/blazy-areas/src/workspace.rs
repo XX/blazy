@@ -1,15 +1,7 @@
 //! The workspace file: a split tree plus what lives in each of its areas.
 //!
-//! `rnd/architecture.md` §8 asks the split tree to be the piece that can be written to a
-//! file, and §41.5 answers the question that leaves open: a file has to say more than
-//! "two splits and three leaves" — it has to say that *this* leaf is a node editor and
-//! *that* one is an outliner, and the tree is pure geometry on purpose.
-//!
-//! So the pairing lives here rather than in the tree. A [`Workspace`] is a tree and a
-//! map from [`AreaId`] to a **name the application chose**, which is the same shape the
-//! keymap already uses for operators (§11): a string, because a file has to survive being
-//! written, edited by hand and read back, and because this crate has no business knowing
-//! what a node editor is.
+//! A [`Workspace`] is a tree plus, per [`AreaId`], a name the application chose for what
+//! fills the area, and its sidebar.
 //!
 //! # The format
 //!
@@ -26,23 +18,13 @@
 //!
 //! `tree` is a prefix expression — `area <id>` or `split <h|v> <ratio> <expr> <expr>`.
 //! The rest of a `content` line is the application's own name, spaces included. A
-//! `sidebar` line is an area's sidebar (§61): `shown` or `hidden`, and its width in logical
+//! `sidebar` line is an area's sidebar: `shown` or `hidden`, and its width in logical
 //! pixels at scale 1.0. Version 2 added it; a version 1 file, which has none, still reads.
 //!
-//! A file is input, and it is read as input: an area id at or above
-//! [`MAX_AREAS`](crate::MAX_AREAS), or splits nested deeper than that many areas could
-//! need, is [`WorkspaceError::Malformed`] — never an allocation the size of the number,
-//! and never a stack overflow. No tree a split can build is past either bound.
-//!
-//! **No `serde`, and that is a decision rather than an omission (§41.6).** A dependency
-//! in `blazy-areas` is a dependency for everyone who sits on this library; behind a
-//! feature flag it is also a flag the facade has to forward (§40.4). What it would buy is
-//! a hundred lines of reader and writer for a structure with three shapes in it. The
-//! trade would look different for a format with a hundred fields, and that is the point
-//! at which to revisit it.
-//!
-//! **The format is not promised stable.** The version on the first line exists so that a
-//! file this build cannot read is refused rather than misread.
+//! A file is input: an area id at or above [`MAX_AREAS`](crate::MAX_AREAS), or splits nested
+//! deeper than that, is [`WorkspaceError::Malformed`]. No `serde`: a dependency here is one
+//! for every user of the library. The format is not promised stable; the version line makes
+//! an unreadable file refused rather than misread.
 
 use std::fmt;
 
@@ -56,10 +38,6 @@ const VERSION: u32 = 2;
 const OLDEST: u32 = 1;
 
 /// A screen layout as it goes to a file: the tree, and what fills each area.
-///
-/// The owner the pairing needed. `SplitTree` stays pure geometry — it knows an area only
-/// by its id — and this is where the id is joined to the application's idea of what the
-/// area is for.
 #[derive(Clone, Debug)]
 pub struct Workspace {
     tree: SplitTree,
@@ -167,12 +145,8 @@ impl Workspace {
         self.contents.iter().map(|(area, kind)| (*area, kind.as_str()))
     }
 
-    /// Writes the workspace out.
-    ///
-    /// What is written is the tree's *shape* and its area ids, never its node ids: the
-    /// round trip has to give back the same rectangles and the same [`AreaId`]s, because
-    /// the caller's widgets are keyed by those, and nothing else about the tree is
-    /// anybody's business.
+    /// Writes the workspace out: the tree's shape and area ids, so a round trip gives back
+    /// the same rectangles and ids.
     pub fn write(&self) -> String {
         let mut out = String::new();
         out.push_str(MAGIC);
@@ -185,8 +159,7 @@ impl Workspace {
         out.push('\n');
 
         for (area, kind) in &self.contents {
-            // A kind with a newline in it would produce a file that reads back as
-            // something else, so it is written as one line and no more.
+            // One line only: a newline would read back as something else.
             let kind = kind.replace(['\n', '\r'], " ");
             out.push_str(&format!("content {area} {kind}\n"));
         }

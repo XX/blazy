@@ -1,41 +1,18 @@
 //! The split tree: which area sits where, and nothing at all about widgets.
 //!
-//! Kept free of Masonry on purpose. `rnd/architecture.md` §8 calls areas "a
-//! subsystem over the widget tree, not another widget", and the split tree is the
-//! part of that claim which has to be true first: it is the piece that will later
-//! be serialised into a workspace file, diffed, and possibly swapped for a
-//! vertex-and-edge graph if edge alignment ever becomes worth its complexity.
-//! Anything that reaches for a `WidgetId` here would make all three harder.
+//! Free of Masonry, so it can be serialised, diffed, or replaced by a vertex-and-edge graph.
 
 use masonry::kurbo::{Axis, Point, Rect};
 
-/// Index of a node in the tree.
-///
-/// Not stable across operations and not written to a workspace file: a [`Bar`] carries
-/// one so a drag can name the split it is moving, and it is re-read from the layout that
-/// produced it. [`AreaId`] is the identifier that keeps its meaning.
+/// Index of a node in the tree; not stable across operations (unlike [`AreaId`]).
 pub type NodeId = usize;
 
-/// Index of an area. Stable for the life of the tree.
-///
-/// Nothing renumbers one: a join frees the id of the area that went, a later split hands
-/// that id out again, and every area that stayed keeps the id it had. That is what lets a
-/// caller key its own state by [`AreaId`] — `AreaScreen` keys the widgets by it, and a
-/// workspace file names areas by it.
+/// Index of an area, stable for the life of the tree: a join frees an id for a later split
+/// to reuse, and nothing renumbers the rest.
 pub type AreaId = usize;
 
-/// The most areas one tree holds, and with it the bound on every [`AreaId`].
-///
-/// A policy rather than a measurement: a screen holds tens of areas, not thousands. It
-/// exists because an id is a size somebody allocates — a caller keys its own arrays by
-/// id, and `AreaScreen` does — so without a bound one line of a hand-edited workspace
-/// file, `area 4000000000`, is a multi-gigabyte allocation instead of an error.
-///
-/// One bound, enforced in both directions: [`SplitTree::split`] refuses to grow a tree
-/// past it and the workspace reader refuses a file that goes past it, so whatever a tree
-/// can become, a file can bring back. That rests on ids being reused before fresh ones
-/// are handed out — a tree holding fewer than `MAX_AREAS` areas never hands out an id at
-/// or above it.
+/// The most areas one tree holds, and the bound on every [`AreaId`] (callers allocate by
+/// id). Enforced by [`SplitTree::split`] and by the workspace reader alike.
 pub const MAX_AREAS: usize = 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -48,11 +25,7 @@ enum Node {
         b: NodeId,
     },
     Area(AreaId),
-    /// A slot whose node has left the tree.
-    ///
-    /// Kept rather than removed because every other node names its children by index:
-    /// compacting `nodes` would move ids that are still referenced, and a tree of tens
-    /// of nodes has nothing to gain from it.
+    /// A slot whose node has left the tree (nodes name their children by index).
     Free,
 }
 
@@ -65,21 +38,12 @@ pub struct Bar {
     pub axis: Axis,
     /// The bar itself, for hit testing and painting.
     pub rect: Rect,
-    /// The whole rect the split divides.
-    ///
-    /// A drag turns a pointer position into a ratio against this rect, so it has to
-    /// travel with the bar: by the time the pointer moves, the recursion that knew
-    /// the parent rect is long gone.
+    /// The whole rect the split divides, which a drag computes the ratio against.
     pub span: Rect,
 }
 
-/// A binary tree of splits with an area at every leaf.
-///
-/// Binary rather than the vertex-and-edge graph Blender uses. The graph exists so
-/// that resizing aligns the borders of areas which are not in a parent/child
-/// relation; the tree cannot do that, and is an order of magnitude simpler. §8's
-/// recommendation is to start here and keep the operations behind this type, so
-/// that swapping the representation later touches nothing else.
+/// A binary tree of splits with an area at every leaf: simpler than Blender's
+/// vertex-and-edge graph, which can also align borders that are not siblings.
 #[derive(Clone, Debug)]
 pub struct SplitTree {
     nodes: Vec<Node>,
@@ -89,18 +53,10 @@ pub struct SplitTree {
     /// Node slots a join emptied, for the next split to fill.
     free_nodes: Vec<NodeId>,
     /// Area ids a join freed, for the next split to hand out again.
-    ///
-    /// Reused rather than retired, because an id is an index into the caller's own
-    /// arrays: retiring them means those arrays grow with the number of joins a session
-    /// has seen rather than with the number of areas it holds.
     free_areas: Vec<AreaId>,
     /// The next never-used area id.
     next_area: AreaId,
-    /// The area shown alone, if the screen is maximized.
-    ///
-    /// A flag on the tree rather than a saved copy of it (§41.3): the tree underneath is
-    /// untouched, so restoring gives back exactly the rectangles that were there — a
-    /// property a test can check bit for bit, which a rebuilt tree could only approximate.
+    /// The area shown alone, if the screen is maximized; the tree underneath is untouched.
     maximized: Option<AreaId>,
 }
 
@@ -118,12 +74,7 @@ impl SplitTree {
         }
     }
 
-    /// A screen tiled into `areas` roughly equal parts.
-    ///
-    /// Splits alternate axis by depth, so the result stays close to square instead
-    /// of degenerating into stripes. Deterministic, because it is what the
-    /// measurements sweep over and a benchmark that tiles differently between runs
-    /// measures nothing.
+    /// A screen tiled into `areas` roughly equal parts, alternating the axis by depth.
     ///
     /// # Panics
     ///
@@ -175,10 +126,7 @@ impl SplitTree {
         self.areas
     }
 
-    /// The areas the tree holds, in tree order rather than by id.
-    ///
-    /// Ids are not dense once anything has been joined, so this is the only honest way
-    /// to ask what is on the screen.
+    /// The areas the tree holds, in tree order (ids need not be dense).
     pub fn areas(&self) -> impl Iterator<Item = AreaId> + '_ {
         self.nodes.iter().filter_map(|node| match node {
             Node::Area(area) => Some(*area),
@@ -191,15 +139,8 @@ impl SplitTree {
         self.node_of(area).is_some()
     }
 
-    /// Splits `area` in two, returning the id of the area that appears.
-    ///
-    /// The existing area keeps its id and the first `ratio` of the space, which is
-    /// what makes a split non-destructive: whatever widget the caller has already
-    /// built for `area` stays valid and stays where it was.
-    ///
-    /// The new id is one a join freed, if there is one, and a fresh one otherwise.
-    ///
-    /// `None` if `area` is not in the tree, or if the tree already holds [`MAX_AREAS`].
+    /// Splits `area` in two and returns the new area's id (a freed one first); `area` keeps
+    /// its id and the first `ratio`. `None` if `area` is not in the tree or the tree is full.
     pub fn split(&mut self, area: AreaId, axis: Axis, ratio: f64) -> Option<AreaId> {
         let node = self.node_of(area)?;
         if self.areas >= MAX_AREAS {
@@ -224,12 +165,7 @@ impl SplitTree {
         Some(fresh)
     }
 
-    /// The area `area` could be joined with, if any.
-    ///
-    /// **Its sibling, and only its sibling** — that is the whole of what a binary tree
-    /// can express, and §41.1 measures what it costs: on a screen of eight areas, eleven
-    /// pairs share a full border and four of them are siblings. An area whose sibling is
-    /// a split rather than a leaf has no partner at all.
+    /// The area `area` could be joined with: its sibling, if that is an area.
     pub fn joinable(&self, area: AreaId) -> Option<AreaId> {
         let node = self.node_of(area)?;
         let parent = self.parent_of(node)?;
@@ -248,17 +184,8 @@ impl SplitTree {
         keep != dropped && self.joinable(keep) == Some(dropped)
     }
 
-    /// Merges two areas into one, keeping `keep` and freeing `dropped`.
-    ///
-    /// Returns whether anything happened. The two have to be **siblings**: the parent
-    /// split disappears and `keep` takes the whole rectangle the two of them shared.
-    /// `keep` keeps its id, and therefore its widget and everything that widget holds —
-    /// which is the requirement, not the optimisation (§30 already priced losing a
-    /// view's state).
-    ///
-    /// Blender joins any two areas with a coincident border; this joins the pairs that
-    /// happen to be siblings, which is a subset. §41.1 says which pairs are missing and
-    /// on what screens.
+    /// Merges two sibling areas into one, keeping `keep` and freeing `dropped`. Returns
+    /// whether anything happened.
     pub fn join(&mut self, keep: AreaId, dropped: AreaId) -> bool {
         if !self.can_join(keep, dropped) {
             return false;
@@ -282,13 +209,8 @@ impl SplitTree {
         true
     }
 
-    /// Exchanges the places of two areas. Returns whether anything happened.
-    ///
-    /// The **leaves** are exchanged, not the widgets: an area is its id, so moving the id
-    /// moves everything keyed by it — the editor, its view, its selection, its
-    /// materialised nodes. Nothing is rebuilt and nothing is told, which is why this is
-    /// the version that feels like swapping two editors rather than two rectangles
-    /// (§41.4).
+    /// Exchanges the places of two areas (the leaves, so everything keyed by the ids moves
+    /// with them). Returns whether anything happened.
     pub fn swap(&mut self, a: AreaId, b: AreaId) -> bool {
         if a == b {
             return false;
@@ -333,15 +255,8 @@ impl SplitTree {
 
     /// Takes an area off the screen, giving its place to whatever shared the split.
     ///
-    /// Not [`join`](Self::join) with one argument: join merges two *leaves* and refuses
-    /// an area whose sibling is a split (§41.1). This removes one leaf and hands its
-    /// space to the sibling subtree, whatever shape that has — which is always possible,
-    /// because every leaf but the root has a parent split. That difference is why detach
-    /// works on any area and join does not.
-    ///
-    /// `false` for the last area: a screen with no area is not expressible, and the
-    /// answer to "detach the only area" is that it refuses (decision 5 of the detach
-    /// task).
+    /// Unlike [`join`](Self::join), the space goes to the sibling subtree whatever its shape.
+    /// `false` for the last area.
     pub fn remove(&mut self, area: AreaId) -> bool {
         let Some(node) = self.node_of(area) else {
             return false;
@@ -366,21 +281,15 @@ impl SplitTree {
         true
     }
 
-    /// The node whose child `node` is.
-    ///
-    /// A search rather than a stored parent pointer: a screen holds tens of nodes, and a
-    /// pointer is one more invariant for every operation to keep.
+    /// The node whose child `node` is (a search: a screen holds tens of nodes).
     fn parent_of(&self, node: NodeId) -> Option<NodeId> {
         self.nodes
             .iter()
             .position(|n| matches!(n, Node::Split { a, b, .. } if *a == node || *b == node))
     }
 
-    /// Writes the tree as a prefix expression: `split h 0.5 area 0 area 1`.
-    ///
-    /// Node ids are not written. They are indices into an array with free slots in it,
-    /// so writing them would put this crate's bookkeeping in a file; the shape and the
-    /// area ids are what a workspace means, and both survive the trip.
+    /// Writes the tree as a prefix expression: `split h 0.5 area 0 area 1` (area ids, not
+    /// node ids).
     pub(crate) fn write_expr(&self, out: &mut String) {
         self.write_node(self.root, out);
     }
@@ -393,8 +302,7 @@ impl SplitTree {
                     Axis::Horizontal => 'h',
                     Axis::Vertical => 'v',
                 };
-                // `{}` on an `f64` is the shortest decimal that reads back as the same
-                // number, which is what makes the round trip exact rather than close.
+                // `{}` on an `f64` reads back exactly.
                 out.push_str(&format!("split {axis} {ratio} "));
                 self.write_node(a, out);
                 out.push(' ');
@@ -404,18 +312,10 @@ impl SplitTree {
         }
     }
 
-    /// Reads back what [`write_expr`](Self::write_expr) wrote.
-    ///
-    /// The tree comes out with `next_area` past the largest id it holds and every id below
-    /// that it does not hold on the free list, exactly as if the holes had been left by
-    /// joins. That is not tidiness: [`MAX_AREAS`] bounds the ids only because a hole is
-    /// reused before a fresh id is handed out, and a hole a file brought in has to count
-    /// too — otherwise `area 0` and `area 1023` would let the next split hand out 1024.
-    ///
-    /// `None` for anything the tree could not have become: an id at or above
-    /// [`MAX_AREAS`], or splits nested deeper than that many areas could need. The depth is
-    /// checked on the way down, before any leaf could bound it, so a file of nothing but
-    /// `split` cannot exhaust the stack.
+    /// Reads back what [`write_expr`](Self::write_expr) wrote, with the missing ids on the
+    /// free list (so [`MAX_AREAS`] still bounds the next split). `None` for an id at or above
+    /// [`MAX_AREAS`], or splits nested deeper than that many areas need (checked on the way
+    /// down, so a file cannot exhaust the stack).
     pub(crate) fn parse_expr<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<Self> {
         let mut tree = Self {
             nodes: Vec::new(),
@@ -504,10 +404,7 @@ impl SplitTree {
         }
     }
 
-    /// Moves a splitter. Returns whether anything changed.
-    ///
-    /// Clamped rather than rejected at the edges: a drag that runs past the end of
-    /// the span should pin the splitter there, not stop tracking the pointer.
+    /// Moves a splitter, clamped at the edges. Returns whether anything changed.
     pub fn set_ratio(&mut self, split: NodeId, ratio: f64) -> bool {
         let Some(Node::Split { ratio: current, .. }) = self.nodes.get_mut(split) else {
             return false;
@@ -520,16 +417,11 @@ impl SplitTree {
         true
     }
 
-    /// Computes where every area and every splitter goes inside `rect`.
-    ///
-    /// Both outputs are cleared first, so the caller can keep reusing two buffers
-    /// and a resize allocates nothing.
+    /// Computes where every area and every splitter goes inside `rect`, into reused buffers.
     pub fn layout(&self, rect: Rect, bar_thickness: f64, areas: &mut Vec<(AreaId, Rect)>, bars: &mut Vec<Bar>) {
         areas.clear();
         bars.clear();
-        // Maximized: one area, the whole rect, and no splitter to grab. The tree is not
-        // consulted beyond checking that the area is still in it, which is what makes
-        // restoring exact.
+        // Maximized: one area, the whole rect, no splitter.
         if let Some(area) = self.maximized {
             areas.push((area, rect));
             return;
@@ -547,8 +439,7 @@ impl SplitTree {
     ) {
         match self.nodes[node] {
             Node::Area(area) => areas.push((area, rect)),
-            // Unreachable from the root: a slot is freed only when its node leaves the
-            // tree, and nothing points at it afterwards.
+            // Unreachable from the root.
             Node::Free => {},
             Node::Split { axis, ratio, a, b } => {
                 let (first, bar, second) = split_rect(rect, axis, ratio, bar_thickness);
@@ -565,13 +456,8 @@ impl SplitTree {
     }
 }
 
-/// Divides `rect` into first child, splitter bar and second child.
-///
-/// The first extent is rounded to a whole pixel, and that rounding is load-bearing
-/// rather than cosmetic. An unrounded ratio makes every descendant rect drift by a
-/// fraction of a pixel on every frame of a drag, so every area would count as
-/// resized and the whole point of measuring how many areas a drag disturbs would be
-/// lost — along with the layout work the measurement is there to catch.
+/// Divides `rect` into first child, splitter bar and second child. The first extent is
+/// rounded to a whole pixel, or every area would count as resized on every frame of a drag.
 fn split_rect(rect: Rect, axis: Axis, ratio: f64, bar: f64) -> (Rect, Rect, Rect) {
     let (extent, origin) = match axis {
         Axis::Horizontal => (rect.width(), rect.x0),
@@ -599,11 +485,7 @@ fn split_rect(rect: Rect, axis: Axis, ratio: f64, bar: f64) -> (Rect, Rect, Rect
     }
 }
 
-/// The ratio a pointer at `pos` implies for a bar.
-///
-/// Lives here rather than in the widget because it is the exact inverse of
-/// `split_rect`, and an inverse that drifts from its forward function is a bug
-/// nobody sees until the splitter starts lagging the pointer.
+/// The ratio a pointer at `pos` implies for a bar: the inverse of `split_rect`.
 pub fn ratio_at(bar: &Bar, pos: Point, bar_thickness: f64) -> f64 {
     let (extent, origin, at) = match bar.axis {
         Axis::Horizontal => (bar.span.width(), bar.span.x0, pos.x),

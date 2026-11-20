@@ -149,7 +149,7 @@ impl Widget for Panel {
 
 /// A far-field scene: many curves, stroked in a chosen number of commands.
 ///
-/// The scene §31 is about, reduced to what a rasteriser can see. The geometry does
+/// The far-field link scene, reduced to what a rasteriser can see. The geometry does
 /// not depend on `groups` at all — every row of the raster table draws the same ink —
 /// which is what makes "how many commands" and "how many pixels" two axes rather than
 /// one. Built here rather than imported from the canvas example for the reason the
@@ -160,7 +160,7 @@ struct FarField {
     count: usize,
     /// Stroke commands the same curves are split into.
     ///
-    /// 1 is the batch §31 landed, `count` is the command-per-link scene it replaced,
+    /// 1 is the batch, `count` is the command-per-link scene it replaced,
     /// and everything between is there to say whether the rasteriser cares.
     groups: usize,
     /// Stroke width in logical pixels: the coverage axis, at a fixed command count.
@@ -168,7 +168,7 @@ struct FarField {
     /// What the curves are stroked with.
     ///
     /// Two of these alternate frame by frame in the raster table, so that a frame the
-    /// GPU never drew cannot pass for the frame before it (§32.4).
+    /// GPU never drew cannot pass for the frame before it.
     tint: Color,
 }
 
@@ -239,7 +239,7 @@ impl Widget for FarField {
         }
 
         // One brush and one stroke for every group. Same style, different commands —
-        // which is precisely the thing §31 collapsed, and the thing this measures.
+        // which is precisely the thing batching collapsed, and the thing this measures.
         let stroke = Stroke::new(self.width);
         for path in &paths {
             painter.stroke(path, &stroke, self.tint).draw();
@@ -302,7 +302,7 @@ impl Report {
 
     /// Frames in which the scenario's external content was not a hole.
     ///
-    /// The counter for §26.1, and it is this one rather than "declared minus
+    /// The counter for the paint-mode reset, and it is this one rather than "declared minus
     /// delivered" because that difference is zero both when every hole arrives and
     /// when the widget quietly stopped declaring any — which is exactly the failure
     /// mode. Checked by breaking it: a widget that declares once and stops leaves
@@ -539,7 +539,7 @@ fn presentation_table(opts: &Options) -> Vec<PresentRow> {
 
 /// Curves in the far-field scene the raster table draws.
 ///
-/// The order of magnitude §31.5 measured on 5000 nodes: ~8500 link curves recorded
+/// The order of magnitude measured on 5000 nodes: ~8500 link curves recorded
 /// for one canvas at an overview zoom.
 const RASTER_CURVES: usize = 8000;
 /// Commands the same curves are split into, from the batch to one per curve.
@@ -550,7 +550,7 @@ const RASTER_GROUPS: [usize; 6] = [1, 8, 64, 512, 2048, RASTER_CURVES];
 /// is 0.08 px wide and at 0.2 it is 0.4 — the far field lives at the thin end of this
 /// sweep, and the thick end is there to say what ink costs when there is a lot of it.
 const RASTER_WIDTHS: [f64; 4] = [0.1, 0.5, 2.0, 8.0];
-/// Device scales the raster table walks. x2 is x4 the pixels (§27.4).
+/// Device scales the raster table walks. x2 is x4 the pixels.
 const RASTER_SCALES: [f64; 2] = [1.0, 2.0];
 /// Widths the command sweep is run at, so the answer is not read off one ink level.
 const RASTER_SWEEP_WIDTHS: [f64; 2] = [0.5, 2.0];
@@ -576,7 +576,7 @@ struct RasterRow {
     groups: usize,
     width: f64,
     scale: f64,
-    /// Draw commands in the layer plan (`bench_utils::plan::commands`) — §31's counter.
+    /// Draw commands in the layer plan (`bench_utils::plan::commands`) — the plan's counter.
     commands: usize,
     /// Draw objects in the encoding vello would rasterise, where it can be built.
     objects: usize,
@@ -588,11 +588,11 @@ struct RasterRow {
     ///
     /// A timing row for a frame nobody looked at is worth nothing: a frame that
     /// failed, was skipped or overflowed an allocator is *fast*, and no clock can
-    /// tell that from a frame that was drawn (§32.4).
+    /// tell that from a frame that was drawn.
     difference: f64,
     /// Frames of this row that did not come out as the picture that was asked for.
     unverified: usize,
-    /// Whether the rasteriser refused this scene before drawing it (§33).
+    /// Whether the rasteriser refused this scene before drawing it.
     refused: bool,
     /// Whether a refused scene, drawn anyway, came out right after all.
     ///
@@ -600,12 +600,12 @@ struct RasterRow {
     /// have drawn is as wrong as one that lets a silent failure through, and only
     /// forcing the frame can tell the two apart.
     false_refusal: bool,
-    /// What the tile check costs before the frame is sent (§33.3).
+    /// What the tile check costs before the frame is sent.
     check_ms: f64,
     /// Whether the cheap bounds left the question open, so the guard had to walk the
-    /// scene. The counter form of "the check is free on a real frame" (§33.3).
+    /// scene. The counter form of "the check is free on a real frame".
     walks: bool,
-    /// Passes and plan assembly — the half §31 measured.
+    /// Passes and plan assembly — the half measured on the plan.
     plan_ms: f64,
     /// Turning that plan into pixels, or into a texture — the half it did not.
     raster_ms: f64,
@@ -615,7 +615,7 @@ struct RasterRow {
 ///
 /// The answer to the task's first question, and it is better than the task hoped for:
 /// a scene can be **encoded without a device** and the encoding read out. The counting
-/// lives in `blazy_shell::encode` (§35.1) because the canvas benchmark needs the same
+/// lives in `blazy_shell::encode` because the canvas benchmark needs the same
 /// number and cannot reach `imaging_vello` from where it sits; here it is one call.
 ///
 /// The CPU rasteriser has no equivalent: `imaging_vello_cpu` exposes a renderer and
@@ -675,7 +675,7 @@ fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
     total / (a.len() / 4) as f64 / 255.0
 }
 
-/// What the guard in front of the GPU path costs per frame (§33.3, §34.3).
+/// What the guard in front of the GPU path costs per frame.
 ///
 /// Measured rather than asserted to be small: two cheap counts, and behind them a walk
 /// over the composed scene — which for a deeply nested one also builds a map of the
@@ -702,7 +702,7 @@ fn tile_check_cost(
     0.0
 }
 
-/// Whether the guard would have to walk this scene's geometry (§33.3).
+/// Whether the guard would have to walk this scene's geometry.
 #[cfg(feature = "vello")]
 fn guard_walks(plan: &masonry::app::VisualLayerPlan, scale: f64, frame: PhysicalSize<u32>) -> bool {
     let composed = blazy_shell::Composition::new(plan, scale).scene;
@@ -767,7 +767,7 @@ impl GpuPath {
 /// same ink arrives in, the second how much ink there is at the same command count.
 ///
 /// The scene is drawn in **two tints, alternating frame by frame**, and that is not
-/// decoration. vello can fail to draw a frame and report nothing (§32.4); the target
+/// decoration. vello can fail to draw a frame and report nothing; the target
 /// then keeps whatever was in it, which is the *previous* frame — so a check that only
 /// asks "is there ink in the texture" passes on a frame that was never drawn. Two
 /// tints make the last frame identifiable, and the check runs after every frame
@@ -815,7 +815,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
     let mut rows = Vec::new();
 
     // --- The blit path: compose and rasterise on the CPU. The channel swap that
-    // follows it is measured in §27.4 and does not depend on what is drawn, so it is
+    // follows it was measured separately and does not depend on what is drawn, so it is
     // left out here rather than counted twice.
     let mut host = Host::any().expect("some backend opens").with_background(panel);
     host.set_device_scale(scale);
@@ -863,7 +863,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
 
         // The first frame pays for pipelines, allocations and any resize; nobody
         // wants it in the average. It is also where a scene over the tile budget is
-        // refused (§33), and a refused scene has no frame time to report — what it
+        // refused, and a refused scene has no frame time to report — what it
         // has instead is a question: would it have drawn?
         if let Err(error) = gpu.draw(&plans[0], logical_size(), scale) {
             assert!(
@@ -918,7 +918,7 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
                 .expect("the GPU draws: the first frame already passed the check");
             // Waiting per frame rather than submitting the run and waiting once:
             // this is a claim about what one frame costs, and a window submits one
-            // frame and shows it. §27.4 batched deliberately — it was asking about
+            // frame and shows it. The swapchain measurement batched deliberately — it was asking about
             // throughput.
             gpu.wait();
             total += start.elapsed();
@@ -968,13 +968,13 @@ fn raster_case(gpu: &mut GpuPath, groups: usize, width: f64, scale: f64, frames:
 
 /// Both halves of a far-field frame, over both axes and both paths.
 ///
-/// The table §31.6 asked for: §31 measured the plan and this measures what a
+/// The table: the plan was measured before, and this measures what a
 /// rasteriser then does with it, in one row so that neither half can be quoted
 /// without the other.
 ///
 /// The device scale is the **outer** loop, so the frame size changes twice in a run
 /// rather than forty times. That is not tidiness: alternating the target size makes
-/// the GPU path hand back empty frames on this machine (§32.4), and a benchmark that
+/// the GPU path hand back empty frames on this machine, and a benchmark that
 /// provokes a defect it is not measuring reports noise instead of an answer.
 struct RasterReport {
     rows: Vec<RasterRow>,
@@ -989,7 +989,7 @@ fn raster_table(opts: &Options) -> RasterReport {
     // compare and would pass by having nothing to say.
     let scales: &[f64] = &RASTER_SCALES;
     // 512 is in the quick set on purpose: at the larger scale it is the scene the
-    // rasteriser refuses (§33), and without it the criteria about the refusal would
+    // rasteriser refuses, and without it the criteria about the refusal would
     // pass by having nothing to look at.
     let groups: &[usize] = if opts.quick {
         &[RASTER_GROUPS[0], RASTER_GROUPS[3], RASTER_GROUPS[5]]
@@ -1034,7 +1034,7 @@ fn raster_table(opts: &Options) -> RasterReport {
     if undrawn > 0 {
         println!(
             "\n  {undrawn} frames marked `!` were never drawn: the GPU path reported success and left\n  \
-             the previous frame in the texture (§32.4). Their times are not frame times."
+             the previous frame in the texture. Their times are not frame times."
         );
     }
     if let Some(worst) = rows
@@ -1047,7 +1047,7 @@ fn raster_table(opts: &Options) -> RasterReport {
             .filter(|row| row.groups == 1)
             .max_by(|a, b| a.check_ms.total_cmp(&b.check_ms));
         println!(
-            "\n  the tile check (§33.3) costs at most {:.3} ms here, on the scene of {} commands\n  \
+            "\n  the tile check costs at most {:.3} ms here, on the scene of {} commands\n  \
              whose frame takes {:.1} ms to rasterise{}",
             worst.check_ms,
             worst.commands,
@@ -1063,7 +1063,7 @@ fn raster_table(opts: &Options) -> RasterReport {
         let paranoid = rows.iter().filter(|row| row.false_refusal).count();
         println!(
             "\n  {refused} scenes marked `ref` need more tiles than the rasteriser can allocate and were\n  \
-             refused before being drawn (§33). Forced through, {paranoid} of them produced the picture."
+             refused before being drawn. Forced through, {paranoid} of them produced the picture."
         );
     }
 
@@ -1076,7 +1076,7 @@ fn raster_table(opts: &Options) -> RasterReport {
 /// The rows the JSON report archives, so the two halves can be diffed across commits.
 ///
 /// One scene at one scale on each path, at both ends of the command sweep — the four
-/// numbers §32 is argued from. The rest of the table is printed and not archived: a
+/// numbers the segment argument rests on. The rest of the table is printed and not archived: a
 /// report is for diffing a claim, not for keeping every row ever measured.
 fn raster_records(rows: &[RasterRow]) -> Vec<ScenarioRecord> {
     let pick = |path: &str, groups: usize| {
@@ -1157,11 +1157,11 @@ fn print_raster(rows: &[RasterRow]) {
     }
 }
 
-// --- MARK: nesting, and the second buffer (§34)
+// --- MARK: nesting, and the second buffer
 
 /// Nesting depths the sweep walks.
 ///
-/// The switch has to be crossed in both directions to be tested (§28.4), and the two
+/// The switch has to be crossed in both directions to be tested, and the two
 /// device scales put the crossing in two places: a 1100x750 frame survives five nested
 /// groups and is lost at six, a 2200x1500 one is lost at five. So the same four depths
 /// measure both sides at one scale and only the far side at the other.
@@ -1171,12 +1171,12 @@ const NEST_DEPTHS: [usize; 4] = [1, 4, 5, 6];
 ///
 /// The scene an application builds without meaning to — a stack of opacity groups
 /// around a panel — and the one vello's blend scratch runs out on long before its tile
-/// buffer does (§34). Every group here is a visual no-op, so any difference between
+/// buffer does. Every group here is a visual no-op, so any difference between
 /// two depths is the rasteriser losing the frame rather than the picture changing.
 struct Nested {
     depth: usize,
     /// What the content is drawn in; two of these alternate frame by frame, so a frame
-    /// the GPU never drew cannot pass for the frame before it (§32.4).
+    /// the GPU never drew cannot pass for the frame before it.
     tint: Color,
 }
 
@@ -1253,7 +1253,7 @@ struct NestRow {
     /// It was refused and would have drawn anyway — the paranoid failure.
     false_refusal: bool,
     /// Frames whose scene was accepted and whose picture never arrived — the blind
-    /// failure, and the one §33 was written to make impossible.
+    /// failure, and the one the tile check makes impossible.
     unverified: usize,
     /// What asking the question costs, per frame.
     check_ms: f64,
@@ -1296,7 +1296,7 @@ fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> Nest
     };
 
     // The pictures the frames are judged against, from the CPU rasteriser, which has
-    // no such ceiling (§33.5).
+    // no such ceiling.
     let mut host = Host::any().expect("some backend opens").with_background(panel);
     host.set_device_scale(scale);
     let references: Vec<_> = plans
@@ -1321,7 +1321,7 @@ fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> Nest
             );
             row.refused = true;
 
-            // The same question the tile sweep asks (§33.4): forced past the check,
+            // The same question the tile sweep asks: forced past the check,
             // does the frame arrive? Judged against a blank frame put in the texture
             // first, because every row of this sweep draws the same ink and the row
             // before would otherwise pass for a successful draw.
@@ -1359,7 +1359,7 @@ fn nest_case(gpu: &mut GpuPath, depth: usize, scale: f64, frames: usize) -> Nest
 /// Nesting depth against the blend scratch, at two frame sizes.
 ///
 /// The device scale is the outer loop for the reason `raster_table` gives: alternating
-/// the target size provokes the defect of §32.4, and a benchmark that provokes a defect
+/// the target size provokes the dropped-frame defect, and a benchmark that provokes a defect
 /// it is not measuring reports noise.
 fn nest_table(opts: &Options) -> Vec<NestRow> {
     let frames = if opts.quick { 4 } else { 8 };
@@ -1456,7 +1456,7 @@ pub fn run(opts: &Options) -> Outcome {
 
     // --- Scenario 2: external content, frame after frame.
     //
-    // The claim of §4.3 and §14, and the trap of §26.1 in one: a hole has to survive
+    // External content and the paint-mode reset in one: a hole has to survive
     // the frames in which nothing about it changed.
     let external = {
         let layouts = Rc::new(Cell::new(0));
@@ -1471,7 +1471,7 @@ pub fn run(opts: &Options) -> Outcome {
 
     // --- Scenario 3: the device scale sweep.
     //
-    // §9's third multiplier: composition, not layout. The counter is the tree's
+    // The device scale: composition, not layout. The counter is the tree's
     // layout passes while the same plan is composed at four different scales.
     let scale_layouts = Rc::new(Cell::new(0));
     let mut scale_frames = Vec::new();
@@ -1505,7 +1505,7 @@ pub fn run(opts: &Options) -> Outcome {
     //
     // Configured the way `window::run` configures it, over a tree that does not cover
     // the window: presentation flattens alpha away, so the frame has to be opaque
-    // before it gets there (§26.4).
+    // before it gets there.
     let transparent = {
         let mut harness = harness(Sparse);
         let mut host = Host::any()
@@ -1596,7 +1596,7 @@ struct Measured<'a> {
     raster_rows: &'a [RasterRow],
     /// Readbacks the raster table made, which is what checks the readback counter.
     raster_readbacks: u64,
-    /// The nesting sweep: what the blend-scratch guard did, row by row (§34).
+    /// The nesting sweep: what the blend-scratch guard did, row by row.
     nest_rows: &'a [NestRow],
 }
 
@@ -1626,7 +1626,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         unit: "backends unreachable",
     });
 
-    // §9, §23.4: the device scale is a transform at composition. If it ever reaches
+    // The device scale is a transform at composition. If it ever reaches
     // layout, a display change costs a relayout of the whole tree.
     criteria.push(Criterion {
         name: "device_scale_does_not_relayout",
@@ -1651,7 +1651,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
     }
 
-    // §4.3: a hole that does not reach the host is a 3D viewport with the UI's stale
+    // A hole that does not reach the host is a 3D viewport with the UI's stale
     // pixels in it. Counted per frame rather than against the declarations, because
     // a widget that stopped declaring would otherwise satisfy the criterion by
     // producing nothing to lose.
@@ -1676,7 +1676,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         unit: "pixels not opaque",
     });
 
-    // --- The rasteriser (§32). What §31 counted in the plan, counted again in the
+    // --- The rasteriser. What was counted in the plan, counted again in the
     // units the rasteriser actually works in.
 
     // The bridge between the two halves: `plan::commands` is worth counting only if a
@@ -1692,7 +1692,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "rows where the two disagree",
         });
 
-        // §31 in the rasteriser's units: the far field arrives as a handful of draw
+        // Batching in the rasteriser's units: the far field arrives as a handful of draw
         // objects however many curves are in it. Broken by taking the batch apart,
         // which is what the sweep's other end measures: 8001.
         let batched = raster_rows.iter().filter(|row| row.groups == 1).map(|row| row.objects);
@@ -1705,7 +1705,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "draw objects",
         });
 
-        // §9 and §23.4 in the same units: the device scale is a transform at
+        // The device scale in the same units: the device scale is a transform at
         // composition, so the rasteriser is asked to draw the same thing at every
         // scale. A host that re-encoded per scale would show up here as a different
         // number of objects or segments for the same scene.
@@ -1734,7 +1734,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     // CPU path is the reference every GPU row is checked against, so this is what
     // checks the reference. A refused row is exempt: it has no frame by construction,
     // and the empty picture it reports is the forced draw that proved the refusal
-    // right (§33.3).
+    // right.
     if !raster_rows.is_empty() {
         criteria.push(Criterion {
             name: "every_measured_frame_has_ink",
@@ -1748,7 +1748,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "rows with an empty frame",
         });
 
-        // §33, both halves. The silent failure this replaced: a frame vello reports
+        // The tile check, both halves. The silent failure this replaced: a frame vello reports
         // as drawn and did not draw. After the check there should be none, because
         // the scenes that would have failed are refused before they are timed.
         criteria.push(Criterion {
@@ -1785,9 +1785,9 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             });
         }
 
-        // The claim §32 rests on, and the one that decides what is worth optimising
+        // The claim segments rest on, and the one that decides what is worth optimising
         // next: a far-field frame is the rasteriser's time, not the plan's. Timing,
-        // because there is no counter for "what a rasteriser did" (§32.1) — and with
+        // because there is no counter for "what a rasteriser did" — and with
         // the margin that kind demands: measured at 0.002 against a bound of 0.5.
         if let Some(row) = raster_rows
             .iter()
@@ -1804,7 +1804,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         }
     }
 
-    // --- The blend scratch (§34). The same three criteria as the tile budget, on the
+    // --- The blend scratch. The same three criteria as the tile budget, on the
     // buffer a user interface reaches first, and absent where there is no device.
     if nest_rows.iter().any(|row| row.on_gpu) {
         // The blind failure: a scene the guard let through whose frame never arrived.
@@ -1831,7 +1831,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
 
         // What the guard's cost rests on, as a counter rather than as a stopwatch: on a
         // frame a user interface actually draws, the cheap bounds answer and the
-        // geometry is never touched (§33.3). The batched far field is that frame — a
+        // geometry is never touched. The batched far field is that frame — a
         // dozen commands nested two deep — and it is the row this counts.
         criteria.push(Criterion {
             name: "the_budget_check_stays_out_of_the_geometry",
@@ -1854,7 +1854,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
 
         // Both of the above pass on a sweep that never nests deep enough to matter, so
-        // the sweep has to reach the ceiling. Counted from the failing side (§20.9).
+        // the sweep has to reach the ceiling. Counted from the failing side.
         criteria.push(Criterion {
             name: "the_blend_budget_check_is_exercised",
             claim: "the sweep contains a scene over the rasteriser's blend budget",
@@ -1865,7 +1865,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
     }
 
-    // --- The GPU frame path (§27). Absent where there is no device to measure it on,
+    // --- The GPU frame path. Absent where there is no device to measure it on,
     // which is the honest answer on a runner without one.
     if let Some(gpu) = gpu {
         let frames = gpu.frames.max(1) as f64;
@@ -1888,7 +1888,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "bytes/frame",
         });
 
-        // The absurdity §27 removes: a GPU rasteriser that has to hand back pixels
+        // What the swapchain path removes: a GPU rasteriser that has to hand back pixels
         // copies them out of video memory every frame.
         criteria.push(Criterion {
             name: "gpu_frames_are_not_read_back",
@@ -1917,7 +1917,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         // The partner of `gpu_frames_are_not_read_back`, in the shape of
         // `the_frame_byte_counter_is_not_a_stub`: zero readbacks on the frame path
         // means something only if the counter reports one when a readback does
-        // happen. The raster table reads frames back on purpose (§32.4), so a
+        // happen. The raster table reads frames back on purpose, so a
         // benchmark run that reports none of them has a counter that is not looking.
         criteria.push(Criterion {
             name: "the_readback_counter_is_not_a_stub",
@@ -1929,7 +1929,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
 
         // And the holes still arrive: a faster path that lost them would be a
-        // regression against §26.
+        // regression of the host.
         criteria.push(Criterion {
             name: "the_gpu_path_keeps_the_holes",
             claim: "external content is still a hole on the GPU path",

@@ -1,48 +1,15 @@
-//! The link layer: edges between nodes, drawn as curves rather than built as widgets.
+//! The link layer: edges between nodes, drawn as curves rather than built as widgets
+//! (there are as many links as nodes, and one with a single end on screen is still drawn).
 //!
-//! `rnd/architecture.md` §10.4 settles the shape: not widgets, but a separate layer of
-//! cubic béziers batched into one stroke stream and recorded in a scene of its own,
-//! re-recorded only when the topology or an endpoint moves.
+//! A link is recorded when either end lies in the recorded region, found through the
+//! adjacency list. That is exact for edges shorter than the region margin; a long link
+//! whose ends are both outside is not drawn (pinned by a test). Links too short to see are
+//! dropped when the set is chosen ([`retain_recorded`](LinkLayer::retain_recorded)), so
+//! the picture and the pick agree.
 //!
-//! The reason it cannot be widgets is the reason Phase 0 exists. Virtualisation
-//! bounded the cost of nodes by removing the off-screen ones from the widget tree
-//! (§20.3). Links cannot leave the tree the same way: there are as many of them as
-//! there are nodes, and one with a single endpoint on screen still has to be drawn.
-//! A link that is a widget is a link that puts the linear cost back.
-//!
-//! # Which links get drawn
-//!
-//! Selected through the adjacency list rather than through a spatial index of their
-//! own: a link is recorded when **either endpoint** lies in the recorded region. That
-//! is exact for a graph whose edges are shorter than the region margin — a quarter of
-//! a viewport — which is what a node editor is, and it makes a drag cheap, because the
-//! links a moved node disturbs are exactly its own.
-//!
-//! It is not exact in general. A link whose two endpoints both lie outside the region
-//! while the curve between them crosses the screen is not drawn. Indexing link
-//! bounding boxes would fix it, and would cost a second index whose cells degenerate
-//! as soon as one edge is long. The limitation is pinned by a test rather than left
-//! to be discovered.
-//!
-//! A link too short to see is dropped from the set as well — see
-//! [`retain_recorded`](LinkLayer::retain_recorded). It happens at selection time, so
-//! the same set answers "what is drawn" and "what can be picked" and no new
-//! invalidation is introduced.
-//!
-//! # How they are drawn, and what that costs the order
-//!
-//! All the recorded curves go into **one path per style** and are stroked with one
-//! command; a `move_to` per link is what keeps them apart, and each subpath is capped
-//! on its own (`kurbo::stroke` finishes the previous one on every `MoveTo`). A command
-//! is charged in every frame it sits in the scene and costs fifteen times what the same
-//! curve costs inside a shared one (§31.1), and the paint pass re-appends the whole
-//! scene every frame whether or not anything changed — so N commands is the one thing a
-//! link layer must not be.
-//!
-//! The price is that **the drawing order between links is not defined**. Curves are
-//! grouped by style, not by index, so two overlapping links stack by group. Picking
-//! is written to match: it takes any of the links under the pointer rather than
-//! claiming the topmost one.
+//! The recorded curves go into one path per style, stroked with one command each: a
+//! command per link costs fifteen times as much every frame. So the drawing order between
+//! links is undefined, and a pick returns any link under the pointer.
 
 use std::collections::HashMap;
 
@@ -50,12 +17,8 @@ use masonry::imaging::Painter;
 use masonry::kurbo::{BezPath, Circle, CubicBez, Point, Rect, Shape};
 use masonry::peniko::Color;
 
-/// A connection from an output of one node to an input of another.
-///
-/// Nodes by index into the canvas's node array, ports by their number on that side of the
-/// node. [`Link::new`] connects port 0 to port 0, which is what a graph that knows nothing
-/// about ports means — and with the default [`PortLayout`] it is drawn exactly as a link
-/// was before ports existed.
+/// A connection from an output port of one node to an input port of another, nodes by
+/// name and ports by their number on that side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Link {
     /// The node the curve leaves, by index.
@@ -84,11 +47,7 @@ impl Link {
         }
     }
 
-    /// The same edge, written the other way round.
-    ///
-    /// A canvas names an edge whichever way it is written (`link_name`), because a graph
-    /// that does not care about direction writes it either way; the ports go with their
-    /// nodes.
+    /// The same edge, written the other way round; the ports go with their nodes.
     #[must_use]
     pub fn reversed(self) -> Self {
         Self {
@@ -123,13 +82,8 @@ pub struct Ports {
     pub outputs: u16,
 }
 
-/// Where a node's ports are, as a rule rather than as a question to the application.
-///
-/// A rule because of where ports are needed: every link's curve ends at two of them, and
-/// the canvas builds curves in bulk — thousands for the recorded set, in the far field
-/// with no widget anywhere (§24, §31). A callback per endpoint would put the application
-/// in the middle of that. What the application does say is *how many* ports a node has
-/// (`NodeSource::ports`), and only when the pointer is near one.
+/// Where a node's ports are, as a rule rather than a callback: curves are built in bulk.
+/// The application says only how many ports a node has (`NodeSource::ports`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[expect(
     clippy::exhaustive_structs,
@@ -137,14 +91,12 @@ pub struct Ports {
 )]
 pub struct PortLayout {
     /// How far below the node's top edge the first port is, in canvas units; `None` puts
-    /// every port at the middle of the edge, which is where a link ended before ports.
+    /// every port at the middle of the edge.
     pub first: Option<f64>,
     /// The distance between one port and the next, in canvas units.
     pub step: f64,
-    /// The radius of the dot at each port, in canvas units, and the least distance at
-    /// which a port is picked. The node draws the dots, not the canvas
-    /// ([`paint_ports`](Self::paint_ports)); nodes without widgets — the far field — have
-    /// none, and are not picked by their ports either.
+    /// The radius of the dot at each port, in canvas units, and the least pick distance.
+    /// Nodes draw the dots ([`paint_ports`](Self::paint_ports)).
     pub dot_radius: f64,
     /// The colour of the dots.
     pub dot_color: Color,
@@ -176,15 +128,7 @@ impl PortLayout {
     }
 
     /// Draws the dots of a node's `ports`, for a node widget to call from its `post_paint`
-    /// with `ctx.border_box()` — the box the canvas gave it, in the coordinates the
-    /// painter is in.
-    ///
-    /// The node draws them rather than the canvas because a dot belongs at its node's
-    /// level in the stacking order: drawn by the canvas over every node, a dot showed
-    /// through the node raised over it, and clipping it by that node's box hid it under
-    /// the corner the node leaves unpainted (§50.8). From the post-paint, so a control
-    /// reaching the node's edge does not cover half of it. Nothing with
-    /// `dot_radius` at zero.
+    /// with `ctx.border_box()`, so a dot stacks with its node.
     pub fn paint_ports(&self, painter: &mut Painter<'_>, rect: Rect, ports: Ports) {
         if self.dot_radius <= 0.0 {
             return;
@@ -212,28 +156,15 @@ impl PortLayout {
 /// Topology, plus which of it is currently recorded.
 #[derive(Default)]
 pub(crate) struct LinkLayer {
-    /// Edges by name. A removed edge leaves a hole rather than moving its neighbours,
-    /// because its name is what `CanvasHit::Link` and the recorded set are written in
-    /// — the rule §41.2 made for areas, applied to links.
+    /// Edges by name; a removed edge leaves a hole.
     edges: Vec<Option<Link>>,
     /// Names a removal freed, for the next insertion to hand out again.
     free_edges: Vec<u32>,
     /// Live edges, so "is there anything to draw" costs nothing.
     live: usize,
-    /// Edge names incident to each node, packed: `incident[offsets[n]..offsets[n+1]]`
-    /// are node `n`'s edges **as of the last packing**.
-    ///
-    /// One array rather than a `Vec` per node: a vector per node is a vector per node,
-    /// and on a million-node graph that is a million allocations to build and 24 MB of
-    /// headers to hold, for lists that average two entries.
-    ///
-    /// The packing is a snapshot, not the truth: it used to be both, because the
-    /// topology could not change after [`new`](Self::new). Edges added since live in
-    /// [`extra`](Self::extra) and edges removed since are holes in `edges`, so reading a
-    /// node's list means walking the packed slice, skipping holes, and then the extra
-    /// list. Re-packing on every edit would make one edit cost the whole graph; this
-    /// makes it cost what it touched, and the packing is redone when the extra lists
-    /// have grown to a fraction of the graph (§43).
+    /// Edge names incident to each node, packed (`incident[offsets[n]..offsets[n+1]]`) as of
+    /// the last packing. Edges added since are in [`extra`](Self::extra), removed ones are
+    /// holes; the packing is redone when `extra` grows to a fraction of the graph.
     offsets: Vec<u32>,
     incident: Vec<u32>,
     /// Edges added since the last packing, by node.
@@ -242,20 +173,14 @@ pub(crate) struct LinkLayer {
     extra_len: usize,
     /// Times the packing has been redone.
     compactions: u64,
-    /// Edge names walked by structural edits, so what an edit costs is a counter rather
-    /// than an argument (§20.9).
+    /// Edge names walked by structural edits.
     edit_scans: u64,
     /// The region the recorded set was chosen for, in canvas coordinates.
     region: Option<Rect>,
     /// Edges in the recorded scene, ascending and without duplicates.
     recorded: Vec<u32>,
-    /// The canvas-space bounding box of each recorded curve, in step with `recorded`.
-    ///
-    /// Kept because it is computed anyway when the set is chosen, and because without it
-    /// a pick rebuilds every recorded curve to find the one under the pointer — a set
-    /// bounded by the *region*, which is what grows when the view pulls back (§28). It
-    /// is a conservative filter: a box that is missing or stale can only cost a curve
-    /// that would have been tested anyway.
+    /// The canvas-space bounding box of each recorded curve, in step with `recorded`, for
+    /// the pick to filter by.
     bounds: Vec<Rect>,
     /// Set when the recorded scene no longer matches the curves and must be redrawn.
     ///
@@ -268,7 +193,7 @@ pub(crate) struct LinkLayer {
     /// Links dropped by the last [`retain_recorded`](Self::retain_recorded).
     ///
     /// Published so the rule that drops them can be measured: a threshold nobody can
-    /// see the effect of is a threshold nobody can check for vacuity (§20.9).
+    /// see the effect of is a threshold nobody can check for vacuity.
     hidden: usize,
     /// Times the set has been re-chosen.
     refreshes: u64,
@@ -403,7 +328,7 @@ impl LinkLayer {
     /// Removes every edge incident to `node` and hands them back, named.
     ///
     /// What undo needs: a node comes back with the links it had, under the names it had
-    /// (§41.2 again — a name nothing renumbers is what a view, a selection and a history
+    /// (a name nothing renumbers is what a view, a selection and a history
     /// are keyed by).
     pub(crate) fn remove_node(&mut self, node: usize) -> Vec<(u32, Link)> {
         let names = self.incident_names(node);
@@ -437,9 +362,7 @@ impl LinkLayer {
     }
 
     /// Re-packs the adjacency once the extra lists have grown to a fraction of it.
-    ///
-    /// A fraction rather than a fixed count, so the amortised cost of an edit does not
-    /// follow the graph: at a quarter, packing `E` edges is paid for by `E/4` edits.
+    /// A fraction, so the amortised cost of an edit does not follow the graph.
     fn compact_if_due(&mut self, node_count: usize) {
         if self.extra_len * 4 < self.live.max(MIN_EXTRA_BEFORE_COMPACTION) {
             return;
@@ -456,11 +379,7 @@ impl LinkLayer {
         &self.recorded
     }
 
-    /// The bounding box of the recorded curve at `at`, if it has been measured.
-    ///
-    /// `None` between a selection and the measurement that follows it, which is the
-    /// only moment the two lists can be out of step. A caller that gets `None` has to
-    /// fall back to testing the curve.
+    /// The bounding box of the recorded curve at `at`; `None` until measured (test the curve).
     pub(crate) fn recorded_bounds(&self, at: usize) -> Option<Rect> {
         self.bounds.get(at).copied()
     }
@@ -479,18 +398,9 @@ impl LinkLayer {
         self.hidden
     }
 
-    /// Measures every recorded link, dropping the ones `measure` answers `None` for.
-    ///
-    /// Meant to be called straight after [`refresh`](Self::refresh), so a rule that
-    /// depends on the zoom runs once per *selection* rather than once per frame. That
-    /// is the whole trick: the set is then slightly stale between selections — a link
-    /// that shrank below the threshold after the last one keeps being drawn for a
-    /// while — and that is the affordable direction of the error. It also keeps
-    /// drawing and picking honest for free, because both read this one set.
-    ///
-    /// The box that comes back is kept: the caller computes it to apply its rule, and a
-    /// pick needs the same box to reject a curve without rebuilding it. Order is
-    /// preserved, so `recorded` stays ascending and the boxes stay in step with it.
+    /// Measures every recorded link, dropping the ones `measure` answers `None` for, and
+    /// keeps the boxes. Called after [`refresh`](Self::refresh), so a zoom-dependent rule
+    /// runs once per selection, not per frame.
     pub(crate) fn measure_recorded(&mut self, mut measure: impl FnMut(Link) -> Option<Rect>) {
         let before = self.recorded.len();
         let edges = &self.edges;
@@ -512,13 +422,8 @@ impl LinkLayer {
         std::mem::take(&mut self.repaint)
     }
 
-    /// Marks the layer for re-recording because a node moved.
-    ///
-    /// Only if the node has links at all, and only if some of them are on screen: a
-    /// drag in an empty corner of the graph should cost nothing.
-    /// `bounds_of` re-measures a curve whose node has just moved: the stored boxes are
-    /// what a pick rejects against, so a curve that moved without them would be
-    /// unpickable until the next selection.
+    /// Marks the layer for re-recording because a node moved, if any of its links are
+    /// recorded; `bounds_of` re-measures their boxes for the pick.
     pub(crate) fn node_moved(&mut self, node: usize, mut bounds_of: impl FnMut(Link) -> Rect) {
         if self.is_empty() {
             return;
@@ -551,21 +456,15 @@ impl LinkLayer {
         self.slack = slack;
     }
 
-    /// Re-chooses the recorded set if [`needs_reselect`](Self::needs_reselect) says so.
-    /// `nodes` are the node indices inside `region`.
-    ///
-    /// Returns whether the set changed. The caller checks `needs_reselect` first to
-    /// avoid the index query it would need to produce `nodes` at all; this re-checks
-    /// rather than trusting it, because the two are far apart in the source and the
-    /// cost of asking again is a rectangle comparison.
+    /// Re-chooses the recorded set if [`needs_reselect`](Self::needs_reselect) says so, from
+    /// the nodes inside `region`, and returns whether it changed.
     pub(crate) fn refresh(&mut self, region: Rect, live_rect: Rect, nodes: &[usize]) -> bool {
         if !self.needs_reselect(live_rect) {
             return false;
         }
         self.reselect = false;
 
-        // The recorded set is taken out so the incident lists can be read while it is
-        // filled; both live in `self`.
+        // Taken out so the incident lists can be read while it is filled.
         let mut recorded = std::mem::take(&mut self.recorded);
         recorded.clear();
         for &node in nodes {
@@ -576,8 +475,7 @@ impl LinkLayer {
         self.recorded.sort_unstable();
         self.recorded.dedup();
 
-        // The boxes belong to the set that has just been replaced; the caller's
-        // `measure_recorded` fills them for the new one.
+        // The caller's `measure_recorded` fills the boxes for the new set.
         self.bounds.clear();
         self.region = Some(region);
         self.hidden = 0;
@@ -594,18 +492,10 @@ impl LinkLayer {
 }
 
 /// Extra entries a graph must have accumulated before re-packing is worth it at all.
-///
-/// Without a floor, a graph of four links would re-pack on its first edit and every
-/// second one after. The number is small enough to be free and big enough that building
-/// a graph one link at a time does not pack on the way.
 const MIN_EXTRA_BEFORE_COMPACTION: usize = 64;
 
-/// Packs the live edges into offsets and incident lists, by node.
-///
-/// A counting sort into one array: count each node's edges, prefix-sum the counts into
-/// offsets, then fill. An edge naming a node outside the graph is dropped here rather
-/// than rejected — the graph is the application's to validate, and it is skipped when
-/// drawn for the same reason.
+/// Packs the live edges into offsets and incident lists by node (a counting sort); an edge
+/// naming a node outside the graph is dropped.
 fn pack(edges: &[Option<Link>], node_count: usize) -> (Vec<u32>, Vec<u32>) {
     let mut offsets = vec![0_u32; node_count + 1];
     let ends = |link: &Link| [link.from, link.to];
@@ -634,17 +524,8 @@ fn pack(edges: &[Option<Link>], node_count: usize) -> (Vec<u32>, Vec<u32>) {
     (offsets, incident)
 }
 
-/// The curve of a link from `start` to `end`.
-///
-/// A cubic with horizontal handles, which is what every node editor draws and what makes
-/// two links between the same pair of columns distinguishable. From two points rather
-/// than two nodes, so that the curve a link is drawn with and the one an editor previews
-/// while a link is being dragged out of a port are the same curve.
-///
-/// The curve, not the path, is what both of the canvas's callers actually want: painting
-/// strokes it and hit testing measures the distance to it. One function so that the two
-/// can never disagree about where a link is — a pointer that picks a curve the eye does
-/// not see there is worse than one that misses.
+/// The curve of a link from `start` to `end`: a cubic with horizontal handles. The one
+/// curve painting, picking and a link drag's preview all use.
 pub fn link_curve(start: Point, end: Point) -> CubicBez {
     // Handles scale with the gap so a short link does not loop and a long one does
     // not go slack.
@@ -658,29 +539,16 @@ pub fn link_curve(start: Point, end: Point) -> CubicBez {
     )
 }
 
-/// Appends one link to a path being built for the whole batch.
-///
-/// A `move_to` rather than a `line_to`, which is what makes this a **new subpath**
-/// instead of a continuation of the previous link: stroking finishes the subpath on
-/// every `MoveTo` and caps it, so the two links never grow a segment joining them.
-/// That is the only reason one command can carry thousands of unrelated curves.
+/// Appends one link to a path being built for the whole batch, as a new subpath.
 pub(crate) fn push_link(path: &mut BezPath, start: Point, end: Point) {
     let curve = link_curve(start, end);
     path.move_to(curve.p0);
     path.curve_to(curve.p1, curve.p2, curve.p3);
 }
 
-/// Appends a link as a thin filled ribbon along its curve, `half` canvas units to either
-/// side, flattened into `pieces` straight pieces.
-///
-/// Along the curve rather than its chord, and that was measured (§53): a link to a node
-/// below loops out to the right and back, and its chord runs diagonally *under* the two
-/// nodes it joins, so a chord ribbon showed 66 blocks of the picture where the curve shows
-/// 888. One piece is the chord, which is what a link a pixel or two long needs.
-///
-/// Wound the same way whatever the link's direction — out along the left offset, back
-/// along the right — so a batch filled with the non-zero rule never cancels where two
-/// ribbons cross.
+/// Appends a link as a thin filled ribbon along its curve (not its chord, which can run
+/// under the nodes), `half` canvas units to either side, in `pieces` straight pieces.
+/// Always wound the same way, so crossing ribbons do not cancel under the non-zero rule.
 pub(crate) fn push_link_ribbon(path: &mut BezPath, start: Point, end: Point, half: f64, pieces: usize) {
     use masonry::kurbo::{ParamCurve, ParamCurveDeriv};
     let curve = link_curve(start, end);
@@ -710,61 +578,25 @@ pub(crate) fn push_link_ribbon(path: &mut BezPath, start: Point, end: Point, hal
 }
 
 /// How the canvas strokes its links.
-///
-/// Style rather than mechanism, like [`DetailThresholds`](crate::DetailThresholds): how a link should look
-/// depends on the application, and baking it into the crate would mean editing this
-/// file to retune a demo.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkStyle {
     /// Colour of an ordinary link.
     pub color: Color,
     /// Colour of the link under the pointer.
     pub hover_color: Color,
-    /// Stroke width in canvas units, so links thicken with the zoom like everything
-    /// else the canvas draws.
-    ///
-    /// Canvas units and not a minimum in screen pixels, which is a decision rather
-    /// than an oversight (§31.3): a constant on-screen width means the *recorded*
-    /// width depends on the zoom, and the scene is recorded in canvas coordinates
-    /// precisely so that panning and zooming reuse it untouched. `imaging` has no
-    /// non-scaling stroke — the transform is prepended to the whole draw — so buying
-    /// a constant hairline means giving the scene a second axis of invalidation.
+    /// Stroke width in canvas units (a constant screen width would make the recorded scene
+    /// depend on the zoom).
     pub width: f64,
-    /// Below this on-screen length, a link is not drawn at all, in **logical pixels**.
-    ///
-    /// A curve two pixels long carries no information and still costs a subpath in
-    /// every frame it is recorded for. Measured on the curve's bounding box, when the
-    /// recorded set is chosen — see `CanvasContent::drop_short_links` for why there.
-    ///
-    /// The rule needs no "only when zoomed out" clause: an on-screen length grows
-    /// with the zoom, so it stops firing on its own. Set to zero to switch it off.
+    /// Below this on-screen length, in logical pixels, a link is not drawn; zero switches
+    /// it off. Measured on the curve's box when the set is chosen.
     pub min_screen_length: f64,
-    /// How far the pointer may miss a link and still pick it, in **screen pixels**.
-    ///
-    /// Screen pixels rather than canvas units, because the tolerance is about the
-    /// pointer and not about the drawing: four canvas units are 0.08 px at the bottom
-    /// of the zoom range and 32 px at the top, which would make a link unpickable
-    /// exactly where it is thinnest (`rnd/architecture.md` §25.2).
+    /// How far the pointer may miss a link and still pick it, in screen pixels.
     pub slop: f64,
-    /// In the far field, draw each link as a thin filled ribbon along its curve rather
-    /// than as a stroked curve.
-    ///
-    /// On the CPU rasteriser a stroked segment costs about seven times a filled one
-    /// (§35.2), and a visible stroke far more: a one-pixel stroke made an overview of
-    /// 5000 nodes cost 81 ms against 7 for the ribbon (§53). On the GPU path the ribbon
-    /// costs 10–50% more than the stroke, which is the price of the default; an
-    /// application that only ever draws on the GPU can turn this off.
+    /// In the far field, draw each link as a thin filled ribbon rather than a stroke: much
+    /// cheaper on the CPU rasteriser, somewhat dearer on the GPU.
     pub far_fill: bool,
-    /// In the far field, the narrowest a link is drawn on screen, in pixels; zero draws
-    /// it at [`width`](Self::width) canvas units whatever that comes to.
-    ///
-    /// Two canvas units at an overview zoom of 0.02 are 0.04 px: a line at four percent
-    /// coverage, which no block of the frame shows (§53). A floor in pixels is what makes
-    /// the graph's structure visible where the overview exists to show it.
-    ///
-    /// The default is half a pixel, not one: a full pixel per link turns a dense overview
-    /// into a grey mat over the nodes, and half a pixel still puts every link on screen
-    /// at about half the link colour's contrast (§53.6).
+    /// In the far field, the narrowest a link is drawn on screen, in pixels; zero draws it
+    /// at [`width`](Self::width) canvas units. Half a pixel by default.
     pub far_min_width_px: f64,
 }
 
@@ -776,8 +608,7 @@ impl Default for LinkStyle {
             width: 2.0,
             min_screen_length: 2.0,
             slop: blazy_shape::DEFAULT_SLOP,
-            // On by default, both: measured, an overview drawn the old way spends most of a
-            // CPU frame on links nobody can see (§53).
+            // On by default, both.
             far_fill: true,
             far_min_width_px: 0.5,
         }
@@ -823,7 +654,7 @@ mod tests {
         assert_eq!(layer.recorded(), &[0, 1, 2]);
     }
 
-    /// The documented limitation, pinned so it is a decision rather than a surprise.
+    /// The documented limitation, pinned.
     #[test]
     fn a_link_with_both_ends_outside_the_region_is_not_recorded() {
         let mut layer = chain();
@@ -839,7 +670,7 @@ mod tests {
     fn a_drag_repaints_without_reselecting() {
         let mut layer = chain();
         // The proportions a viewport really produces: the region is the visible rect
-        // plus a quarter of it on each side (§35.2).
+        // plus a quarter of it on each side.
         let visible = Rect::new(0.0, 0.0, 100.0, 100.0);
         let region = visible.inflate(25.0, 25.0);
         layer.refresh(region, visible, &[0, 1, 2]);
@@ -870,10 +701,6 @@ mod tests {
     }
 
     /// A region chosen while zoomed out must not outlive the zoom that produced it.
-    ///
-    /// It contains every viewport that follows, so containment alone would keep it
-    /// forever — and with it every edge it recorded. This is §28, and it is what made
-    /// a canvas stay slow after one look at the whole graph.
     #[test]
     fn zooming_back_in_re_chooses_the_set() {
         let mut layer = chain();
@@ -916,12 +743,7 @@ mod tests {
         assert!(layer.take_repaint(), "node 0's link is");
     }
 
-    /// The promise the crate makes about a graph it did not validate: an edge naming a
-    /// node that is not there is skipped, not rejected, and takes nothing with it.
-    ///
-    /// Worth a test of its own now that the adjacency is packed: with a vector per node
-    /// the out-of-range end simply found no list, and with offsets it is an index that
-    /// has to be checked before it is counted.
+    /// An edge naming a node that is not there is skipped and takes nothing with it.
     #[test]
     fn an_edge_naming_a_missing_node_is_skipped() {
         let mut layer = LinkLayer::new(vec![Link::new(0, 1), Link::new(1, 9), Link::new(2, 2)], 3);

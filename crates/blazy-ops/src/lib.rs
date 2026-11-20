@@ -1,27 +1,13 @@
-//! Operators, keymap and modality — the mechanism behind `rnd/architecture.md` §11.
+//! Operators, keymap and modality.
 //!
-//! An *operator* is one named unit of user-visible work. It can be run from a key,
-//! from a button, from a test or from a script, it says for itself whether it is
-//! available right now, and while it is *modal* it receives events instead of the
-//! widget under the pointer. The keymap that starts it is **data**: a context, an
+//! An *operator* is one named unit of user-visible work: run from a key, a button, a
+//! menu or a script, it says whether it can run now, and while it is *modal* it receives
+//! events instead of the widget under the pointer. The keymap is data: a context, an
 //! event pattern, an operator name and its properties.
 //!
-//! ## What this crate is not
-//!
-//! It is not a widget, and it does not know Masonry's routing exists. That is
-//! deliberate and it is the finding of §38: there is no single seat in Masonry from
-//! which a layer can both see an event before the tree *and* keep it from the tree.
-//! So the state — the registry, the keymap, the modal stack, the undo journal — lives
-//! in a plain object that a driver hands events to, and a driver may sit in the widget
-//! tree, in a layer's `capture_pointer_event` hook, or in the host in front of
-//! `RenderRoot::handle_pointer_event`. [`runtime::Seat`] is how the runtime is told
-//! which one an event came through, and it is what makes "the tree saw it first"
-//! countable rather than arguable.
-//!
-//! The consequence for a caller is the useful part: the same operators run in a test
-//! with no widgets at all. [`Operator::exec`] and [`Operator::invoke`] act on the same
-//! world through the same context, so "the key and the script do the same thing" is a
-//! claim a test can check by comparing state rather than pixels.
+//! Not a widget: the state lives in a plain object ([`runtime::OpRuntime`]) that a driver
+//! hands events to, from whichever seat it sits in ([`runtime::Seat`]). So the same
+//! operators run in a test without widgets, and a key and a script do the same thing.
 //!
 //! ## The shape of a use
 //!
@@ -69,10 +55,8 @@
 //! assert_eq!(world.dx, 60.0);
 //! ```
 //!
-//! The world type `W` is the application's: everything an operator may touch goes
-//! through it, and nothing else does. Widgets cannot be touched from an operator at
-//! all — an operator changes the model and leaves the driver to carry the consequences
-//! into the tree (§30 already requires the model to be the truth).
+//! The world type `W` is the application's: everything an operator may touch, and no
+//! widgets.
 
 #![warn(missing_docs, unreachable_pub)]
 
@@ -84,12 +68,7 @@ pub mod undo;
 
 use crate::runtime::OpCtx;
 
-/// What an operator did with the event it was given.
-///
-/// The four cases are §11's, and they are Blender's: a transform that follows the
-/// mouse is `Running` until it is confirmed (`Finished`) or aborted (`Cancelled`),
-/// and `PassThrough` is how a modal operator says "this one is not mine" without
-/// giving up its place on the stack.
+/// What an operator did with the event it was given, as in Blender.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OpResult {
@@ -97,33 +76,20 @@ pub enum OpResult {
     Running,
     /// Done. Whatever it changed stays changed.
     Finished,
-    /// Aborted. An operator that returns this must have put the world back itself —
-    /// the runtime does not snapshot anything on its behalf.
+    /// Aborted. The operator must have put the world back itself.
     Cancelled,
     /// Not this operator's event. The runtime keeps looking, and a modal operator
     /// returning this stays on the stack.
     PassThrough,
 }
 
-/// One named unit of user-visible work.
-///
-/// `W` is the application's world — the model, the selection, whatever else an
-/// operator is allowed to touch. It is a type parameter rather than a trait object of
-/// ours because the alternative is a vocabulary of domain verbs in this crate, and
-/// this crate has no business knowing what a node is.
+/// One named unit of user-visible work, over the application's world `W`.
 pub trait Operator<W> {
     /// The name the keymap, a menu or a script refers to this operator by.
-    ///
-    /// A string rather than a type, for the same reason Blender uses one: a keymap
-    /// that is data has to survive being written to a file and read back.
     fn name(&self) -> &'static str;
 
-    /// Whether the operator can run right now.
-    ///
-    /// Asked before every run, on both paths — [`invoke`](Self::invoke) and
-    /// [`exec`](Self::exec) — so that "the key and the script do the same thing"
-    /// includes refusing in the same circumstances. Cheap: it is asked once per
-    /// candidate binding on every matching event.
+    /// Whether the operator can run right now; asked before every run, on both paths, once
+    /// per candidate binding. Keep it cheap.
     fn poll(&self, cx: &OpCtx<'_, W>) -> bool {
         let _ = cx;
         true
@@ -132,11 +98,8 @@ pub trait Operator<W> {
     /// Runs the operator from the interface, with the event that started it.
     fn invoke(&mut self, cx: &mut OpCtx<'_, W>) -> OpResult;
 
-    /// Runs the operator from a script, a test or a redo, from its properties alone.
-    ///
-    /// The default forwards to [`invoke`](Self::invoke), which is right for an
-    /// operator whose whole input is its properties, and wrong for one that reads the
-    /// pointer — that one has to state what it does without an event.
+    /// Runs the operator from its properties alone (a script, a menu, a test). Defaults to
+    /// [`invoke`](Self::invoke); an operator reading the pointer overrides it.
     fn exec(&mut self, cx: &mut OpCtx<'_, W>) -> OpResult {
         self.invoke(cx)
     }
@@ -146,12 +109,9 @@ pub trait Operator<W> {
     /// The event is in `cx.event()`. Returning [`OpResult::Running`] keeps the
     /// operator on the stack; anything else takes it off.
     ///
-    /// **No event at all means the gesture was cut off** — the window lost focus, the
-    /// driver is going away ([`OpRuntime::cancel_all`](runtime::OpRuntime::cancel_all)).
-    /// The operator is off the stack whatever it answers, and this call is its one chance
-    /// to leave the world either as it found it or recorded in the history: a preview, a
-    /// band or a half-made change it leaves behind stays there. Answering `Running`, as an
-    /// unknown event is usually answered, is the mistake, and the runtime counts it
+    /// **No event means the gesture was cut off**
+    /// ([`OpRuntime::cancel_all`](runtime::OpRuntime::cancel_all)): the operator leaves the
+    /// stack whatever it answers, and must clean up now. Answering `Running` is counted
     /// ([`OpCounters::cut_off_running`]).
     fn modal(&mut self, cx: &mut OpCtx<'_, W>) -> OpResult {
         let _ = cx;
@@ -160,10 +120,6 @@ pub trait Operator<W> {
 }
 
 /// Cumulative counters, for spotting work — and leaks — that should not be happening.
-///
-/// Counters rather than timings, for the reason `rnd/architecture.md` §20.9 gives and
-/// §37.4 repeated: a claim about an interaction system that can be stated as a count
-/// has to be, because a count is the same number on a laptop and on a CI runner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpCounters {
@@ -175,11 +131,7 @@ pub struct OpCounters {
     pub invoked: u64,
     /// Times an operator was executed from a script, a test or a redo.
     pub executed: u64,
-    /// Operators that ran without their poll being asked.
-    ///
-    /// Structurally zero: both paths ask. It is counted rather than asserted because
-    /// a third path is exactly the sort of thing a later change adds, and a criterion
-    /// on this number notices while an assertion in a doc comment does not.
+    /// Operators that ran without their poll being asked; zero by construction.
     pub unpolled: u64,
     /// Events delivered to a modal operator.
     pub modal_events: u64,
@@ -190,39 +142,20 @@ pub struct OpCounters {
     /// Modal operators that were cancelled.
     pub modal_cancels: u64,
     /// Operators cut off by [`OpRuntime::cancel_all`](runtime::OpRuntime::cancel_all)
-    /// that answered as if the gesture went on.
-    ///
-    /// The miss that looks like nothing: an operator that answers the missing event
-    /// `Running` or `PassThrough` has not cleaned up, and is taken off the stack anyway,
-    /// so whatever it was showing or holding stays. Zero when every operator honours
-    /// [`Operator::modal`]'s rule; a number rather than an assertion because the
-    /// operators are the application's as well as ours.
+    /// that answered as if the gesture went on (and so did not clean up).
     pub cut_off_running: u64,
     /// Events a modal operator deliberately let past.
     pub passthrough: u64,
-    /// Events that reached the widget tree before the runtime, while a modal operator
-    /// was running.
-    ///
-    /// The leak counter, and the one §38 is written on. Zero for a modal operator
-    /// that started from a press — Masonry's pointer capture makes the driver the
-    /// target — and *not* zero for one started from a key, because capture cannot be
-    /// taken outside a press. See [`runtime::Seat`].
+    /// Events that reached the widget tree before the runtime while a modal operator was
+    /// running: the leak counter.
     pub tree_first: u64,
     /// Events the pre-tree seat saw, whether or not it was allowed to act on them.
     pub seen_first: u64,
     /// Events a pre-tree seat kept from the widget tree.
-    ///
-    /// The mirror of [`tree_first`](Self::tree_first), and the number §39 is written on:
-    /// with the flag this fork adds to `Layer::capture_pointer_event`, a gesture the
-    /// runtime owns costs the tree nothing at all.
     pub withheld: u64,
     /// Presses held while the runtime waited to see what they became.
     pub holds: u64,
     /// Held presses that resolved into neither a click nor a drag, and were dropped.
-    ///
-    /// Not an error: another button, a key or a cancel arrived first. It is counted
-    /// because a hold that is abandoned often means a keymap asking to hold presses
-    /// nothing is waiting for.
     pub holds_abandoned: u64,
     /// Presses that turned out to be clicks.
     pub clicks: u64,

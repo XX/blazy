@@ -1,10 +1,7 @@
 //! The node editor, as this example uses it.
 //!
-//! The widget is `blazy::node_editor::NodeEditor` over this example's graph, and it
-//! lived here until §42 moved it into the library. What stays is the one thing that is
-//! the example's own: the statistics overlay is always on, because Phase 0 is a
-//! measurement, not a demo — numbers that only appear in a log are numbers nobody
-//! checks while dragging a node around — and because the tests read it back.
+//! `blazy::node_editor::NodeEditor` over this example's graph, always with the statistics
+//! overlay (the tests read it back).
 
 use blazy::canvas::CanvasLayer;
 use blazy::node_editor::{OverlayStyle, SelectionOutline, SessionHandle};
@@ -42,10 +39,7 @@ pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph) -> NodeEditor {
         .with_style(style())
 }
 
-/// The same, over a session that already exists.
-///
-/// What an area rebuilt in another window is made of: a new widget showing the state the
-/// old one showed (the detach task, decision 1).
+/// The same, over a session that already exists (an area rebuilt in another window).
 pub fn with_session(canvas: CanvasLayer, session: SessionHandle<GraphModel>) -> NodeEditor {
     NodeEditor::with_session(canvas, session)
         .with_hud(HUD_CAPTION)

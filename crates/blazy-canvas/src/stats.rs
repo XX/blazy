@@ -5,11 +5,7 @@ use masonry::kurbo::Point;
 use crate::detail::Detail;
 use crate::links::{Link, PortSide};
 
-/// What the canvas found under a point.
-///
-/// Nodes win over links, at every detail level, because that is the order they are
-/// painted in (§25.3): a pointer that disagrees with the picture is worse than one
-/// that is imprecise.
+/// What the canvas found under a point. Nodes win over links, as they are painted over them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum CanvasHit {
@@ -41,11 +37,8 @@ pub enum CanvasHit {
 }
 
 impl CanvasHit {
-    /// The node index, if this is a node or one of its ports.
-    ///
-    /// A port is part of its node for everything that is not about ports: a click on one
-    /// selects the node. What tells a port apart is the binding order — the link drag is
-    /// bound before the node drag, and its poll is the one that asks for a port.
+    /// The node index, if this is a node or one of its ports (a click on a port selects
+    /// its node).
     pub fn node(self) -> Option<usize> {
         match self {
             Self::Node { index, .. } | Self::Port { index, .. } => Some(index),
@@ -70,57 +63,31 @@ impl CanvasHit {
     }
 }
 
-/// What the canvas is doing right now, plus counters for the Phase 0 measurements.
-///
-/// Deliberately cheap to collect: Phase 0 exists to produce numbers, and numbers
-/// nobody can see are not evidence.
-///
-/// Captured during the canvas's layout. That matters for [`CanvasCounters::far_repaints`],
-/// which is bumped during *paint* and is therefore always one frame behind the rest.
+/// What the canvas is doing right now, plus work counters; captured during layout, so
+/// [`CanvasCounters::far_repaints`] (bumped in paint) is a frame behind.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct CanvasStats {
     /// Total number of nodes.
     pub total: usize,
-    /// Nodes that currently have a widget in the tree.
-    ///
-    /// This is the number the passes walk, which is the point: it is bounded by the
-    /// viewport, not by the graph. Zero in far-field mode, where nodes are painted
-    /// rather than materialised — they are on screen but they are not widgets.
+    /// Nodes that currently have a widget in the tree; zero in far-field mode.
     pub materialised: usize,
-    /// Nodes inside the visible rect, whether or not they have a widget.
-    ///
-    /// The number the budget is decided on, and it is not the same as
-    /// [`materialised`](Self::materialised): in the far field every node on screen is
-    /// visible and none is a widget. Published because a policy nobody can see the
-    /// input of cannot be checked — the criteria in §29.3 are written on this and on
-    /// [`CanvasCounters::level_switches`].
+    /// Nodes inside the visible rect, whether or not they have a widget: what the budget is
+    /// decided on.
     pub visible: usize,
-    /// Detail level applied at the last layout.
-    ///
-    /// The stricter of the two rules that choose it: readability by zoom
-    /// ([`DetailThresholds`](crate::DetailThresholds)) and cost by widgets ([`DetailBudget`](crate::DetailBudget)).
+    /// Detail level applied at the last layout: the stricter of
+    /// [`DetailThresholds`](crate::DetailThresholds) and [`DetailBudget`](crate::DetailBudget).
     pub detail: Option<Detail>,
     /// Current zoom factor.
     pub zoom: f64,
     /// Nodes in the far-field recording, and therefore drawn on every repaint of it.
     pub recorded_far: usize,
     /// Link curves currently recorded, and therefore drawn on every repaint.
-    ///
-    /// Bounded by the region the set was chosen for rather than by the viewport, and
-    /// the two part company as soon as the view zooms out (§28).
     pub recorded_links: usize,
-    /// Link curves the last selection dropped as too short to see.
-    ///
-    /// The output of [`LinkStyle::min_screen_length`](crate::LinkStyle::min_screen_length), and the only way to tell a
-    /// rule that is doing nothing from one that is quietly deleting the graph's structure.
-    /// Zero at any zoom a node is still readable at.
+    /// Link curves the last selection dropped as too short to see
+    /// ([`LinkStyle::min_screen_length`](crate::LinkStyle::min_screen_length)).
     pub hidden_links: usize,
     /// What the pointer was last found to be over, as of the last pointer move.
-    ///
-    /// One frame behind whatever moved the pointer, because it is recorded during
-    /// event handling and read here during layout — which is exactly the point: a
-    /// pick must not ask for a layout pass of its own (§25.4).
     pub hovered: Option<CanvasHit>,
     /// Cumulative work counters.
     pub counters: CanvasCounters,
@@ -132,119 +99,47 @@ pub struct CanvasStats {
 pub struct CanvasCounters {
     /// Layout passes run on the content widget.
     pub content_layouts: u64,
-    /// Nodes that actually needed layout, summed over all passes.
-    ///
-    /// `run_layout_on` early-returns for a clean widget of unchanged size, so panning
-    /// should leave this flat. If it climbs with every pan, something is dirtying
-    /// children that should not be.
+    /// Nodes that actually needed layout, summed over all passes; flat while panning.
     pub child_layouts: u64,
     /// Compose passes run on the content widget.
     pub composes: u64,
     /// Widgets built, one per node entering the materialised region.
-    ///
-    /// If this climbs steeply while panning slowly, the overscan is too tight and
-    /// nodes are thrashing in and out.
     pub builds: u64,
     /// Classes put on or taken off nodes (`CanvasLayer::set_node_class`).
-    ///
-    /// The cost of a view's state reaching its nodes, counted per node that changed: a
-    /// selection that touched every selected node on each click would be a selection that
-    /// cost the selection, and this is where it shows.
     pub class_changes: u64,
     /// Nodes raised to the top of the stacking order (`CanvasLayer::raise_node`).
     pub raises: u64,
-    /// Nodes inserted into or removed from the canvas (§43).
+    /// Nodes inserted into or removed from the canvas.
     pub node_edits: u64,
     /// Links inserted into or removed from the canvas.
     pub link_edits: u64,
     /// Times the packed adjacency was rebuilt.
-    ///
-    /// A structural edit files its link in an overflow list and the packing is redone
-    /// when those have grown to a quarter of the graph, so an edit costs what it touched
-    /// and the re-packing is amortised. This is the counter that says how often the
-    /// second half of that sentence happens.
     pub link_compactions: u64,
     /// Link names walked by structural edits.
-    ///
-    /// What an edit actually costs in the adjacency, and the counter the claim "a
-    /// removal costs its own links, not the graph's" is decided on.
     pub edit_edge_scans: u64,
-    /// Node geometries examined while deciding what is on screen, summed over all
-    /// passes.
-    ///
-    /// The number the spatial index exists to bound. A count rather than a duration
-    /// on purpose: it is exact and machine-independent, where the microseconds it
-    /// replaced are the kind of measurement that disappears into noise until the
-    /// graph is large enough for the problem to be urgent.
+    /// Node geometries examined while deciding what is on screen, summed over all passes.
     pub slot_visits: u64,
-    /// Times the link curves have been re-emitted into the scene.
-    ///
-    /// Rises whenever the content widget repaints for any reason — a node entering
-    /// view is enough — so it measures work done rather than a decision made.
-    /// Informational; the decision is [`link_reselects`](Self::link_reselects).
+    /// Times the link curves have been re-emitted into the scene (on any repaint).
     pub link_repaints: u64,
-    /// Times the canvas has re-chosen *which* links are recorded.
-    ///
-    /// This is the one to bound. Panning inside the recorded region must not raise
-    /// it, because the curves are in canvas coordinates and the layer transform does
-    /// the work; neither must dragging a node, which moves its own curves without
-    /// changing which curves are on screen. Only leaving the region should.
+    /// Times the canvas has re-chosen which links are recorded: only leaving the region
+    /// should, not a pan inside it or a node drag.
     pub link_reselects: u64,
-    /// Times the effective detail level actually changed.
-    ///
-    /// The counter the hysteresis is judged on. A pan near the budget boundary jitters
-    /// the visible set by a fifth (§29.1), and a policy without a margin answers every
-    /// wobble with a rebuild of every visible node — which is more expensive than the
-    /// widgets it saves. Zero while panning at zoom 1–2 is the other half of the
-    /// claim: ordinary work must not reach the policy at all.
+    /// Times the effective detail level actually changed (what the hysteresis is judged on).
     pub level_switches: u64,
-    /// Times the far-field scene has been re-emitted into the widget's scene.
-    ///
-    /// Rises whenever the content widget repaints for any reason, so it measures work
-    /// done rather than a decision made — the same relation `link_repaints` has to
-    /// `link_reselects`. Informational; the decision is
-    /// [`far_records`](Self::far_records).
+    /// Times the far-field scene has been re-emitted (on any repaint).
     pub far_repaints: u64,
-    /// Times the canvas has re-chosen *which* nodes the far field records.
-    ///
-    /// This is the one to bound, and it is the counter the overscan trades against
-    /// (§35.2): the recorded scene is in canvas coordinates, so panning and zooming
-    /// inside the region reuse it untouched and only leaving the region costs a new
-    /// selection. A wider margin buys fewer of these with a bigger scene — and the
-    /// scene is what the rasteriser is charged for in every frame (§32.3).
+    /// Times the canvas has re-chosen which nodes the far field records: only leaving the
+    /// region should.
     pub far_records: u64,
     /// Picks performed: pointer moves, button presses, explicit hit tests.
-    ///
-    /// The denominator of the two counters below. On its own it says only how often
-    /// the question was asked.
     pub hit_queries: u64,
-    /// Node geometries examined while answering picks, summed.
-    ///
-    /// Bounded by the grid cell the point falls in plus its slack, so it is bounded
-    /// by node *density* and not by the size of the graph — which is the difference
-    /// between a pointer that stays cheap on a million nodes and one that does not.
+    /// Node geometries examined while answering picks, summed: bounded by density, not size.
     pub hit_node_tests: u64,
     /// Ports measured against the pointer, summed over every pick.
-    ///
-    /// Bounded by the nodes near the pointer and the ports each has, never by the graph:
-    /// a pick that asked every node how many ports it has would be a pick that cost the
-    /// graph.
     pub hit_port_tests: u64,
-    /// Link curves whose geometry a pick actually rebuilt and measured, summed.
-    ///
-    /// The expensive half, and the one that must not follow the zoom: a curve counted
-    /// here was reconstructed from its endpoints and handed to `near_segment`. What
-    /// keeps it small is the box stored with the recorded set — see
-    /// [`hit_curve_scans`](Self::hit_curve_scans) for the other half.
+    /// Link curves a pick rebuilt and measured, summed; kept small by the stored boxes.
     pub hit_curve_tests: u64,
-    /// Recorded curves a pick walked past, summed — box tests, not curve tests.
-    ///
-    /// The candidate set is the links the canvas has recorded, so what can be clicked
-    /// is exactly what can be seen; but that set is bounded by the recorded *region*
-    /// and not by the viewport, so it grows as the view pulls back (§28). Counted
-    /// separately from [`hit_curve_tests`](Self::hit_curve_tests) precisely because the
-    /// box filter would otherwise hide it: a counter that only measures the work per
-    /// candidate cannot see a defect that lives in the number of candidates, which is
-    /// the lesson of §28.4.
+    /// Recorded curves a pick walked past, summed (box tests): the candidate count, which
+    /// grows as the view pulls back.
     pub hit_curve_scans: u64,
 }

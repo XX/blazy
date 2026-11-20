@@ -1,12 +1,8 @@
 //! What vello will try to allocate for a frame, worked out before the frame is sent.
 //!
-//! vello sizes its bump-allocated buffers with constants that do not depend on the
-//! scene, and a scene that needs more is dropped in silence: `render_to_texture`
-//! returns `Ok`, `fine.wgsl` sees the failure flag of an earlier stage and returns
-//! without drawing, and the target keeps the frame before it. Two of the six buffers
-//! are modelled here so a host can refuse such a frame out loud instead. Why it is
-//! silent, where it is filed upstream and the boundaries this arithmetic was checked
-//! against: `rnd/architecture.md` §33 and §34.
+//! vello sizes its buffers with constants, and a scene that needs more is dropped in
+//! silence (`render_to_texture` returns `Ok`, the target keeps the previous frame). Two
+//! of the six buffers are modelled here, so a host can refuse such a frame out loud.
 //!
 //! # The two demands
 //!
@@ -15,31 +11,20 @@
 //! blend  = sum over tiles of  max(0, deepest nesting over this tile - 4) * 256 words
 //! ```
 //!
-//! The first is per path, the second per **tile**, and the difference is not a detail:
-//! what nests over a tile is not what nests in the scene. `coarse.wgsl` includes a
-//! layer in a tile when `n_segs != 0 || (backdrop_clear == is_clip) || is_blend`, so
+//! The first is per path, the second per tile. `coarse.wgsl` includes a layer in a tile
+//! when `n_segs != 0 || (backdrop_clear == is_clip) || is_blend`, so
 //!
 //! * a **group** is a blend layer and charges every tile of its box;
 //! * a **clip** charges only the tiles its *outline* crosses. Tiles inside keep the depth they had; tiles outside take
 //!   the `clip_zero` branch and charge nothing.
 //!
-//! That is why an area tree and a canvas viewport, which clip with rectangles, do not
-//! go near this ceiling, while an application nesting a few opacity groups does (§34.2).
-//!
 //! # What this counts, and which way it errs
 //!
-//! Fills, strokes and clip shapes are counted from their bounding boxes, which is what
-//! vello bins on; a glyph is charged its em box; image draws are not counted. A
-//! rectangular clip is charged the far column and far row of its box — the count the
-//! measurements pin down, placed where the model puts it (§34.3). Every approximation
-//! is deliberately **generous**: charging too much refuses a frame that would have
-//! drawn, which is visible and reportable, while charging too little brings back the
-//! silent one. The two places that shows: a clip that is not a rectangle charges its
-//! whole box, and a group with no clip of its own charges the whole frame, because
-//! that is what `imaging_vello` pushes it against (`scene_sink.rs`, `surface_clip`).
-//!
-//! The boundaries themselves live in the tests below, which is where they are checked
-//! rather than restated.
+//! Fills, strokes and clip shapes by their bounding boxes (what vello bins on); a glyph
+//! by its em box; images not at all. A rectangular clip is charged its far column and row.
+//! Every approximation errs generous — a refused frame is visible, a dropped one is not:
+//! a non-rectangular clip charges its box, and a group without a clip the whole frame
+//! (`imaging_vello`'s `surface_clip`). The boundaries are checked in the tests below.
 
 mod blend;
 
@@ -57,17 +42,13 @@ const TILE: f64 = TILE_PX as f64;
 
 /// Tiles vello can allocate for one frame, whatever that frame contains.
 ///
-/// `vello_encoding::BufferSizes::new`, `tiles = BufferSize::new(1 << 21)` — the same in
-/// 0.9 and in 0.10, checked. Pinned along with the rasteriser: `imaging_vello` 0.0.2
-/// selects vello 0.9 (§27.1), and a version that sizes this buffer from the scene would
-/// make the whole check moot.
+/// `vello_encoding::BufferSizes::new`: `tiles = BufferSize::new(1 << 21)`, in vello 0.9
+/// and 0.10.
 pub const TILE_BUDGET: u64 = 1 << 21;
 
 /// Words of blend scratch vello can allocate for one frame.
 ///
-/// `blend_spill = BufferSize::new(1 << 20)`, with the comment "16 * 16 (1 << 8) is one
-/// blend spill, so this allows for 4096 spills" — the same in 0.9 and in 0.10, checked
-/// the same way and pinned for the same reason as [`TILE_BUDGET`].
+/// `blend_spill = BufferSize::new(1 << 20)`: 4096 spills of one tile, in vello 0.9 and 0.10.
 pub const BLEND_BUDGET: u64 = 1 << 20;
 
 /// Levels a tile nests before it starts spilling to `blend_spill`.
@@ -93,15 +74,14 @@ pub struct Demand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Overflow {
-    /// More tiles than [`TILE_BUDGET`]: too many large paths (§33.1).
+    /// More tiles than [`TILE_BUDGET`]: too many large paths.
     Tiles {
         /// Tiles the scene asks for.
         tiles: u64,
         /// Tiles the rasteriser can allocate.
         budget: u64,
     },
-    /// More blend scratch than [`BLEND_BUDGET`]: layers nested too deep over one tile
-    /// (§34).
+    /// More blend scratch than [`BLEND_BUDGET`]: layers nested too deep over one tile.
     Blend {
         /// Words the scene asks for.
         words: u64,
@@ -110,23 +90,12 @@ pub enum Overflow {
     },
 }
 
-/// Whether a scene is over one of the budgets — the question the frame path asks,
-/// answered without walking the scene when the answer is obvious.
+/// Whether a scene is over one of the budgets, as the frame path asks before every frame.
 ///
-/// Two cheap bounds come first, because this runs in front of every frame:
-///
-/// * a scene cannot need more tiles than its command count times the frame's own tiles, because no single path can be
-///   charged for more than the whole frame;
-/// * a tile cannot nest deeper than the scene nests, and nesting is visible in the command stream alone — no geometry,
-///   no bounding boxes.
-///
-/// Both are far under for anything a user interface actually draws, so the exact walk —
-/// proportional to the geometry, and the expensive half of this — runs only for a scene
-/// that could plausibly be over (§33.3).
+/// Two cheap bounds first: no more tiles than commands times the frame's tiles, and no
+/// tile deeper than the scene nests. The exact walk runs only when they leave it open.
 pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> {
-    // Read once and handed to both halves: it is the cheap bound *and* the switch that
-    // decides whether the walk allocates a blend map at all, and the two used to count
-    // it separately.
+    // Read once: the cheap bound, and whether the walk needs a blend map.
     let depth = nesting_depth(scene);
     if !over_cheap_bounds(scene, frame, depth) {
         return None;
@@ -148,12 +117,8 @@ pub fn over_budget(scene: &Scene, frame: PhysicalSize<u32>) -> Option<Overflow> 
     None
 }
 
-/// Whether the cheap bounds leave the question open, so the exact walk has to run.
-///
-/// The property the guard's cost rests on, published so it can be *counted* rather than
-/// timed: a benchmark that asserts "the guard is cheap on a real frame" in milliseconds
-/// is asserting something about the machine, while this is the same claim as a
-/// deterministic counter (§20.9).
+/// Whether the cheap bounds leave the question open, so the exact walk has to run
+/// (published so a benchmark can count it).
 pub fn needs_walk(scene: &Scene, frame: PhysicalSize<u32>) -> bool {
     over_cheap_bounds(scene, frame, nesting_depth(scene))
 }
@@ -164,19 +129,15 @@ fn over_cheap_bounds(scene: &Scene, frame: PhysicalSize<u32>, depth: u32) -> boo
     ceiling > TILE_BUDGET || depth > BLEND_STACK_SPLIT
 }
 
-/// What a composed scene will ask vello for, at this frame size.
-///
-/// The exact walk. [`over_budget`] is what a frame path should call; this is for a test
-/// or a measurement that wants the numbers themselves.
+/// What a composed scene will ask vello for, at this frame size: the exact walk. A frame
+/// path calls [`over_budget`].
 pub fn demand(scene: &Scene, frame: PhysicalSize<u32>) -> Demand {
     demand_at_depth(scene, frame, nesting_depth(scene))
 }
 
 /// [`demand`], for a caller that already knows how deep the scene nests.
 fn demand_at_depth(scene: &Scene, frame: PhysicalSize<u32>, depth: u32) -> Demand {
-    // The blend map is only allocated for a scene that could reach the spill at all:
-    // four levels live in registers, so a shallower scene asks for zero words and the
-    // per-tile bookkeeping would measure nothing.
+    // A blend map only for a scene deeper than the four register levels.
     let mut counter = Counter::new(frame, depth > BLEND_STACK_SPLIT);
     replay(scene, &mut counter);
     counter.finish()
@@ -192,11 +153,7 @@ pub fn blend_demand(scene: &Scene, frame: PhysicalSize<u32>) -> u64 {
     demand(scene, frame).blend_words
 }
 
-/// The deepest the command stream nests, clips and groups alike.
-///
-/// An upper bound for the depth of any one tile, read from the command stream without
-/// touching a single bounding box. That is what makes it usable as the cheap half of
-/// [`over_budget`]: no tile can nest deeper than the scene does.
+/// The deepest the command stream nests, clips and groups alike: a bound on any tile.
 pub fn nesting_depth(scene: &Scene) -> u32 {
     let mut depth = 0_u32;
     let mut deepest = 0_u32;
@@ -221,10 +178,10 @@ fn frame_tiles(frame: PhysicalSize<u32>) -> u64 {
 
 /// Adds up the tiles, one path at a time, and the blend scratch, one tile at a time.
 struct Counter {
-    /// The frame, in physical pixels: vello bins only over the target (§33.1).
+    /// The frame, in physical pixels: vello bins only over the target.
     frame: Rect,
     tiles: u64,
-    /// `None` for a scene that cannot reach the blend spill (§34.3).
+    /// `None` for a scene that cannot reach the blend spill.
     blend: Option<Blend>,
 }
 
@@ -257,8 +214,7 @@ fn charge_of(frame: Rect, transform: Affine, bounds: Rect) -> u64 {
     if bounds.is_zero_area() {
         return 0;
     }
-    // Tiles are a fixed grid, so a box that straddles a tile boundary pays for both —
-    // which is why this is not `width / TILE` rounded up.
+    // A box straddling a tile boundary pays for both tiles.
     let across = (bounds.x1 / TILE).ceil() - (bounds.x0 / TILE).floor();
     let down = (bounds.y1 / TILE).ceil() - (bounds.y0 / TILE).floor();
     (across.max(1.0) * down.max(1.0)) as u64
@@ -278,8 +234,7 @@ impl PaintSink for Counter {
         let frame = self.frame;
         if let Some(blend) = &mut self.blend {
             let inside = tiles_of(frame, transform, bounds).intersect(blend.visible);
-            // The clip is included only where its outline cuts a tile; inside it the
-            // depth is unchanged, outside it nothing is included at all (§34.2).
+            // Included only where its outline cuts a tile.
             let charged = if rectangular {
                 Charge::Edges(inside)
             } else {
@@ -358,7 +313,7 @@ mod tests {
 
     /// `count` paths, each one a diagonal across the whole frame.
     ///
-    /// The scene the reproducer of §33.1 draws, in this crate's own terms: every path
+    /// The scene the upstream reproducer draws, in this crate's own terms: every path
     /// covers the target, so the tiles it needs are the target's tiles.
     pub(super) fn diagonals(count: usize, frame: PhysicalSize<u32>) -> Scene {
         let (w, h) = (f64::from(frame.width), f64::from(frame.height));
@@ -373,7 +328,7 @@ mod tests {
         scene
     }
 
-    /// The boundary, where vello itself puts it (§33.1).
+    /// The boundary, where vello itself puts it.
     ///
     /// Measured against vello directly: at 1100x750, 646 screen-spanning paths draw
     /// and 647 come back empty; at 2200x1500, 161 draw and 162 do not. If this
@@ -394,7 +349,7 @@ mod tests {
     /// A path hanging outside the frame pays for the part inside it, and no more.
     ///
     /// Checked against vello rather than assumed: its boundary does not move when
-    /// every path is three times the size of the frame (§33.1). Counting the whole
+    /// every path is three times the size of the frame. Counting the whole
     /// bounding box would refuse a scene that draws perfectly well — a canvas at an
     /// overview zoom has plenty of geometry outside the viewport.
     #[test]
@@ -413,9 +368,9 @@ mod tests {
     }
 
     /// The canvas's own far field has an order of magnitude of headroom, which is why
-    /// §33 is a guard and not a redesign.
+    /// The check is a guard and not a redesign.
     ///
-    /// §31 leaves a far-field frame at thirteen commands. Thirteen paths across a
+    /// A far-field frame is about thirteen commands. Thirteen paths across a
     /// HiDPI window ask for 168 636 tiles of 2 097 152 — 8%, so the canvas would have
     /// to grow twelve times more *styles* (not more curves: a curve inside a batch
     /// costs no tiles of its own) before this check has anything to say to it.
@@ -476,7 +431,7 @@ mod fast_path_tests {
         let frame = PhysicalSize::new(2200, 1500);
         let mut scene = Scene::new();
         let stroke = Stroke::new(2.0);
-        // One command, eight thousand curves in it — the batch of §31.
+        // One command, eight thousand curves in it — the far field's batch.
         let mut path = masonry::kurbo::BezPath::new();
         for i in 0..8000 {
             let x = f64::from(i % 100) * 22.0;
@@ -587,7 +542,7 @@ mod blend_tests {
     const LARGE: PhysicalSize<u32> = PhysicalSize::new(2200, 1500);
 
     /// Where vello loses the frame to nested groups, measured against vello itself
-    /// (§34.2): five nested layers fit a 1100x750 frame and six do not; on 2200x1500
+    ///: five nested layers fit a 1100x750 frame and six do not; on 2200x1500
     /// even five are too many.
     ///
     /// The same shape of test as `the_boundary_is_where_vello_puts_it` for tiles, and
@@ -630,8 +585,8 @@ mod blend_tests {
     /// A clip that is not a rectangle costs what a group costs, because its outline
     /// can cross every tile — and this one does.
     ///
-    /// This is the case that disproves "clips are free" (§33.7 said so, §34.1 corrects
-    /// it): the same twelve levels that a rectangular clip survives lose the frame at
+    /// This is the case that disproves "clips are free", as an earlier
+    /// reading had it: the same twelve levels that a rectangular clip survives lose the frame at
     /// six when the clip is a zigzag.
     #[test]
     fn a_clip_that_is_not_a_rectangle_costs_what_a_group_costs() {

@@ -2,9 +2,9 @@
 //!
 //! A window cannot be opened from a benchmark — there is no event loop — so a window
 //! here is what a window is as far as the frame is concerned: its own `RenderRoot` with
-//! its own screen over the shared models. That is the same approximation §39.4 used for
+//! its own screen over the shared models. That is the same approximation used for
 //! the host seat, and it is exact for everything this table claims: frame cost is the
-//! cost of walking *a* tree (§20.2), and the two trees are real.
+//! cost of walking *a* tree, and the two trees are real.
 
 use std::time::Instant;
 
@@ -58,11 +58,11 @@ fn window(areas: usize, nodes: usize, graph: Option<&SharedGraph>) -> (TestHarne
 ///
 /// Layout *passes* rather than child layouts, and that is the whole difference between a
 /// counter that sees an idle window working and one that does not: moving a node
-/// re-places a child without re-laying it out, which is what §20's drag criterion
+/// re-places a child without re-laying it out, which is what the drag criterion
 /// measured as 0.0. A window made to work by another window would move nodes, not lay
 /// out children, and `child_layouts` would report nothing.
 ///
-/// Summed over the areas, because what a pass walks is the window's whole tree (§20.2)
+/// Summed over the areas, because what a pass walks is the window's whole tree
 /// — an area holding nothing still costs its own visit.
 fn counters(harness: &TestHarness<Screen>) -> (u64, u64) {
     let areas = harness.root_widget().area_ids().len();
@@ -217,7 +217,7 @@ fn idle_row(
     }
 }
 
-/// What a change in one window costs the other to follow (§30 across the boundary).
+/// What a change in one window costs the other to follow (across the boundary).
 pub(crate) struct CrossRow {
     /// Nodes showing a different place in the second window before it caught up.
     pub(crate) adrift_before: usize,
@@ -238,9 +238,9 @@ pub(crate) struct CrossRow {
     /// for canvases no window holds — after a join, a detach and an edit.
     ///
     /// A view that left the tree used to stay registered and owed every later change, so
-    /// the windows were woken after every event from the first join on (§36). Measured
+    /// the windows were woken after every event from the first join on. Measured
     /// on the size of what is held rather than on work per frame, which is the only
-    /// place that defect lived (§28.4).
+    /// place that defect lived.
     pub(crate) owed_after: usize,
     /// Views the graph held at the end, and canvases the three windows hold.
     pub(crate) views: usize,
@@ -440,7 +440,7 @@ pub(crate) fn criteria(rows: &[WindowRow], cross: &CrossRow) -> Vec<Criterion> {
     let panned = rows.iter().find(|row| row.what == "pan in one window");
 
     vec![
-        // A frame is the cost of walking a tree, and the tree is per window (§20.2), so
+        // A frame is the cost of walking a tree, and the tree is per window, so
         // two idle windows are two idles. Measured as "an idle window lays out nothing",
         // with and without a second one, rather than as the difference between the two:
         // a difference of zero is also what two windows that both do useless work would
@@ -453,7 +453,7 @@ pub(crate) fn criteria(rows: &[WindowRow], cross: &CrossRow) -> Vec<Criterion> {
             bound: 1.0,
             unit: "layout passes/frame in an idle window",
         },
-        // The other half: a gesture in one window is that window's work. Claim 2 of §21,
+        // The other half: a gesture in one window is that window's work. Claim 2 of the areas,
         // raised from an area to a window.
         Criterion {
             name: "a_frame_in_one_window_leaves_the_other_alone",
@@ -463,7 +463,7 @@ pub(crate) fn criteria(rows: &[WindowRow], cross: &CrossRow) -> Vec<Criterion> {
             bound: 1.0,
             unit: "layout passes and resizes/frame in the untouched window",
         },
-        // §30 across the boundary, and the reason the pull exists: without it the second
+        // Across the boundary, and the reason the pull exists: without it the second
         // window shows a node where it used to be, and nothing says so. Counted from the
         // failing side, so the criterion is about the mechanism working rather than about
         // the defect existing.
@@ -485,7 +485,7 @@ pub(crate) fn criteria(rows: &[WindowRow], cross: &CrossRow) -> Vec<Criterion> {
             unit: "changes applied for one moved node",
         },
         // Everything a view copies out of the model has to cross, and topology is part of
-        // it (§43): the record a window collects from had nodes and no links, so a link
+        // it: the record a window collects from had nodes and no links, so a link
         // made in one window existed in the model and in that window only, for good.
         Criterion {
             name: "a_link_reaches_the_other_window",
@@ -497,7 +497,7 @@ pub(crate) fn criteria(rows: &[WindowRow], cross: &CrossRow) -> Vec<Criterion> {
         },
         // A view that left the tree is owed nothing. Without it the windows never idle
         // again after the first join: they are woken while anything is owed, and a view
-        // that no window holds can never collect what it is owed (§36, §28.4).
+        // that no window holds can never collect what it is owed.
         Criterion {
             name: "a_departed_view_is_owed_nothing",
             claim: "after a join, a detach and an edit, every window's pull leaves nothing owed",
@@ -518,7 +518,7 @@ pub(crate) struct DetachRow {
     /// Nodes whose name means a different node in the new window.
     ///
     /// Measured on a graph that has been edited, so the names have holes in them: on
-    /// dense names they would agree by accident (§43).
+    /// dense names they would agree by accident.
     pub(crate) names_adrift: usize,
     /// Operators left running in the session after the move.
     pub(crate) still_running: usize,
@@ -534,7 +534,7 @@ pub(crate) struct DetachRow {
 pub(crate) fn detach_row(areas: usize, nodes: usize) -> DetachRow {
     let (mut screen, graph) = window(areas.max(2), nodes, None);
 
-    // A graph with holes in its names, so "the names agree" means something (§43).
+    // A graph with holes in its names, so "the names agree" means something.
     let id = editor_id(&screen, 1);
     screen.edit_widget_with_id(id, |mut widget| {
         let mut editor = widget.downcast::<NodeEditor>();
@@ -555,7 +555,7 @@ pub(crate) fn detach_row(areas: usize, nodes: usize) -> DetachRow {
     let builds_before = screen.root_widget().stats().counters.builds;
 
     // A gesture in flight when the area is taken away. Started through the session's own
-    // runtime, because that is where a modal operator lives (§38) and what detach has to
+    // runtime, because that is where a modal operator lives and what detach has to
     // deal with (decision 6): without one running, the criterion below would ask nothing.
     let running = screen
         .root_widget()
@@ -599,7 +599,7 @@ pub(crate) fn detach_row(areas: usize, nodes: usize) -> DetachRow {
         + usize::from(arrived.stats().zoom != before.2);
 
     // Every live name means the same node in both places. The old window no longer holds
-    // this area, so the comparison is against the model, which is the truth (§30).
+    // this area, so the comparison is against the model, which is the truth.
     let names_adrift = (0..graph.borrow().names())
         .filter(|&index| {
             let truth = graph.borrow().try_node(index).map(|node| node.pos);
@@ -694,7 +694,7 @@ pub(crate) fn detach_criteria(row: &DetachRow) -> Vec<Criterion> {
             bound: 1.0,
             unit: "session fields different after the move",
         },
-        // §41.2's rule, at the window boundary.
+        // Ids are never renumbered, at the window boundary.
         Criterion {
             name: "detach_rebuilds_nothing_that_stayed",
             claim: "detaching one area rebuilds no other",
@@ -703,7 +703,7 @@ pub(crate) fn detach_criteria(row: &DetachRow) -> Vec<Criterion> {
             bound: 1.0,
             unit: "area widgets built in the source screen",
         },
-        // §43's names, across the boundary: checked on a graph that has holes, because
+        // Node names, across the boundary: checked on a graph that has holes, because
         // dense names would agree by accident.
         Criterion {
             name: "names_travel_with_the_area",

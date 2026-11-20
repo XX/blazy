@@ -1,14 +1,8 @@
 //! The runtime: a registry, a keymap, a modal stack and the counters.
 //!
-//! Not a widget and not a host hook — a plain object a *driver* hands events to. §38
-//! is the reason: Masonry has a place where an event can be seen before the tree
-//! (`Layer::capture_pointer_event`) and a place where it can be kept from the tree
-//! (pointer capture, obtainable only during a press), and they are not the same place.
-//! Keeping the state out of both means a driver can sit in either, or in the host in
-//! front of `RenderRoot`, without the operators knowing which.
-//!
-//! [`Seat`] is how a driver says where an event came from, and it is what turns "the
-//! modal operator got the events" from an assertion into [`OpCounters::tree_first`].
+//! A plain object a driver hands events to, so that a driver can sit in any seat — the
+//! host in front of `RenderRoot`, a layer's pre-tree hook, the tree — without the
+//! operators knowing which. [`Seat`] says where an event came from.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -24,36 +18,20 @@ use crate::undo::{Step, UndoStack};
 use crate::{OpCounters, OpResult, Operator};
 
 /// Where an event reached the runtime from.
-///
-/// The three seats §38 measured, and the distinction is not academic: only one of
-/// them can keep an event from the widget tree, and only the other two know what the
-/// event is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Seat {
-    /// From the host, in front of `RenderRoot::handle_pointer_event`.
-    ///
-    /// Can withhold the event from the tree completely — and knows nothing about what
-    /// is under it without paying `RenderRoot::edit_widget`, which runs the whole
-    /// rewrite battery (§38.2).
+    /// From the host, in front of `RenderRoot::handle_pointer_event`: can keep the event from
+    /// the tree, but does not know what is under the pointer.
     Host,
-    /// From a layer root's pre-tree hook, which can also keep the event from the tree.
-    ///
-    /// The seat §38.1 measured as useless and this fork made real: `Layer::capture_pointer_event`
-    /// returns `Handled` now, so this place has the host's power *and* knows what is
-    /// under the pointer. It differs from [`Host`](Self::Host) in one way that matters
-    /// here: the widget tree is underneath it and still wants its right of first
-    /// refusal, so an idle runtime does not act from this seat (§39.3).
+    /// From a layer root's pre-tree hook, which can also keep the event from the tree and
+    /// knows what is under the pointer. An idle runtime does not act from here: the tree
+    /// below has the first refusal.
     Layer,
-    /// From inside the widget tree, targeted at the driver itself.
-    ///
-    /// What pointer capture produces, and what focus produces for keys: nothing below
-    /// the driver was offered the event.
+    /// From inside the widget tree, targeted at the driver itself (capture, or focus).
     Tree,
-    /// From inside the widget tree, after a descendant was offered it first.
-    ///
-    /// Ordinary bubbling. Legitimate when nothing is running; a leak while a modal
-    /// operator is, which is what [`OpCounters::tree_first`] counts.
+    /// From inside the widget tree, after a descendant was offered it first; counted as a
+    /// leak ([`OpCounters::tree_first`]) while a modal operator runs.
     Bubbled,
 }
 
@@ -143,11 +121,7 @@ impl<W> OpCtx<'_, W> {
         self.world
     }
 
-    /// The event that brought us here, if there was one.
-    ///
-    /// `None` on the [`exec`](crate::Operator::exec) path, which is the point of that
-    /// path: an operator that cannot state what it does without an event cannot be
-    /// scripted, tested or redone.
+    /// The event that brought us here; `None` on the [`exec`](crate::Operator::exec) path.
     pub fn event(&self) -> Option<&OpEvent> {
         self.event
     }
@@ -189,7 +163,7 @@ struct Modal {
     props: Props,
 }
 
-/// A history several runtimes keep together — the areas over one graph (§70).
+/// A history several runtimes keep together — the areas over one graph.
 pub type SharedHistory<W> = Rc<RefCell<UndoStack<W>>>;
 
 /// The registry, the keymap, the modal stack and the history.
@@ -197,24 +171,16 @@ pub struct OpRuntime<W> {
     ops: Vec<Option<Box<dyn Operator<W>>>>,
     names: Vec<&'static str>,
     /// Where each name sits in `ops`.
-    ///
-    /// A map rather than a scan of `names`, because the lookup is per *binding* per
-    /// *event*: a press consults the keymap twice (§39.3), and a keymap the size of
-    /// Blender's answers with several candidates each time. The registry is small today
-    /// and the scan cost nothing today; the shape is what a keymap as data grows into.
     by_name: HashMap<&'static str, usize>,
     keymap: Keymap,
     stack: Vec<Modal>,
-    /// The history, in a cell another runtime may share (§70): runtimes over one document —
-    /// the areas over one graph — keep one history, as Blender keeps one per file.
+    /// The history, in a cell other runtimes over the same document may share.
     undo: SharedHistory<W>,
     counters: OpCounters,
-    /// A press whose meaning is not decided yet (§39.3).
+    /// A press whose meaning is not decided yet.
     pending: Option<Pending>,
     last_click: Option<LastClick>,
-    /// Reused buffers for the candidates a lookup produces, so an event allocates
-    /// nothing. Taken out while they are filled, because the keymap they are filled
-    /// from and the operators they are spent on are both fields of `self`.
+    /// Reused buffers for the candidates a lookup produces, so an event allocates nothing.
     scratch_bindings: Vec<(usize, Props)>,
     scratch_holds: Vec<usize>,
 }
@@ -238,10 +204,7 @@ impl<W> OpRuntime<W> {
         }
     }
 
-    /// Registers an operator under its own name.
-    ///
-    /// A later registration of the same name replaces the earlier one, which is how a
-    /// test swaps one operator for a stub without rebuilding the keymap.
+    /// Registers an operator under its own name, replacing one of the same name.
     pub fn register(&mut self, op: impl Operator<W> + 'static) {
         let name = op.name();
         match self.by_name.get(name) {
@@ -255,10 +218,6 @@ impl<W> OpRuntime<W> {
     }
 
     /// The names of every registered operator, in the order they were first registered.
-    ///
-    /// For a check that has to reach every operator — that each one cut off cleans up
-    /// after itself, say — and should fail when a new one arrives rather than pass
-    /// without it.
     pub fn operators(&self) -> &[&'static str] {
         &self.names
     }
@@ -290,7 +249,7 @@ impl<W> OpRuntime<W> {
         self.undo.borrow_mut()
     }
 
-    /// The history cell, to share with another runtime over the same document (§70).
+    /// The history cell, to share with another runtime over the same document.
     pub fn shared_history(&self) -> SharedHistory<W> {
         self.undo.clone()
     }
@@ -301,12 +260,7 @@ impl<W> OpRuntime<W> {
         self.undo = history;
     }
 
-    /// How many modal operators are running.
-    ///
-    /// Nested rather than one, because §11 asks for a stack and because a transform
-    /// started inside a modal tool is exactly what a stack is for. Zero between
-    /// gestures, and a sweep that ends with it non-zero has found a gesture that
-    /// never ended.
+    /// How many modal operators are running (they nest); zero between gestures.
     pub fn modal_depth(&self) -> usize {
         self.stack.len()
     }
@@ -316,14 +270,8 @@ impl<W> OpRuntime<W> {
         self.stack.last().map(|modal| self.names[modal.op])
     }
 
-    /// The properties the operator currently receiving events was started with, if any.
-    ///
-    /// For a driver that does something on the operator's behalf the operator cannot do
-    /// itself — scrolling the view at the edge of an area while the pointer stands still
-    /// and sends no events — and has to know whether the binding asked for it. A binding's
-    /// properties are where Blender keeps that choice (`view2d_edge_pan`), and reading them
-    /// here keeps it there rather than in a flag every operator would have to set and
-    /// clear on every way it can end.
+    /// The properties the operator currently receiving events was started with, if any: for
+    /// a driver acting on the binding's behalf (edge pan).
     pub fn modal_props(&self) -> Option<&Props> {
         self.stack.last().map(|modal| &modal.props)
     }
@@ -333,17 +281,8 @@ impl<W> OpRuntime<W> {
         self.counters
     }
 
-    /// What the pre-tree seat can do today: watch.
-    ///
-    /// `Layer::capture_pointer_event` is called for every pointer event before the
-    /// target is even computed — including events outside the layer's own rectangle —
-    /// and it has no way to stop one. Upstream's own TODO lists "return flag to
-    /// suppress event from reaching children" as a possible evolution; until it
-    /// exists this seat can count what it sees and nothing more (§38.1), which is
-    /// worth doing because the count is the evidence for the request.
+    /// Counts an event the pre-tree seat saw and did not dispatch (the tree has it).
     pub fn observe(&mut self, event: &OpEvent) {
-        // The event is taken rather than ignored so that the day the flag exists this
-        // becomes `dispatch` and nothing else about the seat changes.
         let _ = event;
         self.counters.seen_first += 1;
     }
@@ -358,11 +297,11 @@ impl<W> OpRuntime<W> {
     /// This is [`dispatch`](Self::dispatch) plus the one thing a keymap cannot express on
     /// its own: whether a press was a click or a drag. The decision is made here, from
     /// the events themselves, exactly as Blender's window manager makes it before its
-    /// keymap sees anything (§39.2) — so a binding says `Trigger::Click` and never
+    /// keymap sees anything — so a binding says `Trigger::Click` and never
     /// carries a property telling somebody else's operator what a click is.
     ///
     /// The order is the whole design, and it is chosen so that a wrong guess costs
-    /// nothing (§39.3):
+    /// nothing:
     ///
     /// 1. a running modal operator gets the event, as before;
     /// 2. a **held press** takes it: a move past the threshold turns into [`OpEvent::Drag`], a release inside it into
@@ -371,9 +310,8 @@ impl<W> OpRuntime<W> {
     ///    hold instead of doing anything.
     ///
     /// The press itself is **never** withheld from the widget tree: a hold starts only
-    /// after the tree has refused it. That is what makes the scheme safe where §38.1
-    /// said buffering could not be — an event held in error is a *move*, and a move that
-    /// the tree missed costs a hover, not a lost click.
+    /// after the tree has refused it, so an event held in error is a move (a hover), never a
+    /// lost click.
     pub fn feed(&mut self, world: &mut W, event: &OpEvent, sample: Sample, scope: Scope<'_>, seat: Seat) -> Feed {
         // Everything passes the pre-tree seat, whether or not it stops there. Counted
         // first so that the number keeps meaning "what this seat saw" now that the seat
@@ -395,7 +333,7 @@ impl<W> OpRuntime<W> {
         }
 
         // Idle, and underneath this seat there is a widget tree that has not been asked
-        // yet. A slider inside a node has the right of first refusal (§20 claim 3), so
+        // yet. A slider inside a node has the right of first refusal, so
         // this seat only counts; the bubbled route below will bring the event back.
         if seat == Seat::Layer {
             return Feed::Pass;
@@ -420,19 +358,15 @@ impl<W> OpRuntime<W> {
                 device: sample.device,
             });
             self.counters.holds += 1;
-            // Consumed rather than passed: the press belongs to a gesture now, and a
-            // driver inside the tree marks it handled so nothing above acts on it too.
+            // Consumed: the press belongs to a gesture now.
             return self.answer(seat, true);
         }
 
         Feed::Pass
     }
 
-    /// Feeds the held press the event that may resolve it.
-    ///
-    /// `None` means "not for me": the hold is abandoned and the caller carries on with
-    /// an ordinary dispatch. Abandoning is cheap by construction — the press went to the
-    /// tree when it happened, so nothing is owed to anyone.
+    /// Feeds the held press the event that may resolve it. `None` abandons the hold, and the
+    /// caller dispatches as usual (the press already went to the tree).
     fn resolve(
         &mut self,
         world: &mut W,
@@ -446,8 +380,7 @@ impl<W> OpRuntime<W> {
             OpEvent::Move { .. } => {
                 let travel = (sample.screen - pending.screen).hypot();
                 if travel < self.keymap.thresholds().drag_for(pending.device) {
-                    // Still undecided. The move is kept from the tree, which is the
-                    // whole saving: a canvas that never sees it never picks on it.
+                    // Still undecided: the move is kept from the tree.
                     return Some(self.answer(seat, true));
                 }
                 self.pending = None;
@@ -459,8 +392,7 @@ impl<W> OpRuntime<W> {
                     mods: pending.mods,
                 };
                 let started = self.dispatch(world, &drag, scope, seat).is_consumed();
-                // The move that resolved it goes to whatever started, or the drag would
-                // lag one event behind the pointer for the rest of its life.
+                // The move that resolved it goes to whatever started.
                 if started && !self.stack.is_empty() {
                     self.dispatch(world, event, scope, seat);
                 }
@@ -481,8 +413,7 @@ impl<W> OpRuntime<W> {
                     count,
                 };
                 self.dispatch(world, &click, scope, seat);
-                // The release is *not* withheld: the tree saw the press, and a widget
-                // that saw a press and never sees its release is a widget stuck down.
+                // The release is not withheld: the tree saw the press.
                 Some(Feed::Pass)
             },
             // Another button, a key, a cancel: this press is not going to resolve.
@@ -517,13 +448,8 @@ impl<W> OpRuntime<W> {
         count
     }
 
-    /// Whether any binding on `button` is waiting for a click or a drag, and would run.
-    ///
-    /// The poll is asked here, at the press, and asked **again** when the gesture
-    /// resolves — the answers can differ, because the pointer has moved in between, and
-    /// the second one is the one that decides whether an operator runs. A yes here that
-    /// turns into a no there costs a held gesture that does nothing; that is the whole
-    /// price of asking early, and it is paid in moves the tree did not see (§39.4).
+    /// Whether any binding on `button` is waiting for a click or a drag, and would run. Polled
+    /// again when the gesture resolves, which decides.
     fn would_hold(&mut self, world: &mut W, button: PointerButton, press: &OpEvent, scope: Scope<'_>) -> bool {
         let mut candidates = std::mem::take(&mut self.scratch_holds);
         candidates.clear();
@@ -577,9 +503,7 @@ impl<W> OpRuntime<W> {
     /// Offers an event to the modal operator, or to the keymap.
     pub fn dispatch(&mut self, world: &mut W, event: &OpEvent, scope: Scope<'_>, seat: Seat) -> Dispatch {
         if seat == Seat::Bubbled && !self.stack.is_empty() {
-            // The tree was offered an event that belongs to a running operator. Not a
-            // hypothetical: it is what happens to every modal operator started from a
-            // key, because pointer capture can only be taken during a press (§38.1).
+            // The tree was offered an event that belongs to a running operator.
             self.counters.tree_first += 1;
         }
 
@@ -614,8 +538,7 @@ impl<W> OpRuntime<W> {
                     outcome = Dispatch::Consumed;
                     break;
                 },
-                // The operator matched and declined the event: the next binding gets
-                // its turn, which is what makes a keymap layered rather than a switch.
+                // Declined: the next binding gets its turn.
                 Some(OpResult::PassThrough) | None => {},
             }
         }
@@ -624,11 +547,8 @@ impl<W> OpRuntime<W> {
         outcome
     }
 
-    /// Runs an operator by name, from a script, a test or a redo.
-    ///
-    /// The same poll, the same context, the same history as the interactive path —
-    /// only the event is missing. That is what makes "the key and the script do the
-    /// same thing" a claim a test can check by comparing state.
+    /// Runs an operator by name, from a script, a menu or a test: the same poll, context and
+    /// history as a key, without an event.
     pub fn exec(&mut self, world: &mut W, name: &str, props: &Props) -> OpResult {
         let Some(at) = self.index_of(name) else {
             return OpResult::PassThrough;
@@ -645,12 +565,8 @@ impl<W> OpRuntime<W> {
         }
     }
 
-    /// Whether operator `name` would run now, with `props` — `None` if there is no such
-    /// operator.
-    ///
-    /// What a menu asks to show an entry as available or not: the same poll, in the same
-    /// context, that a key and a script are refused by (§38), so an entry the menu offers
-    /// is one that runs. Counted as a poll, and as nothing else.
+    /// Whether operator `name` would run now, with `props` (`None` if there is no such
+    /// operator): what a menu shows.
     pub fn poll(&mut self, world: &mut W, name: &str, props: &Props) -> Option<bool> {
         let at = self.index_of(name)?;
         let op = self.ops[at].as_ref()?;
@@ -666,14 +582,9 @@ impl<W> OpRuntime<W> {
         Some(op.poll(&cx))
     }
 
-    /// Cancels every running operator, innermost first.
-    ///
-    /// What a window losing focus, or a driver being torn down, has to do: a modal
-    /// stack with no way to empty it is a hang with extra steps.
-    ///
-    /// Each operator hears it as [`Operator::modal`] with no event, and has to clean up
-    /// there; one that answers as if it went on is counted
-    /// ([`OpCounters::cut_off_running`](crate::OpCounters::cut_off_running)).
+    /// Cancels every running operator, innermost first (a window losing focus). Each hears
+    /// [`Operator::modal`] with no event and must clean up; one that answers as if it went on
+    /// is counted ([`OpCounters::cut_off_running`](crate::OpCounters::cut_off_running)).
     pub fn cancel_all(&mut self, world: &mut W) {
         while let Some(modal) = self.stack.pop() {
             let props = modal.props;
@@ -686,9 +597,7 @@ impl<W> OpRuntime<W> {
                 scope: &[],
                 undo: &mut undo,
             };
-            // Whatever it answers, it is off the stack: this is the caller saying the
-            // gesture is over, not the operator being asked whether it would like to
-            // continue.
+            // Whatever it answers, it is off the stack.
             if matches!(op.modal(&mut cx), OpResult::Running | OpResult::PassThrough) {
                 self.counters.cut_off_running += 1;
             }
@@ -699,9 +608,7 @@ impl<W> OpRuntime<W> {
 
     /// Hands one event to the operator on top of the stack.
     fn deliver_modal(&mut self, world: &mut W, event: &OpEvent, scope: Scope<'_>) -> Dispatch {
-        // Taken off the stack and put back, rather than read in place and its properties
-        // cloned: this runs on every event of a gesture, and an operator cannot reach
-        // the runtime from its context, so nothing can observe the gap.
+        // Taken off the stack and put back, rather than its properties cloned per event.
         let modal = self.stack.pop().expect("called with a non-empty stack");
         let at = modal.op;
         self.counters.modal_events += 1;
@@ -739,19 +646,10 @@ impl<W> OpRuntime<W> {
         }
     }
 
-    /// Polls an operator and runs it, or does neither.
+    /// Polls an operator and runs it; `None` when the poll refused.
     ///
-    /// Returns `None` when the poll refused. Both entry points come through here, so
-    /// there is one place where "was the poll asked" can be true or false — which is
-    /// what [`OpCounters::unpolled`] is a criterion on.
-    ///
-    /// The operator is moved out of the registry for the call, because it is given a
-    /// context that borrows the rest of the runtime. The slot cannot be found empty:
-    /// every entry point takes `&mut self`, and an [`OpCtx`] offers no way back to the
-    /// runtime, so nothing can be running while this runs. The `expect` states that
-    /// invariant rather than guarding a case a caller can reach — if a driver ever
-    /// holds the runtime behind shared mutability, this is the line that has to be
-    /// revisited.
+    /// The operator is moved out of the registry for the call; an [`OpCtx`] cannot reach the
+    /// runtime, so the slot is never found empty.
     fn run(
         &mut self,
         world: &mut W,
@@ -1184,7 +1082,7 @@ mod tests {
         assert_eq!(runtime.counters().seen_first, 1, "it did see it");
     }
 
-    /// The claim §11 is built on: one operator, two ways in, one result.
+    /// One operator, two ways in, one result.
     #[test]
     fn a_key_and_a_script_do_the_same_thing() {
         let mut runtime = runtime();
@@ -1284,9 +1182,7 @@ mod tests {
         assert_eq!(runtime.counters().modal_finishes, 1);
     }
 
-    /// The leak counter: an event that reached the tree first while an operator was
-    /// running. Counted rather than prevented, because today it cannot be prevented
-    /// for an operator that started from a key (§38.1).
+    /// The leak counter: an event that reached the tree first while an operator was running.
     #[test]
     fn an_event_that_reached_the_tree_first_is_counted() {
         let mut runtime = runtime();

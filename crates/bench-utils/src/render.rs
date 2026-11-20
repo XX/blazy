@@ -1,6 +1,6 @@
 //! Measuring what a renderer put on screen, rather than how long it took.
 //!
-//! `rnd/architecture.md` §9 makes a claim that decides part of why `imaging` was
+//! The architecture makes a claim that decides part of why `imaging` was
 //! chosen at all:
 //!
 //! > Because `imaging` rasterises from curves with the final transform in hand,
@@ -104,7 +104,7 @@ pub fn block_magnified(original: &RgbaImage, width: u32, height: u32) -> RgbaIma
     resize(original, width, height, FilterType::Nearest)
 }
 
-// --- MARK: comparing two frames by block (§45)
+// --- MARK: comparing two frames by block
 
 /// Side of the block two frames are compared in, in pixels.
 pub const BLOCK: usize = 16;
@@ -114,7 +114,7 @@ pub const BLOCK: usize = 16;
 /// Derived rather than tuned. A block holds 256 pixels, so a pair of edge pixels flipping
 /// between two extremes moves its mean by 2 * 255 / 256 ≈ 2; a block that lost the
 /// content drawn in it moves by tens. Eight sits between the two, four times away from
-/// each (§45).
+/// each.
 pub const BLOCK_DELTA: u32 = 8;
 
 /// Blocks of two frames whose average colour differs by more than antialiasing.
@@ -154,7 +154,7 @@ pub fn blocks_changed(first: &[u8], second: &[u8], width: usize) -> u64 {
 
 /// How far one pixel's channel may move before the change is something an eye sees.
 ///
-/// Derived from the far field it is used on (§53.6): a link half a pixel wide moves the
+/// Derived from the far field it is used on: a link half a pixel wide moves the
 /// pixels it crosses by about half its contrast against the background, some fifty
 /// levels; the link of two canvas units at zoom 0.02 moves them by four. Sixteen sits
 /// between the two, three times from each.
@@ -167,7 +167,7 @@ pub const PIXEL_DELTA: u8 = 16;
 /// about three levels, under [`BLOCK_DELTA`]. Asking pixel by pixel is safe only where the
 /// two frames come from one deterministic rasteriser — two CPU frames, not two GPU
 /// submissions — which is why this does not replace the block mean in the idle-frame
-/// criterion of §45.
+/// criterion that reads the frame.
 pub fn blocks_touched(first: &[u8], second: &[u8], width: usize) -> u64 {
     if first.len() != second.len() || width == 0 {
         return 0;

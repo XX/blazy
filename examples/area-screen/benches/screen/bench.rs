@@ -88,7 +88,7 @@ struct Report {
     worst: Duration,
     before: Snapshot,
     after: Snapshot,
-    /// Most draw commands the window's layer plan held in any frame (§31).
+    /// Most draw commands the window's layer plan held in any frame.
     ///
     /// The window's total, which is the unit this cost belongs in: the paint pass
     /// rebuilds one plan for the whole window every frame, so an area holding a huge
@@ -239,7 +239,7 @@ fn header_seen(harness: &TestHarness<Screen>, area: usize) -> f64 {
 
 /// The width each control of an area's header occupies, in order.
 ///
-/// The content box rather than the border box: the box channel of §46 pushes padding
+/// The content box rather than the border box: the box channel pushes padding
 /// onto every control, so a border box grows with the scale whether or not the control
 /// itself followed it. What is being measured here is whether the *control* moved.
 fn header_control_widths(harness: &TestHarness<Screen>, area: usize) -> Vec<f64> {
@@ -378,7 +378,7 @@ pub(crate) fn zoom_area(harness: &mut TestHarness<Screen>, area: usize, factor: 
     });
 }
 
-/// Widgets in the whole window — what a frame walks (§20.2).
+/// Widgets in the whole window — what a frame walks.
 ///
 /// Counted from the tree rather than summed from the canvases' own numbers, because
 /// the claim is about the window and every area contributes its own furniture to it.
@@ -390,7 +390,7 @@ fn widgets_in_window(harness: &mut TestHarness<Screen>) -> usize {
 
 /// Every area zoomed out to an overview, and work going on in one of them.
 ///
-/// The scenario the reconnaissance in §29.1 was written from, at its worst point. An
+/// The scenario the budget was written from, at its worst point. An
 /// area zoomed out holds its largest tree and pays nothing for it — no layout, no
 /// rebuild, no repaint — while every frame the *other* areas cause walks it anyway.
 /// Without a shared ceiling this is the arithmetic that breaks the screen: eight areas
@@ -498,7 +498,7 @@ pub fn run(opts: &Options) -> Outcome {
 
     // --- Scenario 5: change the interface scale of one region.
     //
-    // §9's first rule: `ui_scale` is a layout input. The scale is changed in area 0's
+    // The first rule: `ui_scale` is a layout input. The scale is changed in area 0's
     // header only, so everything this scenario counts outside area 0 is a leak, and
     // the header is asked afterwards what scale it actually laid out at — a property
     // that reaches the widget but not its layout would otherwise look like success.
@@ -523,7 +523,7 @@ pub fn run(opts: &Options) -> Outcome {
 
     // --- Scenario 5b: do the *controls* follow the scale, or only the region?
     //
-    // §22.1 said Masonry's widgets do not honour `UiScale`, and §46 found out why: they
+    // Masonry's widgets do not honour `UiScale`, because they
     // are never handed it. The scale reaches the region's root and stops there, so a
     // header full of controls at the wrong size looks exactly like a header at the right
     // one — no counter of regions can tell them apart. Counted from the failing side,
@@ -543,7 +543,7 @@ pub fn run(opts: &Options) -> Outcome {
 
     // --- Scenario 6: zoom the content of one region.
     //
-    // §9's second rule, and the one that decides whether the two knobs stayed apart:
+    // The second rule, and the one that decides whether the two knobs stayed apart:
     // `view` is a transform at composition time and must cost no layout at all.
     // Measured at the region level rather than inside the canvas, because the claim
     // being checked here is that nothing in the region stack was tempted to treat a
@@ -694,14 +694,14 @@ fn region_cost(opts: &Options, areas: usize, nodes: usize) -> (f64, f64) {
 /// Everything the criteria are decided from.
 ///
 /// A struct rather than eight arguments, for the reason the host benchmark has one
-/// (§26.4): a criterion list that grows an argument per measurement stops being
+///: a criterion list that grows an argument per measurement stops being
 /// readable long before the compiler complains.
 struct Measured<'a> {
     reports: &'a [Report],
     sweep: &'a [SweepRecord],
     /// `ui_scale` changes a region's layout never saw.
     scale_misses: u64,
-    /// Controls of a header whose own size did not follow the region's scale (§46).
+    /// Controls of a header whose own size did not follow the region's scale.
     unscaled_controls: u64,
     /// Idle milliseconds with one region per area and with two.
     regions: (f64, f64),
@@ -709,9 +709,9 @@ struct Measured<'a> {
     overview_widgets: usize,
     overview_commands: usize,
     areas: usize,
-    /// What the layer cache did, row by row (§36).
+    /// What the layer cache did, row by row.
     cache: &'a [crate::cache::CacheRow],
-    /// What each operation on the areas cost (§41.2).
+    /// What each operation on the areas cost.
     operations: &'a [crate::ops::OpsRow],
 }
 
@@ -812,7 +812,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "changes not seen",
         });
 
-        // And one level down, which is where §46 found the gap: the region laying itself
+        // And one level down, which is where the gap was: the region laying itself
         // out at the new scale says nothing about the controls inside it. They follow
         // only because something carries the scale to each of them — box metrics as
         // properties, text as a call — and if that carrying stops, this is the number
@@ -862,7 +862,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
 
     if let Some(zoom) = find("zoom content in one region") {
-        // §9's second rule. A zoom that resizes a region is a zoom that has been
+        // The second rule. A zoom that resizes a region is a zoom that has been
         // confused with a scale, and it would cost a re-layout on every frame.
         criteria.push(Criterion {
             name: "content_zoom_resizes_no_region",
@@ -886,7 +886,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
     }
 
-    // --- The window's share of the widget budget (§29).
+    // --- The window's share of the widget budget.
     //
     // A canvas budget is a per-canvas number, and a screen of areas is where that
     // stops adding up: what a frame walks is the window's tree. Every area is at the
@@ -902,7 +902,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         unit: "widgets in the window",
     });
 
-    // --- The other half of the same frame (§31).
+    // --- The other half of the same frame.
     //
     // Widgets are not what an overview area holds: below the far-field threshold it
     // holds none and still fills the plan with the scene it painted. Before batching,
@@ -922,11 +922,11 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         unit: "draw commands in the window",
     });
 
-    // --- §36: keeping the pixels of areas that did not change.
+    // --- Keeping the pixels of areas that did not change.
     //
-    // Counted in layers rather than in milliseconds, for the usual reason (§20.9): a
+    // Counted in layers rather than in milliseconds, for the usual reason: a
     // layer either was rasterised or was not, on any machine. Absent where there is no
-    // graphics device, like every GPU claim here (§27.5).
+    // graphics device, like every GPU claim here.
     let cached_row = |what: &str| cache.iter().find(|row| row.cached && row.what == what);
     if let Some(idle) = cached_row("nothing changes") {
         criteria.push(Criterion {
@@ -939,7 +939,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
     }
     if let Some(one) = cached_row("one area pans") {
-        // The claim §7.3 wrote down and §36 measured: dragging in one editor leaves the
+        // The claim: dragging in one editor leaves the
         // other seven alone. Two rather than one as the bound, because the number that
         // matters is "not eight".
         criteria.push(Criterion {
@@ -979,7 +979,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
     if let (Some(menu), Some(idle)) = (cached_row("a menu is open"), cached_row("nothing changes")) {
         // A menu is its own layer above the areas, and the areas under it are unchanged:
-        // an open menu costs the menu, not the window (§36). Summed over the row rather
+        // an open menu costs the menu, not the window. Summed over the row rather
         // than averaged, because the frame that opens the menu is the one a menu painted
         // into its area would show up in, and an average over eight frames hides one.
         criteria.push(Criterion {
@@ -1003,7 +1003,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
 
     if let Some(idle) = cached_row("nothing changes") {
-        // Why the cache pays for itself (§36.3), as a counter: comparing scenes is
+        // Why the cache pays for itself, as a counter: comparing scenes is
         // cheap, finding out where a layer sits walks its whole scene, and a layer that
         // did not change already has a rectangle. Compute the rectangle first and this
         // is eight per frame on an idle screen.
@@ -1030,7 +1030,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
 
     if !cache.is_empty() {
-        // §37.2: the cache is bounded. Cached layers tile the window, so what they hold
+        // The cache is bounded. Cached layers tile the window, so what they hold
         // adds up to about one frame however many of them there are — but a caller that
         // registers more than that, or a window that has just resized, must not be able
         // to grow it without limit.
@@ -1052,7 +1052,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         // evict. What it must never evict is a layer *this frame* is copying, whose
         // pixels are in the cache and nowhere else — the copy then finds nothing, the
         // area is empty for a frame, and `reused` has already been counted, so every
-        // other number here says the cache did its job (§44.9).
+        // other number here says the cache did its job.
         criteria.push(Criterion {
             name: "the_cache_keeps_the_pixels_it_promised",
             claim: "a layer the cache said it would copy was there to copy",
@@ -1062,9 +1062,9 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "kept layers with no pixels/frame",
         });
 
-        // The gate the three defects of §44.9 slipped through: every counter here is a
+        // The gate the three defects slipped through: every counter here is a
         // count of *work*, and none of them is shaped to see a defect that lives in the
-        // result of the work (§28.4 from the same side). So one criterion reads the
+        // result of the work. So one criterion reads the
         // frame itself — an idle window draws the same picture twice, or it is broken
         // in a way no per-frame counter will report.
         criteria.push(Criterion {
@@ -1076,7 +1076,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
             unit: "16x16 blocks whose content changed between two idle frames",
         });
 
-        // The precondition §36 asks a caller for, in the only half a host can check:
+        // The precondition the cache asks a caller for, in the only half a host can check:
         // layers registered as disjoint have to *be* disjoint. They stopped being so
         // the moment an area painted outside its own box — a selection outline and a
         // status line — and overlapping rectangles also add up to more pixels than the
@@ -1102,7 +1102,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
         });
     }
     if let Some(selects) = cache.iter().find(|row| row.cached && row.what == "one area selects") {
-        // Where a gesture's pixels land (§38.5, §50.8). The selection is the graph's, so
+        // Where a gesture's pixels land. The selection is the graph's, so
         // every area over the graph shows it and has to be drawn again — here, all of
         // them: the areas share one graph. Counted from the failing side, as an area that
         // kept its old pixels: one that copied its layer still shows the old selection.
@@ -1150,9 +1150,9 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
 
     if !operations.is_empty() {
-        // The requirement of §41.2, and not an optimisation: an area that survived an
+        // The requirement, and not an optimisation: an area that survived an
         // operation has to come out of it as the same widget, because its view, its
-        // selection and its materialised nodes live nowhere else (§30). Split is the one
+        // selection and its materialised nodes live nowhere else. Split is the one
         // operation that may build, and it is excluded here and guarded below.
         let rebuilt: u64 = operations
             .iter()
@@ -1181,7 +1181,7 @@ fn evaluate(measured: &Measured<'_>) -> Vec<Criterion> {
     }
 
     if let Some(restore) = op("maximize and restore") {
-        // A return has to be exact, not approximate (§28.4 on sweeps that only go one
+        // A return has to be exact, not approximate (sweeps that only go one
         // way): the screen comes back to the rectangles it left, or the flag is not a
         // flag but a rebuild.
         criteria.push(Criterion {

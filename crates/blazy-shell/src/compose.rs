@@ -1,21 +1,9 @@
 //! Turning a [`VisualLayerPlan`] into one scene and a list of holes.
 //!
-//! This is the part of the host `rnd/architecture.md` §4.2 describes as "variant 2":
-//! rather than flattening the plan and forgetting it had layers, walk the layers,
-//! apply the device scale, and hand back what the host itself has to draw.
-//!
-//! Two things live here that live nowhere else.
-//!
-//! **The device scale factor.** §9 counts three multipliers and puts this one in
-//! composition, not in layout: `VisualLayerPlan` comes out in logical coordinates and
-//! applying the window's scale is the host's job (§4.2, §23.4). One `Affine::scale`
-//! at replay time, and the rasteriser redraws the curves at the physical size — which
-//! is what §23.3 measured as 4.64x sharper than upscaling the same picture.
-//!
-//! **External layers.** Masonry records a placeholder where a widget said the host
-//! draws the content (§4.3). The compatibility helpers — `root_layer`,
-//! `overlay_layers`, `replay_into` — skip them by design, which is why a host that
-//! wants a 3D viewport has to walk `layers` itself.
+//! Walks the layers rather than flattening the plan: applies the device scale (one
+//! `Affine::scale` at replay, so curves are drawn at physical size rather than upscaled)
+//! and collects the external layers the host draws itself, which Masonry's flattening
+//! helpers skip.
 
 use masonry::app::{VisualLayer, VisualLayerKind, VisualLayerPlan};
 use masonry::core::WidgetId;
@@ -24,10 +12,7 @@ use masonry::imaging::record::{Scene, replay_transformed};
 use masonry::kurbo::{Affine, Rect, Size};
 use masonry::peniko::Color;
 
-/// A rectangle the host is expected to fill itself.
-///
-/// In physical window coordinates, because that is the space the host composites in:
-/// the caller gets a rectangle it can hand straight to a viewport pass.
+/// A rectangle the host is expected to fill itself, in physical window coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hole {
     /// The widget that declared it.
@@ -55,7 +40,7 @@ pub struct Composition {
 pub(crate) enum LayerChoice {
     /// Replay it into the frame's scene, which is what an ordinary frame does.
     Draw,
-    /// Leave it out: its pixels are coming from somewhere else (§36).
+    /// Leave it out: its pixels are coming from somewhere else.
     #[cfg_attr(
         not(feature = "vello"),
         expect(dead_code, reason = "only the layer cache keeps a layer")
@@ -64,26 +49,13 @@ pub(crate) enum LayerChoice {
 }
 
 impl Composition {
-    /// Walks a plan at a device scale factor.
-    ///
-    /// `device_scale` is the window's scale factor: 1.0 on a normal display, 2.0 on a
-    /// HiDPI one. It multiplies each layer's own transform, so it reaches the
-    /// rasteriser as part of the final transform and never as a resample.
+    /// Walks a plan at the window's device scale factor, applied to each layer's transform.
     pub fn new(plan: &VisualLayerPlan, device_scale: f64) -> Self {
         Self::build(plan, device_scale, None, |_, _, _, _| LayerChoice::Draw)
     }
 
-    /// The same walk, over an opaque fill covering `width` x `height` physical pixels.
-    ///
-    /// A widget tree is under no obligation to cover the window — `AreaScreen` paints
-    /// its splitter bars and leaves the rest to its areas — and every path to the
-    /// screen flattens alpha away in the end. Doing the fill here means the rasteriser
-    /// blends the edges, which is what keeps a curve from becoming a staircase (§26.4).
-    ///
-    /// A constructor rather than something done to a finished composition, and that is
-    /// the whole difference: prepending the fill afterwards means copying every command
-    /// of the frame into a second scene, once per frame, and a command is not free to
-    /// append (§31.1). Painted first, it is one command in front of the walk.
+    /// The same walk, over an opaque fill covering `width` x `height` physical pixels, so
+    /// the rasteriser blends edges against it. One command in front of the walk.
     pub fn on_background(plan: &VisualLayerPlan, device_scale: f64, color: Color, width: u32, height: u32) -> Self {
         Self::build(plan, device_scale, Some((color, width, height)), |_, _, _, _| {
             LayerChoice::Draw
@@ -91,11 +63,6 @@ impl Composition {
     }
 
     /// The same walk, with the caller deciding which scene layers are drawn.
-    ///
-    /// One walk rather than two: the device scale, the background and the external
-    /// holes are decided here and nowhere else, so a frame that keeps some layers (§36)
-    /// cannot drift from a frame that draws them all — which it would, since the two
-    /// differ by one `if` and are three hundred lines apart.
     pub(crate) fn build(
         plan: &VisualLayerPlan,
         device_scale: f64,
@@ -105,8 +72,7 @@ impl Composition {
         let to_physical = Affine::scale(device_scale);
         let mut composition = Self::default();
 
-        // First, so everything the plan draws lands on top of it. The rectangle is
-        // already in physical coordinates, which is the space this scene is in.
+        // First, under everything, in physical coordinates.
         if let Some((color, width, height)) = background {
             Painter::new(&mut composition.scene)
                 .fill(Rect::new(0.0, 0.0, f64::from(width), f64::from(height)), color)

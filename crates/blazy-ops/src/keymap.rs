@@ -1,42 +1,21 @@
 //! The keymap: data, not code.
 //!
-//! A binding is `(context, event pattern) -> (operator, properties)`, which is §11's
-//! shape and Blender's. Nothing here holds a closure or a type: an operator is named
-//! by a string and its arguments are values, so a keymap can be written to a file,
-//! edited by a user and read back. That is the whole reason the indirection exists —
-//! menus, macros and user overrides all become possible later without any of them
-//! being built now.
+//! A binding is `(context, event pattern) -> (operator, properties)`, as in Blender: names
+//! and values only, so a keymap can be written to a file and read back.
 //!
-//! **Contexts nest, and the innermost wins.** A [`Scope`] is the chain of contexts an
-//! event happened in, innermost first — the canvas inside an area inside the screen
-//! inside the window. Lookup walks it outwards and stops at the first binding whose
-//! operator's poll agrees, so a canvas binding shadows a window one, and a window
-//! binding still catches what no canvas claimed.
+//! A [`Scope`] is the chain of contexts an event happened in, innermost first. Lookup walks
+//! it outwards and stops at the first binding whose operator's poll agrees.
 
 use std::borrow::Cow;
 
 use crate::event::{Device, OpEvent, Pattern};
 pub use crate::keyfile::KeymapError;
 
-/// A name in a keymap: an operator's, a context's or a property's.
-///
-/// `Cow` rather than `&'static str`, because a keymap is data (see the module docs). One
-/// written in code borrows its literals and costs what it cost before; one read from a
-/// file owns what it read. With `&'static str` the second kind could only be built by
-/// leaking every string it contained, and user overrides — the reason the keymap is
-/// data at all — would have had nothing to be made of.
-///
-/// An operator's own [`name`](crate::Operator::name) stays `&'static str`: operators are
-/// code, registered from code, and it is only the keymap that has to survive a file.
+/// A name in a keymap: an operator's, a context's or a property's. Borrowed when written
+/// in code, owned when read from a file.
 pub type Name = Cow<'static, str>;
 
-/// One property value.
-///
-/// Four cases. Text came last and for one reason (§64): the kind of node `node.add` adds
-/// belongs to the *application's* graph, so the library has no enum to write it as, and a
-/// keymap file has to say it — `node.add kind="add"`. The typo the old note here warned of
-/// is caught where the name meets the graph: an operator whose text names nothing refuses
-/// in its poll, so the binding does nothing and the menu shows the entry refused.
+/// One property value. A name that means nothing to its operator is refused in its poll.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Value {
@@ -50,10 +29,7 @@ pub enum Value {
     Text(Name),
 }
 
-/// An operator's arguments, as data.
-///
-/// A short association list rather than a map: a binding carries one or two of these
-/// and is looked up on an event, so a hash would cost more than the scan it replaces.
+/// An operator's arguments, as data: a short association list.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Props(Vec<(Name, Value)>);
 
@@ -108,9 +84,6 @@ impl Props {
     }
 
     /// The name `name` is set to, or `None` if the binding did not set it.
-    ///
-    /// No default: a name the binding did not give is a different thing from any name it
-    /// could have given, and the operator says what it does then.
     pub fn text(&self, name: &str) -> Option<&str> {
         match self.get(name) {
             Some(Value::Text(value)) => Some(value),
@@ -118,10 +91,7 @@ impl Props {
         }
     }
 
-    /// As [`bool`](Self::bool), for a float property.
-    ///
-    /// An integer is accepted where a float is asked for, because `{"dx": 30}` is what
-    /// a hand-written keymap will say and refusing it teaches nothing.
+    /// As [`bool`](Self::bool), for a float property; an integer is accepted.
     pub fn float(&self, name: &str, default: f64) -> f64 {
         match self.get(name) {
             Some(Value::Float(value)) => *value,
@@ -131,10 +101,6 @@ impl Props {
     }
 
     /// Sets `name` to `value`, replacing what it was.
-    ///
-    /// The in-place twin of the `with_*` builders, for a reader that does not know the
-    /// value's kind until it has read it. A name set twice keeps the last value, as a
-    /// file that says it twice means.
     pub fn set(&mut self, name: Name, value: Value) {
         match self.0.iter_mut().find(|(key, _)| *key == name) {
             Some((_, slot)) => *slot = value,
@@ -205,7 +171,7 @@ pub struct Section {
 /// bindings on the same button that disagreed about what a click is would resolve the
 /// same gesture two ways, and which one the user got would depend on binding order.
 /// Blender puts these in preferences for the same reason, and computes the answer in the
-/// window manager before the keymap ever sees the event (§39.2).
+/// window manager before the keymap ever sees the event.
 ///
 /// The distances are in **screen pixels**, taken from [`Sample::screen`](crate::event::Sample);
 /// a threshold measured in the driver's own units would mean something different at
@@ -222,7 +188,7 @@ pub struct Thresholds {
     ///
     /// Counted here rather than taken from the platform's own `PointerState::count`:
     /// `ui-events-winit` fills that in, other backends may not, and a double click that
-    /// works on one backend is worse than none (§39.2).
+    /// works on one backend is worse than none.
     pub double_click_ms: u64,
     /// How far apart two clicks may be and still be a double click.
     pub double_click_slop: f64,
@@ -260,7 +226,7 @@ pub struct Keymap {
 
 /// The chain of contexts an event happened in, innermost first.
 ///
-/// §11's nesting — Window → Screen → Area → Region → the active modal operator — with
+/// The nesting — Window → Screen → Area → Region → the active modal operator — with
 /// the modal end handled by the runtime's stack rather than by a name here. The names
 /// are the application's: this crate never invents one.
 #[derive(Clone, Copy, Debug)]
@@ -430,7 +396,7 @@ mod tests {
             )])
     }
 
-    /// The nesting of §11, as a test: the inner context is offered first and the outer
+    /// The nesting, as a test: the inner context is offered first and the outer
     /// one still gets its turn.
     #[test]
     fn the_innermost_context_is_tried_first() {

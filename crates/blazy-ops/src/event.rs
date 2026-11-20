@@ -1,23 +1,13 @@
 //! The event an operator sees, and the pattern a keymap matches it against.
 //!
-//! Normalised on purpose: the runtime is driven from three places (§38) — the widget
-//! tree, a layer's pre-tree hook and the host in front of `RenderRoot` — and all three
-//! have a different event type in their hands. One shape here means the keymap has one
-//! thing to match and an operator has one thing to read.
-//!
-//! Positions are in the driver's own coordinate space, whatever that is; the runtime
-//! never interprets them. The example converts to canvas coordinates before it builds
-//! the event, because that is the space its operators think in.
+//! One shape for the three seats a runtime is driven from. Positions are in the driver's
+//! own space (canvas coordinates in the node editor); the runtime never interprets them.
 
 use masonry::core::keyboard::{Code, Key, KeyState, KeyboardEvent, Modifiers};
 use masonry::kurbo::Point;
 use masonry::ui_events::pointer::PointerButton;
 
-/// What kind of pointer produced an event.
-///
-/// Here because the drag threshold is not one number: a mouse and a finger differ by an
-/// order of magnitude in how far they travel before the user meant to travel (§39.2).
-/// Masonry carries this on every pointer event, so a driver has it for free.
+/// What kind of pointer produced an event; the drag threshold depends on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Device {
@@ -32,15 +22,9 @@ pub enum Device {
     Other,
 }
 
-/// What a driver knows about an event that the event itself does not say.
-///
-/// Two fields, and both are needed to tell a click from a drag without a clock:
-///
-/// * `time_ns` comes from `PointerState::time` — the platform's own timestamp, so a double click is decided from the
-///   events and a test can produce one by hand.
-/// * `screen` is where the pointer was **in screen pixels**. The position inside an [`OpEvent`] is in whatever space
-///   the driver thinks in — canvas units in the example, which span a factor of 400 across the zoom range — so a
-///   threshold measured on it would mean something different at every zoom (§25.2 learned this once already).
+/// What a driver knows about an event that the event itself does not say, to tell a click
+/// from a drag without a clock: the platform's timestamp, and the position in screen
+/// pixels (an [`OpEvent`]'s position is in the driver's space, which zooms).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Sample {
     /// The platform's own timestamp, in nanoseconds.
@@ -52,10 +36,7 @@ pub struct Sample {
 }
 
 impl Sample {
-    /// A sample with no timestamp, for a driver or a test that has none.
-    ///
-    /// Zero time means every click is a first click: two of them cannot be closer than
-    /// the double-click window because they are not closer at all.
+    /// A sample with no timestamp; every click is then a first click.
     pub fn at(screen: Point) -> Self {
         Self {
             time_ns: 0,
@@ -87,21 +68,15 @@ pub enum OpEvent {
         /// The modifiers held at the time.
         mods: Modifiers,
     },
-    /// The pointer moved. Never matched by a binding — a keymap that could start an
-    /// operator on a bare move would start one on every frame of a drag.
+    /// The pointer moved. Never matched by a binding.
     Move {
         /// Where the pointer is now, in the driver's own space.
         pos: Point,
         /// The modifiers held at the time.
         mods: Modifiers,
     },
-    /// The wheel or a trackpad scrolled.
-    ///
-    /// `dy` is in **logical pixels**, positive towards the user (the wheel rolled back, a
-    /// page scrolled down), whatever unit the platform reported: a line or a page is
-    /// converted by the driver, which is the one that knows how big a line and a page are
-    /// (`blazy_canvas::wheel_pixels`). An operator that zooms decides how many pixels are
-    /// worth how much zoom; the event only says how far.
+    /// The wheel or a trackpad scrolled, by `dy` logical pixels, positive towards the user
+    /// (the driver converts lines and pages: `blazy_canvas::wheel_pixels`).
     Scroll {
         /// Where the pointer was, in the driver's own space.
         pos: Point,
@@ -119,31 +94,21 @@ pub enum OpEvent {
         /// Whether this is the key going down.
         down: bool,
     },
-    /// A press that turned out to be a click: the button went down and came up again
-    /// without travelling past the drag threshold.
-    ///
-    /// Synthesised by [`OpRuntime`](crate::runtime::OpRuntime), never by a driver, and
-    /// `pos` is **the press's** position rather than the release's — an operator started
-    /// by a gesture wants where the gesture began.
+    /// A press that turned out to be a click (no travel past the drag threshold), made by
+    /// [`OpRuntime`](crate::runtime::OpRuntime). `pos` is the press's position.
     Click {
         /// The button that was clicked.
         button: PointerButton,
         /// Where the **press** was, in the driver's own space.
         pos: Point,
         /// The same point in screen pixels, for an operator that works in that space.
-        ///
-        /// Both are here because a gesture has one beginning and two audiences: an
-        /// operator that moves a node thinks in the driver's space, one that moves the
-        /// view thinks in pixels, and neither should have to ask the other's question.
         screen: Point,
         /// The modifiers held at the time.
         mods: Modifiers,
         /// 1 for a single click, 2 for the second click of a double, and so on.
         count: u8,
     },
-    /// A press that turned out to be a drag: the pointer travelled past the threshold
-    /// while the button was down. `pos` is the press's position, which is the anchor a
-    /// transform operator needs.
+    /// A press that turned out to be a drag; `pos` is the press's position.
     Drag {
         /// The button holding the drag.
         button: PointerButton,
@@ -170,13 +135,8 @@ impl OpEvent {
         }
     }
 
-    /// The same event at another position.
-    ///
-    /// For a driver that has to convert: the positions in an [`OpEvent`] are in one
-    /// space — whichever one the operators think in — and what arrives from the toolkit
-    /// is in another. Converting once, here, is what keeps an operator from having to
-    /// know which is which; the space that is *not* this one travels in
-    /// [`Sample::screen`]. An event with no position is returned unchanged.
+    /// The same event at another position, for a driver converting into the operators'
+    /// space. An event with no position is returned unchanged.
     #[must_use]
     pub fn with_pos(self, at: Point) -> Self {
         match self {
@@ -254,35 +214,20 @@ pub enum Trigger {
     Release(PointerButton),
     /// A key going down.
     Key(Key),
-    /// A key coming up. Rare, and here because a keymap that cannot express it makes
-    /// "held to pan" impossible to write as data.
+    /// A key coming up (for "held to pan").
     KeyUp(Key),
     /// A press and release of `button` that never became a drag.
-    ///
-    /// The trigger a keymap wants for "click on nothing deselects", and the reason this
-    /// enum grew: with only [`Press`](Self::Press) that sentence had to be a property on
-    /// somebody else's binding (§39.1).
     Click(PointerButton),
     /// A press of `button` that travelled past the drag threshold.
     Drag(PointerButton),
-    /// The wheel, or a trackpad's scroll, in either direction.
-    ///
-    /// One trigger for both directions, because what the direction means is the
-    /// operator's — a zoom reads `dy` and goes in or out — and two bindings for one
-    /// gesture would be two places to rebind it.
+    /// The wheel, or a trackpad's scroll, in either direction (the operator reads `dy`).
     Scroll,
-    /// The second click of a double click, within the keymap's window.
-    ///
-    /// A separate trigger rather than a count property, because a binding on it must be
-    /// able to sit *before* the single-click one and win.
+    /// The second click of a double click; a binding on it placed first wins over a click.
     DoubleClick(PointerButton),
 }
 
-/// One event pattern: what happened, and which modifiers were held while it did.
-///
-/// Modifiers match **exactly**. Shift-click is a different binding from click, which
-/// is what lets `extend` be a property of the binding rather than a branch inside the
-/// operator — the difference between a keymap a user can edit and one they cannot.
+/// One event pattern: what happened, and which modifiers were held (matched exactly, so
+/// Shift-click is a binding of its own).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
     /// What has to happen.
@@ -347,12 +292,8 @@ impl Pattern {
         Self::new(Trigger::Key(Key::Named(key)))
     }
 
-    /// Whether this pattern is waiting for a gesture on `button` rather than for a raw
-    /// press or release.
-    ///
-    /// What the runtime asks to decide whether a press is worth holding: if no binding
-    /// wants a click or a drag on this button, there is nothing to wait for and the
-    /// press is over the moment it happened.
+    /// Whether this pattern waits for a click or drag on `button` (so a press is worth
+    /// holding).
     pub fn wants_gesture(&self, button: PointerButton) -> bool {
         matches!(
             self.trigger,
@@ -362,8 +303,7 @@ impl Pattern {
 
     /// Whether `event` is this pattern.
     pub fn matches(&self, event: &OpEvent) -> bool {
-        // Only the modifiers a binding names are compared, and all of them are: an
-        // exact test is what keeps Ctrl+Z from also firing on Ctrl+Shift+Z.
+        // Exactly, so Ctrl+Z does not fire on Ctrl+Shift+Z.
         if !mods_equal(self.mods, event.mods()) {
             return false;
         }
@@ -372,9 +312,7 @@ impl Pattern {
             (Trigger::Release(want), OpEvent::Release { button, .. }) => want == button,
             (Trigger::Key(want), OpEvent::Key { key, down: true, .. }) => same_key(want, key),
             (Trigger::KeyUp(want), OpEvent::Key { key, down: false, .. }) => same_key(want, key),
-            // A double click is also a click, and the keymap's order decides which
-            // binding gets it: a `DoubleClick` binding placed first wins, and one that
-            // is not there leaves the second click behaving like any other.
+            // A double click is also a click; the keymap's order decides.
             (Trigger::Click(want), OpEvent::Click { button, .. }) => want == button,
             (Trigger::DoubleClick(want), OpEvent::Click { button, count, .. }) => want == button && *count >= 2,
             (Trigger::Drag(want), OpEvent::Drag { button, .. }) => want == button,
@@ -384,10 +322,7 @@ impl Pattern {
     }
 }
 
-/// Whether a binding's key is the event's key.
-///
-/// A letter matches in either case: a keymap file says `Shift+D` as naturally as
-/// `Shift+d`, and [`OpEvent::from_keyboard`] already gives the event in lower case.
+/// Whether a binding's key is the event's key; a letter matches in either case.
 fn same_key(want: &Key, key: &Key) -> bool {
     match (want, key) {
         (Key::Character(want), Key::Character(key)) => want.eq_ignore_ascii_case(key),
@@ -468,10 +403,6 @@ fn us_character(code: Code) -> Option<&'static str> {
 }
 
 /// Whether two modifier sets are the same, ignoring the lock keys.
-///
-/// Caps Lock and Num Lock are state, not intent: a keymap that compared them would
-/// stop working the moment someone leans on Caps Lock, and no keymap ever means to
-/// bind them.
 fn mods_equal(a: Modifiers, b: Modifiers) -> bool {
     const INTENT: Modifiers = Modifiers::CONTROL
         .union(Modifiers::SHIFT)

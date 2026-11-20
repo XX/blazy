@@ -1,32 +1,14 @@
 //! Keeping the pixels of an area that did not change.
 //!
-//! The paint pass rebuilds the layer plan every frame and re-appends every widget's
-//! cached scene into it, so a rasteriser redraws an idle area exactly as often as a
-//! working one — seven areas' worth of wasted work on a screen of eight (§30, §32.7).
-//! This is the level B of §7.3: a texture per layer, and a layer that did not change is
-//! copied instead of drawn. What it saves and what it costs is §36.
+//! The paint pass re-appends every widget's scene each frame, so an idle area is
+//! rasterised as often as a busy one. Here a layer gets a texture, and a layer whose
+//! `Scene` compares equal to last frame's is copied (`copy_texture_to_texture`, pixel for
+//! pixel) instead of drawn.
 //!
-//! Three things make it simple enough to be worth having:
-//!
-//! * Masonry hands the host a layer per widget that asked for one, with the owner's [`WidgetId`] and the layer's
-//!   transform (§26.1);
-//! * a layer that did not change is recognisable without help from the application: its `Scene` compares equal to the
-//!   one kept from last frame;
-//! * putting the pixels back needs no shader and no resampling — frame and cache have the same format, so it is
-//!   `copy_texture_to_texture`, pixel for pixel.
-//!
-//! # What a caller has to promise
-//!
-//! A cached layer **owns its rectangle**: nothing else may draw into it. That holds for
-//! Blender-style areas, which tile the window and paint opaque backgrounds, and it does
-//! not hold for a popup over an area. The host cannot check it — the plan carries no
-//! bounds, only scenes — so it is asked for rather than inferred: a caller registers the
-//! layers it knows to be disjoint through
-//! [`GpuFrames::cache_layers`](crate::gpu::GpuFrames::cache_layers).
-//!
-//! The order the decision is made in is load-bearing rather than incidental: comparing
-//! scenes is cheap, working out where a layer sits walks its whole scene, and a layer
-//! that has not changed sits where it sat (§36.3).
+//! A cached layer must own its rectangle — true of areas tiling a window, false of a
+//! popup over one. The host cannot check it, so a caller registers the layers it knows
+//! to be disjoint ([`GpuFrames::cache_layers`](crate::gpu::GpuFrames::cache_layers)).
+//! Scenes are compared before a layer's rectangle is worked out, which walks its scene.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,50 +25,24 @@ pub struct LayerCounters {
     /// Layers offered to the cache — registered, and present in the plan.
     pub offered: u64,
     /// Layers whose pixels were copied from the cache instead of being drawn.
-    ///
-    /// The counter the whole mechanism is judged on: an idle area should raise this
-    /// once per frame and cost the rasteriser nothing.
     pub reused: u64,
     /// Layers that were drawn because their scene or their place changed.
     pub drawn: u64,
-    /// Times a layer's rectangle had to be worked out by walking its scene.
-    ///
-    /// The counter behind the ordering of §36.3: comparing scenes is cheap, finding out
-    /// where a layer sits is not, and a layer that did not change sits where it sat. A
-    /// frame in which nothing changed must not raise this at all — which is a fact about
-    /// the code and not about the machine, so it is counted rather than timed.
+    /// Times a layer's rectangle had to be worked out by walking its scene; zero in a frame
+    /// where nothing changed.
     pub walks: u64,
     /// Bytes of texture the cache is holding.
     pub bytes: u64,
-    /// Layers whose pixels were promised and then were not there to copy.
-    ///
-    /// Zero by construction now, and counted because it was not: an eviction used to be
-    /// able to drop a texture that *this frame* had already decided to reuse, and the
-    /// copy then found nothing and did nothing. What that looks like on screen is an
-    /// area that blinks, and what it looked like in the counters was a cache working
-    /// perfectly — `reused` had already been raised (§44.9). A promise the cache cannot
-    /// keep is a fault, so it is a number.
+    /// Layers whose pixels were promised and then were not there to copy (an empty area);
+    /// zero by construction.
     pub dropped: u64,
-    /// Registered layers whose rectangles overlapped another's, this frame.
-    ///
-    /// The precondition §36 asks a caller for — a cached layer owns its rectangle — and
-    /// the only half of it the host can check cheaply, since it has the rectangles
-    /// anyway. It is not free to be wrong about: overlapping layers copy over each
-    /// other, and they also add up to more pixels than the window, which is what put
-    /// the cache over its ceiling (§44.9).
+    /// Registered layers whose rectangles overlapped another's, this frame: a broken
+    /// precondition.
     pub overlaps: u64,
-    /// Times eviction could not bring the cache inside its ceiling.
-    ///
-    /// Reachable by design rather than by accident: the layers this frame is copying are
-    /// not evictable, because their pixels are in the cache and nowhere else (§44.9). So
-    /// the ceiling can yield for a frame — and when it does it says so, instead of
-    /// leaving a silent `return` where a promise used to be (§45).
+    /// Times eviction could not bring the cache inside its ceiling (this frame's copies are
+    /// not evictable).
     pub over_ceiling: u64,
     /// Textures dropped to stay inside the ceiling.
-    ///
-    /// An eviction is not a fault — it costs the layer a redraw on the frame it comes
-    /// back — but it is the difference between a cache that is bounded and one that
-    /// grows with whatever an application registers (§37.2).
     pub evictions: u64,
 }
 
@@ -96,13 +52,9 @@ pub(crate) struct LayerCache {
     entries: HashMap<WidgetId, Entry>,
     /// Bytes of texture the cache may hold before it starts evicting.
     budget: u64,
-    /// The layers this frame has already decided to copy rather than draw.
-    ///
-    /// Held so that storing a layer cannot evict one of them: their pixels are not in
-    /// the frame, they are only in the cache, and dropping one leaves its area empty.
+    /// The layers this frame copies rather than draws, which must not be evicted.
     protected: HashSet<WidgetId>,
-    /// Ticks once per store or reuse, so "least recently used" is a number rather than
-    /// a guess. A frame counter would do as well; this one does not need the frame.
+    /// Ticks once per store or reuse, for least-recently-used eviction.
     clock: u64,
     counters: LayerCounters,
 }
@@ -111,8 +63,7 @@ struct Entry {
     texture: wgpu::Texture,
     /// When this entry was last kept or refilled, by [`LayerCache::clock`].
     used: u64,
-    /// The scene this texture was drawn from. Compared, not hashed: equality is exact,
-    /// and §36.3 measures what it costs.
+    /// The scene this texture was drawn from, compared for equality.
     scene: Scene,
     /// Where it sat, in physical pixels, and under which transform.
     transform: Affine,
@@ -120,9 +71,6 @@ struct Entry {
 }
 
 /// A rectangle in whole physical pixels, which is what a texture copy takes.
-///
-/// Public because the benchmark prices the cache's own decision (§36.3), and the
-/// decision is this rectangle plus a scene comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelRect {
     /// Left edge, in physical pixels.
@@ -141,10 +89,7 @@ impl PixelRect {
         (self.x, self.y)
     }
 
-    /// Whether two rectangles share a pixel.
-    ///
-    /// Touching edges do not: areas tile, so the area to the right starts at the pixel
-    /// after this one ends.
+    /// Whether two rectangles share a pixel (touching edges do not).
     fn overlaps(self, other: Self) -> bool {
         self.x < other.x + other.width
             && other.x < self.x + self.width
@@ -186,29 +131,14 @@ impl LayerCache {
         self.recount();
     }
 
-    /// Sets how many bytes of texture the cache may hold.
-    ///
-    /// The natural ceiling is a few frames' worth: cached layers **tile** the window, so
-    /// their pixels add up to about one frame however many areas there are — 4.9 MiB for
-    /// eight areas of a 1400x900 window, which is that window (§37.2). A ceiling above
-    /// that covers a resize, where the old textures live until their layers are stored
-    /// again, and bounds the damage from a caller that registers overlapping layers
-    /// against the precondition.
+    /// Sets how many bytes of texture the cache may hold (tiling layers add up to one frame).
     pub(crate) fn set_budget(&mut self, bytes: u64) {
         self.budget = bytes;
         self.evict_to_fit(None);
     }
 
-    /// Drops least-recently-used textures until the cache is inside its ceiling.
-    ///
-    /// `keep` is the entry that has just been filled, which is never worth evicting: it
-    /// is the most recently used by definition, and dropping it would mean drawing it
-    /// again next frame for nothing.
-    /// Layers this frame is copying rather than drawing are off limits as well, and
-    /// that is not a refinement: their pixels exist nowhere else, so evicting one to
-    /// stay inside a ceiling trades a bounded cache for an empty area. The ceiling
-    /// bounds what is kept *between* frames; this frame's own layers are not part of
-    /// what there is to save.
+    /// Drops least-recently-used textures until the cache is inside its ceiling, never
+    /// `keep` (just filled) nor a layer this frame copies.
     fn evict_to_fit(&mut self, keep: Option<WidgetId>) {
         while self.counters.bytes > self.budget {
             let oldest = self
@@ -235,8 +165,7 @@ impl LayerCache {
         self.wanted.contains(&id)
     }
 
-    /// Re-adds up what the textures cost. Called where the set of them changes, which
-    /// is the only time it can move.
+    /// Re-adds up what the textures cost, when the set changes.
     fn recount(&mut self) {
         self.counters.bytes = self.entries.values().map(|entry| texture_bytes(&entry.texture)).sum();
     }
@@ -245,14 +174,8 @@ impl LayerCache {
         self.counters
     }
 
-    /// The rectangle this layer's pixels are already sitting in, if they can be copied
-    /// rather than drawn.
-    ///
-    /// Asked before the layer's bounds are computed, and that order is the difference
-    /// between a cache that pays for itself and one that does not (§36.3): working out
-    /// where a layer sits means walking its whole scene, and a layer that has not
-    /// changed sits where it sat. Same scene and same transform is enough — the
-    /// rectangle is a function of both.
+    /// The rectangle this layer's pixels already sit in, if the scene and transform are
+    /// unchanged; asked before its bounds are worked out.
     pub(crate) fn reusable(&mut self, id: WidgetId, scene: &Scene, transform: Affine) -> Option<PixelRect> {
         self.clock += 1;
         let clock = self.clock;
@@ -283,9 +206,6 @@ impl LayerCache {
     }
 
     /// Counts the registered layers that overlap another one this frame.
-    ///
-    /// Counted from the failing side, like every other criterion: the claim is that a
-    /// caller registered layers that tile, so what is measured is how many did not.
     pub(crate) fn note_overlaps(&mut self, rects: &[PixelRect]) {
         for (i, a) in rects.iter().enumerate() {
             if rects[i + 1..].iter().any(|b| a.overlaps(*b)) {
@@ -370,12 +290,8 @@ fn texture_bytes(texture: &wgpu::Texture) -> u64 {
     u64::from(texture.width()) * u64::from(texture.height()) * 4
 }
 
-/// The pixels a layer's scene covers, in physical coordinates.
-///
-/// The union of every drawn shape's bounding box, transformed and clipped to the frame
-/// — the same arithmetic [`crate::tiles`] charges tiles with, for the same reason: the
-/// plan carries scenes and no bounds, so a host that wants a rectangle has to work it
-/// out from what is drawn.
+/// The pixels a layer's scene covers, in physical coordinates: the union of its shapes'
+/// boxes, transformed and clipped.
 pub fn scene_bounds(scene: &Scene, transform: Affine, frame: PhysicalSize<u32>) -> Option<PixelRect> {
     let mut bounds = Bounds {
         transform,
@@ -394,13 +310,8 @@ pub fn scene_bounds(scene: &Scene, transform: Affine, frame: PhysicalSize<u32>) 
 struct Bounds {
     transform: Affine,
     union: Option<Rect>,
-    /// The clips currently open, in physical coordinates.
-    ///
-    /// Tracked rather than ignored, and that took a measurement to justify: a stroke at
-    /// the edge of an area inflates its bounding box by half a stroke width, so a box
-    /// that ignores the clip spills over the neighbouring area and the copy lands on the
-    /// wrong pixels (§36.2). The clip is where the true edge of an area is, and it is
-    /// already a whole number of pixels because §21 rounds area rectangles.
+    /// The clips currently open, in physical coordinates: a stroke at an area's edge would
+    /// otherwise spill into its neighbour.
     clips: Vec<Rect>,
 }
 

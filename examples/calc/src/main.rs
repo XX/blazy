@@ -1,4 +1,4 @@
-//! `calc`: an arithmetic node graph — the second application on blazy (§63).
+//! `calc`: an arithmetic node graph — the second application on blazy.
 //!
 //! Written against the facade alone and without looking inside `hello`, to find out what an
 //! application that did not grow up with the library has to do. Four kinds of node with
@@ -13,7 +13,7 @@
 //!
 //! `Ctrl+S` writes both files; `Ctrl+O` reads both back while the application runs.
 //!
-//! `Shift+A` opens the `Add` menu of the four kinds, from the graph's own list (§64).
+//! `Shift+A` opens the `Add` menu of the four kinds, from the graph's own list.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -74,7 +74,7 @@ impl Kind {
     }
 
     /// The kind as the graph file writes it — `number 2.5`, `add` — and as a copy on the
-    /// system clipboard does (§66).
+    /// system clipboard does.
     fn text(self) -> String {
         match self {
             Self::Number(value) => format!("number {value}"),
@@ -473,7 +473,7 @@ impl NodeGraph for Calc {
         }
     }
 
-    /// A kind as the graph file writes it (§66).
+    /// A kind as the graph file writes it.
     fn text_form(&self) -> Option<&dyn ContentText<Kind>> {
         Some(&KindText)
     }
@@ -536,7 +536,7 @@ impl NodeSource for Nodes {
 }
 
 /// A field over a number node's value — in the node and in the panel: the library's
-/// `ContentField` (§70), which writes the model on every key, makes one step of an edit when
+/// `ContentField`, which writes the model on every key, makes one step of an edit when
 /// the field is left, and shows the value again if what was typed is not a number.
 fn number_field(
     graph: &SharedGraph<Calc>,
@@ -739,7 +739,7 @@ fn app(graph: &SharedGraph<Calc>, file: &Path) -> EditorApp<Calc> {
             Err(error) => eprintln!("{}: {error}", file_to_save.display()),
         },
     )
-    // `Ctrl+O` reads the graph back from its file while the application runs (§69).
+    // `Ctrl+O` reads the graph back from its file while the application runs.
     .on_load(move |calc| {
         let read = std::fs::read_to_string(&file_to_load)
             .map_err(|error| error.to_string())
@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(entries.len(), 4, "one entry per kind");
         // Unchecked: the harness looks for a widget under the pointer in the base layer only,
         // and a menu is a layer of its own. A click, which in a window of two areas used to
-        // spill past the event's rewrite passes (§65).
+        // spill past the event's rewrite passes.
         harness.mouse_move_to_unchecked(entries[3]);
         harness.mouse_button_press(Some(PointerButton::Primary));
         harness.mouse_button_release(Some(PointerButton::Primary));

@@ -20,19 +20,12 @@ type Show<C> = dyn Fn(&C) -> String;
 /// one yet — half a number.
 type Edit<C> = dyn Fn(&C, &str) -> Option<C>;
 
-/// A text field that edits what node `index` holds — in a node's widget or in a panel (§70).
+/// A text field that edits what node `index` holds, in a node's widget or in a panel.
 ///
-/// The four things every such field of `hello` and `calc` did by hand, in one place:
-///
-/// * **every key into the model**, and recorded for every view but the one the edit is shown in already — the field's
-///   canvas, or its panel — so the others follow as it is typed and this one is not rebuilt under the caret (§47);
-/// * **one step in the history** when the edit ends — the field left, `Enter`, `Escape` — if it changed anything, as
-///   Blender writes one (§67), not one per key;
-/// * **text that does not read** — an emptied number — leaves the model alone, and the field shows the model's value
-///   again when it is left;
-/// * `Enter` and `Escape` leave the field, so the keys are the editor's again.
-///
-/// The application says only how its content reads as text and what text makes of it.
+/// Every key goes into the model and to the other views (not to its own, so the field is
+/// not rebuilt under the caret). Leaving the field (`Enter`, `Escape`, a click elsewhere)
+/// records one undo step if anything changed, and shows the model's value again if the
+/// text did not read.
 pub struct ContentField<G: NodeGraph> {
     input: WidgetPod<TextInput>,
     graph: SharedGraph<G>,
@@ -73,7 +66,7 @@ impl<G: NodeGraph> ContentField<G> {
         }
     }
 
-    /// The text input inside, for a test or an application that styles it.
+    /// The text input inside.
     pub fn input_mut<'t>(this: &'t mut WidgetMut<'_, Self>) -> WidgetMut<'t, TextInput> {
         this.ctx.get_mut(&mut this.widget.input)
     }

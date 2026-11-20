@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Exits non-zero if a criterion fails, which is what makes `rnd/architecture.md`
-//! §26 a gate rather than a paragraph. What is gated and what is merely reported is
+//! the host's claims a gate rather than a paragraph. What is gated and what is merely reported is
 //! argued in [`bench_utils::criteria`]; the short version is that everything here is
 //! a counter, because a host is about which piece takes a decision and not about how
 //! many microseconds it takes.

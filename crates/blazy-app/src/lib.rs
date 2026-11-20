@@ -1,25 +1,15 @@
 //! The assembly: node editors over one graph, in areas, in as many windows as the user
 //! opens.
 //!
-//! Every crate below this one is a mechanism — a split tree, a canvas, an operator
-//! runtime, a window loop — and an application has to put them together before any of
-//! them shows anything. That putting-together was written once, in the `area-screen`
-//! example, and it was where two defects lived that no mechanism could see
-//! (`issues/application assembly.md`): a view that left the tree stayed owed every later
-//! change, so every window was woken after every event for good; and a link made in one
-//! window never reached another. Both were the application's bookkeeping, and both are
-//! the library's now — [`Views`](blazy_node_editor::Views) in `blazy-node-editor`, and
-//! the driver here.
+//! An application writes its graph ([`NodeGraph`]), what a node looks like
+//! ([`NodeSource`](blazy_canvas::NodeSource)) and what fills an area; [`EditorApp`] does
+//! the rest:
 //!
-//! What an application still writes is what only it knows: its graph
-//! ([`NodeGraph`]), what a node looks like ([`NodeSource`](blazy_canvas::NodeSource)),
-//! and what fills an area. The rest is [`EditorApp`]:
-//!
-//! * every area is its own layer, so an idle area keeps its pixels (§36);
-//! * a window collects what another window changed before it draws, and is woken only when something is owed (§44.3);
+//! * every area is its own layer, so an idle area keeps its pixels;
+//! * a window collects what another window changed before it draws, and is woken only when something is owed;
 //! * the screen's operations — split, join, swap, maximize, detach, another window, the workspace file — are operators
-//!   in every area's keymap, bound by data ([`ScreenKeys`]) and done by the driver (§71);
-//! * a detached area takes its view, its selection and its history with it, and leaves nothing modal behind (§44).
+//!   in every area's keymap, bound by data ([`ScreenKeys`]) and done by the driver;
+//! * a detached area takes its view, its selection and its history with it, and leaves nothing modal behind.
 //!
 //! ```no_run
 //! # use blazy_app::EditorApp;
@@ -62,11 +52,8 @@ use masonry::peniko::Color;
 
 pub use crate::keys::{SCREEN_CONTEXT, ScreenAction, ScreenKeys, UnknownScreenAction};
 
-/// The keymap an application starts from: the editor's bindings and the screen's.
-///
-/// One keymap, so one file overrides both — a user who rebinds `node.delete` and the
-/// split in the same breath writes one file, and [`Keymap::write`] of this is that file's
-/// starting point.
+/// The keymap an application starts from: the editor's bindings and the screen's, so one
+/// overrides file covers both.
 pub fn default_keymap() -> Keymap {
     blazy_node_editor::ops::default_keymap().with(SCREEN_CONTEXT, ScreenKeys::default().bindings())
 }
@@ -96,10 +83,6 @@ impl std::fmt::Display for KeymapLoadError {
 impl std::error::Error for KeymapLoadError {}
 
 /// A screen of node editors: areas that carry the session their editor shows.
-///
-/// The session is the area's payload rather than its widget's field, because a widget
-/// does not survive being rebuilt in another window and a view, a selection and a
-/// history must (§44.2).
 pub type EditorScreen<G> = AreaScreen<SessionHandle<G>>;
 
 /// What fills one area, given the session it shows.
@@ -125,31 +108,22 @@ pub struct AppCounters {
     pub windows_opened: u64,
     /// Changes a window collected because another window made them.
     pub pulled: u64,
-    /// Windows woken because one of their views was owed something.
-    ///
-    /// Zero after an event that changed nothing, and that is the claim §36 rests on: a
-    /// window that is woken for no reason is a window that never idles.
+    /// Windows woken because one of their views was owed something; zero after an event
+    /// that changed nothing.
     pub wakes: u64,
-    /// Times a window's keys were pointed at another editor.
-    ///
-    /// One per crossing from one area into another, not one per event: the target is
-    /// read on every event, and set only when it changed.
+    /// Times a window's keys were pointed at another editor (once per area crossed).
     pub key_targets: u64,
     /// Pointer events handed from the host seat to an operator started by a key
-    /// ([`NodeEditor::host_pointer_event`]) — each one an edit of a widget, the price
-    /// §38.2 measured. Zero outside such a gesture.
+    /// ([`NodeEditor::host_pointer_event`]).
     pub host_events: u64,
 }
 
 /// Node editors over one graph, in areas, in windows: the [`ShellDriver`] an application
 /// hands to the window loop.
-///
-/// One per process, like any driver (§44.4). The graph is shared by every window; each
-/// window is another screen over it, not another application (§30).
 pub struct EditorApp<G: NodeGraph> {
     graph: SharedGraph<G>,
     build: Rc<BuildArea<G>>,
-    /// What fills each area's sidebar, when the application gave its areas one (§61).
+    /// What fills each area's sidebar, when the application gave its areas one.
     sidebar: Option<Rc<BuildSidebar<G>>>,
     session: Rc<MakeSession<G>>,
     /// Edge pan for every session the application makes, when it asked for it.
@@ -157,9 +131,9 @@ pub struct EditorApp<G: NodeGraph> {
     /// The process's clipboard, once the first window is up — handed to every area's world.
     clipboard: Option<SharedClipboard>,
     workspace: Option<PathBuf>,
-    /// What the application writes beside the workspace when it is saved — its graph (§63).
+    /// What the application writes beside the workspace when it is saved — its graph.
     on_save: Option<Rc<SaveGraph<G>>>,
-    /// What replaces the graph when the workspace is read — its file (§69).
+    /// What replaces the graph when the workspace is read — its file.
     on_load: Option<Rc<LoadGraph<G>>>,
     /// Whether the workspace file has been read at startup yet.
     restored: bool,
@@ -174,7 +148,7 @@ pub struct EditorApp<G: NodeGraph> {
     /// Windows still to open at startup.
     remaining: usize,
     /// The properties every widget falls back on: the theme, and the application's
-    /// styles — what a selected node looks like among them (§50).
+    /// styles — what a selected node looks like among them.
     properties: Option<DefaultProperties>,
     /// Every window this application has.
     windows: Vec<WindowKey>,
@@ -184,14 +158,9 @@ pub struct EditorApp<G: NodeGraph> {
 }
 
 impl<G: NodeGraph> EditorApp<G> {
-    /// An application over `graph`, whose areas are filled by `build`.
-    ///
-    /// `build` is called for every area that appears — at startup, on a split, when a
-    /// workspace is read, in a window that was just opened — with the session the area
-    /// shows. The usual body is a [`NodeEditor`] over a
-    /// canvas, made with
-    /// [`NodeEditor::with_session`],
-    /// optionally inside an `AreaContent` with a header above it.
+    /// An application over `graph`, whose areas are filled by `build`, called for every area
+    /// that appears with the session it shows — usually a [`NodeEditor`] made with
+    /// [`NodeEditor::with_session`].
     pub fn new(
         graph: &SharedGraph<G>,
         build: impl Fn(AreaId, &SessionHandle<G>) -> NewWidget<dyn Widget> + 'static,
@@ -225,24 +194,16 @@ impl<G: NodeGraph> EditorApp<G> {
         }
     }
 
-    /// The same application, making each area's session with `make`.
-    ///
-    /// For a keymap of the application's own, or operators of its own beside the
-    /// editor's: [`EditorSession::with_runtime`] takes the runtime whole.
+    /// The same application, making each area's session with `make` (a runtime of its own:
+    /// [`EditorSession::with_runtime`]). Its keymap should include the screen's section.
     #[must_use]
     pub fn with_sessions(mut self, make: impl Fn(&SharedGraph<G>) -> SessionHandle<G> + 'static) -> Self {
         self.session = Rc::new(make);
         self
     }
 
-    /// The same application, scrolling the view at the edge of an area while a gesture
-    /// holds a node or a link there ([`EdgePan`]).
-    ///
-    /// Off unless asked for: without it a gesture carries on past the area's border and the
-    /// view stands still. Laid over every session the application makes, whichever of
-    /// [`with_sessions`](Self::with_sessions) and [`with_keymap`](Self::with_keymap) made it,
-    /// so the order of the calls does not matter. Which gestures scroll is the keymap's
-    /// ([`EDGE_PAN`](blazy_node_editor::EDGE_PAN) on a binding).
+    /// The same application, scrolling the view at the edge of an area during a gesture
+    /// whose binding asks for it ([`EdgePan`], [`EDGE_PAN`](blazy_node_editor::EDGE_PAN)).
     #[must_use]
     pub fn with_edge_pan(mut self, edge_pan: EdgePan) -> Self {
         self.edge_pan = Some(edge_pan);
@@ -259,17 +220,14 @@ impl<G: NodeGraph> EditorApp<G> {
         self
     }
 
-    /// The same application, with `keymap` in force for the editors and the screen.
-    ///
-    /// Each area's session gets a runtime with this keymap, and the screen's bindings
-    /// come from its [`SCREEN_CONTEXT`] section. Replaces [`with_sessions`](Self::with_sessions).
+    /// The same application, with `keymap` in force for the editors and the screen (its
+    /// [`SCREEN_CONTEXT`] section). Replaces [`with_sessions`](Self::with_sessions).
     ///
     /// # Errors
     ///
     /// When the screen section names an action there is none of.
     pub fn with_keymap(mut self, keymap: Keymap) -> Result<Self, UnknownScreenAction> {
-        // Checked, not kept: a screen binding that names no action is refused rather than
-        // left to do nothing (§45). The bindings themselves go with the keymap.
+        // Checked: a screen binding naming no action is refused.
         let _ = ScreenKeys::from_keymap(&keymap)?;
         self.session = Rc::new(move |graph| {
             EditorSession::with_runtime(graph, blazy_node_editor::ops::runtime_with(keymap.clone())).share()
@@ -277,10 +235,8 @@ impl<G: NodeGraph> EditorApp<G> {
         Ok(self)
     }
 
-    /// The same application, with a user's overrides file laid over [`default_keymap`].
-    ///
-    /// All or nothing: a file with one bad line leaves the defaults in force and says
-    /// which line.
+    /// The same application, with a user's overrides file laid over [`default_keymap`], all
+    /// or nothing.
     ///
     /// # Errors
     ///
@@ -292,10 +248,8 @@ impl<G: NodeGraph> EditorApp<G> {
         self.with_keymap(keymap).map_err(KeymapLoadError::Screen)
     }
 
-    /// The same application, with `properties` in place of the theme's defaults.
-    ///
-    /// Where an application's style goes — the theme, plus a property stack for its node
-    /// type saying what a node wearing [`SELECTED`](blazy_node_editor::SELECTED) looks like.
+    /// The same application, with `properties` (the theme and the application's styles, such
+    /// as a selected node's) in place of the theme's defaults.
     #[must_use]
     pub fn with_properties(mut self, properties: DefaultProperties) -> Self {
         self.properties = Some(properties);
@@ -303,15 +257,9 @@ impl<G: NodeGraph> EditorApp<G> {
     }
 
     /// The same application, every area of which has a sidebar on its right, filled by
-    /// `build` (§61).
-    ///
-    /// The assembly builds the regions rather than the application's `build`, because it is
-    /// the one that has to reach them: `N` ([`ScreenAction::ToggleSidebar`]) shows and hides
-    /// the sidebar of the area under the pointer, and the workspace file records it. Each
-    /// area becomes an [`AreaContent`] — what `build` gave as its main region, this beside
-    /// it — and the sidebar's state is the area's session's
-    /// ([`EditorSession::sidebar`](blazy_node_editor::EditorSession::sidebar)), so a detached
-    /// area or a workspace read back shows it as it was.
+    /// `build`: each area becomes an [`AreaContent`], and the sidebar's state is the
+    /// session's, shown and hidden by [`ScreenAction::ToggleSidebar`] and kept in the
+    /// workspace file.
     #[must_use]
     pub fn with_sidebar(
         mut self,
@@ -321,11 +269,8 @@ impl<G: NodeGraph> EditorApp<G> {
         self
     }
 
-    /// The same application, writing and reading its workspace at `path`.
-    ///
-    /// Without one, [`ScreenAction::SaveWorkspace`] and [`ScreenAction::LoadWorkspace`]
-    /// do nothing. If the file is there when the first window opens, it is read then: the
-    /// screen comes back as it was left, which is what the file is for (§63).
+    /// The same application, writing and reading its workspace at `path`; read when the
+    /// first window opens if the file is there.
     #[must_use]
     pub fn with_workspace(mut self, path: impl Into<PathBuf>) -> Self {
         self.workspace = Some(path.into());
@@ -335,10 +280,7 @@ impl<G: NodeGraph> EditorApp<G> {
     /// Runs `save` whenever the workspace is saved ([`ScreenAction::SaveWorkspace`]), after
     /// the workspace file is written.
     ///
-    /// Where an application writes its graph: the graph's format is the application's
-    /// (§42.4), and `Ctrl+S` saving the screen but not the document was the first thing a
-    /// second application had to work around (§63). Nothing is written without a
-    /// workspace path, as nothing is saved then.
+    /// Where an application writes its graph. Not called without a workspace path.
     #[must_use]
     pub fn on_save(mut self, save: impl Fn(&SharedGraph<G>) + 'static) -> Self {
         self.on_save = Some(Rc::new(save));
@@ -347,29 +289,21 @@ impl<G: NodeGraph> EditorApp<G> {
 
     /// Runs `load` whenever the workspace is read ([`ScreenAction::LoadWorkspace`], `Ctrl+O`),
     /// before the screen is: the application reads its graph's file and replaces the
-    /// graph's contents, and answers whether it did (§69).
+    /// graph's contents, and answers whether it did.
     ///
-    /// **Replace the contents, keep the registry.** The graph's [`Views`](blazy_node_editor::Views)
-    /// is what every canvas over the graph is registered in; a graph built afresh carries an
-    /// empty one, and putting it in place of the old would leave every view registered
-    /// nowhere. Move the old registry into the new graph before swapping them.
+    /// **Keep the registry:** move the old graph's [`Views`](blazy_node_editor::Views) into
+    /// the new one before swapping them, or every view is registered nowhere.
     ///
-    /// The rest is the library's: the gestures running in the window are cancelled before
-    /// the hook runs, and after it every view in every window starts over from the new
-    /// graph, the selection and the copy in the process go, and every area's history starts
-    /// over — as Blender's Open does. Not called at startup: a graph read before the first
-    /// window is just the graph the application starts with.
+    /// Gestures are cancelled before the hook; after it every view starts over, the selection
+    /// and the copy go, and the history is cleared. Not called at startup.
     #[must_use]
     pub fn on_load(mut self, load: impl Fn(&mut G) -> bool + 'static) -> Self {
         self.on_load = Some(Rc::new(load));
         self
     }
 
-    /// Whether idle areas keep their pixels (§36). On by default.
-    ///
-    /// The areas still have to ask to be layers — `AreaContent::with_isolated_layer` —
-    /// and this is the host's half: naming them, so the shell asks them to repaint and
-    /// the presenter may keep their pixels.
+    /// Whether idle areas keep their pixels (areas also ask, with
+    /// `AreaContent::with_isolated_layer`). On by default.
     #[must_use]
     pub fn with_layer_cache(mut self, enabled: bool) -> Self {
         self.layers = enabled;
@@ -388,19 +322,14 @@ impl<G: NodeGraph> EditorApp<G> {
         self.screen_carrying(tree, None)
     }
 
-    /// The same, with the first area taking over a session that already exists.
-    ///
-    /// What detach builds: the window is new, the tree is new, the widget is new — and
-    /// the session is the one the area had (§44).
+    /// The same, with the first area taking over a session that already exists (detach).
     pub fn screen_carrying(&self, tree: SplitTree, carried: Option<SessionHandle<G>>) -> EditorScreen<G> {
         let (graph, build, session) = (self.graph.clone(), self.build.clone(), self.session.clone());
         let sidebar = self.sidebar.clone();
         let edge_pan = self.edge_pan;
         let mut carried = carried;
         AreaScreen::with_payloads(tree, move |area| {
-            // The carried session goes to the first area asked for and to no other: an
-            // area that appears later is a new view and needs a session of its own, or
-            // two areas would share one selection.
+            // The carried session goes to the first area only.
             let session = carried.take().unwrap_or_else(|| {
                 let session = session(&graph);
                 if edge_pan.is_some() {
@@ -445,13 +374,8 @@ impl<G: NodeGraph> EditorApp<G> {
         run(config, NewWidget::new(screen).erased(), properties, self)
     }
 
-    /// The windows that have to draw to catch up with a change, after an event.
-    ///
-    /// Every window while any view is owed something, and none otherwise. Coarse on
-    /// purpose: a window does not know which views are in another window's tree, and a
-    /// window woken with nothing to collect draws a frame its layers mostly copy (§36).
-    /// What must never happen is a wake with nothing owed, and that is what the
-    /// registry forgetting departed views guarantees.
+    /// The windows that have to draw to catch up with a change: all of them while any view
+    /// is owed something, none otherwise.
     pub fn windows_to_wake(&self) -> Vec<WindowKey> {
         if !self.graph.borrow().views().has_pending() {
             return Vec::new();
@@ -461,8 +385,7 @@ impl<G: NodeGraph> EditorApp<G> {
 
     /// Collects what the views in `root` are owed. What [`ShellDriver::frame`] does.
     pub fn pull(&mut self, root: &mut RenderRoot) -> usize {
-        // Cloned out of the graph so that applying a change — which may build a node,
-        // which reads the graph — never meets a borrow held here.
+        // Cloned: applying a change may read the graph.
         let views = self.graph.borrow().views().clone();
         if !views.has_pending() {
             return 0;
@@ -472,27 +395,15 @@ impl<G: NodeGraph> EditorApp<G> {
         applied
     }
 
-    /// Points `window`'s keys at the editor of the area under the pointer, or of the
-    /// first area when the pointer is over none.
-    ///
-    /// Masonry hands a key to the focused widget or to the window's focus fallback and to
-    /// nobody else (§38.3); a window of several editors that names none has editors that
-    /// never hear `G`, `X` or `Ctrl+Z` — which is what the window this crate replaced did.
-    /// The area under the pointer is Blender's answer and the one an area can give: the
-    /// screen publishes it, and the area's session knows its editor.
-    ///
-    /// Read through a `WidgetRef`, not a `WidgetMut`: this runs after every event, and an
-    /// edit would cost the window a battery of rewrite passes each time (§38.2).
+    /// Points `window`'s keys (the focus fallback) at the editor of the area under the
+    /// pointer, or of the first area. Read through a `WidgetRef`, which costs no passes.
     pub fn route_keys(&mut self, window: WindowKey, root: &mut RenderRoot) {
         let target = {
             let screen = root.get_layer_root(0);
             let Some(screen) = screen.downcast::<EditorScreen<G>>() else {
                 return;
             };
-            // Mid-gesture the keys stay with the operator without asking: the screen
-            // learns where the pointer is from the moves it sees, and it sees none while
-            // an editor holds the capture or the host hands the moves to a running
-            // operator — so `Escape` over the next area still reaches the one it ends.
+            // Mid-gesture the keys stay with the running operator.
             let area = screen.hovered_area().or_else(|| screen.tree().areas().next());
             area.and_then(|area| screen.payload(area))
                 .and_then(|session| session.borrow().editor())
@@ -536,14 +447,12 @@ impl<G: NodeGraph> EditorApp<G> {
                 AreaScreen::split(screen, area, Axis::Vertical, 0.5);
             }),
             ScreenAction::Join => on_area::<G>(root, target, |screen, area| {
-                // The survivor is the one under the pointer, as in Blender. An area
-                // whose sibling is a split has no partner: that is what a binary tree can
-                // express, and §41.1 counts what it costs.
+                // This area survives, as in Blender.
                 match screen.widget.tree().joinable(area) {
                     Some(sibling) => {
                         AreaScreen::join(screen, area, sibling);
                     },
-                    None => tracing::info!(area, "no sibling to join with; see §41.1"),
+                    None => tracing::info!(area, "no sibling to join with"),
                 }
             }),
             ScreenAction::Swap => {
@@ -574,8 +483,7 @@ impl<G: NodeGraph> EditorApp<G> {
                 });
                 match taken {
                     Some(session) => self.open_window(cx, Some(session)),
-                    // The last area of a window does not detach, exactly as an area with
-                    // no sibling does not join.
+                    // The last area of a window does not detach.
                     None => tracing::info!("nothing to detach here"),
                 }
             },
@@ -604,12 +512,8 @@ impl<G: NodeGraph> EditorApp<G> {
         Handled::Yes
     }
 
-    /// Asks for another window over the graph, with the first area taking over
-    /// `carried` if there is one.
-    ///
-    /// The screen is built here and handed over as a fresh tree, because a widget tree
-    /// cannot move between windows: `RenderRoot` owns its arena and Masonry has no
-    /// reparenting (§44.1). What the windows share is the graph.
+    /// Asks for another window over the graph, with a fresh tree, the first area taking
+    /// over `carried` if there is one.
     fn open_window(&mut self, cx: &mut ShellCtx, carried: Option<SessionHandle<G>>) {
         let detached = carried.is_some();
         let tree = if detached {
@@ -639,8 +543,7 @@ impl<G: NodeGraph> EditorApp<G> {
             return;
         };
         let text = with_screen::<G, _>(root, |screen| {
-            // The tree is the geometry; what fills each area is the application's to
-            // say, and here every area is the same kind of editor (§41.5).
+            // Every area is the same kind of editor.
             let mut workspace = Workspace::new(screen.widget.tree().clone());
             let areas: Vec<AreaId> = screen.widget.tree().areas().collect();
             for area in areas {
@@ -667,7 +570,7 @@ impl<G: NodeGraph> EditorApp<G> {
         let Some(load) = self.on_load.clone() else {
             return;
         };
-        // A gesture holds names of the graph about to go; it ends first, cleaning up (§58).
+        // A gesture holds names of the graph about to go; it ends first, cleaning up.
         // Gestures in other windows end when their editors see the new generation.
         with_screen::<G, _>(root, |screen| {
             let areas: Vec<AreaId> = screen.widget.tree().areas().collect();
@@ -685,7 +588,7 @@ impl<G: NodeGraph> EditorApp<G> {
             let graph = self.graph.borrow();
             graph.views().graph_replaced(&*graph);
         }
-        // This window starts over now; the others when they next draw (§44.3).
+        // This window starts over now; the others when they next draw.
         self.pull(root);
         tracing::info!("graph read");
     }
@@ -731,9 +634,6 @@ impl<G: NodeGraph> EditorApp<G> {
 
 impl<G: NodeGraph> ShellDriver for EditorApp<G> {
     /// Records the window, and opens the next one `with_windows` asked for.
-    ///
-    /// Each new window comes back here, so the count walks down to zero through the same
-    /// path a key takes, rather than through a loop of its own.
     fn started(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
         // The first window brings the screen back as the workspace file left it.
         if !self.restored {
@@ -744,7 +644,7 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         }
         self.windows.push(window);
         self.counters.windows_opened += 1;
-        // The one clipboard of the process, which the editors' copy and paste reach (§71).
+        // The one clipboard of the process, which the editors' copy and paste reach.
         if self.clipboard.is_none() {
             self.clipboard = Some(cx.shared_clipboard());
         }
@@ -757,25 +657,13 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
     }
 
     /// Catches this window up with what another one changed.
-    ///
-    /// The pull half of §30: the push reaches the areas of one window and is dropped
-    /// across the boundary of two, so the views record what they are owed and the window
-    /// collects it when it draws (§44.3).
     fn frame(&mut self, _window: WindowKey, root: &mut RenderRoot) {
         self.pull(root);
     }
 
-    /// Points the keys at the area under the pointer, and wakes the windows whose views are
-    /// owed something.
-    ///
-    /// After the event rather than in a seat: a seat is offered the event before the
-    /// tree acts on it, so a change made with the mouse would be noticed one gesture
-    /// late (§44.3).
+    /// Does what the screen's operators asked, points the keys at the area under the
+    /// pointer, and wakes the windows whose views are owed something.
     fn settled(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
-        // The keys follow the pointer from area to area, decided after the event like
-        // everything else here: the event is what moved the pointer.
-        // What the screen's operators asked for in this event — from a key, a menu or a
-        // script alike — the driver does now: the screen is not theirs to touch (§38.3, §71).
         self.do_screen_requests(cx, root);
         self.route_keys(window, root);
         self.sync_screen(root);
@@ -796,15 +684,8 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
             .unwrap_or_default()
     }
 
-    /// Hands the pointer to an operator started by a key, wherever the pointer is.
-    ///
-    /// A gesture started by a press holds the pointer through capture, and the tree
-    /// routes it; one started by a key cannot (capture is a press's, §38.1), so past its
-    /// area the tree gave its events to the editor next door — the node stopped at the
-    /// border and a click to confirm went to the wrong editor. While such an operator
-    /// runs, every pointer event of the window goes to its editor from here and is kept
-    /// from the tree, which is Blender's arrangement: a modal handler belongs to the
-    /// window. One edit of a widget per event, counted in `host_events`.
+    /// Hands the pointer to an operator started by a key, wherever the pointer is: it has
+    /// no capture (a press's), so its window's pointer events go to its editor from here.
     fn pointer_event(
         &mut self,
         _cx: &mut ShellCtx,
@@ -832,15 +713,7 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         if consumed { Handled::Yes } else { Handled::No }
     }
 
-    /// The screen's operations, from the seat in front of the tree.
-    ///
-    /// Here rather than in a widget because they are the *screen's* operations and the
-    /// screen is the root: there is nothing above it to bubble to.
-    ///
-    /// **Not while a text field has focus.** This seat hears a key before the field does,
-    /// so a binding here would take the key from the text — and the defaults are `Alt`
-    /// and `Ctrl` with a letter, which on macOS is how `Option` types a character.
-    /// Blender's text field takes every key while it is edited; so does this one.
+    /// Keeps the screen's snapshot current before a key reaches the tree.
     fn text_event(
         &mut self,
         cx: &mut ShellCtx,
@@ -849,9 +722,6 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
         event: &TextEvent,
     ) -> Handled {
         let _ = (cx, event);
-        // The keys are the editors' — the screen's operations are operators in their keymap
-        // (§71), and a text field with focus keeps them (§56). What this seat still does is
-        // the snapshot the operators poll on.
         self.sync_screen(root);
         Handled::No
     }
@@ -859,7 +729,7 @@ impl<G: NodeGraph> ShellDriver for EditorApp<G> {
 
 impl<G: NodeGraph> EditorApp<G> {
     /// Gives every area's world of this window the snapshot of the screen its operators poll
-    /// on, and the system clipboard (§71).
+    /// on, and the system clipboard.
     fn sync_screen(&mut self, root: &mut RenderRoot) {
         let (workspace, sidebar, clipboard) =
             (self.workspace.is_some(), self.sidebar.is_some(), self.clipboard.clone());
@@ -934,14 +804,8 @@ fn modal_editor<G: NodeGraph>(screen: &WidgetRef<'_, EditorScreen<G>>) -> Option
         })
 }
 
-/// Takes an area out of a screen, ready to be built in another window.
-///
-/// `AreaScreen::detach` removes the area and hands back what it carried; this adds the
-/// one thing the screen cannot know to do — **cancelling whatever was modal in the
-/// session**. A gesture belongs to the window it was made in: pointer capture is that
-/// window's `RenderRoot`'s, and the area is about to stop being there (§44).
-///
-/// `None` for the last area of a screen, which does not detach.
+/// Takes an area out of a screen for another window, cancelling any gesture in its session
+/// (a gesture belongs to its window). `None` for the last area.
 pub fn detach_area<G: NodeGraph>(
     screen: &mut WidgetMut<'_, EditorScreen<G>>,
     area: AreaId,

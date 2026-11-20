@@ -1,4 +1,4 @@
-//! What keeping the pixels of idle areas is worth, and what it costs (§36).
+//! What keeping the pixels of idle areas is worth, and what it costs.
 //!
 //! Its own file for the reason the far-field table has one: it is a table rather than a
 //! scenario — the same screen and the same gesture, with the host told to keep the
@@ -19,7 +19,7 @@ use node_canvas::property_set;
 
 use crate::bench::{Options, PAN_STEP, SCALES, VIEWPORT, pan_area, set_header_scale, zoom_area};
 
-// --- MARK: the layer cache (§36)
+// --- MARK: the layer cache
 
 /// Frames each cache scenario is timed over. Few: each one is a whole GPU frame.
 pub(crate) const CACHE_FRAMES: usize = 8;
@@ -35,7 +35,7 @@ pub(crate) struct CacheRow {
     pub(crate) drawn: f64,
     /// Per frame: layers whose rectangle had to be worked out by walking their scene.
     ///
-    /// The counter form of "deciding is cheap" (§36.3): a frame in which nothing changed
+    /// The counter form of "deciding is cheap": a frame in which nothing changed
     /// must not touch any layer's geometry, and that is a fact about the code rather
     /// than about the machine.
     pub(crate) walks: f64,
@@ -43,7 +43,7 @@ pub(crate) struct CacheRow {
     /// from last frame, and — only for a layer that changed — working out where it sits.
     ///
     /// Split because the answer decides whether a cheap pre-filter before the comparison
-    /// is worth building (§37.1): a filter can only speed up scenes that differ, and an
+    /// is worth building: a filter can only speed up scenes that differ, and an
     /// idle screen's scenes are all equal.
     pub(crate) compare_ms: f64,
     pub(crate) walk_ms: f64,
@@ -52,7 +52,7 @@ pub(crate) struct CacheRow {
     /// Texture the cache is holding, in KiB.
     pub(crate) kib: u64,
     /// The ceiling this row ran under, and how many textures it dropped to stay inside
-    /// it (§37.2).
+    /// it.
     pub(crate) budget_kib: u64,
     pub(crate) evictions: f64,
     /// Frames in which the ceiling had to yield because everything left was in use.
@@ -62,13 +62,13 @@ pub(crate) struct CacheRow {
     /// Zero by construction, and measured because it was not: an eviction could drop a
     /// texture the same frame had already decided to reuse, and the copy then did
     /// nothing at all. The area went empty for a frame while every other counter here
-    /// said the cache was working (§44.9).
+    /// said the cache was working.
     pub(crate) dropped: f64,
     /// Pixels that changed between two frames in which nothing was touched.
     ///
     /// Read off the frame rather than counted inside the cache, because every counter
     /// the cache has was green while an area blinked: the layer that was dropped had
-    /// already raised `reused` (§44.9, §45). An idle window draws the same picture
+    /// already raised `reused`. An idle window draws the same picture
     /// twice or something is wrong that no per-frame counter is shaped to see.
     pub(crate) idle_pixels: u64,
     /// Blocks of the same two frames whose average colour moved enough to be content
@@ -77,19 +77,19 @@ pub(crate) struct CacheRow {
     /// The criterion stands on this rather than on `idle_pixels`, because **the GPU does
     /// not rasterise bit-identically across submissions**: with every layer copied and
     /// nothing drawn, two consecutive frames still differed by one pixel in two runs out
-    /// of three (§45). A block mean moves by at most 2/255 when a pair of edge pixels
+    /// of three. A block mean moves by at most 2/255 when a pair of edge pixels
     /// flips, and by tens when a region loses its content, so the line between noise and
     /// structure is arithmetic rather than a tuned threshold.
     pub(crate) idle_blocks: u64,
     /// Per frame: registered layers whose rectangle overlapped another's.
     ///
-    /// The half of §36's precondition the host can check, and the one that failed: an
+    /// The half of the cache's precondition the host can check, and the one that failed: an
     /// area painting outside its own box moves its layer rectangle onto its neighbour,
     /// which is what put the cache over its ceiling in the first place.
     pub(crate) overlaps: f64,
 }
 
-/// Asks every area to repaint, the way the shell does before a frame (§36.1).
+/// Asks every area to repaint, the way the shell does before a frame.
 ///
 /// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
 /// loop does it for the ids `ShellDriver::layers` returns — and a library method that
@@ -110,7 +110,7 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     );
     let _ = harness.redraw();
     // Every canvas out at an overview zoom: the far field is what makes a frame cost
-    // tens of milliseconds (§35.5), and therefore what a kept layer saves.
+    // tens of milliseconds, and therefore what a kept layer saves.
     for area in 0..areas {
         zoom_area(&mut harness, area, 0.05);
     }
@@ -118,13 +118,13 @@ fn layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     harness
 }
 
-/// The same screen, with the operator layer inside every area (§38.5).
+/// The same screen, with the operator layer inside every area.
 ///
 /// The row it exists for asks where a gesture's pixels land. A selection outline is
 /// drawn by the driver *inside* its area, so it dirties that area's layer and no
 /// other; an overlay across the window would dirty every one of them, and worse, it
 /// would break the condition the cache cannot check — that a cached layer owns its
-/// rectangle (§36.4).
+/// rectangle.
 fn ops_layered_harness(areas: usize, nodes: usize) -> TestHarness<Screen> {
     let (screen, _graph) = ScreenSpec::new(areas, nodes)
         .with_isolated_layers(true)
@@ -183,7 +183,7 @@ fn node_on_screen(harness: &mut TestHarness<Screen>, area: usize, index: usize) 
 /// Right-clicks a node in one area, the way a user selects one.
 ///
 /// At this zoom no node has a widget at all: the press is answered from the model
-/// (§25.3), which is the whole reason a selection works in the far field.
+///, which is the whole reason a selection works in the far field.
 fn click_node(harness: &mut TestHarness<Screen>, area: usize, index: usize) {
     let at = node_on_screen(harness, area, index);
     harness.mouse_move(at);
@@ -194,7 +194,7 @@ fn click_node(harness: &mut TestHarness<Screen>, area: usize, index: usize) {
 /// One gesture, on one path.
 ///
 /// The device comes from the caller and serves the whole table: a driver initialisation
-/// per row would sit inside the measurement, and §32.4 found that churning the target
+/// per row would sit inside the measurement, and churning the target
 /// provokes frames the GPU never draws. A row differs by what the cache is told to keep
 /// — nothing at all, for the uncached ones.
 #[derive(Clone, Copy)]
@@ -367,7 +367,7 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
         rows.extend(cache_case(&mut gpu, case("one area pans"), |h, _| {
             pan_area(h, 0, PAN_STEP);
         }));
-        // A scale change in one area's header (§46): a layout change, unlike a pan, and
+        // A scale change in one area's header: a layout change, unlike a pan, and
         // one that runs the screen's own layout on the way — so the row that says whether
         // a layout in one area reaches the pixels of the others. The scales never repeat
         // on consecutive frames, so no frame of it is secretly idle.
@@ -375,14 +375,14 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
             set_header_scale(h, 0, SCALES[(i + 1) % SCALES.len()]);
         }));
         // In the quick set too: it is the row that keeps the two criteria above from
-        // passing on a sweep where nothing ever changes (§20.9).
+        // passing on a sweep where nothing ever changes.
         rows.extend(cache_case(&mut gpu, case("every area pans"), move |h, _| {
             for area in 0..areas {
                 pan_area(h, area, PAN_STEP);
             }
         }));
         // A gesture rather than a pan: where a selection's pixels land is the question
-        // §38.5 asks, and the answer is a column — one area drawn, the rest copied.
+        // The question, and the answer is a column — one area drawn, the rest copied.
         // Two nodes alternately, because selecting the same node twice changes nothing
         // and a row that changes nothing would agree with any answer at all.
         rows.extend(cache_case(
@@ -418,7 +418,7 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
             },
         ));
         // The set of layers *is* the set of areas, so an operation that changes the areas
-        // changes what the cache holds — §41.2 asks whether it survives that. The join
+        // changes what the cache holds — the question is whether it survives that. The join
         // happens once, part way through, so the row measures the frames on both sides of
         // it rather than the frame it happened in.
         let join = |h: &mut TestHarness<Screen>, i: usize| {
@@ -448,7 +448,7 @@ pub(crate) fn cache_table(_opts: &Options, areas: usize, nodes: usize) -> Vec<Ca
         ));
         // A ceiling two areas wide, so the cache has to drop textures to stay inside it.
         // Without this row the criterion that says it does would pass by never being
-        // asked (§20.9).
+        // asked.
         rows.extend(cache_case(
             &mut gpu,
             CacheCase {

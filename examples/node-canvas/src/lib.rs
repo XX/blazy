@@ -1,9 +1,7 @@
 //! Phase 0 feasibility experiment for blazy.
 //!
-//! `rnd/architecture.md` §16 says: before committing to Masonry, build a node
-//! canvas of 5000 nodes on `masonry_core@main` — per-child `Affine`, culling, LOD,
-//! ordinary sliders and checkboxes inside the nodes — and measure it. The pass
-//! criteria are:
+//! A node canvas of 5000 nodes on Masonry — per-child `Affine`, culling, LOD, ordinary
+//! sliders and checkboxes inside the nodes — and its measurements. The criteria:
 //!
 //! * panning must not re-run layout on the children;
 //! * moving one node must not rebuild the whole window;
@@ -15,14 +13,8 @@
 //! cargo make bench-report          # what CI runs, plus a JSON report
 //! ```
 //!
-//! The benchmark is the deliverable. The window is there so the claims can be
-//! checked by eye as well as by counter.
-//!
-//! This crate is a library so that the window (`src/main.rs`), the benchmark
-//! (`benches/phase0/`) and the correctness tests can share one canvas construction.
-//! Cargo bench targets are separate crates and can only reach a package's library,
-//! so a binary-only layout would mean duplicating the graph generator — the one
-//! thing every measurement depends on being identical.
+//! A library so the window, the benchmark and the tests build the same canvas (a bench
+//! target can reach only the library).
 
 pub mod editor;
 pub mod model;
@@ -39,13 +31,8 @@ use blazy::canvas::{CanvasLayer, Link};
 use crate::model::{GraphModel, NODE_SIZE, SharedGraph, share};
 use crate::node::GraphSource;
 
-/// The theme, plus what a selected node looks like.
-///
-/// The one place this example's style for a selected node is written: a layer of
-/// `GraphNode`'s property stack, matched by the `selected` class the editor puts on the
-/// nodes of its own selection (§38.7). Everything that builds a scene of this example —
-/// the windows, the tests, the benchmarks — builds it with this, so that what they
-/// measure is what the window shows (§44.6).
+/// The theme, plus what a selected node looks like (a layer of `GraphNode`'s property
+/// stack, matched by the `selected` class). Used by the window, the tests and the benchmarks.
 pub fn property_set() -> blazy::masonry::core::DefaultProperties {
     use blazy::masonry::core::{PropertyStack, Selector};
     use blazy::masonry::peniko::Color;
@@ -63,25 +50,16 @@ pub fn property_set() -> blazy::masonry::core::DefaultProperties {
 pub const DEFAULT_NODES: usize = 5000;
 
 /// How a canvas is put together for a window, a test or a measurement.
-///
-/// One description with defaults rather than a constructor per combination: every knob
-/// this example grew — controls on hover, an explicit edge set, the far-field levers of
-/// §35 — used to add another `build_canvas_*`, and the combinations multiply while the
-/// bodies stay the same three lines.
 #[derive(Clone, Debug)]
 pub struct CanvasSpec {
     /// Nodes in the generated graph.
     pub nodes: usize,
     /// Edges: the generated ones unless an exact set is given (the link sweep gives one).
     pub links: Option<Vec<Link>>,
-    /// Whether only the node under the pointer gets interactive controls.
-    ///
-    /// Off by default: at `Full` the painted stand-in does not resemble Masonry's themed
-    /// slider and checkbox closely enough, so swapping them in on hover reads as the
-    /// interface changing under the cursor. The benchmark keeps measuring both so the
-    /// price of that choice stays visible.
+    /// Whether only the node under the pointer gets interactive controls. Off by default:
+    /// the painted stand-in does not look enough like Masonry's controls.
     pub controls_on_hover: bool,
-    /// The far-field knobs (§35.2).
+    /// The far-field knobs.
     pub far: FarTuning,
 }
 
@@ -115,25 +93,16 @@ impl CanvasSpec {
     }
 
     /// Builds the canvas over a graph of its own.
-    ///
-    /// Only geometry is handed to the canvas up front. Widgets are built on demand by
-    /// the source, which reads current state from the shared model — so a node that
-    /// scrolls out of view and back again comes back with the user's edits intact.
     pub fn build(self) -> (CanvasLayer, SharedGraph) {
         let graph = share(GraphModel::generated(self.nodes));
         let canvas = self.over(&graph);
         (canvas, graph)
     }
 
-    /// Builds a canvas over a graph that already exists.
-    ///
-    /// Several views of one model is the normal arrangement — Blender shows the same
-    /// scene in several editors at once — and it is the arrangement the area
-    /// measurements need: comparing one area against sixteen only means something if
-    /// all sixteen are looking at the same graph rather than sixteen graphs of their own.
+    /// Builds a canvas over a graph that already exists (another view of it).
     pub fn over(self, graph: &SharedGraph) -> CanvasLayer {
         // Names rather than nodes: a graph that has been edited has holes, and the view
-        // has to agree about them (§43).
+        // has to agree about them.
         let names = graph.borrow().names();
         let geometry = {
             let graph = graph.clone();
@@ -143,7 +112,7 @@ impl CanvasSpec {
         CanvasLayer::new(names, geometry, source)
             .with_controls_on_hover(self.controls_on_hover)
             // The graph's links unless the caller names its own, because topology is the
-            // model's (§43): two views over one graph must not hold two copies of it.
+            // model's: two views over one graph must not hold two copies of it.
             .with_links(self.links.unwrap_or_else(|| graph.borrow().links().to_vec()))
             .with_far_overscan(self.far.overscan)
             .with_ports(crate::node::PORTS)
@@ -182,7 +151,7 @@ pub fn generated_links(count: usize) -> Vec<Link> {
     links
 }
 
-/// The far-field knobs the §35 measurements sweep.
+/// The far-field knobs the measurements sweep.
 ///
 /// Not a public API of the library — knobs of *this example*, so that the levers
 /// `blazy-canvas` offers (the recorded margin) and the ones an application owns (how
@@ -196,9 +165,9 @@ pub struct FarTuning {
     pub min_radius_px: f64,
     /// `LinkStyle::min_screen_length`: how long a link must be on screen to be drawn.
     pub min_link_px: f64,
-    /// `LinkStyle::far_fill`: links filled rather than stroked in the far field (§53).
+    /// `LinkStyle::far_fill`: links filled rather than stroked in the far field.
     pub fill_links: bool,
-    /// `LinkStyle::far_min_width_px`: the narrowest a far-field link is on screen (§53).
+    /// `LinkStyle::far_min_width_px`: the narrowest a far-field link is on screen.
     pub link_min_px: f64,
 }
 

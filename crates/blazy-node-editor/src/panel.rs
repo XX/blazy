@@ -16,40 +16,25 @@ use masonry::layout::{LenReq, Length, SizeDef};
 
 use crate::{NodeGraph, SharedGraph, WatchToken};
 
-/// What builds a panel's content: from the graph, the selection, and the panel's own id —
-/// the id a field in the content records its own changes under
-/// ([`Views::note_except`](crate::Views::note_except)), so that typing into the panel does
-/// not rebuild the panel under the caret.
+/// What builds a panel's content from the graph, the selection and the panel's own id. A
+/// field in the content records its changes past that id, so typing does not rebuild it.
 pub type BuildPanel<G> = dyn Fn(&SharedGraph<G>, &BTreeSet<usize>, WidgetId) -> NewWidget<dyn Widget>;
 
 /// What a panel did, summed over its life.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PanelCounters {
-    /// Times the content was built again, the first build included.
-    ///
-    /// One per frame in which the graph changed, and none in a frame in which it did not:
-    /// a panel must not wake an idle window (§36).
+    /// Times the content was built, the first build included.
     pub builds: u64,
 }
 
-/// Shows what the application builds from the graph and its selection, and builds it again
-/// when either changes, in whatever area or window the change was made (§62).
+/// Shows what the application builds from the graph and its selection, and rebuilds it
+/// whole when something it can show changes (the selection, content, structure, a move of
+/// a selected node), in any area or window.
 ///
-/// A *watcher* of the graph's [`Views`](crate::Views): it is owed a refresh after any
-/// change recorded there — a selection, a node's content, a move, an edit — and the editor
-/// that made the change refreshes it in the same frame if it is in the same window, the
-/// window's pull if it is in another. Owed is a flag, so many changes before a frame cost
-/// one build, and nothing changed costs nothing.
-///
-/// The content is the application's: what a node holds is opaque to the editor
-/// ([`NodeGraph::Content`]), so only the application can say what its panel shows. It is
-/// rebuilt whole, which is cheap for a panel of one node and keeps the content free of
-/// any idea of "update"; the one thing it must do is record its own edits under the
-/// panel's id, or it is rebuilt under the user's hands.
-///
-/// Carries the region's interface scale to its content in the pass it arrives in
-/// ([`CarriesScale`]), and gives a rebuilt content the scale it had.
+/// A watcher of the graph's [`Views`](crate::Views): refreshed by the editor in the same
+/// window, by the pull in another; many changes before a frame cost one build. Carries the
+/// region's interface scale to its content ([`CarriesScale`]).
 pub struct GraphPanel<G: NodeGraph> {
     graph: SharedGraph<G>,
     build: Rc<BuildPanel<G>>,
@@ -92,7 +77,7 @@ impl<G: NodeGraph> GraphPanel<G> {
             .to_pod()
     }
 
-    /// Builds the content again from the graph. What the registry calls on a watcher.
+    /// Builds the content again from the graph.
     pub fn refresh(this: &mut WidgetMut<'_, Self>) {
         let panel = this.ctx.widget_id();
         this.widget.graph.borrow().views().refreshed(panel);

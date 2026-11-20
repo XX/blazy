@@ -1,9 +1,4 @@
 //! The host: a chosen rasteriser, a composed plan, and the frame that comes out.
-//!
-//! This is the piece `rnd/architecture.md` §23.4 wrote by hand in forty lines of test
-//! code when the sharpness measurement needed a device scale factor and the upstream
-//! harness would not apply one. It belongs here, and the sharpness tests now go
-//! through it rather than through a copy of it.
 
 use masonry::app::VisualLayerPlan;
 use masonry::dpi::PhysicalSize;
@@ -71,26 +66,13 @@ pub struct HostCounters {
     /// Scene layers replayed into the frame.
     pub scenes: u64,
     /// Holes reported to the host.
-    ///
-    /// Compared against what the widgets declared, this is what says whether a hole
-    /// was lost on the way (§26.1).
     pub holes: u64,
     /// Bytes of frame that became pixels in main memory.
-    ///
-    /// Counted here because here is where it happens: a rasterised frame *is* this
-    /// many bytes, and anything downstream that moves them is moving these. A path
-    /// that never asks the host for an image never adds to it, which is what the
-    /// criteria of §27.4 are about.
     pub image_bytes: u64,
 }
 
 impl HostCounters {
     /// What has happened since `before`, field by field.
-    ///
-    /// The counters are cumulative for the life of the host, and every caller of them
-    /// wants a window: a benchmark brackets a scenario, a test brackets a frame. Doing
-    /// the subtraction here rather than at each call site is what lets a new counter be
-    /// added without every one of them having to hear about it.
     #[must_use]
     pub fn since(self, before: Self) -> Self {
         Self {
@@ -103,18 +85,12 @@ impl HostCounters {
     }
 }
 
-/// Composes plans and rasterises them, with the backend chosen at startup.
-///
-/// Owns no window: it turns a plan into pixels, and where those pixels go is
-/// [`crate::window`]'s business in owner mode and the engine's in guest mode (§14).
+/// Composes plans and rasterises them, with the backend chosen at startup. Owns no window.
 pub struct Host {
     backend: Backend,
     renderer: Box<dyn ImageRenderer>,
     device_scale: f64,
     /// What shows where nothing was drawn.
-    ///
-    /// The host's business rather than the tree's: a window has to have something
-    /// behind its widgets, and a rasteriser clears to transparent.
     background: Option<Color>,
     counters: HostCounters,
 }
@@ -155,7 +131,7 @@ impl Host {
     ///
     /// Deliberately nothing else happens: the scale reaches the rasteriser through
     /// the composition transform, so a display change costs a frame and never a
-    /// layout pass (§9, §22). That is the claim four criteria and seven tests hold
+    /// layout pass. That is the claim four criteria and seven tests hold
     /// for `ui_scale`, and this is the same line drawn for the third multiplier.
     pub fn set_device_scale(&mut self, scale: f64) {
         self.device_scale = scale;

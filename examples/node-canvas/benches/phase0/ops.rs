@@ -1,11 +1,11 @@
-//! What a gesture costs, and where the operator layer can sit (§38).
+//! What a gesture costs, and where the operator layer can sit.
 //!
 //! Its own file because it is a table rather than a scenario: one graph, one gesture
 //! per row, and the same counters under each of them. Three things are being compared
 //! and they are not variations of one another —
 //!
 //! * the **seat**: the same grab driven from inside the widget tree and from in front of `RenderRoot`, which is the
-//!   choice §11 got wrong and this answers with numbers;
+//!   choice got wrong and this answers with numbers;
 //! * the **start**: a modal operator begun by a press holds Masonry's pointer capture, one begun by a key cannot, and
 //!   the difference is a column;
 //! * the **shape of undo**: a journal of what changed against a snapshot of the model.
@@ -60,7 +60,7 @@ pub(crate) struct OpsRow {
     pub(crate) tree_first: f64,
     /// Events a pre-tree seat kept from the widget tree, per gesture.
     ///
-    /// The mirror of [`tree_first`](Self::tree_first), and the column §39 added: what
+    /// The mirror of [`tree_first`](Self::tree_first), and the column the layer seat added: what
     /// used to leak is now withheld, and the two numbers add up to the same gesture.
     pub(crate) withheld: f64,
     /// Nodes laid out, per gesture. The comparison with the canvas's own drag.
@@ -70,7 +70,7 @@ pub(crate) struct OpsRow {
     /// The counter a gesture is judged on rather than [`child_layouts`](Self::child_layouts):
     /// a pass over clean children costs almost nothing and leaves that one at zero, so
     /// bounding it would let a gesture ask for layout on every event and still pass —
-    /// the same trap `picking_does_not_relayout` was checked against (§25.4).
+    /// the same trap `picking_does_not_relayout` was checked against.
     pub(crate) content_layouts: f64,
     /// Picks answered, per gesture.
     pub(crate) picks: f64,
@@ -92,7 +92,7 @@ pub(crate) struct OpsRow {
     /// own, and a zoom row whose operator never ran would cost exactly what the canvas's
     /// zoom costs — and pass any comparison with it.
     pub(crate) invoked: f64,
-    /// Classes put on or taken off nodes, per gesture (§38.7): what a view's selection
+    /// Classes put on or taken off nodes, per gesture: what a view's selection
     /// costs its nodes.
     pub(crate) class_changes: f64,
     /// Nodes on screen whose look disagrees with the selection, after the row: selected
@@ -322,7 +322,7 @@ fn box_row(count: usize, repeats: usize) -> OpsRow {
 /// A grab started by `G`: the case pointer capture cannot cover.
 ///
 /// `cancel` ends it with Escape instead of a confirming press, because a sweep that
-/// only ever confirms tests half a switch (§28.4).
+/// only ever confirms tests half a switch.
 fn grab_row(gesture: &'static str, count: usize, repeats: usize, cancel: bool) -> OpsRow {
     let (mut harness, _graph) = ops_harness(count);
     let index = visible_node(&mut harness);
@@ -379,7 +379,7 @@ fn drag_row(count: usize, repeats: usize) -> OpsRow {
     row("drag (LMB)", "tree", &mut harness, start, repeats, MOVES + 2, 0, ms)
 }
 
-/// Drags a link out of one node's output into another node's second input (§52).
+/// Drags a link out of one node's output into another node's second input.
 ///
 /// A different pair of on-screen nodes each time, into the input no generated link uses, so
 /// that every gesture really adds a link: a repeat would be a duplicate the graph refuses,
@@ -465,7 +465,7 @@ fn reset_view(harness: &mut TestHarness<NodeEditor>, delta: Vec2) {
 }
 
 /// The canvas's own drag, for comparison: the same node moved the same way, by the
-/// code the operator layer replaced (§20.5, §30.4).
+/// code the operator layer replaced.
 fn canvas_drag_row(count: usize, repeats: usize) -> OpsRow {
     let (mut harness, _graph) = plain_harness(count, true);
     let index = visible_node(&mut harness);
@@ -490,7 +490,7 @@ fn canvas_drag_row(count: usize, repeats: usize) -> OpsRow {
     row("canvas drag", "canvas", &mut harness, start, repeats, MOVES + 2, 0, ms)
 }
 
-/// The same grab, driven from the seat in front of `RenderRoot` (§38.2).
+/// The same grab, driven from the seat in front of `RenderRoot`.
 ///
 /// This is what a host hook can and cannot do, priced. It can withhold any event from
 /// the tree, which is the one thing the in-tree seat cannot — and it knows nothing
@@ -678,7 +678,7 @@ pub(crate) const NOTCHES: usize = 6;
 
 /// Zooms in by a few wheel notches, through the keymap or through the canvas's own wheel.
 ///
-/// The pair §38.7 left open: the wheel was the canvas's, and `view.zoom` took it over
+/// The pair left open: the wheel was the canvas's, and `view.zoom` took it over
 /// (`issues/keymap file and zoom operator.md`). The claim is that it costs nothing for
 /// having moved — the same passes, no node laid out — and the operator row has to show
 /// its operator actually ran, or it is the canvas row twice.

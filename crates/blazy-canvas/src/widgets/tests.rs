@@ -127,7 +127,7 @@ fn node_rect(x: f64, y: f64) -> Rect {
 
 const EVERYTHING: Rect = Rect::new(-1000.0, -1000.0, 1000.0, 1000.0);
 
-/// The claim of §6.1: the hit geometry is the shape, not the box it sits in.
+/// The hit geometry is the shape, not the box it sits in.
 #[test]
 fn a_point_in_the_corner_of_a_node_misses_it() {
     let mut canvas = content(&[node_rect(0.0, 0.0)], Vec::new(), EVERYTHING);
@@ -160,7 +160,7 @@ fn a_link_is_picked_along_its_curve() {
     assert_eq!(canvas.hit(Point::new(250.0, 90.0), 1.0), None);
 }
 
-/// Nodes are painted over links, so they are picked over links too (§25.3).
+/// Nodes are painted over links, so they are picked over links too.
 #[test]
 fn a_node_wins_over_a_link_running_under_it() {
     let mut canvas = content(
@@ -192,7 +192,7 @@ fn a_node_wins_over_a_link_running_under_it() {
 }
 
 /// The tolerance is in screen pixels, so the same canvas point picks a link when
-/// the canvas is zoomed out and misses it when zoomed in (§25.2).
+/// the canvas is zoomed out and misses it when zoomed in.
 #[test]
 fn the_link_tolerance_follows_the_zoom() {
     let mut canvas = content(
@@ -209,7 +209,7 @@ fn the_link_tolerance_follows_the_zoom() {
 }
 
 /// What can be picked is what is drawn, including where that is not enough: a
-/// link whose ends are both outside the recorded region is neither (§24.4).
+/// link whose ends are both outside the recorded region is neither.
 #[test]
 fn a_link_that_is_not_drawn_is_not_picked() {
     let mut canvas = content(
@@ -223,7 +223,7 @@ fn a_link_that_is_not_drawn_is_not_picked() {
 }
 
 /// Nodes below the far-field threshold have no widget at all, and must still be
-/// pickable — the reason picking asks the model and not the tree (§20.6).
+/// pickable — the reason picking asks the model and not the tree.
 #[test]
 fn a_node_with_no_widget_is_still_picked() {
     let mut canvas = content(&[node_rect(0.0, 0.0)], Vec::new(), EVERYTHING);
@@ -309,7 +309,7 @@ fn an_unlimited_budget_never_binds() {
 
 /// Coming back up costs more than staying put, which is what stops the flapping.
 ///
-/// The gap is the measured jitter of the visible set during a pan (§29.1): with
+/// The gap is the measured jitter of the visible set during a pan: with
 /// the two thresholds equal, a set wobbling between 249 and 251 nodes switches
 /// level twice a second and rebuilds every visible node each time.
 #[test]
@@ -538,7 +538,7 @@ fn overlapping_curves_composite_once_in_a_batch() {
     );
 }
 
-// --- MARK: STRUCTURE (§43)
+// --- MARK: STRUCTURE
 
 /// Three nodes in a row, wired 0-1-2, everything visible.
 fn chain() -> CanvasContent {
@@ -554,7 +554,7 @@ fn node_at(canvas: &mut CanvasContent, x: f64, y: f64) -> Option<usize> {
     canvas.hit(Point::new(x, y), 1.0).and_then(CanvasHit::node)
 }
 
-/// The rule §41.2 made for areas, here: a removal renumbers nothing.
+/// Names are never renumbered: a removal renumbers nothing.
 ///
 /// The node that stayed keeps its name, its place and its links — which is what a
 /// selection, a history and the other views of the graph are all keyed by.
@@ -609,7 +609,7 @@ fn a_removed_node_comes_back_with_its_links() {
 }
 
 /// A structural edit is not a view change, and the recorded sets are chosen by the
-/// view — so the edit has to say so itself (§28.4).
+/// view — so the edit has to say so itself.
 #[test]
 fn an_edit_re_chooses_the_recorded_sets() {
     let mut canvas = chain();

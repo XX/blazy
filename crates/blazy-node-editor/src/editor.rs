@@ -1,28 +1,19 @@
-//! The node editor widget: a canvas, the operator layer's driver, and two overlays.
-//!
-//! The selection overlay is always drawn. The statistics overlay is optional
-//! ([`NodeEditor::with_hud`]): it began because Phase 0 is a measurement, not a demo —
-//! numbers that only appear in a log are numbers nobody checks while dragging a node
-//! around — and it is what an application wants while it tunes its own graph.
+//! The node editor widget: a canvas, the operators' driver, the selection overlay and an
+//! optional statistics overlay ([`NodeEditor::with_hud`]).
 //!
 //! ## The driver
 //!
-//! With [`NodeEditor::with_ops`] this widget is also where §38's answer lands: the
-//! seat the operator layer sits in. It is three seats at once, and it has to be,
-//! because no single one of them does the whole job:
+//! With [`NodeEditor::with_ops`] the widget runs operators from three seats, because no
+//! single one does the whole job:
 //!
-//! * [`Layer::capture_pointer_event`] — every pointer event, before the tree, even outside this widget's rectangle. It
-//!   cannot stop one, so it only counts them.
-//! * [`Widget::on_pointer_event`] — the ordinary bubbled route. Everything below has had its refusal first, which is
-//!   what keeps the sliders inside nodes working, and it is the only place pointer capture may be taken (Masonry allows
-//!   it during a press and nowhere else).
-//! * [`Widget::on_text_event`] — keys, once the host has made this widget the focus fallback
-//!   (`RenderRoot::set_focus_fallback`), because a keymap has to hear the keys no focused widget claimed.
+//! * [`Layer::capture_pointer_event`] — every pointer event, before the tree and outside this widget too; it can keep
+//!   an event from the tree while an operator owns the gesture.
+//! * [`Widget::on_pointer_event`] — the bubbled route: widgets in nodes refuse first, and pointer capture can be taken
+//!   here (Masonry allows it only during a press).
+//! * [`Widget::on_text_event`] — keys, as the focus fallback (`RenderRoot::set_focus_fallback`).
 //!
-//! Everything an operator does lands in the model. What comes back out is
-//! which nodes moved ([`EditorWorld::take_moved`]), and carrying that into this canvas and into the *other*
-//! views of the same graph is this driver's job — §30's fan-out, moved from the
-//! canvas's own drag handler to here.
+//! Operators change the model; the driver carries the changes into this canvas and into
+//! the other views of the same graph.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -56,58 +47,34 @@ use crate::menu::MenuLayer;
 use crate::ops::CANVAS_SCOPE;
 use crate::{Change, EDGE_PAN, Edit, EditorWorld, MoveRecorder, NodeGraph, SharedGraph};
 
-/// What a view of a graph holds that the graph does not.
+/// What an area keeps about its view of a graph: the view, the operators, the sidebar.
 ///
-/// The three things §30 and §38.4 left outside the model on purpose — where the view is
-/// looking, what is selected in it, and what it can undo — and the one place they now
-/// live. **Beside the widget rather than inside it**, because a widget is temporary and
-/// a session is not: an area rebuilt in another window is the same session under a new
-/// tree, and a widget that owned its state would lose it (the detach task, decision 1).
-///
-/// Not in the model either, and that is a measured line rather than a taste: a selection
-/// shared by every view repaints every area showing the graph, 50.57 ms against 12.99
-/// (§38.4).
+/// Kept beside the widget rather than in it, so that an area rebuilt elsewhere (detached
+/// into another window, read from a workspace) keeps it.
 pub struct EditorSession<G: NodeGraph> {
     /// Everything the operators may touch, selection included.
     pub(crate) world: EditorWorld<G>,
     /// The operators, their keymap, the modal stack and the undo history.
     pub(crate) runtime: OpRuntime<EditorWorld<G>>,
     /// Where the canvas is looking, mirrored from it on every layout.
-    ///
-    /// The canvas owns the view while it exists (§22 keeps it out of layout, so nothing
-    /// else may drive it); this is the copy that outlives it.
     pub(crate) view: Affine,
-    /// The editor widget showing this session, once it is in a tree.
-    ///
-    /// For a driver that has to send it keys: Masonry hands a key to the focused widget
-    /// or to the window's focus fallback and to nobody else (§38.3), so in a window of
-    /// several areas the driver points the fallback at the editor under the pointer —
-    /// and an area knows its session, not its widgets. Recorded by the editor itself when
-    /// it is added, and overwritten by the next one when the area is rebuilt elsewhere.
+    /// The editor widget showing this session, once it is in a tree; set by the editor.
     pub(crate) editor: Option<WidgetId>,
-    /// How the view scrolls at the edge of the area during a gesture, or `None` for not at
-    /// all — the default, which leaves a gesture carrying on past the border while the
-    /// view stands still. A binding still has to ask for it ([`EDGE_PAN`](crate::EDGE_PAN)).
-    ///
-    /// The session's rather than the widget's, so that the choice goes with the area into
-    /// another window, as the view and the history do (§44).
+    /// How the view scrolls at the area's edge during a gesture whose binding asks for it
+    /// ([`EDGE_PAN`](crate::EDGE_PAN)); `None` (the default) for not at all.
     pub(crate) edge_pan: Option<EdgePan>,
-    /// The area's sidebar: shown or not, and how wide (§61).
-    ///
-    /// The session's, for the reason the view is: an area is built again when it is detached
-    /// or a workspace is read, and what it showed has to come back with it. Shared with the
-    /// area's widget, which reads it in layout and writes the width its grip is dragged to.
+    /// The area's sidebar: shown or not, and how wide. Shared with the area's widget.
     pub(crate) sidebar: blazy_areas::SidebarState,
 }
 
 impl<G: NodeGraph> EditorSession<G> {
-    /// The world the area's operators act on (§68): the graph, the pointer, the selection.
+    /// The world the area's operators act on: the graph, the pointer, the selection.
     pub fn world(&self) -> &EditorWorld<G> {
         &self.world
     }
 
-    /// The world, for a driver to keep what it hands its operators — the screen's snapshot
-    /// and the system clipboard (§71) — and to take what they asked of it.
+    /// The world, for a driver to give the operators the screen's snapshot and the clipboard,
+    /// and to take their requests.
     pub fn world_mut(&mut self) -> &mut EditorWorld<G> {
         &mut self.world
     }
@@ -117,20 +84,17 @@ impl<G: NodeGraph> EditorSession<G> {
         &self.world.graph
     }
 
-    /// The area's operators, keymap and history — to read: what is bound, how deep the
-    /// history is, whether a gesture is running. Changing them goes through the session's
-    /// own methods or the editor (`NodeEditor::exec`).
+    /// The area's operators, keymap and history, to read.
     pub fn runtime(&self) -> &OpRuntime<EditorWorld<G>> {
         &self.runtime
     }
 
-    /// The area's view: pan and zoom, which the session keeps across a detach (§44).
+    /// The area's view: pan and zoom.
     pub fn view(&self) -> Affine {
         self.view
     }
 
-    /// The editor widget showing the session, once it is in a tree — what a driver sends
-    /// keys to and a panel runs operators in.
+    /// The editor widget showing the session, once it is in a tree.
     pub fn editor(&self) -> Option<WidgetId> {
         self.editor
     }
@@ -145,31 +109,23 @@ impl<G: NodeGraph> EditorSession<G> {
         self.edge_pan = edge_pan;
     }
 
-    /// The area's sidebar: a shared cell, read by the area's widget in its layout (§61).
+    /// The area's sidebar.
     pub fn sidebar(&self) -> &blazy_areas::SidebarState {
         &self.sidebar
     }
 
-    /// Hands `event` to the runtime against this session's world, as the editor does —
-    /// for a driver of its own: a test, a benchmark, a host seat.
+    /// Hands `event` to the runtime, for a driver of its own.
     pub fn dispatch(&mut self, event: &OpEvent, scope: Scope<'_>, seat: Seat) -> Dispatch {
         self.runtime.dispatch(&mut self.world, event, scope, seat)
     }
 
-    /// Ends whatever gesture is running, cleaning up after it (§58) — what a detach and a
-    /// lost window focus do.
+    /// Ends whatever gesture is running, cleaning up after it.
     pub fn cancel_all(&mut self) {
         self.runtime.cancel_all(&mut self.world);
     }
 
-    /// Records an edit of node `index`'s content, made past the operators — in the node's
-    /// widget or a panel — as one step in this area's history (§67).
-    ///
-    /// The edit is already in the model; this only makes it undoable. Call it once per edit,
-    /// when it is finished — a field left, `Enter` — with what the node held before the edit
-    /// began and what it holds now, not once per key: Blender writes a step when a field's
-    /// edit ends, and five keys are one rename. Undo puts `before` back into the model and
-    /// into every view of the graph; redo, `after`.
+    /// Records an edit of node `index`'s content made past the operators (in a widget) as
+    /// one undo step. The edit is already in the model; call this once, when it ends.
     pub fn record_content(&mut self, index: usize, before: G::Content, after: G::Content) {
         self.runtime
             .history_mut()
@@ -181,11 +137,10 @@ impl<G: NodeGraph> EditorSession<G> {
         Self::with_runtime(graph, crate::ops::runtime())
     }
 
-    /// The same, with a runtime of the caller's own: another keymap, more operators.
+    /// The same, with a runtime of the caller's own.
     ///
-    /// Every session over one graph keeps **one history**, the graph's (§70): an edit made
-    /// in any area clears what any area could redo, as Blender keeps one history per file.
-    /// Per area, a redo in one could put a node under a name another area had taken since.
+    /// Every session over one graph shares the graph's history, as Blender keeps one per
+    /// file: separate histories could redo a node into a name another area has taken.
     pub fn with_runtime(graph: &SharedGraph<G>, mut runtime: OpRuntime<EditorWorld<G>>) -> Self {
         let views = graph.borrow().views().clone();
         match views.history::<EditorWorld<G>>() {
@@ -202,16 +157,14 @@ impl<G: NodeGraph> EditorSession<G> {
         }
     }
 
-    /// The same session, scrolling at the edge of its area as `edge_pan` says, or not at
-    /// all for `None`. See [`edge_pan`](Self::edge_pan).
+    /// The same session, with `edge_pan`.
     #[must_use]
     pub fn with_edge_pan(mut self, edge_pan: Option<EdgePan>) -> Self {
         self.edge_pan = edge_pan;
         self
     }
 
-    /// The edge pan the running operator scrolls by: the session's, if its binding asked
-    /// for it ([`EDGE_PAN`](crate::EDGE_PAN)), and `None` between gestures.
+    /// The edge pan the running operator scrolls by, if its binding asked for it.
     fn edge_pan_in_force(&self) -> Option<EdgePan> {
         let asked = self
             .runtime
@@ -227,17 +180,9 @@ impl<G: NodeGraph> EditorSession<G> {
 }
 
 /// A session as it is held: by the area that owns it and by the widget that shows it.
-///
-/// `Rc<RefCell<_>>` for the reason the model is (§30): everything here lives on the UI
-/// thread, and the alternative — a lock — buys no thread it could be used from, since
-/// Masonry's tree is not `Send`, while turning a re-entrant borrow from a loud panic
-/// into a silent deadlock.
 pub type SessionHandle<G> = Rc<RefCell<EditorSession<G>>>;
 
 /// The colours the editor draws with.
-///
-/// Style rather than mechanism, like the canvas's `LinkStyle`: what a selection looks
-/// like is the application's business.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OverlayStyle {
     /// Behind the canvas, where no node is.
@@ -246,34 +191,24 @@ pub struct OverlayStyle {
     pub selection: Color,
     /// The inside of the rubber band.
     pub band_fill: Color,
-    /// The dot of a lit port: the one under the pointer a press and drag would start a link
-    /// drag from, the one a new link is being drawn out of, and the one a link being dragged
-    /// would be connected to. The canvas's default link hover colour, so the two highlights
-    /// read as one. Only the colour changes: a layout without dots
-    /// (`PortLayout::dot_radius` at zero) has nothing to light.
+    /// A lit port: under the pointer, the one a link is drawn from, or the one it would
+    /// connect to.
     pub port_hover: Color,
-    /// A link being dragged onto a port the graph would not connect it to
-    /// ([`NodeGraph::accepts_link`]) — red, as Blender draws an invalid link.
+    /// A link dragged onto a port that refuses it.
     pub refused: Color,
     /// Where the editor outlines selected nodes itself.
     pub outline: SelectionOutline,
 }
 
-/// Where the editor draws its own outline round a selected node.
-///
-/// Every selected node wears the [`SELECTED`](crate::SELECTED) class whatever this says,
-/// so an application that styles it (`DefaultProperties::insert_stack` with
-/// `Selector::classes(&["selected"])`) can have the node look selected by itself. The
-/// outline is for what such a style cannot reach.
+/// Where the editor outlines selected nodes itself. Every selected node also wears the
+/// [`SELECTED`](crate::SELECTED) class, for an application to style.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[expect(clippy::exhaustive_enums, reason = "configuration, matched by the caller")]
 pub enum SelectionOutline {
-    /// Round every selected node on screen. The default, because an application that
-    /// styles nothing would otherwise have a selection nobody can see.
+    /// Round every selected node on screen. The default.
     #[default]
     Always,
-    /// Only where nodes have no widgets — the far field (§20.6), where a node is a shape
-    /// in the canvas's own scene and wears no class.
+    /// Only where nodes have no widgets (the far field), which no class reaches.
     FarField,
 }
 
@@ -294,20 +229,13 @@ impl Default for OverlayStyle {
 pub struct NodeEditor<G: NodeGraph> {
     canvas: WidgetPod<CanvasLayer>,
     /// The operator layer, or `None` for an editor with the canvas's own gestures.
-    ///
-    /// Optional so that every measurement written before §38 still measures what it
-    /// measured: an editor without operators is the widget it always was, down to the
-    /// counter.
     session: Option<SessionHandle<G>>,
     /// How the overlays are drawn.
     style: OverlayStyle,
     /// The last line of the statistics overlay, or `None` for no overlay at all.
     hud_caption: Option<String>,
-    /// The canvas's view transform, as of the last layout.
-    ///
-    /// Cached because the overlay is drawn in `post_paint`, and a `PaintCtx` cannot
-    /// reach into a child. It cannot go stale: the view only ever changes through a
-    /// layout (§22), and this is refreshed in every one.
+    /// The canvas's view transform as of the last layout, for `post_paint`, which cannot
+    /// reach into a child.
     view: Affine,
     /// Stats cached during layout, so `post_paint` draws numbers from this frame.
     stats: CanvasStats,
@@ -316,47 +244,31 @@ pub struct NodeEditor<G: NodeGraph> {
     /// Scratch buffer the next HUD text is formatted into, reused between frames.
     hud_next: String,
     /// The HUD text, shaped.
-    ///
-    /// Shaping three lines of text costs more than everything else this widget does,
-    /// so it must not happen per frame. It is redone only when [`Self::hud`] actually
-    /// changes, which during a steady pan is almost never.
+    /// Reshaped only when [`Self::hud`] changes: shaping costs more than the rest of a frame.
     hud_layout: Option<Layout<BrushIndex>>,
-    /// The nodes this editor's canvas has been told are selected.
-    ///
-    /// What the [`SELECTED`](crate::SELECTED) class was last set from, so that a change of
-    /// selection touches the nodes that changed and no others — a box select of a
-    /// thousand nodes and one more click should cost one class, not a thousand.
+    /// The nodes this editor's canvas has been told are selected, so a change of selection
+    /// touches only the nodes that changed.
     shown: BTreeSet<usize>,
-    /// The graph's generation this editor last saw: a newer one means the graph was
-    /// replaced as a whole, and the history is started over (§69).
+    /// The graph's generation this editor last saw; a newer one means the graph was replaced.
     generation: u64,
     /// The menu this editor opened and has not seen closed, by its layer's root.
     menu: Option<WidgetId>,
     /// What the pointer was over when the press now held was made.
     press_hover: Option<CanvasHit>,
-    /// The port under the pointer, when a press and drag from it would start a link drag —
-    /// lit up over the canvas, as the canvas lights up the link under the pointer (§59.6).
+    /// The port under the pointer a drag would start a link from, lit over the canvas.
     port_hint: Option<(usize, PortSide, u16)>,
-    /// The node edge under the pointer a drag would resize the node by — lined over the
-    /// canvas, since the cursor before the press is the node widget's to choose (§60).
+    /// The node edge under the pointer a drag would resize the node by.
     edge_hint: Option<(usize, crate::ops::NodeEdge)>,
-    /// The modifiers held as of the last event, keys included: `Ctrl` pressed with the
-    /// pointer standing still changes what a drag from the port under it would do.
+    /// The modifiers held as of the last event (`Ctrl` changes what a port drag does).
     mods: Modifiers,
-    /// The canvas's hover is from before a gesture an operator held, which the canvas saw
-    /// none of; it is trusted again from the next move.
+    /// The canvas's hover predates a gesture it did not see; trusted again from the next move.
     hover_stale: bool,
     /// The running gesture's edge pan, and what edge pan has done here.
     edge: EdgePanState,
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
-    /// The canvas this editor drives.
-    ///
-    /// What a graph names its views by: a canvas tells the model its own id when it is
-    /// attached (`NodeSource::attached`), so an application that has to reach a view —
-    /// to carry a change into a window the push fan-out cannot reach — asks the editor
-    /// for it.
+    /// The canvas this editor drives; its id is what the graph's views are named by.
     pub fn canvas_id(&self) -> WidgetId {
         self.canvas.id()
     }
@@ -367,9 +279,6 @@ impl<G: NodeGraph> NodeEditor<G> {
     }
 
     /// Runs a callback with a `WidgetMut` for the inner canvas.
-    ///
-    /// The canvas is reached through a context rather than a field because a
-    /// `WidgetPod` hands its widget to the arena once inserted.
     pub fn with_canvas<R>(this: &mut WidgetMut<'_, Self>, f: impl FnOnce(WidgetMut<'_, CanvasLayer>) -> R) -> R {
         let canvas = this.ctx.get_mut(&mut this.widget.canvas);
         f(canvas)
@@ -399,36 +308,22 @@ impl<G: NodeGraph> NodeEditor<G> {
         }
     }
 
-    /// The same editor, with the operator layer driving the primary button and the
-    /// keyboard.
+    /// The same editor, with operators driving the pointer and the keyboard.
     ///
-    /// Takes the canvas's own primary-button gestures away
-    /// ([`CanvasLayer::with_builtin_gestures`]): the canvas is *below* this widget, so
-    /// leaving them on would mean the canvas answering a press before the keymap ever
-    /// heard of it. What the canvas keeps is the middle-button pan, the wheel zoom and
-    /// the pick on every pointer event — the last of which is what the operators' poll
-    /// reads as context.
+    /// Turns the canvas's own gestures off ([`CanvasLayer::with_builtin_gestures`]), or it
+    /// would answer a press before the keymap heard of it; the canvas still picks on every
+    /// pointer event, which is what the operators poll on.
     pub fn with_ops(canvas: CanvasLayer, graph: &SharedGraph<G>) -> Self {
         Self::with_session(canvas, EditorSession::new(graph).share())
     }
 
     /// As [`with_ops`](Self::with_ops), with a runtime of the caller's own.
-    ///
-    /// For a keymap read from a file, or operators of the application's own registered
-    /// beside [`ops`](crate::ops)'s. The runtime is handed over whole rather than
-    /// assembled here, because what goes into it is the application's decision and
-    /// `blazy-ops` already has the vocabulary for it.
     pub fn with_runtime(canvas: CanvasLayer, graph: &SharedGraph<G>, runtime: OpRuntime<EditorWorld<G>>) -> Self {
         Self::with_session(canvas, EditorSession::with_runtime(graph, runtime).share())
     }
 
-    /// An editor over a session that already exists.
-    ///
-    /// The constructor detach is built on: the area is rebuilt — a widget tree cannot
-    /// move between windows — but what it was showing, what was selected in it and what
-    /// it could undo are the session's, and the session does not move at all. The canvas
-    /// is handed the session's view, so the new widget opens where the old one was
-    /// looking.
+    /// An editor over a session that already exists (an area rebuilt elsewhere); the canvas
+    /// opens at the session's view.
     pub fn with_session(canvas: CanvasLayer, session: SessionHandle<G>) -> Self {
         // The wheel too: `view.zoom` is bound on it, and the canvas below would answer
         // first and mark it handled.
@@ -445,18 +340,11 @@ impl<G: NodeGraph> NodeEditor<G> {
     }
 
     /// The session this editor shows, if it has one.
-    ///
-    /// What an area hands to the area that replaces it (decision 1a): the handle is the
-    /// state, and passing it is the whole of "moving" an editor.
     pub fn session(&self) -> Option<&SessionHandle<G>> {
         self.session.as_ref()
     }
 
     /// The same editor, drawing a statistics overlay whose last line is `caption`.
-    ///
-    /// Two lines of numbers a human watches — what is materialised, the zoom, the
-    /// detail level, the widgets built, and the gestures the runtime recognised — and
-    /// one line of the application's, usually what the keys do.
     #[must_use]
     pub fn with_hud(mut self, caption: impl Into<String>) -> Self {
         self.hud_caption = Some(caption.into());
@@ -486,8 +374,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             .unwrap_or_default()
     }
 
-    /// How many operators are running. Zero between gestures, and a gesture that ends
-    /// with this non-zero is one that never finished.
+    /// How many operators are running; zero between gestures.
     pub fn modal_depth(&self) -> usize {
         self.session
             .as_ref()
@@ -495,17 +382,11 @@ impl<G: NodeGraph> NodeEditor<G> {
     }
 
     /// The status line as it was last painted. Empty without [`with_hud`](Self::with_hud).
-    ///
-    /// For a test that wants to check what the window says rather than what the counters
-    /// hold — the two can disagree, and when they do it is the line that is wrong.
     pub fn hud(&self) -> &str {
         &self.hud
     }
 
-    /// Whether a press is being held while the runtime waits to see what it becomes.
-    ///
-    /// Between "nothing running" and "a modal operator running" there is now a third
-    /// state, and a gesture that ends in it is one that never resolved (§39.3).
+    /// Whether a press is held while the runtime waits to see what it becomes.
     pub fn is_holding(&self) -> bool {
         self.session
             .as_ref()
@@ -531,19 +412,13 @@ impl<G: NodeGraph> NodeEditor<G> {
         self.edge.counters
     }
 
-    /// Runs an operator by name, from outside the tree.
-    ///
-    /// The `exec` half of §11 — a script, a test, a redo — and it goes through the
-    /// same runtime, the same poll and the same history as a key would. What it also
-    /// does is what the interactive path does after a dispatch: carry the moved nodes
-    /// into this canvas and into the other views of the graph.
+    /// Runs an operator by name (a menu, a script, a test), through the same poll and history
+    /// as a key, and carries its changes into the views.
     pub fn exec(this: &mut WidgetMut<'_, Self>, name: &str, props: &Props) -> OpResult {
         let Some(session) = this.widget.session.clone() else {
             return OpResult::PassThrough;
         };
-        // The borrow ends before the flush, which takes one of its own: a session is
-        // shared now, and a borrow held across a call into the tree is how a `RefCell`
-        // turns into a panic.
+        // The borrow ends before the flush, which takes its own.
         let result = {
             let session = &mut *session.borrow_mut();
             session.runtime.exec(&mut session.world, name, props)
@@ -552,18 +427,12 @@ impl<G: NodeGraph> NodeEditor<G> {
         result
     }
 
-    /// Hands a pointer event to the operator running in this editor, from the host's seat
-    /// in front of the tree (`ShellDriver::pointer_event`), wherever the pointer is.
+    /// Hands a pointer event to the operator running here, from the host's seat in front of
+    /// the tree, wherever the pointer is.
     ///
-    /// For an operator started by a key. It has no pointer capture and cannot have one —
-    /// Masonry grants capture during a press only (§38.1) — so past this editor's
-    /// rectangle the tree hands its events to whatever is there: the editor of the next
-    /// area heard the moves, the node stopped at the border, and a click there to confirm
-    /// went to the wrong editor. Positions come in window coordinates, and outside this
-    /// widget they are simply outside it: the operator goes on in this editor's view.
-    ///
-    /// Returns whether the operator consumed the event; the host keeps a consumed event
-    /// from the tree. Costs the host an edit of this widget per event, which §38.2 priced.
+    /// For an operator started by a key, which has no pointer capture (Masonry grants it
+    /// only during a press). Positions are in window coordinates. Returns whether the
+    /// operator consumed the event.
     pub fn host_pointer_event(this: &mut WidgetMut<'_, Self>, event: &PointerEvent) -> bool {
         if this.widget.session.is_none() {
             return false;
@@ -607,15 +476,8 @@ impl<G: NodeGraph> NodeEditor<G> {
     }
 
     /// Follows the running gesture's pointer for edge pan, and says whether to ask for an
-    /// animation frame.
-    ///
-    /// Called after every event the operators were offered, and after the gesture was
-    /// cancelled from outside: it is where a gesture that may scroll begins and ends. One
-    /// that was cancelled after scrolling puts the view back where it was, as Blender's
-    /// does — what the operator puts back is in canvas coordinates, and a view left
-    /// scrolled would show the node returned somewhere off the area. The pan back goes
-    /// out with what the operator changed (`EditorWorld::pan`), so the caller's flush
-    /// carries it.
+    /// animation frame. A gesture cancelled after scrolling puts the view back, as Blender's
+    /// does.
     fn watch_edge_pan(&mut self, event: Option<&OpEvent>, size: Size) -> bool {
         let Some(session) = self.session.clone() else {
             return false;
@@ -652,17 +514,13 @@ impl<G: NodeGraph> NodeEditor<G> {
     }
 
     /// One animation frame of edge pan: moves the view, and hands the operator a move at
-    /// the same screen position — which is somewhere else on the graph now.
-    ///
-    /// From the mutate pass, because that is where a frame can reach the canvas and the
-    /// other views of the graph through the path a host event takes (`flush_mut`).
+    /// the same screen position.
     fn edge_pan_frame(this: &mut WidgetMut<'_, Self>, interval_ns: u64) {
         let Some(session) = this.widget.session.clone() else {
             return;
         };
         let config = session.borrow().edge_pan_in_force();
-        // The gesture ended between the request and the frame, and the event that ended it
-        // has closed it already.
+        // The gesture ended between the request and the frame.
         let (Some(config), Some(pointer)) = (config, this.widget.edge.pointer) else {
             return;
         };
@@ -712,18 +570,16 @@ impl<G: NodeGraph> NodeEditor<G> {
         this.widget.menu = None;
     }
 
-    /// Sets how a finished move becomes an undo step. The recorder is the world's, used when `node.move` ends.
+    /// Sets how a finished move becomes an undo step.
     pub fn set_move_recorder(this: &mut WidgetMut<'_, Self>, recorder: MoveRecorder<G>) {
         if let Some(session) = this.widget.session.as_ref() {
             session.borrow_mut().world.record_move = recorder;
         }
     }
 
-    /// Brings the [`SELECTED`](crate::SELECTED) class on this editor's nodes in line with
-    /// the session's selection, touching only the nodes whose selection changed.
-    ///
-    /// Only this editor's canvas: a selection is the view's, not the graph's (§38.4), so
-    /// the other views of the graph do not follow it.
+    /// Brings the [`SELECTED`](crate::SELECTED) class on this canvas's nodes in line with the
+    /// graph's selection, touching only the nodes whose selection changed. Every editor over
+    /// the graph does this for its own canvas.
     fn sync_selection(this: &mut WidgetMut<'_, Self>) {
         let Some(session) = this.widget.session.clone() else {
             return;
@@ -739,25 +595,18 @@ impl<G: NodeGraph> NodeEditor<G> {
             for index in gone {
                 CanvasLayer::set_node_class(&mut canvas, index, crate::SELECTED, false);
             }
-            // The nodes that came are raised as well, once, by the graph's registry and not
-            // here: every editor over the graph runs this, and a raise per editor would
-            // reorder the nodes once per view (§50.8).
+            // Raising is the registry's, once for every view.
             for index in came {
                 CanvasLayer::set_node_class(&mut canvas, index, crate::SELECTED, true);
             }
         }
         this.widget.shown = selection;
-        // The outline is this editor's own paint (`SelectionOutline`), and a selection made
-        // in another area changed nothing this editor was asked to repaint for.
+        // The outline is this editor's own paint.
         this.ctx.request_post_paint();
     }
 
-    /// The menu an operator asked for, made into the layer that shows it — `None` when
-    /// nothing asked.
-    ///
-    /// Each entry is polled now, through the runtime a key goes through, so the menu shows
-    /// as available exactly what would run; and each is labelled with the binding that runs
-    /// the same operator with the same properties, if there is one.
+    /// The menu an operator asked for, as a layer. Each entry is polled, so it shows as
+    /// available exactly what would run, and labelled with its key binding if it has one.
     fn take_menu(
         &self,
         target: WidgetId,
@@ -795,12 +644,8 @@ impl<G: NodeGraph> NodeEditor<G> {
             .is_some_and(|session| session.borrow().world.selection() != self.shown)
     }
 
-    /// Applies what the operators changed, from a `WidgetMut`.
-    ///
-    /// The twin of [`flush`](Self::flush), and what the two share — draining the world,
-    /// and what a peer does with the result — is [`Changes`] and [`apply_moves`]. What
-    /// is left here is the only thing that really differs: which context reaches the
-    /// canvas.
+    /// Applies what the operators changed, from a `WidgetMut`; the twin of
+    /// [`flush`](Self::flush).
     fn flush_mut(this: &mut WidgetMut<'_, Self>) {
         let Some(session) = this.widget.session.clone() else {
             return;
@@ -828,9 +673,7 @@ impl<G: NodeGraph> NodeEditor<G> {
                 CanvasLayer::zoom_around(&mut canvas, origin, factor);
             }
         }
-        // After the edits: a node added and selected in one step — a duplicate, a paste,
-        // `node.add` — has to be in the canvas before its class can go on it. Before them
-        // the class went onto a slot that was not there and the selection counted as shown.
+        // After the edits: a node added and selected in one step must exist before its class.
         Self::sync_selection(this);
         if !changes.concerns_the_graph() {
             return;
@@ -847,9 +690,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             this.ctx
                 .mutate_later(peer, move |widget| apply_to_peer(widget, positions, edits, announced));
         }
-        // The panels showing the graph, in this window in the same frame (§62); one in
-        // another window is not in this tree, and its mutate is dropped — its own pull
-        // refreshes it.
+        // Panels in this window; another window's refresh on its own pull.
         for (watcher, refresh) in session.borrow().world.graph.borrow().views().owed_watchers() {
             this.ctx.mutate_later(watcher, move |mut widget| refresh(&mut widget));
         }
@@ -857,17 +698,9 @@ impl<G: NodeGraph> NodeEditor<G> {
 }
 
 /// What the operators changed and the driver has not carried into the tree yet.
-///
-/// Drained in one place because the two flush paths used to drain it in two, in
-/// slightly different orders — the `EventCtx` one asked for a post-paint before it
-/// computed the positions and the `WidgetMut` one after, which is the kind of
-/// difference that survives a review and then diverges.
 struct Changes {
     positions: Vec<(usize, Point)>,
-    /// Changes to the shape of the graph, in the order the operators made them.
-    ///
-    /// Order matters here where it does not for positions: a link added to a node that
-    /// was added in the same step has to arrive after it.
+    /// Structure changes, in order: a link to a node added in the same step comes after it.
     edits: Vec<Edit>,
     pan: Vec2,
     zoom: Vec<(Point, f64)>,
@@ -889,7 +722,7 @@ impl Changes {
 
     /// Whether the other views of the graph have anything to hear. A pan or a zoom is this
     /// view's business alone: the view is not model state, so the other views of the graph
-    /// are not following it (§30).
+    /// are not following it.
     fn concerns_the_graph(&self) -> bool {
         !self.positions.is_empty() || !self.edits.is_empty() || self.selected.is_some()
     }
@@ -928,13 +761,8 @@ fn apply_edits(canvas: &mut WidgetMut<'_, CanvasLayer>, edits: &[Edit]) {
 
 /// Applies one structural edit, so that applying it twice changes nothing.
 ///
-/// Twice is the normal case rather than a hazard: inside a window the push delivers an
-/// edit to the graph's other views in the same frame, and the pull that carries it across
-/// windows delivers it to them again (`Views`). A node inserted again under its own name
-/// keeps its widget and takes the geometry (`CanvasLayer::insert_node`) and a removal of
-/// something absent is nothing — but a link is named by
-/// the canvas, so inserting one twice would file it twice, and that is what the lookup
-/// here is for.
+/// Applying an edit twice is normal (the push and then the pull deliver it), so a link is
+/// looked up before it is inserted: the canvas would file it twice.
 pub(crate) fn apply_edit(canvas: &mut WidgetMut<'_, CanvasLayer>, edit: Edit) {
     match edit {
         Edit::NodeAdded { index, rect } => CanvasLayer::insert_node(canvas, index, rect.origin(), rect.size()),
@@ -958,10 +786,7 @@ pub(crate) fn apply_edit(canvas: &mut WidgetMut<'_, CanvasLayer>, edit: Edit) {
     }
 }
 
-/// Moves nodes in another view of the same graph (§30).
-///
-/// The body of every `mutate_later` this driver schedules, in one place: a peer is
-/// reached the same way whichever path found the change.
+/// Moves nodes in another view of the same graph.
 fn apply_moves(mut widget: WidgetMut<'_, dyn Widget>, positions: Vec<(usize, Point)>, edits: Vec<Edit>) {
     let mut canvas = widget.downcast::<CanvasLayer>();
     apply_edits(&mut canvas, &edits);
@@ -970,9 +795,8 @@ fn apply_moves(mut widget: WidgetMut<'_, dyn Widget>, positions: Vec<(usize, Poi
     }
 }
 
-/// What a view of the graph in this window is pushed: the moves and edits, then what the
-/// selection changed (`Views::announce_selection`). The registry has all of it too, for the
-/// views of other windows; this one will collect it again, harmlessly.
+/// What a view of the graph in this window is pushed: the moves and edits, then the
+/// selection changes.
 fn apply_to_peer(
     mut widget: WidgetMut<'_, dyn Widget>,
     positions: Vec<(usize, Point)>,
@@ -990,10 +814,6 @@ fn apply_to_peer(
 }
 
 /// The current position of every node in `moved`, deduplicated.
-///
-/// Deduplicated here rather than as it is filled: a drag pushes the same index on
-/// every frame, and one sort of a handful of indices per event is cheaper than a set
-/// lookup per node per frame.
 fn positions_of<G: NodeGraph>(world: &EditorWorld<G>, mut moved: Vec<usize>) -> Vec<(usize, Point)> {
     if moved.is_empty() {
         return Vec::new();
@@ -1007,15 +827,8 @@ fn positions_of<G: NodeGraph>(world: &EditorWorld<G>, mut moved: Vec<usize>) -> 
         .collect()
 }
 
-/// Hands what the operators changed to every other view of the graph, and names the
-/// ones in reach.
-///
-/// Two deliveries in one place, so that neither can know something the other does not:
-/// every change goes into the graph's [`Views`](crate::Views) for the views of other
-/// windows to collect, and the ids come back for the caller to push to in this frame
-/// (§30). They used to be two lists kept by two owners — the push here, the record in the
-/// application's model — and the record had no links in it, so a link made in one
-/// window never reached another (`issues/application assembly.md`).
+/// Records what the operators changed in the graph's [`Views`](crate::Views) for every
+/// other view, and returns the views to push to in this frame.
 fn fan_out<G: NodeGraph>(
     session: &EditorSession<G>,
     own_canvas: WidgetId,
@@ -1029,8 +842,7 @@ fn fan_out<G: NodeGraph>(
     for &(index, pos) in &changes.positions {
         views.note_except(own_canvas, Change::Moved { index, pos });
     }
-    // After the edits, so that a node added and selected in one gesture exists by the time
-    // it is raised; for every view, this one included.
+    // After the edits: a node added and selected in one gesture must exist to be raised.
     let announced = changes
         .selected
         .as_deref()
@@ -1043,17 +855,9 @@ fn fan_out<G: NodeGraph>(
 
 /// Formats the HUD into `out`, reusing its allocation.
 ///
-/// Deliberately shows only quantities a human watches: how much of the graph is
-/// materialised, the zoom, the detail level, and how many widgets have been built.
-/// The cumulative pass counters live in [`CanvasStats`] for the benchmark; putting
-/// them on screen would change the text every frame and defeat the cache.
-///
-/// The second line is a measurement rather than a caption. A gesture is decided from
-/// the events themselves — the travel since the press and the
-/// platform's own timestamps (§39.2) — so the only way to know that the platform really
-/// gives us what the mechanism assumes is to watch the counters move in a real window.
-/// A double click that never registers because `PointerState::time` arrives as zero on
-/// some backend is invisible to every test we have, and obvious here.
+/// Only what a human watches: the first line changes rarely, so the shaped text stays
+/// cached. The second line counts recognised gestures, which shows in a real window
+/// whether the platform's timestamps make double clicks work.
 fn format_hud(stats: &CanvasStats, ops: &OpCounters, caption: &str, out: &mut String) {
     let detail = match stats.detail {
         Some(detail) => detail.as_str(),
@@ -1077,14 +881,8 @@ fn format_hud(stats: &CanvasStats, ops: &OpCounters, caption: &str, out: &mut St
     .ok();
 }
 
-/// The pre-tree seat (§38.1).
-///
-/// Called for every pointer event before the target is even computed, and for events
-/// outside this widget's rectangle as well. It cannot stop one: the method returns
-/// nothing, its `EventCtx` is dropped, and `capture_pointer` is refused because the
-/// pass does not allow capture here. So what it does is count, and the count is the
-/// evidence for the one-line request upstream — whose own TODO already lists "return
-/// flag to suppress event from reaching children".
+/// The pre-tree seat: every pointer event, before the target is computed and outside this
+/// widget's rectangle too. Returns whether the event is kept from the tree.
 impl<G: NodeGraph> Layer for NodeEditor<G> {
     fn capture_pointer_event(
         &mut self,
@@ -1098,20 +896,16 @@ impl<G: NodeGraph> Layer for NodeEditor<G> {
         if self.session.is_none() {
             return Handled::No;
         }
-        // Somebody below holds the pointer, so the event is going to the tree whatever
-        // this seat says — the fork lets capture outrank a layer, exactly so that a
-        // widget in the middle of a gesture is told how it ends. Dispatching here as
-        // well would deliver every event twice.
+        // Somebody below holds the pointer: the event goes to the tree anyway, and
+        // dispatching here too would deliver it twice.
         if ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
             if let Some(session) = self.session.as_ref() {
                 session.borrow_mut().runtime.observe(&op_event);
             }
             return Handled::No;
         }
-        // Everything else is the runtime's call. It acts from this seat only when it
-        // already owns the gesture — a running modal operator, or a press it is holding
-        // to see whether it becomes a click or a drag — and otherwise counts and lets
-        // the tree have its right of first refusal (§20 claim 3, §39.3).
+        // The runtime acts from this seat only when it owns the gesture (a modal operator,
+        // or a held press); otherwise the tree has the first refusal.
         if self.dispatch(ctx, &op_event, sample, Seat::Layer) {
             Handled::Yes
         } else {
@@ -1121,19 +915,15 @@ impl<G: NodeGraph> Layer for NodeEditor<G> {
 }
 
 impl<G: NodeGraph> NodeEditor<G> {
-    /// Offers one event to the runtime and carries out what it changed.
-    ///
-    /// Returns whether the event was consumed. Everything the operators need to know
-    /// about the world is filled in first: where the pointer is, in canvas
-    /// coordinates, and what the canvas last found under it.
+    /// Offers one event to the runtime, carries out what it changed, and returns whether it
+    /// was consumed.
     fn dispatch(&mut self, ctx: &mut EventCtx<'_>, event: &OpEvent, sample: Sample, seat: Seat) -> bool {
         let (view, mut hover) = {
             let (canvas, _) = ctx.get_raw(&mut self.canvas);
             (canvas.view(), canvas.stats().hovered)
         };
-        // An operator holding the pointer that needs to know what is under it — a link
-        // being dragged to a port — gets a pick of its own: the canvas below sees no events
-        // while the operator holds them, so its own hover is the one from the press.
+        // An operator holding the pointer gets a pick of its own when it asks (a link drag):
+        // the canvas sees no events meanwhile.
         let tracking = self
             .session
             .as_ref()
@@ -1144,12 +934,8 @@ impl<G: NodeGraph> NodeEditor<G> {
             hover = canvas.hit_test_raw(pos, window, &mut raw);
         }
         let is_press = matches!(event, OpEvent::Press { .. });
-        // A release that ends a gesture an operator held: the canvas saw none of its moves,
-        // so what it last published is where the press was, and lighting from it lit the
-        // port the drag had started from until the pointer moved again. Not picked afresh
-        // instead: two criteria hold a gesture to the one pick at its press.
-        // Until the next move, which the canvas does see: a release reaches this editor twice,
-        // through the layer seat and then the tree, and by the second no operator is running.
+        // After a held gesture the canvas's hover is from the press; distrust it until the
+        // next move (not re-picked: criteria hold a gesture to one pick).
         if matches!(event, OpEvent::Release { .. }) && self.modal_depth() > 0 {
             self.hover_stale = true;
         } else if matches!(event, OpEvent::Move { .. }) {
@@ -1162,18 +948,8 @@ impl<G: NodeGraph> NodeEditor<G> {
             ctx.request_anim_frame();
         }
 
-        // Masonry's own modality. It may be taken during a press and at no other time,
-        // and only where the event is addressed to this widget — the pre-tree seat is
-        // given a context that refuses it (§38.1). Kept even though the layer seat can
-        // now withhold events on its own: capture is what stops the *tree* from acting
-        // on a gesture this driver already owns.
-        //
-        // A held press owns the gesture as much as a running operator does: a binding on
-        // `Drag` holds the press and starts its operator on the first move past the
-        // threshold, when capture is no longer on offer. Counting only running operators
-        // left every drag uncaptured — the moves past the area's edge went to the editor
-        // next door, the node stopped at the border, and a release there never reached
-        // the operator, which went on dragging with the button up.
+        // Capture keeps the tree off a gesture this driver owns. Masonry grants it only
+        // during a press, so a held press (which may become a drag) takes it too.
         if seat != Seat::Layer {
             let running = self.modal_depth() > 0 || self.is_holding();
             let holds = ctx.pointer_capture_target_id() == Some(ctx.widget_id());
@@ -1188,11 +964,8 @@ impl<G: NodeGraph> NodeEditor<G> {
         consumed
     }
 
-    /// Lights up the port under the pointer if a press and drag from it would start a link
-    /// drag, and puts the light out when that stops being so; a repaint only when it changes.
-    ///
-    /// `stale` says the hover cannot be trusted — the release in `dispatch` — and puts the
-    /// light out until the next move.
+    /// Lights the port under the pointer a drag would start a link from; a repaint only when
+    /// it changes. `stale` puts the light out until the next move.
     fn show_port_hint(&mut self, ctx: &mut EventCtx<'_>, stale: bool) {
         let (hint, edge) = self
             .session
@@ -1215,7 +988,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         }
     }
 
-    /// The node edge under the pointer a drag would resize the node by, if any (§60).
+    /// The node edge under the pointer a drag would resize the node by, if any.
     pub fn edge_hint(&self) -> Option<(usize, crate::ops::NodeEdge)> {
         self.edge_hint
     }
@@ -1225,9 +998,8 @@ impl<G: NodeGraph> NodeEditor<G> {
         self.port_hint
     }
 
-    /// Hands one event to the runtime, in canvas coordinates and with what is under the
-    /// pointer filled in, and says whether it was consumed. What it changed is carried
-    /// out by the caller, which is the one holding a context.
+    /// Hands one event to the runtime in canvas coordinates and says whether it was
+    /// consumed; the caller carries out the changes.
     fn feed(
         &mut self,
         event: &OpEvent,
@@ -1238,13 +1010,8 @@ impl<G: NodeGraph> NodeEditor<G> {
     ) -> bool {
         self.view = view;
 
-        // A held press is decided — click or drag — on the first move past the threshold,
-        // and what it is decided *about* is where it was pressed: `OpEvent::Drag` carries
-        // the press's position for exactly that reason (§39.3). So while the press is held,
-        // what the pointer is over is what it was over at the press. Taking it from the
-        // move instead handed every fast drag that left its target before the threshold —
-        // out of a port, off the edge of a node — to whatever was under the pointer by
-        // then, usually the view (§52).
+        // While a press is held, what the pointer is over is what it was over at the press:
+        // a fast drag leaves its target before the threshold.
         if matches!(event, OpEvent::Press { .. }) {
             self.press_hover = hover;
         } else if self
@@ -1255,10 +1022,8 @@ impl<G: NodeGraph> NodeEditor<G> {
             hover = self.press_hover;
         }
 
-        // Into canvas coordinates before the runtime sees it, because that is the space
-        // this application's operators think in — and the space a `Drag` has to carry its
-        // anchor in, or the first event of every drag moves the node by the pan (§39.7).
-        // The other space travels in the sample, which is what a view operator uses.
+        // Operators work in canvas coordinates; screen ones travel in the sample, for view
+        // operators.
         let event = match event.pos() {
             Some(pos) => event.clone().with_pos(view.inverse() * pos),
             None => event.clone(),
@@ -1271,7 +1036,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             if let Some(pos) = event.pos() {
                 session.world.pointer = pos;
                 session.world.pointer_screen = sample.screen;
-                // The view is a uniform scale and a translation (§22), so one coefficient says it.
+                // The view is a uniform scale and a translation, so one coefficient says it.
                 let [a, b, ..] = view.as_coeffs();
                 session.world.scale = a.hypot(b);
             }
@@ -1282,11 +1047,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         result.is_consumed()
     }
 
-    /// Applies what the operators changed to this canvas and to the graph's other
-    /// views.
-    ///
-    /// The §30 fan-out, from here rather than from the canvas's drag: the operator
-    /// wrote the model, and only the driver holds a widget context.
+    /// Applies what the operators changed to this canvas and to the graph's other views.
     fn flush(&mut self, ctx: &mut EventCtx<'_>) {
         let Some(session) = self.session.clone() else {
             return;
@@ -1295,24 +1056,18 @@ impl<G: NodeGraph> NodeEditor<G> {
         if changes.dirty {
             ctx.request_post_paint();
         }
-        // A menu goes on screen as a layer above the window, at the pointer; the host puts
-        // it there (`blazy_shell::window::apply_layer_signal`).
+        // A menu is a layer above the window, at the pointer; the host puts it there.
         let origin = ctx.to_window(Point::ORIGIN);
         if let Some((menu, at)) = self.take_menu(ctx.widget_id(), |p| p + origin.to_vec2()) {
             self.menu = Some(menu.id());
             ctx.create_layer(LayerType::Other, menu, at);
         }
-        // Structure goes through the mutate pass even for this canvas, because adding a
-        // node may add a child and removing one may drop a child, and that is the only
-        // pass allowed to do either. A drag does not wait for it; an edit can.
+        // Structure goes through the mutate pass, the only one that may add or drop children.
         if !changes.edits.is_empty() {
             let edits = changes.edits.clone();
             ctx.mutate_later(self.canvas.id(), move |widget| apply_moves(widget, Vec::new(), edits));
         }
-        // Classes are changed from the mutate pass: it is where a child's `WidgetMut` is to
-        // be had, and a selection is a click, not a frame of a drag. Queued after the
-        // edits, which the pass runs in order: a node added and selected in one step has
-        // to be in the canvas before its class can go on it.
+        // Classes too, queued after the edits so a node added and selected exists first.
         if self.selection_stale() {
             ctx.mutate_self_later(|mut widget| Self::sync_selection(&mut widget.downcast::<Self>()));
         }
@@ -1336,8 +1091,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         }
         let (peers, announced) = fan_out(&session.borrow(), self.canvas.id(), &changes);
         if !announced.is_empty() {
-            // After the edits queued above, in the same pass: a node selected as it is added
-            // has to be there before it is raised.
+            // After the edits: a node selected as it is added must exist to be raised.
             let announced = announced.clone();
             ctx.mutate_later(self.canvas.id(), move |widget| {
                 apply_to_peer(widget, Vec::new(), Vec::new(), announced);
@@ -1353,27 +1107,17 @@ impl<G: NodeGraph> NodeEditor<G> {
         }
     }
 
-    /// Draws the selection and the rubber band over the canvas.
-    ///
-    /// In this widget rather than in the canvas, and in canvas coordinates through the
-    /// view transform, because that is the answer §38.5 gives to "where does a modal
-    /// operator draw": inside the area that owns the pixels. An overlay across areas
-    /// would break the one condition the layer cache cannot check — that a cached
-    /// layer owns its rectangle (§36.4).
+    /// Draws the selection and the rubber band over the canvas, inside this area: a cached
+    /// area layer must own its rectangle.
     /// The status line and the panel under it.
-    ///
-    /// Split out of `post_paint` so that both halves of what this widget paints for
-    /// itself sit inside one clip; see there for why the clip is not optional.
     fn paint_hud(&mut self, ctx: &mut PaintCtx<'_>, painter: &mut Painter<'_>) {
         let Some(caption) = self.hud_caption.as_deref() else {
             return;
         };
         let content_box = ctx.content_box();
 
-        // Formatted here rather than in `layout`, because half of what it says changes
-        // without the layout changing: a click moves the counters and relayouts nothing.
-        // Formatting into a scratch buffer and swapping only on a real difference is what
-        // keeps the shaped text — which is the expensive half — valid between frames.
+        // Formatted here (counters change without a layout) into a scratch buffer, swapped
+        // only on a real difference so the shaped text stays valid.
         let counters = self.op_counters();
         format_hud(&self.stats, &counters, caption, &mut self.hud_next);
         if self.hud_next != self.hud {
@@ -1395,9 +1139,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             return;
         };
 
-        // The panel is as tall as the text, rather than as tall as the text used to be:
-        // a line added to the status line should not disappear under the edge of a
-        // rectangle whose height someone typed in once.
+        // As tall as the text.
         let height = f64::from(layout.height()) + 16.0;
         let panel = Rect::new(content_box.x0, content_box.y1 - height, content_box.x1, content_box.y1);
         painter.fill(panel, Color::from_rgba8(0x10, 0x10, 0x14, 0xd0)).draw();
@@ -1418,9 +1160,7 @@ impl<G: NodeGraph> NodeEditor<G> {
         let session = session.borrow();
         let viewport = ctx.content_box();
         let graph = session.world.graph.borrow();
-        // The links being dragged: the curves they will be, in the colour of the selection —
-        // or of a refusal, where the port under the pointer would not take them — over
-        // everything else the editor draws.
+        // The links being dragged, in the selection's colour or the refusal's.
         if let Some(preview) = &session.world.link_preview {
             let colour = if preview.refused {
                 self.style.refused
@@ -1432,10 +1172,7 @@ impl<G: NodeGraph> NodeEditor<G> {
                 painter.stroke(curve, &Stroke::new(2.0), colour).draw();
             }
         }
-        // Lit ports: the one a press and drag would start from, the one a new link is being drawn
-        // out of, and the one a link being dragged would be connected to — in the colour of a
-        // refusal where the graph refuses it. The dot again, the same size, over the node that
-        // drew it.
+        // Lit ports, drawn again over the node's own dots.
         let preview = session.world.link_preview.as_ref();
         let source = preview.and_then(|preview| preview.source);
         let target = preview.and_then(|preview| {
@@ -1473,8 +1210,7 @@ impl<G: NodeGraph> NodeEditor<G> {
             let at = self.view * ports.position(graph.node_rect(index), side, port);
             painter.fill(Circle::new(at, radius), colour).draw();
         }
-        // Nodes with widgets wear the class and can look selected by themselves; the far
-        // field has no widgets and nothing to wear it on.
+        // Nodes with widgets wear the class; far-field nodes have nothing to wear it on.
         let outline = match self.style.outline {
             SelectionOutline::Always => true,
             SelectionOutline::FarField => self.stats.detail == Some(blazy_canvas::Detail::Box),
@@ -1484,8 +1220,7 @@ impl<G: NodeGraph> NodeEditor<G> {
                 continue;
             }
             let rect = self.view.transform_rect_bbox(graph.node_rect(index));
-            // Only what is on screen. A box select can hold thousands of nodes, and an
-            // outline off screen costs the same as one on it.
+            // Only what is on screen.
             if rect.intersect(viewport).is_zero_area() {
                 continue;
             }
@@ -1499,11 +1234,8 @@ impl<G: NodeGraph> NodeEditor<G> {
     }
 }
 
-/// The modifiers held once `event` has happened.
-///
-/// An event reports the modifiers held *as* it happened, and a modifier key's own press
-/// may or may not include itself, depending on the platform; so a modifier key is applied
-/// here, and the hint follows `Ctrl` pressed with the pointer standing still.
+/// The modifiers held once `event` has happened: whether a modifier key's own event
+/// includes itself depends on the platform.
 fn held_after(event: &OpEvent) -> Modifiers {
     let mut mods = event.mods();
     if let OpEvent::Key {
@@ -1525,10 +1257,8 @@ fn held_after(event: &OpEvent) -> Modifiers {
     mods
 }
 
-/// Converts a Masonry pointer event into the one the keymap matches.
-///
-/// Returns `None` for the events an operator layer has no use for — enter, leave and
-/// gestures. The scroll is `view.zoom`'s since the wheel became a binding.
+/// Converts a Masonry pointer event into the one the keymap matches; `None` for enter,
+/// leave and gestures.
 fn to_op_event(ctx: &EventCtx<'_>, event: &PointerEvent) -> Option<(OpEvent, Sample)> {
     to_op_event_in(
         |p| ctx.local_position(p),
@@ -1588,14 +1318,8 @@ fn to_op_event_in(
             return None;
         },
     };
-    // The threshold is measured in screen pixels and the timestamp comes from the
-    // platform, so a drag means the same distance at every zoom and a double click can
-    // be produced by a test without a clock (§39.2).
-    //
-    // `screen` is this widget's own logical space — the space `EditorWorld::pointer_screen`
-    // is in — and not the physical position the event arrived with. Two spaces are one
-    // too many already; a third, differing by the display's scale factor, is how the
-    // view came to jump by half a click on a HiDPI screen.
+    // The drag threshold is in screen pixels and the timestamp is the platform's. `screen`
+    // is this widget's logical space, not the event's physical position.
     let sample = Sample {
         time_ns: state.time,
         device: match info.pointer_type {
@@ -1613,9 +1337,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     type Action = NoAction;
 
     fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &PointerEvent) {
-        // Any pointer activity may have moved, zoomed or dragged something, so the
-        // HUD needs redrawing. The numbers themselves are refreshed in `layout`,
-        // which runs before paint, so what gets drawn is this frame's data.
+        // Pointer activity may change what the HUD shows; its numbers refresh in `layout`.
         if matches!(
             event,
             PointerEvent::Move(_) | PointerEvent::Scroll(_) | PointerEvent::Down(_) | PointerEvent::Up(_)
@@ -1626,8 +1348,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         if self.session.is_none() {
             return;
         }
-        // A cancel is the window telling us the gesture is over, and there is nobody
-        // else to tell the operators.
+        // The window says the gesture is over.
         if let PointerEvent::Cancel(_) = event {
             if let Some(session) = self.session.clone() {
                 let session = &mut *session.borrow_mut();
@@ -1637,18 +1358,15 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
             self.flush(ctx);
             return;
         }
-        // Something below took it — a slider in a node, or the canvas panning. The
-        // capture target rather than `is_handled` alone, for the reason the canvas
-        // gives: a control may capture without marking the event handled, and
-        // dispatching over it would steal the grip.
+        // Something below took it (a slider, the canvas panning); a control may capture
+        // without marking the event handled.
         if ctx.is_handled() || ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
             return;
         }
         let Some((op_event, sample)) = to_op_event(ctx, event) else {
             return;
         };
-        // Bubbled means a descendant was offered this event first. While an operator is
-        // running that is a leak, and the runtime counts it (§38.1).
+        // Bubbled: a descendant was offered it first (counted as a leak while an operator runs).
         let seat = if ctx.target() == ctx.widget_id() {
             Seat::Tree
         } else {
@@ -1659,12 +1377,8 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         }
     }
 
-    /// Keys, once the host has made this widget the focus fallback.
-    ///
-    /// Bubbled from whatever had focus, or targeted here directly when nothing did —
-    /// which is what a keymap needs and what `RenderRoot::set_focus_fallback` is for.
-    /// A text field keeps its keys: it is focused, it handles them, and this never
-    /// sees them (§12).
+    /// Keys: bubbled from whatever has focus, or sent here as the focus fallback. A text
+    /// field handles its own keys.
     fn on_text_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &TextEvent) {
         let Some(session) = self.session.clone() else {
             return;
@@ -1678,8 +1392,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                 self.watch_edge_pan(None, ctx.content_box().size());
                 self.flush(ctx);
             },
-            // While its menu is open the keys are the menu's, and the menu cannot take
-            // them itself: `Escape` closes it, and nothing else reaches the keymap.
+            // While the menu is open, `Escape` closes it and no key reaches the keymap.
             TextEvent::Keyboard(key) if !ctx.is_handled() && self.menu.is_some() => {
                 if key.state == KeyState::Down
                     && key.key == masonry::core::keyboard::Key::Named(masonry::core::keyboard::NamedKey::Escape)
@@ -1696,8 +1409,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
                 } else {
                     Seat::Bubbled
                 };
-                // A key has no position and no device: the sample is what a resolver
-                // would measure a gesture on, and there is no gesture here.
+                // A key has no position: no sample.
                 if self.dispatch(ctx, &op_event, Sample::default(), seat) {
                     ctx.set_handled();
                 }
@@ -1719,9 +1431,7 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         if let (Update::WidgetAdded, Some(session)) = (event, self.session.as_ref()) {
             session.borrow_mut().editor = Some(ctx.widget_id());
         }
-        // The pointer has left this editor and everything in it. A `PointerEvent::Leave`
-        // has no target and never reaches `on_pointer_event`, so this is the one notice:
-        // without it the port the pointer last stood on stayed lit after it had gone.
+        // The pointer left (`PointerEvent::Leave` never reaches `on_pointer_event`).
         if matches!(event, Update::ChildHoveredChanged(false))
             && (self.port_hint.take().is_some() | self.edge_hint.take().is_some())
         {
@@ -1729,9 +1439,8 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         }
     }
 
-    /// The resize cursor while a node is being resized: the editor holds the pointer then,
-    /// and Masonry asks the capture target. Before the press the pointer is over the node's
-    /// own widget, which chooses — so there the edge is lined instead (`edge_hint`).
+    /// The resize cursor while a node is resized (Masonry asks the capture target). Before
+    /// the press the node's own widget chooses, so the edge is lined instead.
     fn get_cursor(&self, _ctx: &QueryCtx<'_>, _pos: Point) -> CursorIcon {
         let resizing = self
             .session
@@ -1768,10 +1477,8 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     }
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
-        // The graph was replaced as a whole since this editor last looked (§69): its
-        // history names nodes of a graph that is gone, and the classes it set went with the
-        // node widgets the canvas dropped. Here, because a reset reaches the canvas from the
-        // window's pull, and the canvas's layout is this editor's too.
+        // The graph was replaced: its history names nodes that are gone, and the classes went
+        // with the node widgets.
         if let Some(session) = self.session.clone() {
             let generation = session.borrow().world.graph.borrow().views().generation();
             if generation != self.generation {
@@ -1790,16 +1497,12 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
         let (canvas, _) = ctx.get_raw(&mut self.canvas);
         let stats = canvas.stats();
         self.view = canvas.view();
-        // And mirror the view into the session, which is what outlives this widget. The
-        // canvas owns it while it exists (§22 keeps it out of layout); the session is the
-        // copy an area rebuilt elsewhere opens with.
+        // Mirror the view into the session, which outlives this widget.
         if let Some(session) = self.session.as_ref() {
             session.borrow_mut().view = self.view;
         }
         self.stats = stats;
-        // A widget built over a session that already has a selection — an area rebuilt in
-        // another window, a script that selected from outside — has nodes that have not
-        // been told yet. Once, in the next mutate pass; never again while nothing changes.
+        // A widget built over an existing selection tells its nodes once.
         if self.selection_stale() {
             ctx.mutate_self_later(|mut widget| Self::sync_selection(&mut widget.downcast::<Self>()));
         }
@@ -1810,16 +1513,8 @@ impl<G: NodeGraph> Widget for NodeEditor<G> {
     }
 
     fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
-        // Clipped to this editor's own box, and that is load-bearing rather than tidy.
-        // Neither of the two things painted here is a child, so nothing else clips them:
-        // the outline of a selected node is a stroke around a node that may be half off
-        // the area, and the status line is one unwrapped line wider than an area of a
-        // screen of eight. Both landed on the neighbour — and, worse, they took the
-        // area's *layer rectangle* with them, which is measured by walking the scene
-        // (§36.2): a layer claiming two areas' worth of pixels puts the cache over its
-        // ceiling, and what the eviction dropped was somebody else's frame (§44.9).
-        // Pushed and popped rather than `with_fill_clip`, whose closure hands out a
-        // `Painter` with a shorter lifetime than the one these two take.
+        // Clipped to this editor's box: neither outline nor status line is a child, and an
+        // unclipped one widens the area's layer rectangle into its neighbour's.
         painter.push_fill_clip(ctx.content_box());
         // Under the HUD panel, so the numbers stay readable over a selected node.
         self.paint_overlay(ctx, painter);

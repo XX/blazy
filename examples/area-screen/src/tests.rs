@@ -2,7 +2,7 @@
 //!
 //! Every other test in this workspace counts something — widgets in the tree, layouts
 //! per frame, area resizes. None of them look at a pixel. These do, because
-//! `rnd/architecture.md` §9 makes a claim about pixels that the whole choice of
+//! The architecture makes a claim about pixels that the whole choice of
 //! `imaging` partly rests on: changing any of the three multipliers is correct
 //! *without loss of sharpness*, which an atlas-based renderer or a tessellator that
 //! fixed its geometry at one scale could not manage.
@@ -10,7 +10,7 @@
 //! The three multipliers are checked separately because they travel by different
 //! routes. `ui_scale` goes through layout; `view` and `device_scale` are transforms
 //! applied at composition. Two of the three can be driven through Masonry's test
-//! harness; the third cannot, and §23 says why.
+//! harness; the third cannot.
 
 use bench_utils::render::{block_magnified, differing_fraction, sharpness_gain};
 use blazy::areas::{AreaContent, RegionKind, UiScale};
@@ -51,7 +51,7 @@ const TINT: Color = Color::from_rgb8(0x6b, 0x4b, 0x8a);
 fn header_harness(scale: f64, size: (u32, u32)) -> TestHarness<AreaContent> {
     // The caption alone, because the metric compares the same content at two scales and
     // a bar lays out as many controls as fit: with buttons, the small image and the
-    // magnified one show different things and the comparison means nothing (§46).
+    // magnified one show different things and the comparison means nothing.
     let header = NewWidget::new(ScaledHeader::caption(TINT, "ui")).erased();
     let content = AreaContent::new(vec![(RegionKind::Main, 0.0, header)]).with_ui_scale(0, scale);
     TestHarness::create_with_size(
@@ -61,7 +61,7 @@ fn header_harness(scale: f64, size: (u32, u32)) -> TestHarness<AreaContent> {
     )
 }
 
-/// §9, multiplier two: `ui_scale` goes through layout, and the result is drawn at the
+/// Multiplier two: `ui_scale` goes through layout, and the result is drawn at the
 /// new size rather than drawn once and stretched.
 #[test]
 fn ui_scale_magnifies_without_blurring() {
@@ -94,7 +94,7 @@ fn canvas_harness(zoom: f64, size: (u32, u32)) -> TestHarness<CanvasLayer> {
     harness
 }
 
-/// §9, multiplier three: `view` is a transform at composition time, and the scene is
+/// Multiplier three: `view` is a transform at composition time, and the scene is
 /// curves rather than pixels, so magnifying it re-rasterises rather than resamples.
 #[test]
 fn canvas_zoom_magnifies_without_blurring() {
@@ -112,10 +112,10 @@ fn canvas_zoom_magnifies_without_blurring() {
 /// Renders a harness's visual layer plan at a device scale factor.
 ///
 /// Masonry's own `TestHarness::render` cannot do this: the plan is in logical
-/// coordinates and applying the window's scale factor is the host's job (§4.2), which
-/// the harness does not do. §23.4 wrote that host by hand here, in forty lines; it
+/// coordinates and applying the window's scale factor is the host's job, which
+/// the harness does not do. That host was written by hand here, in forty lines; it
 /// now lives in `blazy-shell` and this calls it, so the test exercises the code the
-/// window runs rather than a copy of it (§26.4).
+/// window runs rather than a copy of it.
 fn render_at_device_scale(harness: &mut TestHarness<AreaContent>, scale: f64, size: (u32, u32)) -> RgbaImage {
     let (plan, _tree) = harness.redraw();
     let mut host = Host::any()
@@ -129,7 +129,7 @@ fn render_at_device_scale(harness: &mut TestHarness<AreaContent>, scale: f64, si
     RgbaImage::from_vec(frame.image.width, frame.image.height, frame.image.data).expect("rgba image")
 }
 
-/// §9, multiplier one: the window's HiDPI factor is an `Affine` like any other, and
+/// Multiplier one: the window's HiDPI factor is an `Affine` like any other, and
 /// the same scene replayed under it comes out re-rasterised rather than stretched.
 #[test]
 fn device_scale_magnifies_without_blurring() {
@@ -165,7 +165,7 @@ fn assert_redrawn_not_repeated(small: &RgbaImage, big: &RgbaImage) {
 /// The screen still looks like itself.
 ///
 /// Snapshots are viable here for reasons that are not true of golden images in
-/// general, and §23 lists them: the harness pins its font and disables system fonts,
+/// general, and they are: the harness pins its font and disables system fonts,
 /// the rasteriser is CPU-side, and the upstream commit is pinned. Verified
 /// byte-identical across repeated runs and across the debug and release profiles;
 /// a different CPU architecture is the untested case.
@@ -187,10 +187,10 @@ fn screen_appearance() {
 ///
 /// `screen_four_areas` above is the geometry picture, and it is taken of a screen
 /// **without** operators, tiled small enough that a node fills an area. Three defects
-/// walked past it (§44.9) because nothing it contains could show them: with no operator
+/// walked past it because nothing it contains could show them: with no operator
 /// layer there is no status line and no selection, and those are exactly the two things
 /// that were painted outside their area and over the neighbour. A snapshot of a scene
-/// the application does not build checks another product (§44.6); this one has both
+/// the application does not build checks another product; this one has both
 /// objects and the boundary they crossed.
 ///
 /// Regenerate with `MASONRY_TEST_BLESS=1 cargo make test`.
@@ -261,7 +261,7 @@ fn the_snapshot_scales_are_the_ones_that_were_set() {
     assert_eq!(UiScale::default().0, 1.0);
 }
 
-// --- MARK: several views of one graph (§30)
+// --- MARK: several views of one graph
 
 /// A screen of `areas` areas over one shared graph.
 fn screen_harness(areas: usize, nodes: usize) -> (TestHarness<Screen>, SharedGraph) {
@@ -311,7 +311,7 @@ fn to_window(harness: &TestHarness<Screen>, area: usize, canvas_pos: Point) -> P
 
 /// Dragging a node in one area moves it in every other view of the same graph.
 ///
-/// Node geometry is state, and by §20.2 state belongs to the model: each canvas keeps
+/// Node geometry is state, and state belongs to the model: each canvas keeps
 /// its own copy of it, so a drag that only moved the copy split the two views apart
 /// permanently. The assertion on the model is half the test — a fix that synchronised
 /// the views but left the model behind would lose the move the moment a node scrolls
@@ -407,7 +407,7 @@ fn a_control_edit_in_one_area_reaches_the_others() {
     assert_eq!(shows(&harness, peer), !before, "and so does the other area's copy");
 }
 
-// --- MARK: operators inside an area (§38)
+// --- MARK: operators inside an area
 
 /// A screen whose areas carry the operator layer, over one shared graph.
 fn ops_screen(areas: usize, nodes: usize) -> (TestHarness<Screen>, SharedGraph) {
@@ -465,7 +465,7 @@ fn editor_canvas_pos(harness: &mut TestHarness<Screen>, area: usize, index: usiz
 
 /// A grab driven through the operator layer in one area moves the node everywhere.
 ///
-/// The §30 rule, through the path §38 built: the operator writes the model, the
+/// The model is the truth, through the operator path: the operator writes the model, the
 /// driver moves its own canvas and names the other views. Two areas rather than one,
 /// because with one view "the truth is in the model" and "the truth is in the widget"
 /// are the same sentence.
@@ -513,7 +513,7 @@ fn an_operator_move_in_one_area_reaches_the_others() {
     );
 }
 
-/// A node selected in one area comes to the front in every view of the graph (§50.8).
+/// A node selected in one area comes to the front in every view of the graph.
 ///
 /// The stacking order is the graph's, like a position: raised only in the area that
 /// selected it, the node lay over its neighbour there and under it in the other area.
@@ -546,9 +546,9 @@ fn a_node_raised_in_one_area_is_raised_in_the_others() {
     }
 }
 
-/// A structural edit in one area reaches the other view of the same graph (§43).
+/// A structural edit in one area reaches the other view of the same graph.
 ///
-/// The §30 rule again, for the shape of the graph rather than for a position — and it
+/// The same rule, for the shape of the graph rather than for a position — and it
 /// needs two views for the same reason: with one, "the truth is in the model" and "the
 /// truth is in the view" are indistinguishable. A node added in one area has to exist in
 /// both, under the same name, and a node deleted has to be gone from both.
@@ -603,7 +603,7 @@ fn a_structural_edit_in_one_area_reaches_the_others() {
     }
 }
 
-/// §30 stops at the window boundary, and the pull is what carries it across.
+/// The push stops at the window boundary, and the pull is what carries it across.
 ///
 /// Two screens over one graph, each in its own `RenderRoot` — which is what two windows
 /// are. The push fan-out reaches the canvases of one of them and is silently dropped for
@@ -655,17 +655,17 @@ fn a_change_in_one_window_reaches_the_other_through_the_model() {
 
 /// Every area's layer stays inside the area, and the areas tile the window.
 ///
-/// The promise §36 asks a caller for — a cached layer owns its rectangle — checked at the
+/// The promise the layer cache asks a caller for — a cached layer owns its rectangle — checked at the
 /// one place it can be: the rectangle a layer claims is the one the host works out by
 /// walking its scene, so anything an area paints outside its own box moves that rectangle
 /// onto its neighbour. Two things did: the outline of a selected node and the status
 /// line, neither of which is a child and neither of which anything clipped. The cost was
 /// not cosmetic — eight layers claiming 1.8 windows' worth of pixels put the cache over
-/// its ceiling, and the eviction blanked whichever area was copied that frame (§44.9).
+/// its ceiling, and the eviction blanked whichever area was copied that frame.
 ///
 /// Containment rather than only disjointness, because disjointness is the *consequence*:
 /// a screen of one area has nothing to overlap and would have passed while spilling over
-/// everything around it (§45).
+/// everything around it.
 #[test]
 fn every_areas_layer_stays_inside_its_area() {
     use blazy::shell::layers::scene_bounds;
@@ -689,7 +689,7 @@ fn every_areas_layer_stays_inside_its_area() {
 
     // What the host does on every frame, and without which there are no layers to
     // check: a layer lives exactly one paint, so an area that is clean is not painted
-    // and stops being one (§26.1). This is `ShellDriver::layers` by hand.
+    // and stops being one. This is `ShellDriver::layers` by hand.
     let areas: Vec<WidgetId> = harness.root_widget().area_ids();
     let mut boxes: Vec<(WidgetId, Rect)> = Vec::new();
     for area in &areas {
@@ -752,8 +752,8 @@ fn every_areas_layer_stays_inside_its_area() {
 /// node: `value`, `checked` and the tint are copied too, and a node already on screen
 /// reads none of them again. Inside one window the edit travels as a push
 /// (`GraphNode::broadcast`), which is dropped across a `RenderRoot` like every other
-/// (§44.3) — and the model recorded nothing for the other window to collect, so the two
-/// windows disagreed about a checkbox for good (§44.9).
+/// — and the model recorded nothing for the other window to collect, so the two
+/// windows disagreed about a checkbox for good.
 #[test]
 fn an_edit_inside_a_node_reaches_the_other_window() {
     let (screen_a, graph) = crate::ScreenSpec::new(1, 200).with_ops(true).build();
@@ -805,7 +805,7 @@ fn node_state(harness: &mut TestHarness<Screen>, area: usize, index: usize) -> O
 /// The widget cannot move — `RenderRoot` owns its arena — so what is carried is the
 /// session, and the test is that everything a user would miss comes through it: the view,
 /// the selection and the depth of the history. The areas that stayed keep their widgets,
-/// which is §41.2's rule and the `builds` counter that holds it.
+/// which is the rule that ids are never renumbered, and the `builds` counter that holds it.
 #[test]
 fn a_detached_area_arrives_with_its_view_its_selection_and_its_history() {
     use blazy::masonry::kurbo::Vec2;
@@ -839,7 +839,7 @@ fn a_detached_area_arrives_with_its_view_its_selection_and_its_history() {
     assert_eq!(
         screen.root_widget().stats().counters.builds,
         builds_before,
-        "and the areas that stayed were not rebuilt (§41.2)"
+        "and the areas that stayed were not rebuilt"
     );
 
     // The other window: a new screen of one area over the session that was carried.
@@ -861,8 +861,8 @@ fn a_detached_area_arrives_with_its_view_its_selection_and_its_history() {
 /// A selection made in one area is the selection of every area over the graph.
 ///
 /// It was the other way round until a node dragged in one area moved in the other while a
-/// different node there looked selected: the selection belonged to the view (§38.4), and
-/// this test held that. It belongs to the graph now, as in Blender (§50.8) — and the node
+/// different node there looked selected: the selection belonged to the view, and
+/// this test held that. It belongs to the graph now, as in Blender — and the node
 /// has to *look* selected in the other area, not only be reported so: the class is what an
 /// application styles.
 #[test]
@@ -942,7 +942,7 @@ fn a_node_added_in_one_area_arrives_selected_and_on_top() {
 }
 
 /// The pre-tree seat belongs to the layer root, and an editor inside an area is not
-/// one (§38.1).
+/// one.
 ///
 /// This is the reason the seat cannot be the whole answer for a real application: a
 /// window of eight areas has exactly one widget that `Layer::capture_pointer_event`
@@ -961,7 +961,7 @@ fn an_editor_inside_an_area_has_no_pre_tree_seat() {
     assert_eq!(seen, 0, "no layer hook reaches a widget nested inside an area");
 }
 
-// --- MARK: what a real frame asks the rasteriser for (§34)
+// --- MARK: what a real frame asks the rasteriser for
 
 /// A real frame is nowhere near either of the rasteriser's ceilings, and the guard in
 /// front of it costs nothing to say so.
@@ -970,8 +970,8 @@ fn an_editor_inside_an_area_has_no_pre_tree_seat() {
 /// build the scenes it invents, and what matters is what an *application* nests. Eight
 /// areas over one graph, at a HiDPI scale, come out at one clip deep and no groups at
 /// all — so `over_budget` answers from the command stream and never walks the geometry
-/// (§34.3). An application that wraps widgets in opacity groups is the one that has to
-/// watch the depth, and §34.2 says at what number.
+///. An application that wraps widgets in opacity groups is the one that has to
+/// watch the depth, and the threshold is known.
 #[test]
 fn a_real_frame_is_far_from_both_ceilings() {
     use blazy::masonry::imaging::record::Command;
@@ -1004,7 +1004,7 @@ fn a_real_frame_is_far_from_both_ceilings() {
     // frame asks for no blend scratch at all.
     assert!(depth <= 4, "a real frame nests {depth} deep");
     assert_eq!(demand.blend_words, 0);
-    // And an order of magnitude of headroom in tiles, which is the §33.4 claim
+    // And an order of magnitude of headroom in tiles, which is the claim
     // measured on the real scene rather than on diagonals.
     assert!(
         demand.tiles * 10 < blazy::shell::TILE_BUDGET,
@@ -1014,9 +1014,9 @@ fn a_real_frame_is_far_from_both_ceilings() {
     );
 }
 
-// --- MARK: layers per area (§36)
+// --- MARK: layers per area
 
-/// Asks every area to repaint, the way the shell does before a frame (§36.1).
+/// Asks every area to repaint, the way the shell does before a frame.
 ///
 /// Not a method on `AreaScreen`: keeping a layer alive is the host's job — the window
 /// loop does it for the ids `ShellDriver::layers` returns — and a library method that
@@ -1031,7 +1031,7 @@ fn keep_layers(harness: &mut TestHarness<Screen>) {
 /// Two numbers the design rests on, measured rather than assumed: how many layers the
 /// plan carries when every area declares one, and what happens on the frame after —
 /// the frame a cache exists for. Asking the areas to repaint is what keeps the second
-/// number equal to the first (§26.1).
+/// number equal to the first.
 #[test]
 fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
     let (screen, _graph) = crate::ScreenSpec::new(8, 400)
@@ -1066,12 +1066,11 @@ fn every_area_is_its_own_layer_while_it_is_asked_to_repaint() {
 /// The claim the whole mechanism stands on, checked pixel for pixel rather than by
 /// reasoning about copies: the same screen is drawn twice, once from scratch and once
 /// with every area's pixels kept from the frame before, and the two frames have to be
-/// identical. Skipped where there is no graphics device, like every GPU claim here
-/// (§27.5).
+/// identical. Skipped where there is no graphics device, like every GPU claim here.
 #[test]
 fn a_kept_layer_is_the_same_picture() {
     let size = PhysicalSize::new(1400, 900);
-    // With a background, because that is what a window presents (§26.4) and because a
+    // With a background, because that is what a window presents and because a
     // transparent pixel's colour channels are not part of the picture: without it the
     // two paths differ in the RGB of fully transparent pixels, which is nothing.
     let panel = Color::from_rgb8(0x14, 0x14, 0x18);
@@ -1140,7 +1139,7 @@ fn a_kept_layer_is_the_same_picture() {
     );
 }
 
-/// And the other direction of the same switch (§28.4): a layer that *did* change is
+/// And the other direction of the same switch: a layer that *did* change is
 /// drawn again.
 ///
 /// Without this the picture test above passes on a cache that never invalidates

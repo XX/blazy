@@ -10,7 +10,7 @@
 //! What each shape is worth, and why:
 //!
 //! * a fill, a clip or a stroke is its geometry's bounding box, which is what vello bins on; a stroke is inflated by
-//!   half its width, in the geometry's own space (§31.3);
+//!   half its width, in the geometry's own space;
 //! * a glyph is charged its em box, because a glyph is a path and its outline fits inside one;
 //! * a blurred rectangle spreads by three standard deviations, which is where the filter is cut off.
 
@@ -26,7 +26,7 @@ pub(crate) fn shape_bounds(shape: &GeometryRef<'_>) -> Rect {
         // `bounding_box` solves each curve for its extrema, which sounds like a lot in
         // front of every frame. The cheap alternative — the box over the control
         // points, never smaller — was tried and changed the measured cost of a scene
-        // walk by 2% (§33.3): the time goes into walking the scene, not into the
+        // walk by 2%: the time goes into walking the scene, not into the
         // arithmetic. So the tighter box stays, because it refuses less.
         GeometryRef::Path(path) => path.bounding_box(),
         GeometryRef::OwnedPath(path) => path.bounding_box(),
@@ -36,8 +36,8 @@ pub(crate) fn shape_bounds(shape: &GeometryRef<'_>) -> Rect {
 /// Whether a shape's outline stays along the edges of its bounding box.
 ///
 /// True for a rectangle and a rounded rectangle, which is what an area tree and a
-/// viewport clip with (§20.3), and what makes them nearly free on the blend stack
-/// (§34.2). A path can wander anywhere inside its box.
+/// viewport clip with, and what makes them nearly free on the blend stack
+///. A path can wander anywhere inside its box.
 pub(crate) fn is_rectangular(shape: &GeometryRef<'_>) -> bool {
     matches!(shape, GeometryRef::Rect(_) | GeometryRef::RoundedRect(_))
 }
@@ -64,7 +64,7 @@ pub(crate) fn fill(draw: &FillRef<'_>) -> (Affine, Rect) {
 }
 
 /// Where a stroke lands: half the width on each side, before the transform, because the
-/// stroke is in the geometry's own space (§31.3).
+/// stroke is in the geometry's own space.
 pub(crate) fn stroke(draw: &StrokeRef<'_>) -> (Affine, Rect) {
     let outset = draw.stroke.width / 2.0;
     (draw.transform, shape_bounds(&draw.shape).inflate(outset, outset))

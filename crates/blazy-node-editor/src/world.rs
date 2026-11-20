@@ -9,17 +9,9 @@ use masonry::kurbo::{Point, Rect, Size, Vec2};
 use crate::{Link, NodeGraph, SharedGraph};
 
 /// What a new node is sized at until an application says otherwise.
-///
-/// Neither small enough to be a dot nor large enough to fill a viewport; the number is
-/// a default, not a measurement.
 pub const DEFAULT_NODE_SIZE: Size = Size::new(160.0, 96.0);
 
-/// A change to the shape of the graph, on its way from the model into the views.
-///
-/// The counterpart of the moved nodes ([`EditorWorld::take_moved`]) for structure rather than geometry: an
-/// operator writes the model and leaves this behind, and the driver carries it into its
-/// own canvas and into the graph's other views (§30). Nothing here is a widget, and that
-/// is the rule the whole crate is built on (§38.3).
+/// A change to the structure of the graph, on its way from the model into the views.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Edit {
@@ -35,8 +27,7 @@ pub enum Edit {
         /// The name that is now free.
         index: usize,
     },
-    /// What a node holds changed — an edit undone or redone (§67). Every view builds the node
-    /// again from the model.
+    /// What a node holds changed; every view rebuilds the node.
     ContentChanged {
         /// The node's name.
         index: usize,
@@ -45,9 +36,7 @@ pub enum Edit {
     LinkAdded(Link),
     /// A link went.
     LinkRemoved(Link),
-    /// A node was given a new rectangle — resized, and moved with it when the resize was
-    /// from its left edge (§60). Structure rather than a move because a move carries only the
-    /// corner, and every view has to hear the size.
+    /// A node was given a new rectangle (a resize).
     NodeResized {
         /// The node's name.
         index: usize,
@@ -61,124 +50,69 @@ pub enum Edit {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct LinkPreview {
-    /// Each curve from its output end to its input end, in canvas coordinates. One for a
-    /// new link or a link taken off an input; one per link for the links of an output.
+    /// Each curve from its output end to its input end, in canvas coordinates.
     pub curves: Vec<(Point, Point)>,
-    /// The port under the pointer the links would be connected to, by node, side and
-    /// number; `None` while the pointer is on no port they could go to.
+    /// The port under the pointer the links would connect to, if any.
     pub target: Option<(usize, PortSide, u16)>,
-    /// The port a new link is being drawn out of; `None` when the drag carries links taken
-    /// off a port, whose fixed ends are only where those links already were.
+    /// The port a new link is drawn out of; `None` when the drag carries existing links.
     pub source: Option<(usize, PortSide, u16)>,
-    /// The graph refuses the links at the port under the pointer
-    /// ([`NodeGraph::accepts_link`]): letting go there makes none of them.
+    /// The graph refuses the links at the port under the pointer.
     pub refused: bool,
 }
 
-/// Everything the operators are allowed to touch.
-///
-/// Deliberately not a widget in sight: the model, the selection, where the pointer is
-/// and what it is over. A driver fills the last two in before it dispatches, and reads
-/// the moved nodes ([`take_moved`](Self::take_moved)) afterwards.
+/// Everything the operators may touch: the graph, the pointer and what it is over, and what
+/// they leave for the driver to carry into the views. No widgets.
 pub struct EditorWorld<G: NodeGraph> {
-    /// The graph. The source of truth, shared with every view of it (§30).
+    /// The graph, shared with every view of it.
     pub(crate) graph: SharedGraph<G>,
-    /// The selection as it was before the first change the driver has not announced yet.
-    ///
-    /// The selection itself is the graph's ([`Views::selection`](crate::Views::selection)):
-    /// this is what lets the driver tell the views which nodes came into it.
+    /// The selection before the first change not yet announced to the views.
     pub(crate) selection_before: Option<BTreeSet<usize>>,
     /// What the pointer is over, as the canvas last picked it.
-    ///
-    /// The context an operator polls against, and the reason a press picks as well as
-    /// a move (§38.3): a driver holding an `EventCtx` cannot hit-test a child, so the
-    /// canvas publishes what it found and the driver reads it.
     pub(crate) hover: Option<CanvasHit>,
     /// Pointer position, in canvas coordinates.
     pub(crate) pointer: Point,
-    /// Pointer position in the driver's own coordinates.
-    ///
-    /// Both, because they are not interchangeable during a pan: the view moves under
-    /// the pointer, so an operator that panned in canvas coordinates would chase its
-    /// own tail.
+    /// Pointer position in the driver's own coordinates; a pan works in these, since the
+    /// view moves under the pointer.
     pub(crate) pointer_screen: Point,
-    /// Screen pixels per canvas unit in this view, as of the last event.
-    ///
-    /// For an operator whose target is a strip a few *screen* pixels wide — the edge a node
-    /// is resized by (§60) — since canvas units span a factor of 400 across the zoom range
-    /// (§25.2). Filled in by the driver with the pointer; one until then.
+    /// Screen pixels per canvas unit, as of the last event; one until then.
     pub(crate) scale: f64,
     /// The rubber band, in canvas coordinates, while a box select is running.
     pub(crate) band: Option<Rect>,
-    /// Nodes whose position changed and whose views have not been told yet.
-    ///
-    /// Drained by the driver. Duplicates are allowed and expected — a drag pushes the
-    /// same index every frame — because deduplicating costs more than moving a child
-    /// twice would.
+    /// Nodes moved since the driver last looked; duplicates allowed.
     pub(crate) moved: Vec<usize>,
-    /// View movement the driver has not applied yet, in screen units.
-    ///
-    /// The view is not model state and not the operator's to touch, so it leaves here
-    /// the same way a moved node does — as something for the driver to carry in.
+    /// View movement for the driver to apply, in screen units.
     pub(crate) pan: Vec2,
-    /// View zooms the driver has not applied yet: the point to zoom about, in the
-    /// driver's own (screen) units, and the factor.
-    ///
-    /// The zoom twin of [`pan`](Self::pan), and kept as a list rather than a product
-    /// because two zooms about two points are not one zoom about either.
+    /// View zooms for the driver to apply: the point (screen units) and the factor. A list,
+    /// because two zooms about two points are not one zoom.
     pub(crate) zoom: Vec<(Point, f64)>,
-    /// A menu an operator asked to open, for the driver to put on screen at the pointer.
-    ///
-    /// Left here rather than opened by the operator, for the reason everything here is:
-    /// an operator never touches a widget, and a menu on screen is one (§38.3).
+    /// A menu for the driver to open at the pointer.
     pub(crate) menu: Option<crate::Menu>,
     /// The links being dragged, for the driver to draw over the canvas.
     pub(crate) link_preview: Option<LinkPreview>,
-    /// Where the canvas puts its ports, for an operator that has to know where a port is
-    /// without the pointer on it — the far end of a link taken off an input.
-    ///
-    /// The canvas's rule (§52), copied in by the editor when it is built over a canvas
-    /// (`NodeEditor::with_session`); the default puts every port at the middle of its edge,
-    /// as the canvas's own default does.
+    /// Where the canvas puts its ports; copied from the canvas by the editor.
     pub(crate) ports: PortLayout,
-    /// Whether the running operator needs to know what is under the pointer on every move.
-    ///
-    /// While an operator holds the pointer the canvas below sees no events and publishes no
-    /// hover; the driver picks for it instead — and only while this asks, so a node drag,
-    /// which needs no hover, does not pay a pick per move.
+    /// Whether the running operator needs a pick on every move (the canvas sees no events
+    /// while an operator holds the pointer).
     pub(crate) track_hover: bool,
     /// Set when something changed that only affects pixels.
     pub(crate) dirty: bool,
-    /// Changes to the shape of the graph the views have not been told about yet.
-    ///
-    /// Drained by the driver, exactly like the moved nodes. Structure is not
-    /// geometry: a canvas chooses what it draws for a *region* and re-chooses it when
-    /// the view leaves that region, so an edit nobody announces is an edit no view ever
-    /// notices (§28.4, §43).
+    /// Structure changes not yet carried into the views.
     pub(crate) edits: Vec<Edit>,
-    /// The size a new node is given, unless an operator is told another one.
-    ///
-    /// The canvas holds each node's rectangle and the model decides what a node *is*;
-    /// between the two there is nobody to ask how big a node the user just asked for
-    /// should be, so it is a setting rather than a guess.
+    /// The size a new node is given, unless the binding says otherwise.
     pub(crate) new_node_size: Size,
-    /// How a finished move becomes an undo step. [`journal`] unless replaced.
-    ///
-    /// A seam rather than a fixed choice because §38.4 measured the alternative — a
-    /// snapshot of the whole graph per step — against the journal, and the measurement
-    /// has to stay reproducible. The snapshot needs to know what a node *is*, which
-    /// only the application does, so the application supplies it.
+    /// How a finished move becomes an undo step; [`journal`] unless replaced (the
+    /// `node-canvas` benchmark compares it with a snapshot).
     pub(crate) record_move: MoveRecorder<G>,
-    /// The screen around this world's area, as the driver last saw it (§71).
+    /// The screen around this world's area, as the driver last saw it.
     pub(crate) screen: crate::ScreenState,
     /// What the screen's operators asked the driver to do, in order.
     pub(crate) screen_requests: Vec<crate::ScreenAction>,
-    /// The system clipboard, if a driver handed it over (§71).
+    /// The system clipboard, if a driver handed it over.
     pub(crate) clipboard: Option<crate::SystemClipboard>,
 }
 
 impl<G: NodeGraph> EditorWorld<G> {
-    /// The graph the operators act on (§68).
+    /// The graph the operators act on.
     pub fn graph(&self) -> &SharedGraph<G> {
         &self.graph
     }
@@ -228,21 +162,18 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.new_node_size = size;
     }
 
-    /// Sets what is under the pointer and where it is — what the editor does before each
-    /// event, for a driver of its own (a test, a benchmark, a host seat) that picks for
-    /// itself.
+    /// Sets what is under the pointer and where it is, for a driver of its own.
     pub fn set_pointer(&mut self, hover: Option<CanvasHit>, pos: Point) {
         self.hover = hover;
         self.pointer = pos;
     }
 
-    /// The screen around this world's area, as the driver last saw it (§71).
+    /// The screen around this world's area, as the driver last saw it.
     pub fn screen(&self) -> crate::ScreenState {
         self.screen
     }
 
-    /// Sets the snapshot of the screen the screen's operators poll on — the driver's to keep,
-    /// before every event.
+    /// Sets the snapshot of the screen the screen's operators poll on.
     pub fn set_screen(&mut self, screen: crate::ScreenState) {
         self.screen = screen;
     }
@@ -252,7 +183,7 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.screen_requests.push(action);
     }
 
-    /// What the screen's operators asked for since the last time, taken — the driver's.
+    /// Takes what the screen's operators asked for since the last call.
     pub fn take_screen_requests(&mut self) -> Vec<crate::ScreenAction> {
         std::mem::take(&mut self.screen_requests)
     }
@@ -262,20 +193,18 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.clipboard.as_ref()
     }
 
-    /// Hands the system clipboard over, for `node.copy` and `node.paste` (§71).
+    /// Hands the system clipboard over, for `node.copy` and `node.paste`.
     pub fn set_clipboard(&mut self, clipboard: Option<crate::SystemClipboard>) {
         self.clipboard = clipboard;
     }
 
-    /// Records that nodes moved past the operators' own setters — a step that put a whole
-    /// snapshot back — so that the views follow.
+    /// Records that nodes moved past the operators' setters, so that the views follow.
     pub fn note_moved(&mut self, indices: impl IntoIterator<Item = usize>) {
         self.moved.extend(indices);
         self.dirty = true;
     }
 
-    /// The nodes moved since the last time, taken — for a driver of its own that carries
-    /// the moves into its canvas, as the editor does after each event.
+    /// Takes the nodes moved since the last call, for a driver of its own.
     pub fn take_moved(&mut self) -> Vec<usize> {
         self.dirty = false;
         std::mem::take(&mut self.moved)
@@ -323,7 +252,7 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.graph.borrow().node_rect(index)
     }
 
-    /// Writes what node `index` holds to the model and records that views must follow (§67).
+    /// Writes what node `index` holds to the model and records that views must follow.
     pub fn set_content(&mut self, index: usize, content: G::Content) {
         self.graph.borrow_mut().set_content(index, content);
         self.edits.push(Edit::ContentChanged { index });
@@ -351,7 +280,7 @@ impl<G: NodeGraph> EditorWorld<G> {
     }
 
     /// Adds a node of kind `kind` at `rect` and returns its name; `None` for a kind the
-    /// graph does not have (§64).
+    /// graph does not have.
     pub fn add_kind(&mut self, rect: Rect, kind: &str) -> Option<usize> {
         let index = self.graph.borrow_mut().insert_kind(rect, kind)?;
         self.added(index);
@@ -365,11 +294,8 @@ impl<G: NodeGraph> EditorWorld<G> {
         index
     }
 
-    /// Records a node the model just added, at the rectangle the *model* gave it.
-    ///
-    /// Not the one asked for: a graph may size a node by what it is (`calc` does), and the
-    /// views told the asked-for rectangle showed the node at another size than the model
-    /// held — every view, until the node was moved (§64).
+    /// Records a node the model just added, at the rectangle the model gave it (which may
+    /// differ from the one asked for).
     fn added(&mut self, index: usize) {
         let rect = self.graph.borrow().node_rect(index);
         self.edits.push(Edit::NodeAdded { index, rect });
@@ -415,13 +341,9 @@ impl<G: NodeGraph> EditorWorld<G> {
         true
     }
 
-    /// Connects `link`, first taking off what its input can no longer hold — the oldest links
-    /// there, as many as [`NodeGraph::input_limit`] leaves no room for. Hands back the links
-    /// taken off, or `None` if the graph refused the link, in which case nothing changed.
-    ///
-    /// What `link.drag` and `link.add` both connect through, so a link dropped on a full
-    /// input replaces what was there whichever way it came, and the caller records the links
-    /// taken off in the same step as the one put on.
+    /// Connects `link`, first taking the oldest links off its input beyond
+    /// [`NodeGraph::input_limit`]. Returns the links taken off, or `None` (and changes
+    /// nothing) if the graph refused the link.
     pub fn connect(&mut self, link: Link) -> Option<Vec<Link>> {
         let (limit, mut held) = {
             let graph = self.graph.borrow();
@@ -456,10 +378,7 @@ impl<G: NodeGraph> EditorWorld<G> {
         self.dirty = true;
     }
 
-    /// The selected nodes, by index: the graph's selection, shared by every view of it.
-    ///
-    /// A `BTreeSet` so that iteration order is the graph's order rather than a hash
-    /// seed's: a test comparing two runs would otherwise compare their orderings.
+    /// The selected nodes: the graph's selection, shared by every view of it.
     pub fn selection(&self) -> BTreeSet<usize> {
         self.graph.borrow().views().selection()
     }
@@ -470,9 +389,6 @@ impl<G: NodeGraph> EditorWorld<G> {
     }
 
     /// Replaces the selection, and says whether it changed.
-    ///
-    /// The graph's, not this session's: every view of the graph shows it, as in Blender.
-    /// The driver tells the views after the operator, with what else it changed.
     pub fn select(&mut self, nodes: BTreeSet<usize>) -> bool {
         let Some(before) = self.graph.borrow().views().replace_selection(nodes) else {
             return false;
@@ -482,14 +398,8 @@ impl<G: NodeGraph> EditorWorld<G> {
         true
     }
 
-    /// The nodes whose rectangles meet `rect`.
-    ///
-    /// A scan of the model rather than the canvas's spatial index, and on purpose: the
-    /// index is a *view's* answer to "what is on screen", and a box select must find
-    /// nodes the view has not materialised — including, at an overview zoom, nodes
-    /// that have no widget at all (§25.3). Twenty thousand rectangle tests happen once
-    /// per gesture, not once per frame: the band is drawn on every move and resolved
-    /// on release.
+    /// The nodes whose rectangles meet `rect`, from the model: a box select must find nodes
+    /// the view has not built. Once per gesture, not per frame.
     pub fn nodes_in(&self, rect: Rect) -> BTreeSet<usize> {
         let graph = self.graph.borrow();
         (0..graph.node_count())
@@ -515,17 +425,11 @@ pub struct MoveRecord {
     pub to: Vec<Point>,
 }
 
-/// Turns a finished move into an undo step. See
-/// [`NodeEditor::set_move_recorder`](crate::NodeEditor::set_move_recorder).
-///
-/// Called once per move, when it is confirmed, with the graph already in its final
-/// state — so a recorder that wants the whole graph can read it from the world.
+/// Turns a finished move into an undo step; called when the move is confirmed, with the
+/// graph in its final state.
 pub type MoveRecorder<G> = fn(&EditorWorld<G>, MoveRecord) -> Box<dyn Step<EditorWorld<G>>>;
 
-/// The default [`MoveRecorder`]: a journal entry of what moved (§38.4).
-///
-/// Costs what was touched — 40 bytes for a one-node drag — where a snapshot costs the
-/// graph.
+/// The default [`MoveRecorder`]: a journal entry of what moved.
 pub fn journal<G: NodeGraph>(_world: &EditorWorld<G>, record: MoveRecord) -> Box<dyn Step<EditorWorld<G>>> {
     Box::new(MoveStep(record))
 }
@@ -579,8 +483,7 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for SelectStep {
     }
 }
 
-/// A node that went, and what it takes to bring it back: [`EditorWorld::remove_node`]'s
-/// answer.
+/// A removed node and what it takes to bring it back.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Removed<C> {
@@ -588,29 +491,21 @@ pub struct Removed<C> {
     pub index: usize,
     /// Where it was, in canvas coordinates.
     pub rect: Rect,
-    /// What it held. Kept by whoever means to put the node back, rather than left in the
-    /// graph's slot, which keeps it only until an insertion takes the name back (§57).
+    /// What it held.
     pub content: C,
     /// The links that ended on it.
     pub links: Vec<Link>,
 }
 
 impl<C> Removed<C> {
-    /// What the history holds for it, by the step's own reckoning: the content's inline
-    /// size, not what it owns on the heap — a journal entry is priced at what it touched
-    /// (§38.4), and the editor cannot see past an opaque type.
+    /// Its size in the history: the content's inline size, not its heap.
     fn bytes(&self) -> usize {
         size_of::<usize>() + size_of::<Rect>() + size_of::<C>() + self.links.len() * size_of::<Link>()
     }
 }
 
-/// A node that appeared: undo takes it away, redo puts it back under its own name.
-///
-/// The selection travels with it, and that is the point: adding a node selects it, which
-/// is one action to the user and therefore one step. Recording the selection change as a
-/// step of its own — which is what pushing it through the shared selection path did —
-/// makes one `Shift+A` take two undos, and the second one does something the user never
-/// asked for.
+/// An added node: undo removes it, redo puts it back under its own name. The selection
+/// change is part of the same step.
 pub(crate) struct AddStep<C> {
     pub(crate) index: usize,
     pub(crate) rect: Rect,
@@ -640,11 +535,7 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for AddStep<G::Content> {
     }
 }
 
-/// Nodes that went, with what it takes to bring each of them back.
-///
-/// The links come with the nodes rather than as steps of their own: deleting a node and
-/// deleting its links is one thing the user did, and an undo that returned the node
-/// without its links would be a different graph wearing the same names.
+/// Removed nodes with their links, as one step.
 pub(crate) struct DeleteStep<C> {
     pub(crate) nodes: Vec<Removed<C>>,
     pub(crate) selection: BTreeSet<usize>,
@@ -680,12 +571,7 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for DeleteStep<G::Content> {
     }
 }
 
-/// Nodes that came in as copies — a duplicate or a paste — with the links between them.
-///
-/// One step for the lot, as a delete is one step: undo removes every node it added (the
-/// links go with them) and puts the selection back; redo brings back the same names,
-/// holding the same contents, where the nodes ended up — after the move a duplicate
-/// starts, which is part of the same step (§57).
+/// Nodes added as copies (duplicate, paste) with the links between them, as one step.
 pub(crate) struct CopyStep<C> {
     pub(crate) name: &'static str,
     pub(crate) nodes: Vec<(usize, Rect, C)>,
@@ -723,12 +609,8 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for CopyStep<G::Content> {
     }
 }
 
-/// Nodes copied out of a graph, with the links between them: what `node.copy` leaves on
-/// the graph's clipboard and what `node.duplicate` copies without one.
-///
-/// Links with one end outside the copy are not in it, as in Blender's duplicate and its
-/// clipboard: a copy is a subgraph, and a link into the rest of the graph would be a
-/// second edge into a node nobody copied.
+/// Nodes copied out of a graph with the links between them; links leaving the copy are
+/// not in it, as in Blender.
 #[derive(Debug)]
 pub(crate) struct Clip<C> {
     /// Each node's rectangle where it was copied from, and what it held.
@@ -737,15 +619,14 @@ pub(crate) struct Clip<C> {
     pub(crate) links: Vec<Link>,
 }
 
-/// The first words of a copy as text, and the version this build reads and writes; the
-/// graph's content format follows on the same line.
+/// The first words of a copy as text; the content format follows on the same line.
 const CLIP_FORMAT: &str = "blazy-nodes 1";
 /// The most nodes a copy as text is read with: a clipboard is input from another process.
 const CLIP_MAX_NODES: usize = 10_000;
 
 impl<C: Clone + 'static> Clip<C> {
     /// The copy as text, for the system clipboard: `None` if any node's content has no
-    /// text form (§66).
+    /// text form.
     ///
     /// ```text
     /// blazy-nodes 1 <content format>
@@ -753,13 +634,12 @@ impl<C: Clone + 'static> Clip<C> {
     /// link <from> <from port> <to> <to port>
     /// ```
     ///
-    /// Nodes by position, as the copy names them; links by those positions. The content is
-    /// the graph's own text with `\` and line breaks escaped, so it stays on its line.
+    /// Links name nodes by position in the copy. Content has `\` and line breaks escaped.
     pub(crate) fn to_text<G: NodeGraph<Content = C>>(&self, graph: &G) -> Option<String> {
         let form = graph.text_form()?;
         let format = form.format();
         if format.is_empty() || format.contains(char::is_whitespace) {
-            // A format name the header cannot carry: the copy stays in the process, and says why.
+            // A name the header cannot carry: the copy stays in the process.
             tracing::warn!(format, "a content format is one word; the copy stays in the process");
             return None;
         }
@@ -790,8 +670,7 @@ impl<C: Clone + 'static> Clip<C> {
     /// between nodes the text holds, and contents the graph reads back.
     pub(crate) fn from_text<G: NodeGraph<Content = C>>(graph: &G, text: &str) -> Option<Self> {
         let mut lines = text.lines();
-        // A copy is read only in the format it was written in: the library's version, and the
-        // application's content.
+        // Only our version and the graph's own content format.
         let form = graph.text_form()?;
         let format = form.format();
         if lines.next()?.trim_end().strip_prefix(CLIP_FORMAT)?.strip_prefix(' ')? != format {
@@ -823,8 +702,7 @@ impl<C: Clone + 'static> Clip<C> {
                 ));
             }
         }
-        // A link may name a node the text gives later only if it is written later, and the
-        // writer writes every node first; a reader that allowed otherwise would check twice.
+        // The writer writes every node before any link.
         Some(Self { nodes, links })
     }
 
@@ -934,7 +812,7 @@ impl<G: NodeGraph> Step<EditorWorld<G>> for LinkStep {
     }
 }
 
-/// An edit of what a node holds, made in its widget or a panel: before and after (§67).
+/// An edit of what a node holds, made in its widget or a panel: before and after.
 pub(crate) struct ContentStep<C> {
     pub(crate) index: usize,
     pub(crate) before: C,

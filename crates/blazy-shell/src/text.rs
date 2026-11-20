@@ -1,24 +1,13 @@
 //! Text from the platform: the clipboard and the input method.
 //!
-//! Masonry's text widgets do their part inside the tree — a `TextArea` asks for the
-//! clipboard with a signal, and the focus pass asks for the input method when a widget
-//! that takes text input gains focus — and leave the platform's part to the host. This
-//! loop used to drop both, so in a blazy window nothing could be pasted and nothing typed
-//! through an IME, while every test passed: the harness needs neither (the same story as
-//! layers, `issues/menus.md`). This module is the host's part, as free functions over the
-//! root, so that an embedder running its own loop does the same and a test can check it
-//! without a window.
+//! Masonry's text widgets ask the host for the clipboard (by signal) and the input method
+//! (from the focus pass). This is the host's part, as free functions over the root, so an
+//! embedder or a test does the same.
 //!
-//! # Paste is a key the host turns into text
-//!
-//! There is no paste signal. Upstream's runner watches for `Ctrl+V` (`Cmd+V` on macOS)
-//! itself and hands the tree a `TextEvent::ClipboardPaste` instead of the key. Done
-//! unconditionally, as there, it would make `Ctrl+V` unreachable for a keymap — the node
-//! editor's paste is the same key. So the key is turned into text **only while the focused
-//! widget takes text input** ([`text_input_focused`]), and goes to the seat and the tree as
-//! a key otherwise. Inside a text field the conversion has to happen even with an empty
-//! clipboard: a `TextArea` inserts any character it is given, modifiers or not, and a
-//! `Ctrl+V` delivered as a key would type a `v`.
+//! There is no paste signal: the host turns `Ctrl+V` (`Cmd+V` on macOS) into
+//! `TextEvent::ClipboardPaste`, but only while a text field has focus
+//! ([`text_input_focused`]), so that a keymap can bind the key elsewhere. In a field it is
+//! converted even with an empty clipboard, or the field would type a `v`.
 
 use masonry::app::{RenderRoot, RenderRootSignal};
 use masonry::core::keyboard::{Code, Key, KeyState};
@@ -27,11 +16,8 @@ use masonry::dpi::{LogicalPosition, LogicalSize};
 
 use crate::window::ShellCtx;
 
-/// Where copied text goes and pasted text comes from.
-///
-/// A trait so that a test, or an application with a clipboard of its own, can stand in
-/// for the platform's. The shell's loop opens the system one ([`SystemClipboard`]); a
-/// [`ShellCtx`] made with [`ShellCtx::new`] starts with a [`MemoryClipboard`].
+/// Where copied text goes and pasted text comes from: the platform's ([`SystemClipboard`]),
+/// or a [`MemoryClipboard`].
 pub trait Clipboard {
     /// The text on the clipboard, or `None` when there is none — nothing copied yet, or
     /// something that is not text.
@@ -67,13 +53,7 @@ impl Clipboard for MemoryClipboard {
     }
 }
 
-/// The platform's clipboard, text only.
-///
-/// `arboard` rather than upstream's `copypasta`: the same reach on the three desktop
-/// platforms with one crate rather than a crate per platform, and maintained. On Wayland
-/// it goes through XWayland — `arboard`'s native Wayland path needs the data-control
-/// protocol, which not every compositor offers — so a session with no XWayland gets the
-/// in-process fallback and a warning.
+/// The platform's clipboard, text only, through `arboard` (on Wayland via XWayland).
 pub struct SystemClipboard {
     inner: arboard::Clipboard,
 }
@@ -96,8 +76,7 @@ impl Clipboard for SystemClipboard {
     fn read(&mut self) -> Option<String> {
         match self.inner.get_text() {
             Ok(text) => Some(text),
-            // Nothing copied, or something that is not text: a paste of nothing, not a
-            // failure.
+            // Nothing copied, or not text.
             Err(arboard::Error::ContentNotAvailable) => None,
             Err(error) => {
                 tracing::warn!(%error, "could not read the clipboard");
@@ -113,16 +92,12 @@ impl Clipboard for SystemClipboard {
     }
 }
 
-/// What a window has to do for the input method.
-///
-/// The two calls the host makes on the platform's window, behind a trait so that the
-/// signals can be checked without one; implemented for winit's `Window`.
+/// What a window has to do for the input method; a trait so tests need no window.
 pub trait ImeWindow {
     /// Lets the input method compose into this window, or stops it.
     fn set_ime_allowed(&self, allowed: bool);
 
-    /// Tells the input method where the text being composed is, so its candidate window
-    /// opens next to it rather than in a corner of the screen.
+    /// Tells the input method where the text being composed is, for its candidate window.
     fn set_ime_cursor_area(&self, position: LogicalPosition<f64>, size: LogicalSize<f64>);
 }
 
@@ -137,10 +112,6 @@ impl ImeWindow for winit::window::Window {
 }
 
 /// What the host did with text, counted.
-///
-/// A paste with nothing to paste is normal and invisible, which is exactly the kind of
-/// miss that has to be a number (§44.9): a clipboard that silently fell back to the
-/// in-process one looks like this, too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TextCounters {
@@ -159,12 +130,8 @@ pub struct TextCounters {
     pub ime_moves: u64,
 }
 
-/// Whether the focused widget takes text input — a text field, as opposed to a node
-/// editor that merely holds the keys.
-///
-/// The question a key has to be asked before anyone binds it: inside a text field a key is
-/// text (Blender's text field takes every key while it is being edited). Read from the
-/// widget's state through a `WidgetRef`, so asking costs no rewrite passes.
+/// Whether the focused widget takes text input (a text field, not a node editor holding
+/// the keys). Costs no rewrite passes.
 pub fn text_input_focused(root: &RenderRoot) -> bool {
     root.focused_widget()
         .and_then(|id| root.get_widget(id))
@@ -192,13 +159,8 @@ pub fn is_paste_key(event: &TextEvent) -> bool {
         }
 }
 
-/// What the tree should get for `event`: the event itself, the clipboard's text in place
-/// of the paste key, or nothing at all.
-///
-/// The paste key is turned into text only while a text field has focus (see the module
-/// docs). There the release is swallowed with the press, so a field never sees half of a
-/// paste as a key; an empty clipboard swallows the press as well, because delivering it
-/// would type a `v`.
+/// What the tree should get for `event`: the event, the clipboard's text in place of the
+/// paste key in a text field, or nothing (the release, or an empty clipboard).
 pub(crate) fn paste_or_key(cx: &mut ShellCtx, root: &RenderRoot, event: TextEvent) -> Option<TextEvent> {
     if !is_paste_key(&event) || !text_input_focused(root) {
         return Some(event);
@@ -222,13 +184,8 @@ pub(crate) fn paste_or_key(cx: &mut ShellCtx, root: &RenderRoot, event: TextEven
     }
 }
 
-/// Does what a text signal asks of the platform, or hands the signal back if it is not
-/// one.
-///
-/// The input method is allowed while a text field has focus and stopped when it loses it
-/// (Masonry sends both from its focus pass), and told where the composition is; copied
-/// text goes to `cx`'s clipboard. A free function, like `apply_layer_signal`, so that an
-/// embedder does the same and a test can check it without a window.
+/// Does what a text signal asks of the platform (the input method, copied text), or hands
+/// the signal back if it is not one.
 pub fn apply_text_signal(
     cx: &mut ShellCtx,
     window: &dyn ImeWindow,

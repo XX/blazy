@@ -1,6 +1,6 @@
 //! Hit testing by the shape that was drawn, rather than by the box it was drawn in.
 //!
-//! `rnd/architecture.md` §6.1 gives a widget three geometries: layout is always a
+//! A widget has three geometries: layout is always a
 //! rectangle, the visual one is arbitrary, and the hit one is arbitrary too. Masonry
 //! supplies the first two and leaves a hook for the third —
 //! [`Widget::find_widget_under_pointer`] — which this crate fills in.
@@ -19,7 +19,7 @@
 //! The precise phase runs in the widget's own coordinates, and the pointer's idea of
 //! "close enough" lives on the screen. Inside a zoomable canvas the two differ by the
 //! zoom, which spans 0.02x to 8x — a slop of 4 canvas units is 0.08 px at the bottom
-//! of that range and 32 px at the top (§25.2). So a tolerance is given in screen
+//! of that range and 32 px at the top. So a tolerance is given in screen
 //! pixels and divided by the scale at the moment of the test; [`scale_of`] extracts
 //! that scale from a transform, and [`ShapeHit::find_widget`] reads it from
 //! `QueryCtx::window_transform`, which carries the canvas view.
@@ -28,7 +28,7 @@
 //!
 //! `BezPath::contains` re-walks the path elements on every call: measured at 576 ns
 //! for an eight-segment rounded rectangle against 26 ns for the same shape as a
-//! `RoundedRect`, and 37 ns for a cached polyline (§25.1). A pick tests every
+//! `RoundedRect`, and 37 ns for a cached polyline. A pick tests every
 //! candidate under the pointer, so the difference is the difference between
 //! imperceptible and a visible fraction of a frame. The cache is built on first use
 //! and lives behind a `RefCell`, because the hook takes `&self`.
@@ -57,7 +57,7 @@ pub const DEFAULT_SLOP: f64 = 3.0;
 /// Only the fill cache is flattened, and only for a containment test, so the error
 /// budget is "smaller than a pixel at a plausible zoom" rather than "invisible when
 /// drawn". A quarter of a unit keeps the polyline short: the eight-segment rounded
-/// rectangle of §25.1 flattens to sixteen points.
+/// rectangle flattens to sixteen points.
 const FLATTEN_TOLERANCE: f64 = 0.25;
 
 /// Accuracy asked of [`ParamCurveNearest::nearest`].
@@ -66,7 +66,7 @@ const FLATTEN_TOLERANCE: f64 = 0.25;
 /// cubic, an accuracy of 0.1 answered up to 1.66 units away from the true distance,
 /// which would eat half of a three-pixel tolerance. At 0.01 the worst error is 0.003
 /// units and at 0.001 it is zero to double precision — while the cost barely moves
-/// (123 ns at 0.1, 162 ns at 0.001, §25.1), because the expensive part is being
+/// (123 ns at 0.1, 162 ns at 0.001), because the expensive part is being
 /// called at all rather than being called precisely.
 const NEAREST_ACCURACY: f64 = 0.001;
 
@@ -273,7 +273,7 @@ pub fn scale_of(transform: Affine) -> f64 {
 /// For curves that are not widgets and are rebuilt every frame — the canvas's links —
 /// so there is nothing to cache and the rejection has to be free-standing. The
 /// control polygon contains the curve, so its bounding box is a valid conservative
-/// reject, and it is seven times cheaper than the exact answer (§25.1).
+/// reject, and it is seven times cheaper than the exact answer.
 pub fn near_segment(seg: PathSeg, point: Point, radius: f64) -> bool {
     if !within(hull(seg).inflate(radius, radius), point) {
         return false;
@@ -443,7 +443,7 @@ mod tests {
 
     /// The reason the tolerance is in screen pixels: the same slop must cover more
     /// local units when the shape is drawn smaller, or a curve becomes unclickable
-    /// exactly when it is thinnest (§25.2).
+    /// exactly when it is thinnest.
     #[test]
     fn the_slop_is_screen_pixels_not_local_units() {
         let hit = ShapeHit::stroke_with(Line::new((0.0, 0.0), (100.0, 0.0)), 0.0, 4.0);

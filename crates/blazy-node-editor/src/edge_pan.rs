@@ -1,23 +1,11 @@
-//! Scrolling the view at the edge of an area while an operator holds a node, a link or a
-//! band — Blender's edge pan, and a choice the application makes rather than a behaviour.
+//! Scrolling the view at the edge of an area during a gesture — Blender's edge pan.
 //!
-//! Two switches, and the view scrolls only when both are on:
-//!
-//! * [`EditorSession::edge_pan`](crate::EditorSession::edge_pan) — the application's: how wide the band at the edge is,
-//!   how fast the view goes, and `None` for no edge pan anywhere. Off by default: with it off, a gesture carries on
-//!   past the area's border and the view stands still, which is what every editor did before.
-//! * [`EDGE_PAN`] on a binding — which gestures scroll, as data: the default keymap puts it on `node.move` and
-//!   `link.drag`, and a keymap file can take it off one of them without touching the others. A binding without it does
-//!   not scroll.
-//!
-//! The driver does the scrolling, not the operator, because the interesting case is a
-//! pointer standing still in the band: it sends no events, so no operator hears anything.
-//! The editor asks for an animation frame while the gesture's pointer is in the band and
-//! for none otherwise — a window that keeps asking never idles (§36) — moves the view on
-//! each frame, and hands the running operator a move at the same screen position, which
-//! is a new position in canvas coordinates: the node being dragged travels with the view.
-//! The arithmetic is Blender's (`view2d_edge_pan.cc`) and lives here, apart from any
-//! widget, so a test can check it with no tree; the numbers are in §55.
+//! It scrolls only when the session has an [`EdgePan`]
+//! ([`EditorSession::edge_pan`](crate::EditorSession::edge_pan), off by default) and the
+//! running operator's binding carries [`EDGE_PAN`]. The editor asks for animation frames
+//! while the pointer is in the band (a pointer standing still sends no events), moves the
+//! view, and hands the operator a move at the same screen position. The arithmetic is
+//! Blender's (`view2d_edge_pan.cc`).
 
 use masonry::core::keyboard::Modifiers;
 use masonry::kurbo::{Point, Rect, Size, Vec2};
@@ -28,15 +16,8 @@ pub const EDGE_PAN: &str = "edge_pan";
 
 /// How the view scrolls at the edge of an area while an operator holds the pointer.
 ///
-/// It scrolls only when both switches are on: the session holds one of these
-/// ([`EditorSession::edge_pan`](crate::EditorSession::edge_pan), `None` by default), and the
-/// running operator's binding carries [`EDGE_PAN`]. The view moves on animation frames,
-/// asked for only while the gesture's pointer is in the band, so a pointer standing still
-/// there keeps scrolling and a window with no such gesture idles (§55).
-///
-/// Distances are in the editor's logical pixels and speeds in logical pixels per second
-/// on screen, whatever the zoom: the defaults are Blender's node editor's
-/// (`NODE_EDGE_PAN_*`), at its 20 pixels to a UI unit.
+/// Distances in logical pixels, speeds in logical pixels per second; the defaults are
+/// Blender's node editor's (`NODE_EDGE_PAN_*`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgePan {
     /// How far inside the area's edge the band begins.
@@ -50,8 +31,6 @@ pub struct EdgePan {
     /// The speed at the end of the ramp, in pixels per second.
     pub max_speed: f64,
     /// Seconds from entering the band to full speed, eased in, per axis.
-    ///
-    /// What keeps a drag that brushes the band from throwing the view.
     pub delay: f64,
     /// How much the zoom changes the speed, from 0 (none) to 1 (in proportion): zoomed in,
     /// the view scrolls faster on screen, so it covers a similar distance of the graph.
@@ -73,10 +52,7 @@ impl Default for EdgePan {
 
 impl EdgePan {
     /// Which way the view should move, per axis (`-1`, `0` or `1`), for a pointer at
-    /// `pointer` in an area of `size`.
-    ///
-    /// Towards the edge the pointer is past: a pointer beyond the right edge moves the view
-    /// right, which slides the graph left under it.
+    /// `pointer` in an area of `size`: towards the edge it is past.
     pub fn direction(&self, pointer: Point, size: Size) -> (i8, i8) {
         if let Some(outside) = self.outside
             && !Rect::from_origin_size(Point::ORIGIN, size)
@@ -98,10 +74,8 @@ impl EdgePan {
         (axis(pointer.x, inner.x0, inner.x1), axis(pointer.y, inner.y0, inner.y1))
     }
 
-    /// The part of an area of `size` where the pointer does not scroll.
-    ///
-    /// Collapsed to the middle when the area is narrower than two bands, so that a small
-    /// area still has a place to stand still in.
+    /// The part of an area of `size` where the pointer does not scroll (collapsed to the
+    /// middle in an area narrower than two bands).
     pub fn inner(&self, size: Size) -> Rect {
         let x = self.inside.min(size.width / 2.0);
         let y = self.inside.min(size.height / 2.0);
@@ -138,10 +112,6 @@ fn smootherstep(x: f64) -> f64 {
 #[non_exhaustive]
 pub struct EdgePanCounters {
     /// Animation frames the editor asked for to scroll by.
-    ///
-    /// The number that says the window can idle: it does not move while no gesture's
-    /// pointer is in the band, and a test that sees it move afterwards has found a window
-    /// that keeps itself awake.
     pub frames: u64,
     /// Frames that moved the view.
     pub pans: u64,
@@ -154,10 +124,8 @@ pub struct EdgePanCounters {
 pub(crate) struct EdgePanState {
     /// Whether a gesture that may scroll is running.
     pub(crate) gesture: bool,
-    /// Whether the pointer has been inside the band's inner edge during this gesture.
-    ///
-    /// Blender's rule, and the reason is the same: a drag that starts in the band — a node
-    /// grabbed near the edge — would otherwise throw the view before the user moved at all.
+    /// Whether the pointer has been inside the band's inner edge during this gesture (a
+    /// drag that starts in the band does not scroll until then, as in Blender).
     pub(crate) enabled: bool,
     /// Where the gesture's pointer last was, in the editor's own space.
     pub(crate) pointer: Option<Point>,

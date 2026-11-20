@@ -1,8 +1,8 @@
-//! What a structural edit costs, and what it is obliged to leave behind (§43).
+//! What a structural edit costs, and what it is obliged to leave behind.
 //!
 //! Its own file for the reason the operator table has one: this is a table over graph
 //! sizes rather than a scenario, and what it measures is a *per-edit* quantity, not a
-//! per-frame one. The interesting question is the same one §24.1 got wrong once by
+//! per-frame one. The interesting question is the same one the node sweep got wrong once by
 //! stopping a sweep too early — does the cost follow the graph? — so the sweep reaches
 //! 64 000 nodes, where a linear cost has nowhere left to hide.
 
@@ -18,7 +18,7 @@ use node_canvas::model::SharedGraph;
 use crate::bench::{Options, ScenarioRecord};
 use crate::ops::ops_harness;
 
-/// Graph sizes the table sweeps. The top end is where a linear cost would show (§24.1).
+/// Graph sizes the table sweeps. The top end is where a linear cost would show.
 const EDIT_NODES: [usize; 3] = [5_000, 20_000, 64_000];
 /// Add-and-delete cycles a row runs to see whether freed names come back.
 const NAME_CYCLES: usize = 50;
@@ -45,7 +45,7 @@ pub(crate) struct EditRow {
     restored_wrong: usize,
     /// Links that came back with fewer links than they left with.
     links_lost: usize,
-    /// Structural edits the recorded sets did not notice (§28.4).
+    /// Structural edits the recorded sets did not notice.
     unseen_edits: usize,
     /// Times the packed adjacency was rebuilt, over the whole row.
     compactions: u64,
@@ -54,7 +54,7 @@ pub(crate) struct EditRow {
 /// Runs the edit table.
 pub(crate) fn edit_table(opts: &Options) -> Vec<EditRow> {
     let sizes: &[usize] = if opts.quick { &EDIT_NODES[..1] } else { &EDIT_NODES };
-    println!("\nedits: what one structural edit costs, and what it leaves behind (§43)");
+    println!("\nedits: what one structural edit costs, and what it leaves behind");
     let rows: Vec<EditRow> = sizes.iter().map(|&nodes| edit_row(nodes)).collect();
     print_edits(&rows);
     rows
@@ -161,7 +161,7 @@ fn edit_row(nodes: usize) -> EditRow {
 
     // --- the far field: below the box threshold the canvas paints the nodes itself,
     // from a scene recorded for a region. An edit does not move the view, so nothing
-    // would re-record it unless the edit says so (§28.4).
+    // would re-record it unless the edit says so.
     crate::bench::zoom_to(&mut harness, 0.02);
     let _ = harness.redraw();
     let far_before = harness.root_widget().stats().recorded_far;
@@ -262,7 +262,7 @@ impl EditRow {
     }
 }
 
-/// The criteria of §43, all on counters.
+/// The criteria, all on counters.
 pub(crate) fn criteria(rows: &[EditRow]) -> Vec<Criterion> {
     if rows.is_empty() {
         return Vec::new();
@@ -302,7 +302,7 @@ pub(crate) fn criteria(rows: &[EditRow]) -> Vec<Criterion> {
             bound: 2.0,
             unit: "widgets built/edit",
         },
-        // §41.2, counted: a node that comes back has to come back as itself.
+        // Names are never renumbered, counted: a node that comes back has to come back as itself.
         Criterion {
             name: "a_name_survives_delete_and_undo",
             claim: "undo restores a node under its own name, in its own place",
@@ -331,7 +331,7 @@ pub(crate) fn criteria(rows: &[EditRow]) -> Vec<Criterion> {
             unit: "names added by 50 cycles",
         },
         // The recorded sets are chosen for a region and re-chosen when the view leaves
-        // it; an edit is not the view moving, so it has to say so itself (§28.4).
+        // it; an edit is not the view moving, so it has to say so itself.
         Criterion {
             name: "an_edit_reaches_the_recorded_sets",
             claim: "a link added or removed changes what is drawn in the same frame",

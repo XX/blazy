@@ -19,7 +19,7 @@ impl std::error::Error for UnknownScreenAction {}
 
 /// Which keys do what to the screen: the [`SCREEN_CONTEXT`] section of a keymap, as data.
 ///
-/// The actions are operators now (§71): each area's runtime runs them from this section
+/// The actions are operators now: each area's runtime runs them from this section
 /// like any other binding, after the editor's own sections, and the driver does what they
 /// ask. This type is what an application rebinds them with. The defaults hold a modifier the
 /// editor's own keymap does not use — and a test holds them to that — except `N`, which the
@@ -82,7 +82,7 @@ impl ScreenKeys {
     /// # Errors
     ///
     /// When a binding names an action this build does not have. Refused rather than
-    /// skipped: a binding that does nothing is the miss that looks like success (§45).
+    /// skipped: a binding that does nothing is the miss that looks like success.
     pub fn from_keymap(keymap: &Keymap) -> Result<Self, UnknownScreenAction> {
         let Some(section) = keymap.section(SCREEN_CONTEXT) else {
             return Ok(Self::none());

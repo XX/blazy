@@ -19,11 +19,8 @@ use crate::links::{Link, LinkLayer, LinkStyle};
 use crate::source::NodeSource;
 use crate::stats::{CanvasCounters, CanvasHit, CanvasStats};
 
-/// So a parent driving gestures from above can reach the canvas inside its own event.
-///
-/// The alternative is `mutate_later`, which defers to the mutate pass and boxes a
-/// closure per node per event; a driver moving a selection is the case that makes the
-/// difference (§38.3).
+/// So a parent driving gestures from above can reach the canvas inside its own event,
+/// without a `mutate_later` per node.
 impl AllowRawMut for CanvasLayer {}
 
 /// What the pointer is currently doing on the canvas.
@@ -39,10 +36,8 @@ enum Drag {
 
 // --- MARK: LAYER
 
-/// A canvas of freely positioned children with a pan/zoom view.
-///
-/// This is the viewport: fixed size, clips its content, and owns the view transform
-/// which it pushes down to its [`CanvasContent`] child during layout.
+/// A canvas of freely positioned children with a pan/zoom view: the viewport, which clips
+/// its content and pushes the view down to its [`CanvasContent`] during layout.
 pub struct CanvasLayer {
     content: WidgetPod<CanvasContent>,
     /// Canvas-space to viewport-space transform (pan and zoom).
@@ -52,11 +47,6 @@ pub struct CanvasLayer {
     /// Viewport size in widget coordinates, set during layout.
     viewport: Size,
     /// How far past the viewport to keep nodes alive, as a fraction of the viewport.
-    ///
-    /// Culling exactly at the viewport edge makes nodes pop in mid-drag. Expressed as
-    /// a fraction rather than in canvas units on purpose: a fixed canvas-space margin
-    /// means a huge screen margin when zoomed in and a sliver when zoomed out, which
-    /// is backwards.
     overscan: f64,
     /// How far past the viewport the far-field scene and the link set are recorded.
     far_overscan: f64,
@@ -83,25 +73,18 @@ pub struct CanvasLayer {
     /// Links handed to [`CanvasLayer::with_links`] before the canvas was in a tree.
     pending_links: Option<Vec<Link>>,
     /// Where each node is, by name — kept from [`new`](Self::new) for a
-    /// [`reset`](Self::reset), which reads the whole graph again (§69).
+    /// [`reset`](Self::reset), which reads the whole graph again.
     geometry: Box<dyn FnMut(usize) -> Option<(Point, Size)>>,
     link_style: LinkStyle,
     ports: PortLayout,
 }
 
 impl CanvasLayer {
-    /// Creates a canvas over `count` nodes.
+    /// Creates a canvas over `count` names.
     ///
-    /// `geometry` supplies each node's position and size, and `source` builds its
-    /// widget when it scrolls into view. Only the geometry is stored up front: a
-    /// graph of a million nodes costs a million `(Point, Size)` pairs, not a million
-    /// widgets.
-    ///
-    /// `count` is how many *names* the graph uses, not how many nodes it holds, and
-    /// `geometry` answers `None` for a name nothing holds. A graph that has been edited
-    /// has holes in its names — a removal frees a name and nothing renumbers what stayed
-    /// (§43) — and a view built over it afterwards has to agree about them, or the
-    /// names in a saved selection would mean different nodes in different views.
+    /// `geometry` gives each node's position and size (`None` for a name nothing holds), and
+    /// `source` builds its widget when it scrolls into view. The canvas keeps `geometry` for
+    /// [`reset`](Self::reset).
     pub fn new(
         count: usize,
         geometry: impl FnMut(usize) -> Option<(Point, Size)> + 'static,
@@ -136,13 +119,10 @@ impl CanvasLayer {
         }
     }
 
-    /// Starts over from the graph: `count` names, each where the geometry callback says
-    /// now, and `links` — what [`new`](Self::new) and [`with_links`](Self::with_links) did,
-    /// for a graph replaced as a whole (a file read while the application runs, §69).
+    /// Starts over from the graph, for a graph replaced as a whole: `count` names read again
+    /// from the geometry callback, and `links`.
     ///
-    /// Every node widget leaves the tree and the ones in view are built again from the
-    /// source; classes and the stacking order go with them, because they were the old
-    /// graph's. The view — pan and zoom — stays: it is the user's, not the graph's.
+    /// Every node widget, class and stacking stamp goes; the view stays.
     pub fn reset(this: &mut WidgetMut<'_, Self>, count: usize, links: Vec<Link>) {
         let slots = slots_of(count, &mut this.widget.geometry);
         {
@@ -152,35 +132,20 @@ impl CanvasLayer {
         this.ctx.request_layout();
     }
 
-    /// Adds edges between nodes.
-    ///
-    /// Indices into the node array given to [`new`](Self::new); an edge naming a node
-    /// that does not exist is skipped when drawn rather than rejected here, because
-    /// the graph is the application's to validate.
-    ///
-    /// Held here and handed down at the first layout: a `WidgetPod` gives its widget
-    /// to the arena on insertion, so the canvas cannot reach its own content between
-    /// construction and being in a tree.
+    /// Adds edges between nodes; an edge naming a missing node is skipped when drawn.
     pub fn with_links(mut self, links: Vec<Link>) -> Self {
         self.pending_links = Some(links);
         self
     }
 
-    /// Sets how far past the viewport the far field and the link set are recorded, as
-    /// a fraction of the viewport.
-    ///
-    /// The margin that turns "re-record every frame" into "re-record every few hundred"
-    /// (§20.6a). It is bought with a bigger recorded scene, and the scene is what the
-    /// rasteriser is charged for every frame (§32.3), so the two sides of the trade are
-    /// re-recordings and path segments. [`DEFAULT_FAR_OVERSCAN`](Self::DEFAULT_FAR_OVERSCAN)
-    /// is what §35.2 measured the trade at.
+    /// Sets how far past the viewport the far field and the link set are recorded, as a
+    /// fraction of the viewport: re-recordings against path segments per frame.
     pub fn with_far_overscan(mut self, fraction: f64) -> Self {
         self.far_overscan = fraction.max(0.0);
         self
     }
 
-    /// The default of [`Self::with_far_overscan`]: a quarter of the viewport on each
-    /// side, measured down from a half in §35.2.
+    /// The default of [`Self::with_far_overscan`]: a quarter of the viewport on each side.
     pub const DEFAULT_FAR_OVERSCAN: f64 = FAR_OVERSCAN;
 
     /// Where the ports are on a node, and whether they are drawn.
@@ -201,48 +166,26 @@ impl CanvasLayer {
         self
     }
 
-    /// Materialises interactive controls only for the node under the pointer.
+    /// Builds interactive controls only for the node under the pointer; the others get
+    /// their `Simplified` form. Off by default.
     ///
-    /// Off by default. When on, every other node gets whatever its `Simplified` form
-    /// paints instead of real control widgets, which at 140 visible nodes is roughly
-    /// five times cheaper per frame — a control nobody is touching is still three or
-    /// four widgets that every pass has to walk.
-    ///
-    /// The catch is visual: the painted stand-in is swapped for real widgets as the
-    /// pointer arrives, so unless it matches them closely the interface appears to
-    /// change under the cursor. Matching Masonry's themed controls by hand is also
-    /// fragile — a theme change silently breaks the resemblance. Turn this on only
-    /// where the node body is drawn by the application anyway, or where nodes are
-    /// small enough that the difference does not read.
+    /// Several times cheaper per frame, but the stand-in is swapped for real widgets as the
+    /// pointer arrives, so it has to look like them.
     pub fn with_controls_on_hover(mut self, enabled: bool) -> Self {
         self.controls_on_hover = enabled;
         self
     }
 
-    /// Whether the canvas acts on the primary button itself. On by default.
-    ///
-    /// The seam an operator layer needs (§11, §38). The canvas's own primary-button
-    /// gestures — drag the node under the pointer, pan when there is none — are a
-    /// default, not the mechanism: an application whose keymap binds that button
-    /// cannot have the canvas answering it first, because the canvas sits *below* the
-    /// application's driver and Masonry routes to the deepest widget before it
-    /// bubbles.
-    ///
-    /// Turning them off leaves the rest alone: the middle button still pans, the wheel
-    /// still zooms, and the pointer still picks on every press and move — the pick is
-    /// what an operator's context is made of, and it is measured not to cost a layout
-    /// (§25.4).
+    /// Whether the canvas acts on the primary button itself (drag a node, or pan). On by
+    /// default; an operator layer above turns it off. The middle button, the wheel and the
+    /// pick stay.
     pub fn with_builtin_gestures(mut self, enabled: bool) -> Self {
         self.builtin_gestures = enabled;
         self
     }
 
-    /// Whether the canvas zooms on the wheel itself. On by default.
-    ///
-    /// The same seam as [`with_builtin_gestures`](Self::with_builtin_gestures), for the
-    /// wheel: an operator layer that binds the wheel (`view.zoom`) has to hear it, and the
-    /// canvas sits below it and would answer first. Off, the scroll is left unhandled and
-    /// bubbles up.
+    /// Whether the canvas zooms on the wheel itself. On by default; off, the scroll bubbles
+    /// up to an operator layer.
     #[must_use]
     pub fn with_wheel_zoom(mut self, enabled: bool) -> Self {
         self.wheel_zoom = enabled;
@@ -250,21 +193,13 @@ impl CanvasLayer {
     }
 
     /// Sets where the detail levels switch over for readability.
-    ///
-    /// Policy, and the application's: how small a control may get before it stops
-    /// being usable depends on how the node is drawn (§20.7).
     pub fn with_thresholds(mut self, thresholds: DetailThresholds) -> Self {
         self.thresholds = thresholds;
         self
     }
 
-    /// Sets the ceiling on widgets this canvas may keep in the tree.
-    ///
-    /// The other half of the level decision, and the one that does not follow the
-    /// zoom: see [`DetailBudget`]. An application tiling several canvases in one
-    /// window should hand each of them a share of one window budget
-    /// ([`DetailBudget::split`]), because the frame walks the window's tree and not
-    /// any single canvas's.
+    /// Sets the ceiling on widgets this canvas may keep in the tree. Several canvases in one
+    /// window should share one budget ([`DetailBudget::split`]).
     pub fn with_budget(mut self, budget: DetailBudget) -> Self {
         self.budget = budget;
         self
@@ -275,13 +210,7 @@ impl CanvasLayer {
         self.budget
     }
 
-    /// The canvas-space to viewport-space transform.
-    ///
     /// The same canvas, showing what `view` says.
-    ///
-    /// For a canvas built to take over from another one — the area rebuilt in a second
-    /// window — because the view is a view's own state and nothing else remembers it:
-    /// §22 keeps it out of layout, and §30 kept it out of the model.
     #[must_use]
     pub fn with_view(mut self, view: Affine) -> Self {
         self.view = view;
@@ -289,10 +218,7 @@ impl CanvasLayer {
         self
     }
 
-    /// Public because anything drawing over the canvas — an overlay, a rubber band,
-    /// a tooltip anchored to a node — has to agree with it about where things are,
-    /// and rederiving it from the zoom and the pan is how two answers start to
-    /// differ.
+    /// The canvas-space to viewport-space transform.
     pub fn view(&self) -> Affine {
         self.view
     }
@@ -318,13 +244,8 @@ impl CanvasLayer {
 
     // --- MARK: WIDGETMUT
 
-    /// Sets the view transform.
-    ///
-    /// Requests a layout pass on the canvas itself, because culling depends on the
-    /// view. It does *not* dirty the content widget: child positions are in canvas
-    /// coordinates, so a view change moves nobody and the transform does all the
-    /// work. Keeping the content clean is what stops Masonry from marking it for
-    /// repaint — see the note in [`CanvasLayer::layout`].
+    /// Sets the view transform. Lays out the canvas (culling depends on the view) but not
+    /// the content, whose children are in canvas coordinates.
     pub fn set_view(this: &mut WidgetMut<'_, Self>, view: Affine) {
         if this.widget.store_view(view) {
             this.ctx.request_layout();
@@ -337,11 +258,7 @@ impl CanvasLayer {
         Self::set_view(this, view);
     }
 
-    /// The view that results from zooming about `origin`, or `None` if the zoom is
-    /// already at its limit.
-    ///
-    /// Pure, so the `WidgetMut` entry point and the wheel handler share one copy of
-    /// the arithmetic instead of two that can drift apart.
+    /// The view that results from zooming about `origin`, or `None` at the zoom limit.
     fn zoomed_view(&self, origin: Point, factor: f64) -> Option<Affine> {
         let current = self.zoom();
         let clamped = (current * factor).clamp(self.zoom_limits.0, self.zoom_limits.1);
@@ -358,10 +275,7 @@ impl CanvasLayer {
         )
     }
 
-    /// Zooms around a fixed point given in viewport coordinates.
-    ///
-    /// The canvas point under `origin` stays under `origin`, which is what makes
-    /// wheel-zoom feel anchored to the cursor.
+    /// Zooms about `origin`, in viewport coordinates: the canvas point under it stays.
     pub fn zoom_around(this: &mut WidgetMut<'_, Self>, origin: Point, factor: f64) {
         if let Some(view) = this.widget.zoomed_view(origin, factor) {
             Self::set_view(this, view);
@@ -369,19 +283,12 @@ impl CanvasLayer {
     }
 
     /// Moves a child to a new canvas-space position.
-    ///
-    /// Only the moved child is affected: Masonry re-places it in the next layout,
-    /// and no other child's scene is re-encoded.
     pub fn move_child(this: &mut WidgetMut<'_, Self>, index: usize, pos: Point) {
         let mut content = this.ctx.get_mut(&mut this.widget.content);
         content.widget.store_child_pos(index, pos).apply(&mut content.ctx);
     }
 
-    /// Gives a node a new rectangle: a new size, and a new corner with it.
-    ///
-    /// The resize twin of [`move_child`](Self::move_child). The node's widget is laid out
-    /// at the new size on the next layout, its place in the grid follows, and so do the
-    /// curves that end on its ports.
+    /// Gives a node a new rectangle.
     pub fn set_child_rect(this: &mut WidgetMut<'_, Self>, index: usize, rect: Rect) {
         {
             let mut content = this.ctx.get_mut(&mut this.widget.content);
@@ -390,37 +297,14 @@ impl CanvasLayer {
         this.ctx.request_layout();
     }
 
-    /// Moves a child from the parent's raw context, without telling the model.
-    ///
-    /// The seam an operator layer moves nodes through (§38.3). By then the operator
-    /// has already written the position to the model — that is where the truth lives
-    /// (§30) — and what is left is this view's own copy of the geometry. Three ways
-    /// in, and the difference is who has already been told:
-    ///
-    /// * [`move_child`](Self::move_child) — a `WidgetMut`, from outside any pass;
-    /// * this one — the parent widget, holding an `EventCtx`, in the same event;
-    /// * the canvas's own drag, which also calls [`NodeSource::moved`] because there the canvas is the one that heard
-    ///   the user.
-    ///
-    /// Nothing is broadcast to the other views of the same model: the caller wrote the
-    /// model and knows who else is looking at it.
+    /// Moves a child from the parent's raw context, without telling the model or other
+    /// views: for an operator layer that has written the model already.
     pub fn move_child_raw(&mut self, index: usize, pos: Point, ctx: &mut RawCtx<'_>) {
         let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
         content.store_child_pos(index, pos).apply(&mut raw);
     }
 
-    /// Pans the view from the parent's raw context.
-    ///
-    /// The view twin of [`move_child_raw`](Self::move_child_raw), and it exists for the
-    /// same caller: an operator layer that has taken the primary button owns panning
-    /// too, and the driver holding an `EventCtx` is the one that has to carry it in.
-    /// Only the canvas is dirtied — child positions are in canvas coordinates, so a
-    /// view change moves nobody (§22).
     /// Zooms the view about `origin` from the parent's raw context.
-    ///
-    /// The zoom twin of [`pan_raw`](Self::pan_raw), for the same caller: an operator
-    /// layer that has taken the wheel owns zooming too, and carries it in while it holds
-    /// an `EventCtx`. Only the canvas is dirtied, as for a pan (§22).
     pub fn zoom_raw(&mut self, origin: Point, factor: f64, ctx: &mut RawCtx<'_>) {
         if let Some(view) = self.zoomed_view(origin, factor)
             && self.store_view(view)
@@ -429,9 +313,7 @@ impl CanvasLayer {
         }
     }
 
-    /// Pans the view from the parent's raw context.
-    ///
-    /// See [`zoom_raw`](Self::zoom_raw), which is the same seam for the zoom.
+    /// Pans the view from the parent's raw context, for an operator layer that owns panning.
     pub fn pan_raw(&mut self, delta: Vec2, ctx: &mut RawCtx<'_>) {
         let view = Affine::translate(delta) * self.view;
         if self.store_view(view) {
@@ -470,48 +352,28 @@ impl CanvasLayer {
         true
     }
 
-    /// Puts `class` on node `index`'s widget, or takes it off — now if the node has a
-    /// widget, and on every widget it is built with from now on.
-    ///
-    /// What lets a node *look* like what a view knows about it — selected, active,
-    /// erroneous — without the node knowing why: Masonry resolves a widget's properties
-    /// against the property stack of its type, and a [`Selector`](masonry::core::Selector)
-    /// matches classes the way the theme's matches `hovered`. The view's state stays in the
-    /// view; the node's style stays in data (`DefaultProperties::insert_stack`).
-    ///
-    /// Returns whether anything changed. A node that does not exist wears nothing.
+    /// Puts `class` on node `index`'s widget or takes it off — now, and on every widget it is
+    /// built with later — for a [`Selector`](masonry::core::Selector) to style. Returns
+    /// whether anything changed.
     pub fn set_node_class(this: &mut WidgetMut<'_, Self>, index: usize, class: &'static str, on: bool) -> bool {
         let mut content = this.ctx.get_mut(&mut this.widget.content);
         let changed = CanvasContent::set_node_class(&mut content, index, class, on);
-        // Published here rather than by the next layout, because a class change is
-        // designed not to cause one: the counter would otherwise wait for an unrelated
-        // frame, and a criterion reading it after a click would read the click before.
+        // Published now: a class change causes no layout.
         let mut stats = this.widget.stats.get();
         stats.counters.class_changes = content.widget.class_changes;
         this.widget.stats.set(stats);
         changed
     }
 
-    /// Puts node `index` above every other node of this canvas — drawn over them, and
-    /// picked first where they overlap — and says whether its place changed.
-    ///
-    /// For a canvas that is the only view of its graph. The order belongs to the graph:
-    /// several canvases over one graph stack its nodes alike only if they take their stamps
-    /// from one counter, which is [`stack_node`](Self::stack_node).
-    ///
-    /// It is remembered by name, so the node comes back on top when it scrolls out and in
-    /// again; a name a removal frees and an insertion takes back starts at the bottom, like
-    /// any new node. Raising costs a repaint of the one node and no layout.
+    /// Puts node `index` above every other node of this canvas, and says whether its place
+    /// changed. For a canvas that is the only view of its graph; several views share stamps
+    /// through [`stack_node`](Self::stack_node).
     pub fn raise_node(this: &mut WidgetMut<'_, Self>, index: usize) -> bool {
         Self::restack_with(this, index, |content| content.raise_node(index))
     }
 
-    /// Gives node `index` the stacking stamp `stamp`: nodes stack by `(stamp, name)`, and
-    /// a node no one raised has stamp zero. Says whether the node's place changed.
-    ///
-    /// What a graph shown in several canvases uses: the stamps come from the graph, so a
-    /// node raised in one view is raised in all of them, and a view made later can be
-    /// handed the order as it stands. Setting the same stamp again changes nothing.
+    /// Gives node `index` the stacking stamp `stamp` (nodes stack by `(stamp, name)`; zero
+    /// for never raised), and says whether its place changed.
     pub fn stack_node(this: &mut WidgetMut<'_, Self>, index: usize, stamp: u64) -> bool {
         Self::restack_with(this, index, |content| content.stack_node(index, stamp))
     }
@@ -525,10 +387,7 @@ impl CanvasLayer {
         if !change(content.widget) {
             return false;
         }
-        // The new order reaches the screen with the next paint pass, and nothing about the
-        // pass asks for one: the node's own scene is unchanged. Asking it to repaint is the
-        // cheapest way to get a frame — the content's own repaint would redraw every link.
-        // The port dots go with it: each node draws its own (§50.8).
+        // A repaint of the node is the cheapest way to get a frame for the new order.
         let fresh = content.widget.fresh.contains(&index);
         if let Some(pod) = content.widget.slots[index].pod.as_mut() {
             if fresh {
@@ -568,17 +427,8 @@ impl CanvasLayer {
             .is_some_and(|slot| slot.alive && slot.classes.contains(&class))
     }
 
-    /// Tells the canvas that what node `index` holds has changed in the model.
-    ///
-    /// The type-blind twin of [`update_child`](Self::update_child): the node's widget, if
-    /// it has one, is built again from the [`NodeSource`], which reads the model; a
-    /// far-field canvas re-records the scene the node is drawn in. For a caller that
-    /// knows the node's type, reaching into the widget is cheaper; this is for one that
-    /// does not — a window collecting a change another window made.
-    ///
-    /// Returns whether anything will be rebuilt or re-recorded. `false` is a node with no
-    /// widget and no far field, which reads the model when it is next built and needs
-    /// nothing now.
+    /// Tells the canvas that what node `index` holds has changed: its widget is rebuilt from
+    /// the [`NodeSource`] (or the far field re-recorded). Returns whether anything will be.
     pub fn refresh_node(this: &mut WidgetMut<'_, Self>, index: usize) -> bool {
         let refreshed = {
             let mut content = this.ctx.get_mut(&mut this.widget.content);
@@ -588,17 +438,14 @@ impl CanvasLayer {
             refreshed
         };
         if refreshed {
-            // The cull runs in this widget's layout, and it is the cull that turns the
-            // mark into a rebuild.
+            // The cull, in this widget's layout, turns the mark into a rebuild.
             this.ctx.request_layout();
         }
         refreshed
     }
 
-    /// The nodes that currently have a widget, as `(index, widget id)` pairs.
-    ///
-    /// Useful for tests and for apps that need to reach into a live node. The list
-    /// changes as nodes scroll in and out, so ids must not be cached across frames.
+    /// The nodes that currently have a widget, as `(index, widget id)` pairs. Ids change as
+    /// nodes scroll in and out.
     pub fn live_children(this: &mut WidgetMut<'_, Self>) -> Vec<(usize, WidgetId)> {
         let content = this.ctx.get_mut(&mut this.widget.content);
         content
@@ -611,28 +458,15 @@ impl CanvasLayer {
 
     // --- MARK: STRUCTURE
 
-    /// Puts a node into the canvas under the name `index`, at `pos` with size `size`.
-    ///
-    /// **The name is the caller's** (§43): the model is the truth and a name is part of
-    /// it, so whoever owns the model hands out names — reusing the ones its own removals
-    /// freed — and this array follows. A name beyond the end leaves holes behind it, and
-    /// they are the names the next insertions will use.
-    ///
-    /// Inserting a live name again changes nothing but its geometry: it is the same
-    /// insertion delivered twice, which inside a window is the normal case (the push and
-    /// then the pull). The node keeps its widget, its classes and its place in the stack.
-    /// A name a removal freed starts over, which is what undo of a removal needs.
+    /// Puts a node into the canvas under the name `index` (the model's), at `pos` with size
+    /// `size`. Inserting a live name again only updates its geometry.
     pub fn insert_node(this: &mut WidgetMut<'_, Self>, index: usize, pos: Point, size: Size) {
         {
             let mut content = this.ctx.get_mut(&mut this.widget.content);
             let invalidate = content.widget.insert_node(index, pos, size);
             invalidate.apply(&mut content.ctx);
-            // A node that lands in view is built now, while there is a `WidgetMut` to build
-            // it with, rather than by the cull of the next layout — which can only queue it
-            // for the mutate after, one rewrite pass later. That pass was what an operator
-            // run from a menu, in a window of two areas, did not have (§65). The cull runs
-            // against the view of the last layout, as it would in the next one; a canvas not
-            // laid out yet has nothing in view and leaves it to that layout.
+            // A node landing in view is built now, not by the next layout's cull, which saves
+            // a rewrite pass (a menu entry in a two-area window needs it).
             let rect = Rect::from_origin_size(pos, size);
             if content.widget.readable.is_some() && content.widget.live_rect.overlaps(rect) {
                 content.widget.cull();
@@ -644,11 +478,7 @@ impl CanvasLayer {
         this.ctx.request_layout();
     }
 
-    /// Takes the node named `index` out, with every link that ended on it.
-    ///
-    /// The links come back as `(name, link)` pairs so that undo can put them back under
-    /// the names they had — the same rule as the node's own name (§41.2). Its widget, if
-    /// it had one, leaves the tree in the next mutate pass.
+    /// Takes the node named `index` out with its links, returned as `(name, link)` for undo.
     pub fn remove_node(this: &mut WidgetMut<'_, Self>, index: usize) -> Vec<(usize, Link)> {
         let removed = {
             let mut content = this.ctx.get_mut(&mut this.widget.content);
@@ -695,20 +525,12 @@ impl CanvasLayer {
     }
 
     /// The name of a live link between two nodes, in either direction.
-    ///
-    /// A pick already answers with both the name and the ends ([`CanvasHit::Link`]);
-    /// this is for a caller that has the ends and wants the name — undo, or an
-    /// application whose model names links by their endpoints.
     pub fn link_name(this: &mut WidgetMut<'_, Self>, link: Link) -> Option<usize> {
         let content = this.ctx.get_mut(&mut this.widget.content);
         content.widget.links.name_of(link).map(|name| name as usize)
     }
 
-    /// What is under a point given in this widget's coordinates.
-    ///
-    /// Nodes first, then links; `None` for empty canvas. Answered from the model,
-    /// so it works below the far-field threshold where no node has a widget, and for
-    /// links, which never do.
+    /// What is under a point given in this widget's coordinates, from the model.
     pub fn hit_test(this: &mut WidgetMut<'_, Self>, pos: Point) -> Option<CanvasHit> {
         let canvas_pos = this.widget.view.inverse() * pos;
         let scale = this.widget.hit_scale(this.ctx.window_transform());
@@ -718,12 +540,8 @@ impl CanvasLayer {
         hit
     }
 
-    /// What is under a point given in this widget's coordinates, from the parent's raw
-    /// context.
-    ///
-    /// The pick an operator layer needs while it holds the pointer: the canvas below sees
-    /// no events then, so it publishes no hover, and a driver holding an `EventCtx` cannot
-    /// reach a child to ask (§38.3). The raw context can. Counted like any other pick.
+    /// What is under a point, from the parent's raw context: for an operator holding the
+    /// pointer, while the canvas sees no events.
     pub fn hit_test_raw(&mut self, pos: Point, window: Affine, ctx: &mut RawCtx<'_>) -> Option<CanvasHit> {
         let canvas_pos = self.view.inverse() * pos;
         let scale = self.hit_scale(window);
@@ -734,10 +552,6 @@ impl CanvasLayer {
     }
 
     /// The canvas-space position of a node, or `None` for a name nothing holds.
-    ///
-    /// A removed node answers `None` from the moment it is removed, not from the moment
-    /// its widget leaves the tree: the slot outlives the node by design (§43), and a
-    /// caller asking where a deleted node is has to hear that it is nowhere.
     pub fn child_pos(this: &mut WidgetMut<'_, Self>, index: usize) -> Option<Point> {
         let content = this.ctx.get_mut(&mut this.widget.content);
         content.widget.live_slot(index).map(|slot| slot.pos)
@@ -746,10 +560,6 @@ impl CanvasLayer {
     // --- MARK: INTERNAL
 
     /// Records a new view transform. Returns `true` if a layout pass is needed.
-    ///
-    /// Split out because the two entry points hold different context types — a
-    /// `WidgetMut` from the public API, an `EventCtx` from the pointer handler — and
-    /// only the "who do I tell" half differs between them.
     #[must_use]
     fn store_view(&mut self, view: Affine) -> bool {
         if self.view == view {
@@ -767,13 +577,8 @@ impl CanvasLayer {
         }
     }
 
-    /// Moves a child from an event handler — the drag, as opposed to the programmatic
-    /// [`move_child`](Self::move_child).
-    ///
-    /// The two differ in exactly one thing and it is the point of the split: a drag is
-    /// the *user* moving a node, so the model has to hear about it and so do the other
-    /// canvases showing the same model. A programmatic move is what those other
-    /// canvases then receive, and it must not bounce back out again.
+    /// Moves a child from the canvas's own drag: unlike [`move_child`](Self::move_child), the
+    /// model and the other canvases hear about it.
     fn move_child_at(&mut self, index: usize, pos: Point, ctx: &mut EventCtx<'_>) {
         let mut peers = std::mem::take(&mut self.peers);
         peers.clear();
@@ -786,10 +591,7 @@ impl CanvasLayer {
             invalidate.apply(&mut raw);
         }
         for &peer in &peers {
-            // A mutate callback rather than a direct reach: another canvas is not this
-            // widget's child, and the mutate pass is where a widget outside the current
-            // subtree may legally be changed. It runs before the next layout, so the
-            // other areas move in the same frame.
+            // Another canvas is reached through the mutate pass, still within this frame.
             ctx.mutate_later(peer, move |mut widget| {
                 let mut canvas = widget.downcast::<Self>();
                 Self::move_child(&mut canvas, index, pos);
@@ -798,13 +600,8 @@ impl CanvasLayer {
         self.peers = peers;
     }
 
-    /// How many screen pixels one canvas unit covers.
-    ///
-    /// The zoom is only part of it: the canvas may itself be scaled by whatever it
-    /// sits inside — a region with its own `ui_scale`, a device scale factor — and a
-    /// tolerance in screen pixels has to account for the whole chain. The content
-    /// widget's own transform is exactly this product, but reading it back through
-    /// the arena during an event would cost more than multiplying two numbers.
+    /// How many screen pixels one canvas unit covers: the zoom times whatever scales the
+    /// canvas (a region's `ui_scale`, the device).
     fn hit_scale(&self, window: Affine) -> f64 {
         scale_of(window) * self.zoom()
     }
@@ -833,13 +630,8 @@ impl CanvasLayer {
         hit
     }
 
-    /// Records what the pointer is over and asks for whatever that changes.
-    ///
-    /// A hover changes pixels — the link under the pointer is highlighted — and with
-    /// `controls_on_hover` it also changes which node has real controls, which is a
-    /// layout. Keeping the two apart is the same distinction the link layer makes
-    /// between repainting a curve and re-choosing the set (§24.3): a highlight must
-    /// not drag a relayout of the graph behind it.
+    /// Records what the pointer is over: a repaint for the highlight, a layout only when the
+    /// node with controls changes.
     fn hover(&mut self, pos: Point, ctx: &mut EventCtx<'_>) -> Option<CanvasHit> {
         let hit = self.hit_at(pos, ctx);
         self.set_hovered(hit, ctx);
@@ -862,30 +654,18 @@ impl CanvasLayer {
 impl Widget for CanvasLayer {
     type Action = NoAction;
 
-    /// Handles pan, zoom and node dragging.
-    ///
-    /// This runs *after* the event has been offered to the widget under the pointer
-    /// and bubbled up, so a slider inside a node gets first refusal: if it marked
-    /// the event handled, the canvas leaves it alone. That is what makes claim 3
-    /// work — controls inside nodes need no cooperation from the canvas.
+    /// Handles pan, zoom and node dragging, after the widget under the pointer had its turn.
     fn on_pointer_event(&mut self, ctx: &mut EventCtx<'_>, _props: &mut PropertiesMut<'_>, event: &PointerEvent) {
         match event {
             PointerEvent::Down(e) if !ctx.is_handled() => {
-                // A control inside a node may have taken pointer capture without
-                // marking the event handled — `Checkbox` and `Slider` both do
-                // exactly that. Starting a drag here would steal the capture out
-                // from under them and break every control on the canvas, so the
-                // capture target is the signal to defer to, not `is_handled`.
+                // A control may capture without marking the event handled (`Checkbox`,
+                // `Slider`): defer to the capture target.
                 if ctx.pointer_capture_target_id().is_some_and(|id| id != ctx.widget_id()) {
                     return;
                 }
                 let pos = ctx.local_position(e.state.position);
                 let canvas_pos = self.view.inverse() * pos;
-                // A press picks whatever a move would have picked, whether or not the
-                // canvas is going to act on it. The record is what an operator layer
-                // above reads as its context (§38.3): a driver holding an `EventCtx`
-                // cannot hit-test a child, and this costs the pick the drag decision
-                // needed anyway.
+                // A press picks, whether or not the canvas acts: an operator layer reads it.
                 let hit = self.hover(pos, ctx);
                 // Where the node a port belongs to is, for the drag below to grab it by.
                 let port_node = match hit {
@@ -896,17 +676,13 @@ impl Widget for CanvasLayer {
                     _ => None,
                 };
                 self.drag = match e.button {
-                    // Left button drags a node if there is one under the pointer,
-                    // and pans otherwise — unless the application has taken the
-                    // primary button for its keymap.
+                    // Left button drags a node, or pans, unless operators took the button.
                     Some(PointerButton::Primary) if self.builtin_gestures => match hit {
                         Some(CanvasHit::Node { index, pos: child_pos }) => Drag::Node {
                             index,
                             grab: canvas_pos - child_pos,
                         },
-                        // A port is part of its node here: dragging a link out of one is
-                        // an operator's (`link.drag`), and without operators a press on a
-                        // node's edge moves the node, as it always did.
+                        // Without operators a port is part of its node.
                         Some(CanvasHit::Port { .. }) => match port_node {
                             Some((index, origin)) => Drag::Node {
                                 index,
@@ -914,14 +690,10 @@ impl Widget for CanvasLayer {
                             },
                             None => Drag::Pan { last: pos },
                         },
-                        // A link is pickable but not draggable by the canvas:
-                        // selection and rewiring are operators (§11). A press on a
-                        // curve pans, as it did before curves could be picked at all.
+                        // A press on a link pans: rewiring is an operator's.
                         Some(CanvasHit::Link { .. }) | None => Drag::Pan { last: pos },
                     },
-                    // Middle button always pans, as in Blender. Not a gesture an
-                    // operator layer competes for, so it is not switched off with the
-                    // others.
+                    // The middle button always pans, as in Blender.
                     Some(PointerButton::Auxiliary) => Drag::Pan { last: pos },
                     _ => Drag::None,
                 };
@@ -963,8 +735,7 @@ impl Widget for CanvasLayer {
                 }
             },
             PointerEvent::Scroll(PointerScrollEvent { delta, state, .. }) if self.wheel_zoom && !ctx.is_handled() => {
-                // Wheel notches are converted the same way `Portal` does it, so the
-                // zoom speed matches the platform's idea of a scroll step.
+                // Notches converted as `Portal` does.
                 let y = wheel_pixels(*delta, ctx.scale_factor(), self.viewport);
                 if y == 0.0 {
                     return;
@@ -1003,9 +774,7 @@ impl Widget for CanvasLayer {
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
         self.viewport = size;
 
-        // The first layout is the first moment this widget knows its own id and can
-        // hand it to the source. Construction is too early: a `CanvasLayer` is built
-        // before it is a widget, and the id is minted when it enters the tree.
+        // The first moment this widget knows its id, to hand to the source.
         if !self.attached {
             self.attached = true;
             let id = ctx.widget_id();
@@ -1013,30 +782,19 @@ impl Widget for CanvasLayer {
             content.source.attached(id);
         }
 
-        // Clip to the viewport so children panned out of view cannot paint over the
-        // surrounding UI, and so Masonry excludes them from hit testing.
+        // Clip to the viewport, for painting and hit testing.
         ctx.set_clip_path(Rect::from_origin_size(Point::ORIGIN, size));
 
         let live_rect = self.live_canvas_rect();
         let zoom = self.zoom();
-        // Only the readability half of the decision can be taken here: the cost half
-        // needs the number of visible nodes, which the cull computes (§29.2).
+        // The readability half of the decision; the cull takes the cost half.
         let readable = self.thresholds.for_scale(zoom);
         let view = self.view;
         let view_dirty = std::mem::take(&mut self.view_dirty);
 
-        // Push the view down to the content widget. `set_transform` marks it as
-        // needing compose, which runs after layout — so this does not violate the
-        // "don't set flags for an earlier pass" rule that `get_raw_mut` warns about.
-        // Culling belongs here, not in the content widget: it depends on the view and
-        // the viewport, both of which live on this side. Doing it in the content's
-        // own `layout` would mean asking the content to re-lay-out on every pan — and
-        // Masonry marks anything that re-lays-out for repaint (`passes/layout.rs`,
-        // "TODO - Not everything that has been re-laid out needs to be repainted").
-        // That is what made a far-field pan re-record its scene every frame.
-        //
-        // Child positions are in canvas coordinates, so a view change moves nobody:
-        // the transform does all the work and no layout is needed at all.
+        // Push the view down (`set_transform` marks compose, which runs after layout).
+        // Culling is here rather than in the content's layout: Masonry repaints whatever is
+        // laid out, and a pan would re-record the far field every frame.
         let needs_mutate = {
             let (content, mut raw) = ctx.get_raw_mut(&mut self.content);
             if let Some(links) = self.pending_links.take() {
@@ -1064,10 +822,7 @@ impl Widget for CanvasLayer {
             content.pending.is_some()
         };
         if needs_mutate {
-            // Adding and removing children needs a `WidgetMut`, which layout does not
-            // have. The mutate pass runs before the next layout pass in the same
-            // rewrite loop, so a node entering the view is built and placed in the
-            // same frame.
+            // Children change in the mutate pass, which runs before the next layout.
             ctx.mutate_child_later(&mut self.content, |mut content| {
                 CanvasContent::apply_pending(&mut content);
             });

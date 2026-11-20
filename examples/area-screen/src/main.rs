@@ -16,10 +16,10 @@
 //! application writes is the graph, the nodes and what fills an area, and this file is
 //! the last of those plus its flags.
 //!
-//! # Operations on areas (§41)
+//! # Operations on areas
 //!
 //! All of them act on the area **under the pointer**, which the screen publishes
-//! because a driver above it cannot work it out (§38.3, and the same reason). They are
+//! because a driver above it cannot work it out. They are
 //! `ScreenKeys::default()`, which holds a modifier on every one of them: the screen hears
 //! a key before the editor does, and a plain letter here is a letter the editor never
 //! gets.
@@ -31,7 +31,7 @@
 //! | `Alt+J` | join it with its sibling — it survives, the sibling goes |
 //! | `Alt+W` | swap it with its sibling |
 //! | `Ctrl+Space` | show it alone, or bring the screen back |
-//! | `Alt+N` | open another window over the same graph (§44) |
+//! | `Alt+N` | open another window over the same graph |
 //! | `Alt+D` | move the area into a window of its own |
 //! | `Ctrl+S` | write the workspace to `--workspace` |
 //! | `Ctrl+O` | read it back |
@@ -41,12 +41,12 @@
 //!
 //! Every area carries the operator layer, so the graph itself is edited here the way it
 //! is in the node-canvas window — left-drag a node to move it, `G`, `X`, `F`, `Shift+A`,
-//! `Ctrl+Z` (§38.3).
+//! `Ctrl+Z`.
 //!
 //! `Alt+J` is where the shape of the answer shows: it offers a join only with the area's
 //! **sibling**, so two areas that plainly share a border refuse to merge whenever they
 //! are cousins. That is not a bug in the key, it is what a binary tree can express, and
-//! §41.1 counts what it costs.
+//! (a binary tree joins siblings only).
 
 // On Windows, don't open a console for the GUI mode.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
@@ -87,7 +87,7 @@ struct Args {
     #[arg(long, short = 'w', value_name = "W")]
     budget_widgets: Option<usize>,
 
-    /// Which rasteriser to draw with (§26.2).
+    /// Which rasteriser to draw with.
     #[arg(long, value_name = "NAME")]
     backend: Option<String>,
 
@@ -98,12 +98,12 @@ struct Args {
     /// How many windows to open over the same graph.
     ///
     /// The same path `Alt+N` takes, at startup: a second screen over the same models
-    /// (§30). Here because a window cannot be opened from a test — there is no event loop
+    ///. Here because a window cannot be opened from a test — there is no event loop
     /// — so this is how two windows are seen by eye and by log.
     #[arg(long, value_name = "N", default_value_t = 1)]
     windows: usize,
 
-    /// Draw every frame from scratch instead of keeping idle areas' pixels (§36).
+    /// Draw every frame from scratch instead of keeping idle areas' pixels.
     ///
     /// The cache is on by default because it is what makes eight areas over one graph
     /// affordable: an area nobody is touching costs a texture copy instead of a
@@ -140,8 +140,8 @@ fn main() {
     let areas = args.areas.max(1);
     // With the operator layer, because without it an area holds a bare canvas and the
     // graph cannot be edited at all: `node.move` is bound on the primary drag and lives
-    // in the editor (§38.3). The window was built without it, and that is how a drag in
-    // one window came to change nothing anywhere (§44.3).
+    // in the editor. The window was built without it, and that is how a drag in
+    // one window came to change nothing anywhere.
     let spec = ScreenSpec::new(areas, args.nodes)
         .with_budget(args.budget_widgets)
         .with_header_scale(args.ui_scale.map_or(HeaderScale::Staggered, HeaderScale::Forced))
@@ -208,7 +208,7 @@ mod tests {
     /// application the window runs.
     ///
     /// Not a harness: the application's path goes through `RenderRoot`, and a harness does
-    /// not hand one out (§39.5). This is what the shell does — deliver the change, call
+    /// not hand one out. This is what the shell does — deliver the change, call
     /// `settled`, draw the other window, which calls `frame` — and it is the test that was
     /// missing when a change made with the mouse failed to cross.
     #[test]
@@ -253,7 +253,7 @@ mod tests {
     ///
     /// The defect this pins down: the pull looked only for a `NodeEditor`, and an area
     /// without one holds the canvas itself, so the pull ran on every frame and applied
-    /// nothing — silently, because there is nothing there to fail (§44.3). The pull asks
+    /// nothing — silently, because there is nothing there to fail. The pull asks
     /// the graph's views now, and a view is a canvas whatever wraps it; this shape stays
     /// to keep it that way.
     #[test]

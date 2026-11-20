@@ -1,19 +1,13 @@
 //! The frame stays on the GPU: scene into a texture, texture into the swapchain.
 //!
-//! `rnd/architecture.md` §27.1 has the recipe and where it came from. The shape of it:
 //!
 //! ```text
 //! Composition ──▶ VelloRenderer ──▶ Rgba8Unorm texture ──▶ TextureBlitter ──▶ swapchain
 //! ```
 //!
-//! The intermediate texture is not an accident of the design: `imaging_vello` renders
-//! into `Rgba8Unorm` and nothing else, while a window surface is usually
-//! `Bgra8Unorm`. The blit that bridges them runs on the GPU, so the frame still never
-//! enters main memory — which is the whole point, and the counter the criteria are
-//! decided on.
-//!
-//! Everything here is behind the `vello` feature: it needs a graphics device, and a
-//! machine without one has to fall back to the blit path rather than fail to start.
+//! The intermediate texture exists because `imaging_vello` renders only into `Rgba8Unorm`
+//! and a surface is usually `Bgra8Unorm`; the blit runs on the GPU, so the frame never
+//! enters main memory. Behind the `vello` feature.
 
 use imaging_wgpu::{TextureRenderer, TextureViewTarget};
 use masonry::app::VisualLayerPlan;
@@ -28,14 +22,9 @@ use crate::compose::{Composition, Hole, LayerChoice};
 use crate::layers::{LayerCache, LayerCounters, PixelRect, scene_bounds};
 use crate::present::{PresentCounters, PresentError};
 
-/// What the intermediate frame texture has to allow.
-///
-/// `STORAGE_BINDING` is the one that is not guessable: vello renders through a compute
-/// shader and writes the texture as storage, so without it the first frame fails
-/// validation rather than looking wrong. `TEXTURE_BINDING` is what the blitter reads
-/// it with, `RENDER_ATTACHMENT` is what a raster-based backend would need, `COPY_SRC`
-/// is what makes the texture readable for a test or a screenshot, and `COPY_DST` is
-/// what lets a kept layer be copied back into the frame (§36.2).
+/// What the intermediate frame texture has to allow: storage (vello renders with a compute
+/// shader), sampling (the blitter), render attachment, and copies both ways (readback,
+/// kept layers).
 const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
     .union(wgpu::TextureUsages::TEXTURE_BINDING)
     .union(wgpu::TextureUsages::RENDER_ATTACHMENT)
@@ -45,10 +34,7 @@ const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
 /// The format `imaging_vello` renders into. Checked against the renderer at startup.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Composes plans and draws them into a GPU texture.
-///
-/// The half of the swapchain path that needs no window, which is what makes it
-/// measurable on a machine that has a graphics device but no display (§27.5).
+/// Composes plans and draws them into a GPU texture: the swapchain path without a window.
 pub struct GpuFrames {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -81,8 +67,7 @@ impl GpuFrames {
             }
         })?;
 
-        // The renderer says what it can draw into; believing it rather than assuming
-        // is what keeps a future backend from failing at the first frame.
+        // The renderer says what it can draw into.
         if !renderer.supported_texture_formats().contains(&TARGET_FORMAT) {
             return Err(BackendError::Unavailable {
                 backend: Backend::Vello,
@@ -109,15 +94,9 @@ impl GpuFrames {
         })
     }
 
-    /// Registers the layers whose pixels may be kept between frames (§36).
-    ///
-    /// Empty — the default — draws every frame from scratch. A registered layer must
-    /// **own its rectangle**: nothing else may draw into it, which is true of areas
-    /// tiling a window and false of anything overlapping. The host cannot check that,
-    /// so it is asked for; [`crate::layers`] says why.
-    ///
-    /// The ids are the widgets that declared the layers, which for a screen of areas is
-    /// `AreaScreen::area_ids()`.
+    /// Registers the layers whose pixels may be kept between frames (none by default). A
+    /// layer must own its rectangle: true of areas tiling a window, false of anything
+    /// overlapping.
     pub fn cache_layers(&mut self, ids: Vec<masonry::core::WidgetId>) {
         self.cache.set_wanted(ids);
     }
@@ -127,12 +106,8 @@ impl GpuFrames {
         self.cache.counters()
     }
 
-    /// Sets how many bytes of texture the layer cache may hold before it evicts (§37.2).
-    ///
-    /// The default follows the frame — two frames' worth, reset
-    /// whenever the window resizes — because cached layers tile the window and their
-    /// pixels therefore add up to about one frame however many of them there are. A
-    /// caller with a different arrangement can say so.
+    /// Sets how many bytes of texture the layer cache may hold before it evicts; two frames'
+    /// worth by default, reset on resize.
     pub fn cache_budget(&mut self, bytes: u64) {
         self.cache.set_budget(bytes);
     }
@@ -168,7 +143,7 @@ impl GpuFrames {
         &self.view
     }
 
-    /// The rectangles the last frame left for the host to fill (§4.3).
+    /// The rectangles the last frame left for the host to fill.
     pub fn holes(&self) -> &[Hole] {
         &self.holes
     }
@@ -195,14 +170,10 @@ impl GpuFrames {
         self.cache.set_budget(default_cache_budget(size));
     }
 
-    /// Composes a plan and draws it into the texture.
+    /// Composes a plan and draws it into the texture, reading nothing back.
     ///
-    /// No pixel buffer is created and nothing is read back: the counters this bumps
-    /// are `frames` and `holes` only, which is what the criteria check.
-    ///
-    /// Returns [`PresentError::SceneTooLarge`] or [`PresentError::SceneTooDeep`] for a
-    /// scene the rasteriser cannot take, and draws nothing — [`crate::tiles`] says why
-    /// a frame that *is* sent in that case comes back looking like the frame before it.
+    /// Returns [`PresentError::SceneTooLarge`] or [`PresentError::SceneTooDeep`], drawing
+    /// nothing, for a scene the rasteriser would silently drop ([`crate::tiles`]).
     pub fn draw(&mut self, plan: &VisualLayerPlan, logical: Size, device_scale: f64) -> Result<(), PresentError> {
         let (width, height) = Composition::physical_size(logical, device_scale);
         self.draw_sized(plan, PhysicalSize::new(width, height), device_scale)
@@ -218,13 +189,8 @@ impl GpuFrames {
         self.draw_checked(plan, frame, device_scale, true)
     }
 
-    /// Draws a plan without asking whether the rasteriser can take it.
-    ///
-    /// The door the benchmark needs and an application should not use: the check in
-    /// [`Self::draw_sized`] is arithmetic about somebody else's buffer sizes (§33.3),
-    /// and the only way to show it is neither blind nor paranoid is to draw the
-    /// frames it refuses and look at them. A frame drawn through here can silently be
-    /// the previous frame.
+    /// Draws a plan without the budget check, for the benchmark that verifies the check. A
+    /// frame drawn here can silently be the previous one.
     pub fn draw_unchecked(
         &mut self,
         plan: &VisualLayerPlan,
@@ -245,10 +211,7 @@ impl GpuFrames {
 
         let (composition, kept) = self.compose(plan, device_scale);
 
-        // Before anything is submitted: a scene over one of the rasteriser's fixed
-        // buffers is not drawn, and vello does not say so (§33, §34). Cheap next to
-        // the frame it guards — two counts over the command stream, and a pass over
-        // the composed scene's bounding boxes only when one of them is inconclusive.
+        // Before anything is submitted: vello drops an oversized scene silently.
         if checked && let Some(overflow) = crate::tiles::over_budget(&composition.scene, self.size) {
             self.counters.frames_refused += 1;
             return Err(match overflow {
@@ -274,18 +237,10 @@ impl GpuFrames {
         Ok(())
     }
 
-    /// Walks the plan, leaving out the layers whose pixels the cache still has.
-    ///
-    /// The decision per layer is §36.3: compare the scene first, because working out
-    /// where a layer sits walks the whole of it and a layer that did not change sits
-    /// where it sat. With no cache registered every layer is drawn and this is the
-    /// ordinary composition.
+    /// Walks the plan, leaving out the layers whose pixels the cache still has (the scene is
+    /// compared first: locating a layer walks all of it).
     fn compose(&mut self, plan: &VisualLayerPlan, device_scale: f64) -> (Composition, Kept) {
-        // The base colour goes in as the walk's first command rather than over the
-        // finished composition: the frame is opaque either way, and the alternative
-        // copies every command of it into a second scene once per frame (§26.4, §31.1).
-        // A kept layer's pixels are copied in after rasterisation, so the fill under
-        // them is the same fill it always was.
+        // The base colour as the walk's first command; kept pixels are copied over it later.
         let background = self.background.map(|color| (color, self.size.width, self.size.height));
         let mut kept = Kept::default();
         if !self.cache.is_active() {
@@ -309,8 +264,7 @@ impl GpuFrames {
                 return LayerChoice::Keep;
             }
             cache.note_drawn();
-            // A layer that draws nothing has no rectangle to keep; it goes into the
-            // frame like any other and that is all it needs.
+            // A layer that draws nothing has no rectangle to keep.
             cache.note_walk();
             if let Some(rect) = scene_bounds(scene, transform, size) {
                 kept.store.push((index, layer.widget_id, transform, rect));
@@ -321,27 +275,18 @@ impl GpuFrames {
         (composition, kept)
     }
 
-    /// Puts the kept pixels back, and takes a copy of the ones that were just drawn.
-    ///
-    /// After the rasteriser and not before: vello clears the target, so a rectangle
-    /// copied in first would be painted over. Nothing is resampled — source and target
-    /// have the same format and the copy is pixel for pixel, so §23's sharpness claim
-    /// is untouched by construction rather than by measurement.
+    /// Puts the kept pixels back and copies the ones just drawn: after the rasteriser, which
+    /// clears the target; pixel for pixel, nothing resampled.
     fn exchange(&mut self, plan: &VisualLayerPlan, kept: Kept) {
         if kept.reuse.is_empty() && kept.store.is_empty() {
             return;
         }
 
-        // What this frame is copying is named before anything is stored, because
-        // storing evicts and the pixels of a kept layer are in the cache and nowhere
-        // else: dropping one to stay inside the ceiling empties its area, and the
-        // counters would still say the cache had reused it (§44.9).
+        // Protected before anything is stored: an eviction would empty a kept area.
 
         self.cache.protect(kept.reuse.iter().map(|(id, _)| *id));
 
-        // The rectangles this frame claims, checked against the one promise the host
-        // cannot infer: a cached layer owns its pixels (§36). Overlapping layers copy
-        // over each other, and they add up to more than the window they tile.
+        // Checked: cached layers must not overlap.
         let rects: Vec<_> = kept
             .reuse
             .iter()
@@ -350,8 +295,7 @@ impl GpuFrames {
             .collect();
         self.cache.note_overlaps(&rects);
 
-        // Textures first, because allocating one needs the cache mutably and copying
-        // out of it needs it while the encoder is alive.
+        // Textures first: allocating needs the cache mutably.
         for (index, id, transform, rect) in &kept.store {
             let masonry::app::VisualLayerKind::Scene(layer_scene) = &plan.layers[*index].kind else {
                 continue;
@@ -366,9 +310,7 @@ impl GpuFrames {
         for (id, rect) in &kept.reuse {
             match self.cache.texture_of(*id) {
                 Some(texture) => copy_rect(&mut encoder, texture, CORNER, &self.target, rect.origin(), *rect),
-                // Unreachable while `protect` holds, and counted rather than ignored
-                // because this is exactly the silence §44.9 was found through: the area
-                // is empty this frame and every counter says the cache did its job.
+                // Unreachable while `protect` holds; counted, since the area would be empty.
                 None => self.cache.note_dropped(),
             }
         }
@@ -381,15 +323,8 @@ impl GpuFrames {
         self.cache.release();
     }
 
-    /// Copies part of the frame out of the texture, as tightly packed RGBA8.
-    ///
-    /// A strip rather than the whole frame, for a caller that only needs to know
-    /// *whether* this frame was drawn: at 2200x1500 the frame is 13 MB and a strip of
-    /// it is half a megabyte, which is the difference between a check that can run
-    /// after every frame and one that cannot. Rows outside the texture are clamped
-    /// away; asking for none gives none.
-    ///
-    /// Counts as a readback, for the same reason [`Self::read_pixels`] does.
+    /// Copies rows of the frame out of the texture, as tightly packed RGBA8 (rows outside
+    /// are clamped away): enough to tell whether a frame was drawn. Counts as a readback.
     pub fn read_rows(&mut self, y: u32, rows: u32) -> Vec<u8> {
         let (width, height) = (self.size.width, self.size.height);
         let y = y.min(height);
@@ -399,8 +334,7 @@ impl GpuFrames {
         }
 
         let row_bytes = width * 4;
-        // `copy_texture_to_buffer` wants each row aligned; the padding is dropped on
-        // the way out, so the caller gets an image and not a layout to reason about.
+        // Rows are padded for `copy_texture_to_buffer`; the padding is dropped.
         let padded = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blazy frame readback"),
@@ -451,33 +385,21 @@ impl GpuFrames {
         pixels
     }
 
-    /// Copies the frame out of the texture, as tightly packed RGBA8.
-    ///
-    /// **Not part of the frame path**, and the counter says so: this bumps
-    /// `readbacks`, which is the number `gpu_frames_are_not_read_back` gates at zero
-    /// (§27.4). It is here for a test, a screenshot, or a benchmark that has to know
-    /// whether the frame it just timed contains anything — a frame that failed is
-    /// *fast*, and no clock can tell that from a frame that was drawn (§32.4).
+    /// Copies the frame out of the texture, as tightly packed RGBA8: for a test, a
+    /// screenshot or a benchmark, not the frame path (it counts a readback).
     ///
     /// Blocks until the GPU has finished and the buffer is mapped.
     pub fn read_pixels(&mut self) -> Vec<u8> {
         self.read_rows(0, self.size.height)
     }
 
-    /// Waits for the GPU to finish the frame.
-    ///
-    /// Only a benchmark needs this: a submitted frame is otherwise timed as the cost
-    /// of submitting it, which is not what anybody wants to know.
+    /// Waits for the GPU to finish the frame (for a benchmark's timing).
     pub fn wait(&self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
 
-/// A device with no window behind it.
-///
-/// The same request `masonry_imaging` makes for its headless renderer; its own
-/// version is private, and the alternative to twenty lines here is a dependency on an
-/// async executor for one call.
+/// A device with no window behind it, requested as `masonry_imaging` does privately.
 pub(crate) fn headless_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
     block_on(async {
         let instance = wgpu::Instance::default();
@@ -495,11 +417,7 @@ pub(crate) fn headless_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
     })
 }
 
-/// Runs a future to completion on this thread.
-///
-/// `wgpu`'s setup calls are async and everything else here is not. Parking the thread
-/// until the waker unparks it is what upstream does for the same reason, and it keeps
-/// an executor out of the dependency list for three calls made once at startup.
+/// Runs a future to completion on this thread, by parking it (for `wgpu`'s async setup).
 pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
@@ -548,25 +466,19 @@ fn create_target(device: &wgpu::Device, size: PhysicalSize<u32>) -> (wgpu::Textu
 
 // --- MARK: SWAPCHAIN
 
-/// Draws into a window's swapchain, keeping the frame on the GPU throughout.
-///
-/// The window half of [`GpuFrames`]: the same draw, plus a surface to blit into and
-/// present. Split that way on purpose — a benchmark on a machine with a graphics
-/// device but no display can still measure the frame path (§27.5).
+/// Draws into a window's swapchain, keeping the frame on the GPU: [`GpuFrames`] plus a
+/// surface.
 #[cfg(feature = "window")]
 pub struct SwapchainPresenter {
     gpu: GpuFrames,
     window: std::sync::Arc<winit::window::Window>,
-    /// Kept because a lost surface is recreated from it rather than mourned.
+    /// Kept to recreate a lost surface.
     instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     blitter: wgpu::util::TextureBlitter,
-    /// Set when the surface said the image it handed out no longer matches it.
-    ///
-    /// Acted on at the start of the next frame rather than immediately: the image is
-    /// still ours until it is presented, and reconfiguring while holding it means
-    /// asking for a second one, which is a validation error.
+    /// Set when the surface asked to be reconfigured; done at the next frame, after the
+    /// image it handed out is presented.
     reconfigure: bool,
 }
 
@@ -615,8 +527,7 @@ impl SwapchainPresenter {
             adapter = %adapter.get_info().name,
             "surface capabilities"
         );
-        // Only these two: they are what a blit can land in without a colour-space
-        // surprise, and they are what upstream accepts for the same reason (§27.1).
+        // The two a blit lands in without a colour-space surprise.
         let format = capabilities
             .formats
             .iter()
@@ -674,18 +585,11 @@ impl SwapchainPresenter {
 
     /// The swapchain texture, or `None` for a frame that cannot be shown.
     ///
-    /// Every outcome `wgpu` distinguishes means something different, and treating them
-    /// as one is how a window ends up either panicking or permanently blank:
-    ///
-    /// * `Suboptimal` **hands over a usable image** and asks for a reconfigure. It has to be presented and the
-    ///   reconfigure deferred — reconfiguring here would re-acquire the surface while this image is still held, which
-    ///   is a validation error, and by default an uncaptured validation error panics. A stale surface during a drag is
-    ///   routine on X11 and Xwayland with NVIDIA drivers, so this is the normal path rather than the exceptional one.
-    /// * `Outdated` hands over nothing: reconfigure and ask again.
-    /// * `Occluded` and `Timeout` are ordinary — a minimised window is occluded every frame, and logging that as an
-    ///   error would fill the log with the fact that nobody is looking.
-    /// * `Lost` means the surface must be built again, which is why the instance is kept. Without this the window stays
-    ///   blank for the rest of the session after a compositor restart.
+    /// * `Suboptimal` hands over a usable image: present it, reconfigure next frame (now would be a validation error).
+    ///   Routine with NVIDIA on X11.
+    /// * `Outdated`: reconfigure and ask again.
+    /// * `Occluded`, `Timeout`: ordinary, not logged as errors.
+    /// * `Lost`: rebuild the surface (after a compositor restart).
     fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(texture) => Some(texture),
@@ -747,9 +651,7 @@ impl crate::present::Presenter for SwapchainPresenter {
         frame: PhysicalSize<u32>,
         device_scale: f64,
     ) -> Result<(), PresentError> {
-        // The surface follows the frame rather than the window event that announced
-        // it: one source of truth for the size means the blit can never be asked to
-        // stretch a frame into a swapchain image of another size.
+        // The surface follows the frame's size, so the blit never stretches.
         if self.config.width != frame.width.max(1) || self.config.height != frame.height.max(1) {
             self.set_size(frame);
         } else if std::mem::take(&mut self.reconfigure) {
@@ -759,7 +661,7 @@ impl crate::present::Presenter for SwapchainPresenter {
         self.gpu.draw_sized(plan, frame, device_scale)?;
 
         let Some(surface_texture) = self.acquire() else {
-            // The frame is drawn and simply not shown; the next redraw will show one.
+            // Drawn and not shown.
             return Ok(());
         };
 
@@ -772,8 +674,7 @@ impl crate::present::Presenter for SwapchainPresenter {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("blazy surface blit"),
             });
-        // GPU to GPU: this is the step the whole task exists for, and the reason the
-        // frame never appears in main memory.
+        // GPU to GPU.
         self.blitter
             .copy(self.gpu.device(), &mut encoder, self.gpu.view(), &view);
         self.gpu.queue().submit([encoder.finish()]);
@@ -800,11 +701,8 @@ impl crate::present::Presenter for SwapchainPresenter {
     }
 }
 
-/// Picks an alpha mode and a blitter that agree about premultiplication.
-///
-/// Straight from `masonry_winit`'s surface setup, including the AMD-on-Windows case:
-/// these are three findings from other people's machines, and rediscovering them
-/// costs more than crediting them (§27.1).
+/// Picks an alpha mode and a blitter that agree about premultiplication, as
+/// `masonry_winit` does (including the AMD-on-Windows case).
 #[cfg(feature = "window")]
 fn choose_blit(
     device: &wgpu::Device,
@@ -841,11 +739,8 @@ fn choose_blit(
     }
 }
 
-/// Frames' worth of texture the layer cache may hold by default.
-///
-/// Two, not eight: the layers a caller may cache own disjoint rectangles (§36), so all
-/// of them together are one frame of pixels, and the second frame is the slack a resize
-/// needs while the old textures wait to be replaced.
+/// Frames' worth of texture the layer cache may hold by default: the layers tile one frame,
+/// and the second is slack for a resize.
 const CACHE_FRAMES_OF_TEXTURE: u64 = 2;
 
 /// The default ceiling for a frame of this size.
@@ -853,7 +748,7 @@ fn default_cache_budget(size: PhysicalSize<u32>) -> u64 {
     u64::from(size.width) * u64::from(size.height) * 4 * CACHE_FRAMES_OF_TEXTURE
 }
 
-/// What the frame owes the cache once it is drawn (§36.2).
+/// What the frame owes the cache once it is drawn.
 #[derive(Default)]
 struct Kept {
     /// Layers whose pixels are copied in: id and where they go.

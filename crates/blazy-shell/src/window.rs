@@ -1,36 +1,15 @@
 //! Owner mode: our own windows, our own event loop, our own frames on the screen.
 //!
-//! `rnd/architecture.md` §14 gives the host two modes; this is the first. The second —
-//! guest mode, where an engine hands us its device and its texture — is nearly free
-//! from upstream and waits for something real to embed into (§26.5).
+//! Each window has its own `RenderRoot`, presenter, device and layer cache. One
+//! [`ShellDriver`] serves the process, and every method names its window ([`WindowKey`]);
+//! a driver asks for windows, and for another window to draw, through [`ShellCtx`].
 //!
-//! # Several windows
-//!
-//! The loop holds a map of them, each with its own `RenderRoot`, presenter, device and
-//! layer cache — everything per window, which is a decision with numbers behind it
-//! (§44): a second window costs 123 ms to open, of which 95 are the rasteriser's
-//! pipelines, and sharing a device would save the other 28.
-//!
-//! One [`ShellDriver`] for the process, and every method names the window it is about
-//! ([`WindowKey`]). A driver asks for windows through [`ShellCtx`], which also carries
-//! the one thing one window can do to another: ask it to draw, because an idle window
-//! cannot notice a change made elsewhere (§36, §30).
-//!
-//! # Why not `masonry_winit`
-//!
-//! Because the piece we have to replace is inside the piece we would want to keep
-//! (§26.3): `MasonryState` owns both the event loop and a rasteriser chosen at
-//! compile time, and its event conversion is `pub(crate)`. What we do keep is the
-//! part upstream itself keeps outside: `ui_events_winit::WindowEventReducer` is the
-//! same public crate `masonry_winit` uses to turn winit events into `ui-events`, so
-//! this module does not reimplement input handling — it wires it.
-//!
-//! `RenderRoot` is public in full, so the loop below is a plain winit application
-//! that feeds it events and asks it for a plan.
+//! Not `masonry_winit`, whose runner owns a compile-time rasteriser and keeps its event
+//! conversion private; input conversion is the same public `ui_events_winit`.
 //!
 //! # How a frame reaches the screen
 //!
-//! Two ways, chosen at startup along with the rasteriser (§27):
+//! Two ways, chosen at startup along with the rasteriser:
 //!
 //! * [`SwapchainPresenter`](crate::gpu::SwapchainPresenter) — the scene is drawn into a texture and blitted into the
 //!   swapchain. The frame never enters main memory. Needs a graphics device, so it comes with the `vello` feature.
@@ -38,18 +17,11 @@
 //!   anywhere, including on a machine with no usable GPU, and costs one pass over the frame plus the platform's own
 //!   copy.
 //!
-//! The second is the fallback for the first: asking for the GPU path on a machine
-//! that cannot give it is answered with a warning and a working window, not with a
-//! failure to start.
+//! Without a usable GPU the GPU path falls back to the second, with a warning.
 //!
-//! # What this does not do yet
-//!
-//! Accessibility, and window-manager gestures — dragging by a custom title bar, resize
-//! handles, the system menu. Masonry emits signals for all of them and this loop ignores
-//! those signals rather than pretending: each is a platform integration of its own.
-//! Layers are not among them: a popup is a layer, and [`apply_layer_signal`] puts it in
-//! the window. Nor are the clipboard and the input method, which
-//! [`text`](crate::text) handles.
+//! Not done: accessibility and window-manager gestures (custom title bar, resize handles,
+//! system menu); their signals are ignored. Popups are layers ([`apply_layer_signal`]);
+//! the clipboard and input method are in [`text`](crate::text).
 
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
@@ -89,19 +61,10 @@ pub struct WindowConfig {
     pub min_size: Option<LogicalSize<f64>>,
     /// Whether the user may resize it.
     pub resizable: bool,
-    /// What the window shows where the widget tree drew nothing.
-    ///
-    /// Not decoration: the frame has to be opaque by the time it is presented. A
-    /// widget tree is not obliged to cover the window — `AreaScreen` paints only its
-    /// splitter bars — so without a base colour every anti-aliased edge is blended
-    /// against transparency and then flattened, which throws the blending away and
-    /// turns a curve into a staircase. Compositing here rather than in the blit also
-    /// keeps presentation a plain channel swap.
+    /// What the window shows where the widget tree drew nothing: the frame must be opaque,
+    /// or anti-aliased edges are blended against transparency.
     pub base_color: Color,
     /// Which rasteriser to use, or `None` for the first one that opens.
-    ///
-    /// The point of the whole registry: an application decides this at startup, from
-    /// a flag or a settings file, not by being rebuilt (§26.2).
     pub backend: Option<Backend>,
 }
 
@@ -145,34 +108,18 @@ impl WindowConfig {
     }
 }
 
-/// The name of a window, handed out by the shell.
-///
-/// Ours rather than winit's, and that is what makes it usable: a driver names a window
-/// *before* it exists — [`ShellCtx::open_window`] answers immediately and the window is
-/// created once the current event is done with — and the name it got then is the name it
-/// keeps. Routing winit's own id to this one is the shell's business.
+/// The name of a window, handed out by the shell before the window exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowKey(u64);
 
-/// What a driver asked the shell to do.
-///
-/// Public because [`deliver_pointer`] and [`deliver_text`] are: an embedder running its
-/// own loop gets the same seat as the shell's loop, and therefore the same obligation to
-/// honour what the driver asked for. The shell's own loop drains these itself.
+/// What a driver asked the shell to do; an embedder running its own loop drains these.
 #[non_exhaustive]
 pub enum ShellRequest {
     /// Open a window under the name the driver was given.
-    ///
-    /// Boxed because it is the heavy variant and `Close` is a number: an enum as wide as
-    /// its widest variant would make every queued close carry a window's worth of bytes.
     Open(Box<NewWindow>),
     /// Close a window. Closing the last one ends the loop.
     Close(WindowKey),
     /// Draw a window that may be idle.
-    ///
-    /// The only way one window can reach another: a change made in one window has to
-    /// wake the windows that have to follow it, and nothing else will — an idle window
-    /// stays idle by design (§36).
     Redraw(WindowKey),
 }
 
@@ -182,25 +129,18 @@ pub struct NewWindow {
     pub window: WindowKey,
     /// How it should be created.
     pub config: WindowConfig,
-    /// Its root widget. A tree cannot be moved between windows, so this is a fresh one:
-    /// `RenderRoot` owns its arena and upstream has no reparenting.
+    /// Its root widget, a fresh one (a tree cannot move between windows).
     pub root: NewWidget<dyn Widget>,
 }
 
 /// The process's clipboard, shared: what [`ShellCtx::shared_clipboard`] hands out.
 pub type SharedClipboard = Rc<RefCell<Box<dyn Clipboard>>>;
 
-/// What a driver may ask the shell for.
-///
-/// Passed to every method that could reasonably want a second window — which is every
-/// method that hears from the user. The requests are queued rather than performed on the
-/// spot because creating a window needs the event loop, and the driver is called from
-/// inside an event it is already holding.
+/// What a driver may ask the shell for; queued, since creating a window needs the loop.
 pub struct ShellCtx {
     requests: Vec<ShellRequest>,
     next: u64,
-    /// The process's clipboard: one for every window, as the platform has one — in a cell a
-    /// driver can hand on to whatever copies past the text widgets (§71).
+    /// The process's clipboard, one for every window.
     clipboard: SharedClipboard,
     text: TextCounters,
 }
@@ -212,11 +152,8 @@ impl Default for ShellCtx {
 }
 
 impl ShellCtx {
-    /// A context with nothing asked for yet. For an embedder running its own loop.
-    ///
-    /// Its clipboard is a [`MemoryClipboard`]; the shell's own loop puts the system's in
-    /// its place, and an embedder gives its own with
-    /// [`with_clipboard`](Self::with_clipboard).
+    /// A context with nothing asked for yet, for an embedder running its own loop. Its
+    /// clipboard is a [`MemoryClipboard`] until [`with_clipboard`](Self::with_clipboard).
     pub fn new() -> Self {
         Self {
             requests: Vec::new(),
@@ -233,17 +170,12 @@ impl ShellCtx {
         self
     }
 
-    /// The clipboard text widgets copy to and paste from.
-    ///
-    /// Here rather than in the shell's loop because a driver may want it too: anything an
-    /// application copies past the text widgets goes on the same clipboard. Borrowed from its
-    /// cell: do not hold it across an event.
+    /// The clipboard text widgets copy to and paste from; do not hold it across an event.
     pub fn clipboard(&mut self) -> RefMut<'_, Box<dyn Clipboard>> {
         self.clipboard.borrow_mut()
     }
 
-    /// The clipboard's cell, for a driver to hand to what copies outside the text widgets —
-    /// a node editor's operators, from a key, a menu or a script alike (§71).
+    /// The clipboard's cell, for a driver to hand to what copies outside the text widgets.
     pub fn shared_clipboard(&self) -> SharedClipboard {
         self.clipboard.clone()
     }
@@ -257,11 +189,7 @@ impl ShellCtx {
         &mut self.text
     }
 
-    /// Asks for a window, and names it.
-    ///
-    /// The key is valid from here on: it is what the driver's later calls are tagged
-    /// with, and what [`close_window`](Self::close_window) takes. The window itself
-    /// appears when the shell gets back to the event loop.
+    /// Asks for a window and names it; the window appears when the loop gets control back.
     pub fn open_window(&mut self, config: WindowConfig, root: NewWidget<dyn Widget>) -> WindowKey {
         let window = WindowKey(self.next);
         self.next += 1;
@@ -270,11 +198,7 @@ impl ShellCtx {
         window
     }
 
-    /// Names a window the shell did not open.
-    ///
-    /// For an embedder running its own loop, and for a test: [`deliver_pointer`] and
-    /// [`deliver_text`] take the name of the window an event came from, and a window
-    /// somebody else created still has to have one.
+    /// Names a window the shell did not open (an embedder's, a test's).
     pub fn name_window(&mut self) -> WindowKey {
         let window = WindowKey(self.next);
         self.next += 1;
@@ -286,11 +210,7 @@ impl ShellCtx {
         self.requests.push(ShellRequest::Close(window));
     }
 
-    /// Asks for a window to draw a frame.
-    ///
-    /// For a change that one window made and another has to follow: the model is shared
-    /// and the views are not, and a view that is not drawing cannot notice anything
-    /// (§30, and the pull it takes across a window boundary).
+    /// Asks for a window to draw a frame: for a change another window has to follow.
     pub fn request_redraw(&mut self, window: WindowKey) {
         self.requests.push(ShellRequest::Redraw(window));
     }
@@ -316,88 +236,39 @@ pub trait ShellDriver {
         let _ = (cx, window, action, from);
     }
 
-    /// Called once per window, with its tree built and before its first event.
-    ///
-    /// The window's own startup, which an application cannot do for itself: a
-    /// `RenderRoot` does not exist until the window does, and some of what an
-    /// application needs is settled on the root rather than on a widget. The keymap is
-    /// the case that made this necessary — Masonry sends a key to the focused widget
-    /// or to `RenderRoot::set_focus_fallback` and nowhere else, so a driver that wants
-    /// the keys nobody claimed has to name a widget here (§38.3).
-    ///
-    /// `root.get_layer_root(0).id()` is the application's own root widget, which saves
-    /// threading a `WidgetId` out of a tree that has not been built yet.
+    /// Called once per window, with its tree built and before its first event: where to set
+    /// what lives on the root, such as `RenderRoot::set_focus_fallback`
+    /// (`root.get_layer_root(0).id()` is the application's root widget).
     fn started(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
         let _ = (cx, window, root);
     }
 
-    /// The event has been delivered, and whatever it changed has changed.
-    ///
-    /// The place to notice that *another* window has to follow: a change made here waits
-    /// in the application's model, and a window that is not drawing will not collect it
-    /// (§36 — an idle window is idle on purpose). So this is where an application asks
-    /// for the frames that are needed, with [`ShellCtx::request_redraw`].
-    ///
-    /// **After the event rather than in one of the seats**, because the seats are offered
-    /// an event *before* the tree acts on it: a driver that asked "is there anything to
-    /// carry" from [`pointer_event`](Self::pointer_event) would be asking about the
-    /// previous event, and a change made with the mouse would reach the other window one
-    /// gesture late — which is exactly what it did before this existed.
+    /// The event has been delivered and the tree has acted on it: where an application wakes
+    /// the other windows that have to follow ([`ShellCtx::request_redraw`]). The seats run
+    /// before the tree, too early for that.
     fn settled(&mut self, cx: &mut ShellCtx, window: WindowKey, root: &mut RenderRoot) {
         let _ = (cx, window, root);
     }
 
-    /// The window is about to draw a frame.
-    ///
-    /// Where an application catches a window up with whatever happened in another one.
-    /// Nothing else can do it: a driver is called with the root of the window the event
-    /// arrived at, and a widget in one `RenderRoot` cannot be reached from another — the
-    /// `mutate_later` that carries a change between the areas of one window is silently
-    /// dropped across the boundary of two. So the change waits in the application's model
-    /// and this is where the window collects it.
-    ///
-    /// Only on frames that are happening anyway. A window that has to be woken is woken
-    /// with [`ShellCtx::request_redraw`].
+    /// The window is about to draw a frame: where it catches up with changes made in another
+    /// window (a `mutate_later` does not cross windows).
     fn frame(&mut self, window: WindowKey, root: &mut RenderRoot) {
         let _ = (window, root);
     }
 
-    /// The subtrees that are layers of their own, asked for once per frame (§36).
-    ///
-    /// Returning ids does two things, and both are needed for either to be worth
-    /// anything: the shell asks each of those widgets to repaint, without which its
-    /// layer disappears on the first frame it is idle (§26.1), and it tells the
-    /// presenter it may keep their pixels. For a screen of areas this is
-    /// `AreaScreen::area_ids()`.
-    ///
-    /// Only ever called on frames that are happening anyway, so an application that
-    /// declares layers does not stop the window from going idle. The default declares
-    /// none, and then nothing above happens at all.
-    ///
-    /// No [`ShellCtx`] here, unlike the methods that hear from the user: this one is on
-    /// the frame path, and opening a window from inside a frame is not a thing an
-    /// application should be able to do by accident.
+    /// The subtrees that are layers of their own, asked once per frame (for a screen of areas,
+    /// `AreaScreen::area_ids()`): each is asked to repaint, and the presenter may keep its
+    /// pixels. None by default.
     fn layers(&mut self, window: WindowKey, root: &mut RenderRoot) -> Vec<WidgetId> {
         let _ = (window, root);
         Vec::new()
     }
 
-    /// The seat in front of the widget tree: every pointer event, before `RenderRoot`
-    /// is called, with the power to keep it.
+    /// The seat in front of the widget tree: every pointer event, before `RenderRoot`.
+    /// [`Handled::Yes`] keeps it from the tree entirely.
     ///
-    /// Returning [`Handled::Yes`] means the tree never sees the event at all — not the
-    /// widget under the pointer, not its ancestors, not a layer root's own hook. This is
-    /// the seat §38.2 priced and §39.5 moved out of a benchmark and into the library.
-    ///
-    /// What it buys and what it costs, both measured (§38.2): it is the only seat that
-    /// can withhold *anything*, including events no widget would have handled, and it is
-    /// the only one that does not know what is under the pointer. Asking costs
-    /// `RenderRoot::edit_widget` and the rewrite battery that follows it, at 41.2 probes
-    /// per gesture — which is why an application with a layer root of its own should
-    /// prefer that seat and keep this one for what only it can do.
-    ///
-    /// A gesture never crosses a window: pointer capture belongs to one `RenderRoot`, so
-    /// while a button is down its events go to the window that took it.
+    /// It does not know what is under the pointer, and asking (`RenderRoot::edit_widget`)
+    /// costs a rewrite battery; a layer root's own hook is cheaper where it will do.
     fn pointer_event(
         &mut self,
         cx: &mut ShellCtx,
@@ -410,9 +281,6 @@ pub trait ShellDriver {
     }
 
     /// The same seat, for keys.
-    ///
-    /// Keys never reach a widget that has not been made the focus fallback, so this is
-    /// also the seat that can hear a key when the tree would have dropped it (§38.3).
     fn text_event(
         &mut self,
         cx: &mut ShellCtx,
@@ -425,15 +293,8 @@ pub trait ShellDriver {
     }
 }
 
-/// Does what a layer signal asks of `root`, or hands the signal back if it is not one.
-///
-/// A popup in Masonry — a menu, a tooltip, a selector's list — is a layer, and a layer is
-/// not created by the widget that wants it: the widget emits
-/// [`RenderRootSignal::NewLayer`] and the host puts the root into the window's stack. This
-/// loop used to drop those signals with IME and the clipboard, so no popup ever appeared in
-/// a blazy window — and no test noticed, because the test harness handles them itself
-/// (`issues/menus.md`). A free function over the root, so an embedder running its own loop
-/// does the same, and a test can check it without a window.
+/// Does what a layer signal asks of `root` (a popup is a layer the host adds, from
+/// [`RenderRootSignal::NewLayer`]), or hands the signal back if it is not one.
 pub fn apply_layer_signal(root: &mut RenderRoot, signal: RenderRootSignal) -> Option<RenderRootSignal> {
     match signal {
         RenderRootSignal::NewLayer(_kind, widget, position) => root.add_layer(widget, position),
@@ -444,10 +305,8 @@ pub fn apply_layer_signal(root: &mut RenderRoot, signal: RenderRootSignal) -> Op
     None
 }
 
-/// Offers one pointer event to the host seat, and then to the tree unless it was taken.
-///
-/// The whole of the host seat, and it is a free function so that an embedder running its
-/// own loop — or a test with no window at all — gets exactly what the shell's loop gets.
+/// Offers one pointer event to the host seat, then to the tree unless it was taken. Free,
+/// so an embedder or a test gets what the shell's loop gets.
 pub fn deliver_pointer(
     driver: &mut dyn ShellDriver,
     cx: &mut ShellCtx,
@@ -461,11 +320,8 @@ pub fn deliver_pointer(
     root.handle_pointer_event(event)
 }
 
-/// As [`deliver_pointer`], for keys and text.
-///
-/// The paste key becomes the clipboard's text here, before either seat sees it, and only
-/// while a text field has focus — otherwise it is a key like any other, for a keymap to
-/// bind ([`text`](crate::text) says why both halves are needed).
+/// As [`deliver_pointer`], for keys and text. While a text field has focus, the paste key
+/// becomes the clipboard's text here.
 pub fn deliver_text(
     driver: &mut dyn ShellDriver,
     cx: &mut ShellCtx,
@@ -496,12 +352,7 @@ impl<F: FnMut(ErasedAction, WidgetId)> ShellDriver for F {
 pub enum Error {
     /// No rasteriser could be opened.
     Backend(crate::BackendError),
-    /// A frame could not be composed, rasterised or shown.
-    ///
-    /// The platform's own error arrives as text rather than as its type: which crate
-    /// puts pixels on the screen is an implementation detail of a presenter, and a
-    /// library that leaks it into its public error type passes every upstream rename
-    /// on to everyone downstream (§15.1).
+    /// A frame could not be composed, rasterised or shown (the platform's error as text).
     Presented(PresentError),
     /// The event loop refused to start or to run.
     EventLoop(winit::error::EventLoopError),
@@ -547,23 +398,19 @@ impl From<PresentError> for Error {
 ///
 /// # Errors
 ///
-/// If the event loop cannot start, or the window or the path its frames take to the
-/// screen cannot be created. A frame that fails later is logged rather than returned:
-/// by then the application is running, and one bad frame is not a reason to end it.
+/// If the event loop cannot start, or the window or its presenter cannot be created. A
+/// frame that fails later is logged.
 pub fn run(
     config: WindowConfig,
     root: NewWidget<dyn Widget>,
     default_properties: DefaultProperties,
     driver: impl ShellDriver + 'static,
 ) -> Result<(), Error> {
-    // The same courtesy `masonry_winit` extends: if the application has not set up
-    // tracing, set up ours, so that a fallback to the blit path or a lost swapchain
-    // texture says so out loud instead of disappearing.
+    // Tracing, if the application has none, as `masonry_winit` does.
     let _ = masonry::app::try_init_tracing();
 
     let event_loop = EventLoop::new().map_err(Error::EventLoop)?;
-    // The first window is asked for exactly the way a second one is, so there is one
-    // path that opens a window and not two that drift apart.
+    // The first window is asked for like any other.
     let mut cx = ShellCtx::new().with_clipboard(system_clipboard());
     cx.open_window(config, root);
     let mut app = ShellApp {
@@ -580,13 +427,8 @@ pub fn run(
 
 // --- MARK: BLIT
 
-/// Rasterises the frame into a buffer and copies it into the window.
-///
-/// The path that works everywhere: any [`Backend`], no graphics device required. What
-/// it costs is that the frame passes through main memory — measured at 0.94 ms for the
-/// channel swap alone on an 1100x750 frame — and that a GPU rasteriser has to read its
-/// own output back (§26.2). The swapchain path exists to avoid both; this one exists
-/// because a machine without a usable device still has to show a window.
+/// Rasterises the frame into a buffer and copies it into the window: works with any
+/// [`Backend`] and no graphics device, at the cost of a pass through main memory.
 pub struct BlitPresenter {
     host: Host,
     backend: Backend,
@@ -630,16 +472,10 @@ impl Presenter for BlitPresenter {
         self.holes.extend_from_slice(&frame.holes);
         blit(&mut self.surface, &frame.image)?;
 
-        // Counted after the frame reached the window, so a frame that failed on the
-        // way is not in the denominator of a per-frame criterion.
+        // Counted once the frame reached the window.
         self.counters.frames += 1;
         self.counters.holes += frame.holes.len() as u64;
-        // Read from the host rather than recomputed: the bytes exist because the host
-        // made them, and a second place that works them out is a second place to be
-        // wrong (§27.4).
         self.counters.cpu_bytes = self.host.counters().image_bytes;
-        // A GPU rasteriser on this path has to copy its result out of video memory
-        // once per frame; a CPU one wrote into main memory to begin with.
         self.counters.readbacks += u64::from(self.backend.needs_device());
         Ok(())
     }
@@ -653,39 +489,22 @@ impl Presenter for BlitPresenter {
     }
 
     fn resize(&mut self, _size: PhysicalSize<u32>) {
-        // `softbuffer` is resized when the frame is presented, from the frame's own
-        // size, so there is nothing to do here — and nothing to get out of step.
+        // `softbuffer` is resized when the frame is presented.
     }
 }
 
-/// One window the shell holds.
-///
-/// Everything in here is per window and stays per window (decision 2 of the detach
-/// task): its own presenter, and with it its own device, rasteriser and layer cache with
-/// its own ceiling (§37.2). Two windows cost two of each, once, when they open.
+/// One window the shell holds, with its own presenter, device, rasteriser and layer cache.
 struct ShellWindow {
     window: Arc<Window>,
     presenter: Box<dyn Presenter>,
     root: RenderRoot,
-    /// Where this root drops its signals.
-    ///
-    /// Shared with the sink closure the root owns, because that closure cannot borrow
-    /// the structure that owns the root. One queue per window, so a signal cannot be
-    /// acted on against the wrong one.
+    /// Where this root drops its signals, shared with the sink closure it owns.
     signals: Rc<RefCell<Vec<RenderRootSignal>>>,
     reducer: WindowEventReducer,
-    /// When the last animation frame ran, for the interval the next one gets — `None`
-    /// when the frame before this one did not animate.
-    ///
-    /// Masonry's contract is that the first frame after idling gets an interval of zero
-    /// (`Widget::on_anim_frame`), and an animation that moves by time relies on it: kept
-    /// as the time of the last animation ever, the first frame of the next one was handed
-    /// the whole idle in between, and edge pan (§55) would have thrown the view by it.
+    /// When the last animation frame ran, for the next one's interval; `None` after a frame
+    /// that did not animate, so the first frame after idling gets zero, as Masonry promises.
     last_anim: Option<Instant>,
-    /// Whether the last frame was refused by the rasteriser (§33).
-    ///
-    /// Kept so the warning is logged when the state changes rather than sixty times a
-    /// second: a scene over the tile budget stays over it while nothing moves.
+    /// Whether the last frame was refused by the rasteriser, to warn once per change.
     refusing: bool,
 }
 
@@ -694,32 +513,23 @@ struct ShellApp {
     windows: HashMap<WindowKey, ShellWindow>,
     /// Which of them a winit event belongs to.
     routes: HashMap<WindowId, WindowKey>,
-    /// The theme, shared by every window: one map per application (§22.1).
+    /// The theme, shared by every window: one map per application.
     default_properties: Arc<DefaultProperties>,
     driver: Box<dyn ShellDriver>,
     /// What the driver has asked for and the loop has not done yet.
     cx: ShellCtx,
-    /// Why a window could not be opened, handed back by [`run`] once the loop stops.
-    ///
-    /// Kept rather than raised where it happens: the handler methods have no way to
-    /// return an error, and a panic there unwinds through the platform's event loop and
-    /// takes the `Result` that `run` promises its caller with it.
+    /// Why a window could not be opened, handed back by [`run`] once the loop stops (the
+    /// handlers cannot return errors).
     failure: Option<Error>,
 }
 
 impl ShellApp {
-    /// Does what the driver asked for while it was being called.
-    ///
-    /// Between events rather than during them: creating a window needs the event loop,
-    /// and the driver is called from inside an event that is already holding it.
+    /// Does what the driver asked for, between events.
     fn apply_requests(&mut self, event_loop: &ActiveEventLoop) {
         for request in self.cx.drain() {
             match request {
                 ShellRequest::Open(new) => {
                     if let Err(error) = self.open(event_loop, new.window, new.config, new.root) {
-                        // The first window failing is the application failing to start;
-                        // a later one is the same kind of failure and is reported the
-                        // same way, because there is nobody else to tell.
                         self.failure = Some(error);
                         event_loop.exit();
                         return;
@@ -783,9 +593,6 @@ impl ShellApp {
     }
 
     /// Drops a window. The loop ends when the last one goes.
-    ///
-    /// Closing a window is not exiting: that distinction is what multi-window costs and
-    /// the whole of what the single-window loop got away without.
     fn close(&mut self, event_loop: &ActiveEventLoop, key: WindowKey) {
         if let Some(window) = self.windows.remove(&key) {
             self.routes.remove(&window.window.id());
@@ -795,19 +602,15 @@ impl ShellApp {
         }
     }
 
-    /// Composes, rasterises and presents one frame of one window.
-    ///
-    /// The whole of §4.2 variant 2 in one function: ask the tree for a plan, walk the
-    /// plan rather than flattening it, and put the result on the screen. Anything the
-    /// tree left to the host arrives as a hole and is handed to `fill_holes`.
+    /// Composes, rasterises and presents one frame of one window, from the tree's plan;
+    /// what the tree left to the host arrives as a hole.
     fn redraw(&mut self, key: WindowKey) -> Result<(), Error> {
         let Some(shell) = self.windows.get_mut(&key) else {
             return Ok(());
         };
         let root = &mut shell.root;
 
-        // Before anything this frame is decided: an application may have a change from
-        // another window to apply, and it has to land before the layout that draws it.
+        // First: changes from another window have to land before the layout.
         self.driver.frame(key, root);
 
         if root.needs_anim() {
@@ -819,10 +622,7 @@ impl ShellApp {
             shell.last_anim = None;
         }
 
-        // Layers, before the plan is built: a widget that wants to be one has to be
-        // painting when the paint pass reaches it (§26.1), and the presenter has to
-        // know which pixels it may keep (§36). Both from one answer, so an application
-        // cannot ask for half of the arrangement.
+        // Layers, before the plan is built: they must repaint, and the presenter must know.
         let layers = self.driver.layers(key, root);
         if !layers.is_empty() {
             for id in &layers {
@@ -833,12 +633,7 @@ impl ShellApp {
 
         let (plan, _tree_update) = root.redraw();
 
-        // The window's size in physical pixels is what the frame has to cover, and it
-        // is known exactly; the scale factor goes along separately because it belongs
-        // to the drawing rather than to the size (§9).
-        // A scene the rasteriser cannot take is not a reason to close the window: the
-        // frame is skipped, the window keeps what it had, and — unlike the silent
-        // version this replaces (§33) — somebody is told.
+        // A scene the rasteriser cannot take skips the frame, with a warning.
         match shell.presenter.present(&plan, root.size(), shell.window.scale_factor()) {
             Ok(()) => {
                 if shell.refusing {
@@ -859,19 +654,14 @@ impl ShellApp {
             Err(error) => return Err(Error::Presented(error)),
         }
 
-        // Holes are reported rather than drawn: the host owns what goes in them, and
-        // for an application without external content there are none (§4.3).
+        // Holes are reported; the host owns what goes in them.
         report_holes(shell.presenter.holes());
 
         shell.window.set_cursor(root.cursor_icon());
         Ok(())
     }
 
-    /// Acts on everything the render roots asked for during the last call into them.
-    ///
-    /// Every window's queue, not only the one an event arrived for: a root may be made
-    /// to ask for something by a `mutate_later` scheduled from another window, which is
-    /// exactly what carrying a model change into the other views does (§30).
+    /// Acts on everything every window's render root asked for during the last call.
     fn drain_signals(&mut self, event_loop: &ActiveEventLoop) {
         let keys: Vec<WindowKey> = self.windows.keys().copied().collect();
         for key in keys {
@@ -912,8 +702,7 @@ impl ShellApp {
                             let _ = apply_text_signal(&mut self.cx, shell.window.as_ref(), signal);
                         }
                     },
-                    // The application exiting, rather than one window closing: a window
-                    // goes through `ShellCtx::close_window` or its own close button.
+                    // The application exiting, not one window closing.
                     RenderRootSignal::Exit => event_loop.exit(),
                     signal @ (RenderRootSignal::NewLayer(..)
                     | RenderRootSignal::RemoveLayer(_)
@@ -923,8 +712,7 @@ impl ShellApp {
                             shell.window.request_redraw();
                         }
                     },
-                    // Deliberately unhandled, and listed in the module docs: accessibility
-                    // and window-manager gestures are platform integrations of their own.
+                    // Not handled yet: accessibility and window-manager gestures.
                     _ => {},
                 }
             }
@@ -933,14 +721,8 @@ impl ShellApp {
     }
 }
 
-/// Chooses how a window's frames will reach the screen.
-///
-/// The GPU path when it was asked for and the machine can give it; the blit path
-/// otherwise. A machine with no usable device gets a warning and a working
-/// window, because "start without a GPU" is a requirement and not a courtesy.
-///
-/// A free function rather than a method, because every window answers it for itself:
-/// its own device, its own rasteriser, its own layer cache (decision 2).
+/// Chooses how a window's frames reach the screen: the GPU path if asked for and
+/// available, the blit path otherwise, with a warning.
 fn open_presenter(config: &WindowConfig, window: &Arc<Window>) -> Result<Box<dyn Presenter>, Error> {
     let base = config.base_color;
 
@@ -952,10 +734,7 @@ fn open_presenter(config: &WindowConfig, window: &Arc<Window>) -> Result<Box<dyn
         }
     }
 
-    // Whatever was asked for, the fallback has to be a rasteriser that does not
-    // need a device: arriving here after the GPU path failed usually means there
-    // is no usable device, and answering "no GPU" by asking for one again is how
-    // a promise of "starts without a GPU" turns into a window that never opens.
+    // The fallback must not need a device.
     let backend = config
         .backend
         .filter(|backend| !backend.needs_device())
@@ -969,10 +748,7 @@ fn open_presenter(config: &WindowConfig, window: &Arc<Window>) -> Result<Box<dyn
     Ok(Box::new(BlitPresenter::new(backend, window.clone(), base)?))
 }
 
-/// The platform's clipboard, or the in-process one when there is none to open.
-///
-/// A window without a clipboard is still a window: copy and paste then work inside the
-/// application and not with others, and the warning says so.
+/// The platform's clipboard, or an in-process one (with a warning) when there is none.
 fn system_clipboard() -> Box<dyn Clipboard> {
     match SystemClipboard::open() {
         Ok(clipboard) => Box::new(clipboard),
@@ -990,11 +766,7 @@ fn report_holes(holes: &[Hole]) {
     }
 }
 
-/// Puts a rendered frame on the screen.
-///
-/// One pass over the pixels to drop alpha and reorder the channels, which is what a
-/// CPU presentation path costs. §26.2 explains why the frame arrives as pixels rather
-/// than as a texture, and §26.5 what it would take for it not to.
+/// Puts a rendered frame on the screen: one pass to drop alpha and reorder the channels.
 fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &RgbaImage) -> Result<(), PresentError> {
     let platform = |error: softbuffer::SoftBufferError| PresentError::Platform(error.to_string());
     let (Some(width), Some(height)) = (NonZeroU32::new(image.width), NonZeroU32::new(image.height)) else {
@@ -1011,8 +783,7 @@ fn blit(surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, image: &Rgb
 
 impl ApplicationHandler for ShellApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // The first window is a request like any other, queued by `run`; anything the
-        // driver asked for while it was being started goes out in the same drain.
+        // The first window is a request queued by `run`.
         self.apply_requests(event_loop);
         self.drain_signals(event_loop);
     }
@@ -1026,9 +797,7 @@ impl ApplicationHandler for ShellApp {
         };
         let scale_factor = shell.window.scale_factor();
 
-        // Input first, through the same reducer `masonry_winit` uses (§26.3). One
-        // reducer per window: it accumulates pointer state, and two windows have two
-        // pointers as far as it is concerned.
+        // Input through the reducer `masonry_winit` uses, one per window.
         if let Some(translation) = shell.reducer.reduce(scale_factor, &event) {
             match translation {
                 WindowEventTranslation::Keyboard(key_event) => {
@@ -1047,18 +816,14 @@ impl ApplicationHandler for ShellApp {
         }
 
         match event {
-            // The window, not the process: the loop ends when the last window goes
-            // (`close`), which is the whole difference between one window and several.
+            // The window, not the process.
             WinitWindowEvent::CloseRequested => self.close(event_loop, key),
             WinitWindowEvent::Resized(size) => {
                 shell.root.handle_window_event(WindowEvent::Resize(size));
                 shell.presenter.resize(size);
             },
             WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // The third multiplier of §9, and the only place it is applied: the
-                // tree keeps laying out in logical coordinates and the composition
-                // scales the drawing, so a display change costs a frame and not a
-                // relayout.
+                // The device scale goes into composition only: a frame, not a relayout.
                 shell.root.handle_window_event(WindowEvent::Rescale(scale_factor));
             },
             // Composed text: not a key, so the reducer does not translate it.
@@ -1082,8 +847,6 @@ impl ApplicationHandler for ShellApp {
             _ => {},
         }
 
-        // The event is over and the tree has acted on it: an application that has to move
-        // something into another window says so now (see `ShellDriver::settled`).
         if let Some(shell) = self.windows.get_mut(&key) {
             self.driver.settled(&mut self.cx, key, &mut shell.root);
         }
@@ -1092,10 +855,7 @@ impl ApplicationHandler for ShellApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // An animation frame is a reason to draw the next one; anything else waits
-        // for an event. This is what keeps an idle window idle — apart from an
-        // external hole, which by §26.1 has to keep painting to stay a hole. Asked of
-        // each window separately, so one window animating does not wake the others.
+        // Only an animation (or an external hole) asks for the next frame, per window.
         for shell in self.windows.values() {
             if shell.root.needs_anim() {
                 shell.window.request_redraw();

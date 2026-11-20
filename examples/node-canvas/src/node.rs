@@ -1,19 +1,8 @@
 //! A graph node: a rounded body with a coloured header and interactive controls.
 //!
-//! The node is a container, not a painter callback. That is the whole point of
-//! claim 3: its slider and checkbox are stock Masonry widgets, unmodified, and they
-//! keep working when the canvas is zoomed because Masonry inverts `window_transform`
-//! when routing pointer events.
-//!
-//! The node also implements level of detail. The interesting part is not that it
-//! draws less when zoomed out, but that at [`Detail::Box`] it *stashes* its
-//! contents: a stashed widget is not laid out, not painted and not hit-tested.
-//!
-//! It is drawn as a rounded rectangle, so it is picked as one too, twice over: the
-//! widget overrides `find_widget_under_pointer` with a [`ShapeHit`], and
-//! [`GraphSource::hit`] answers the same question for the canvas, which needs it for
-//! nodes that have no widget at all. Both go through the same shape — a corner the
-//! eye sees as empty has to be empty to the pointer as well.
+//! Its slider and checkbox are stock Masonry widgets, and keep working when the canvas is
+//! zoomed. At lower detail it builds fewer children. It is picked by its rounded shape,
+//! both as a widget (`find_widget_under_pointer`) and by the canvas ([`GraphSource::hit`]).
 
 use std::any::TypeId;
 
@@ -41,61 +30,34 @@ const HEADER_HEIGHT: f64 = 22.0;
 const RADIUS: f64 = 6.0;
 /// Padding around the node's controls.
 const PADDING: f64 = 8.0;
-/// Flattening tolerance for the far-field rounded corners, in canvas units.
-///
-/// Generous on purpose: in the far field a whole node is a few pixels across, so its
-/// corner arc is a fraction of one, and the elements this saves are elements the
-/// batch would carry in every frame.
+/// Flattening tolerance for the far-field rounded corners, in canvas units: generous, a
+/// far-field corner is a fraction of a pixel.
 const FAR_TOLERANCE: f64 = 1.0;
-/// How large a corner must be on screen, in pixels, before the far field bothers
-/// rounding it.
-///
-/// Half a pixel: below that the arc is inside one pixel of coverage and the rounding
-/// is a matter of antialiasing rather than of shape. It is not free — a rounded
-/// rectangle is eight path segments against four (§35.1) — and the far field draws
-/// thousands of them.
+/// How large a corner must be on screen, in pixels, before the far field rounds it
+/// (a rounded rectangle is eight path segments, a plain one four).
 pub(crate) const FAR_MIN_RADIUS_PX: f64 = 0.5;
 
-/// A graph node with a slider and a checkbox.
-///
-/// The node is a *view* over [`GraphModel`](crate::model::GraphModel): it is built
-/// when the node scrolls into view and dropped when it scrolls out, so anything the
-/// user changes has to be written back to the model immediately. That write-back is
-/// [`on_action`](Widget::on_action).
+/// A graph node with a slider and a checkbox: a view over
+/// [`GraphModel`](crate::model::GraphModel), which every edit is written back to at once.
 pub struct GraphNode {
     /// The graph this node belongs to.
     graph: SharedGraph,
-    /// The canvas this node was built for.
-    ///
-    /// Needed to tell the *other* views of the same graph apart from this one when an
-    /// edit is broadcast: re-applying an edit to the node the user is currently
-    /// dragging would be work at best and a lost pointer grip at worst.
+    /// The canvas this node was built for, which an edit is not broadcast back to.
     canvas: Option<WidgetId>,
     /// This node's index in the graph.
     index: usize,
     /// Header tint, used to tell nodes apart at a glance when zoomed out.
     tint: Color,
-    /// Interactive controls, present only at [`Detail::Full`].
-    ///
-    /// At `Simplified` a node is roughly 50 px wide: the slider would be 3 px tall and
-    /// unusable. Building it anyway would cost three extra widgets per node in every
-    /// pass, for something the user cannot touch — so the value is painted instead.
+    /// Interactive controls, present only at [`Detail::Full`]; below, the values are painted.
     controls: Option<Controls>,
     /// The slider value, kept for painting when there is no slider widget.
     value: f64,
     /// The checkbox state, kept for painting when there is no checkbox widget.
     checked: bool,
-    /// The slider value this widget was built with.
-    ///
-    /// Kept so tests can assert that a rebuilt node picked up the model's current
-    /// state rather than a stale default.
+    /// The slider value this widget was built with (for tests).
     #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
     built_value: f64,
-    /// The body as a hit shape, rebuilt in `layout` when the size changes.
-    ///
-    /// Rebuilt there rather than derived per pick because a `ShapeHit` carries a
-    /// flattened cache, and rebuilding it on every pointer move would throw the cache
-    /// away exactly when it pays (§25.1).
+    /// The body as a hit shape, rebuilt in `layout` when the size changes (it caches).
     hit: ShapeHit,
 }
 
@@ -150,18 +112,10 @@ impl GraphNode {
 }
 
 impl GraphNode {
-    /// Pushes this node's new state into every other view of the same graph.
-    ///
-    /// Writing the model is not enough on its own: a node widget reads the model when
-    /// it is *built* and then keeps its own copy, because it is painted far more often
-    /// than it is built. A view already showing this node therefore has to be told.
-    /// Views that are not showing it need nothing — they will read the model when the
-    /// node next scrolls in.
+    /// Pushes this node's new state into every other view of the same graph (a node widget
+    /// keeps its own copy of the model's values).
     fn broadcast(&self, ctx: &mut ActionCtx<'_>) {
-        // This node first. Masonry's `Checkbox` deliberately does not toggle itself —
-        // it emits `CheckboxToggled` and leaves the state to whoever owns the source of
-        // truth — so the same reload that carries the edit to the other views is also
-        // what makes this one show it.
+        // This node first: Masonry's `Checkbox` does not toggle itself.
         ctx.mutate_self_later(|mut widget| Self::reload(&mut widget.downcast::<Self>()));
 
         let mut peers = Vec::new();
@@ -170,10 +124,7 @@ impl GraphNode {
             let graph = self.graph.borrow();
             let views = graph.views();
             match self.canvas {
-                // Recorded for every view but this one, and that exclusion is load-bearing:
-                // this window collects what its views owe before it draws, and a change
-                // owed to *this* canvas would rebuild the node whose slider is being
-                // dragged — once per frame of the drag, out from under the pointer.
+                // For every view but this one, or the slider being dragged is rebuilt.
                 Some(canvas) => {
                     views.note_except(canvas, Change::Contents { index });
                     views.others(canvas, &mut peers);
@@ -185,9 +136,7 @@ impl GraphNode {
             }
         }
         for peer in peers {
-            // The mutate pass is where a widget outside this subtree may legally be
-            // changed, and it runs before the next layout — so the other areas show the
-            // new value in the same frame.
+            // Other canvases through the mutate pass, in the same frame.
             ctx.mutate_later(peer, move |mut widget| {
                 let mut canvas = widget.downcast::<CanvasLayer>();
                 CanvasLayer::update_child(&mut canvas, index, |mut node| {
@@ -198,17 +147,8 @@ impl GraphNode {
         }
     }
 
-    /// Re-reads this node's state from the model.
-    ///
-    /// The receiving half of the push a control's edit starts (`broadcast`, private).
-    /// Also the reason a node
-    /// keeps `value` and `checked` of its own: at `Simplified` there are no control
-    /// widgets and the values are painted, so both copies have to be refreshed.
-    ///
-    /// Public because the push is not the only way in: a window that was not there when
-    /// the edit happened collects it from the graph's views instead (`Change::Contents`),
-    /// which rebuilds the node rather than reloading it — the pull does not know what a
-    /// node is (§44.9).
+    /// Re-reads this node's state from the model: the receiving half of the push an edit
+    /// starts. (Another window rebuilds the node instead, through `Change::Contents`.)
     pub fn reload(this: &mut blazy::masonry::core::WidgetMut<'_, Self>) {
         let state = this.widget.graph.borrow().node(this.widget.index);
         this.widget.value = state.value;
@@ -222,8 +162,7 @@ impl GraphNode {
             let mut checkbox = this.ctx.get_mut(&mut controls.checkbox);
             Checkbox::set_checked(&mut checkbox, state.checked);
         }
-        // The painted stand-ins are this widget's own drawing, so they need a repaint
-        // of their own even when the control widgets asked for theirs.
+        // The painted stand-ins need a repaint of their own.
         this.ctx.request_paint_only();
     }
 }
@@ -242,8 +181,7 @@ impl Widget for GraphNode {
         len_req: LenReq,
         _cross_length: Option<Length>,
     ) -> Length {
-        // The canvas always gives nodes a fixed size from the graph model, so this
-        // is only a fallback. It deliberately does not measure the children.
+        // A fallback: the canvas gives nodes their size.
         let fallback = match axis {
             Axis::Horizontal => 160.0,
             Axis::Vertical => 96.0,
@@ -255,17 +193,12 @@ impl Widget for GraphNode {
     }
 
     fn layout(&mut self, ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, size: Size) {
-        // The hit shape follows the size, and it is the *drawn* shape: `paint` fills
-        // the same rounded rectangle. Two places deriving a body from the size is one
-        // too many, but the alternative — rebuilding the shape inside the hit test —
-        // throws away the flattened cache on every pointer move.
+        // The hit shape follows the size: the same rounded rectangle `paint` fills.
         if self.hit.bounds().size() != size {
             self.hit = body_shape(size);
         }
 
-        // Whether this node has controls was decided when it was built, not here.
-        // Below Full it has none at all, so there is nothing to stash and nothing to
-        // lay out — which is the entire saving.
+        // Below Full there are no controls to lay out.
         let Some(controls) = self.controls.as_mut() else {
             return;
         };
@@ -285,8 +218,7 @@ impl Widget for GraphNode {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
-        // The *global* level, not this node's: it says how many nodes are on screen,
-        // and therefore how much a single extra draw command costs.
+        // The global level: how many nodes share the cost of a command.
         let global = props.get::<CanvasDetail>(ctx.property_cache()).0;
         let box_rect = ctx.content_box();
         let body = RoundedRect::from_rect(box_rect, RADIUS);
@@ -301,9 +233,7 @@ impl Widget for GraphNode {
         );
         painter.fill(RoundedRect::from_rect(header, RADIUS), self.tint).draw();
 
-        // Selected or not is not this widget's to know: it wears a class, and the style
-        // for that class — `crate::property_set` — says what colour its outline is (§38.7).
-        // Transparent, which is the default, means no outline at all.
+        // The outline colour comes from the style for the selected class (`property_set`).
         let outline = props.get::<BorderColor>(ctx.property_cache()).color;
         if outline.components[3] > 0.0 {
             painter
@@ -315,14 +245,8 @@ impl Widget for GraphNode {
                 .draw();
         }
 
-        // Without control widgets the node still has to show its state. The stand-in
-        // sits where the real controls would, because it is swapped for them the
-        // moment the pointer arrives: a mismatch here would read as the UI jumping
-        // under the cursor.
-        //
-        // Fidelity is bought only where it is affordable. Every node's scene is
-        // appended into the layer scene on every frame, so one extra command here is
-        // multiplied by the number of visible nodes.
+        // Without control widgets the state is painted where the controls would be, in
+        // more detail only when few nodes are on screen.
         if self.controls.is_none() {
             let detailed = global == Detail::Full;
             let inner_width = (box_rect.width() - 2.0 * PADDING).max(0.0);
@@ -338,8 +262,7 @@ impl Widget for GraphNode {
                 )
                 .draw();
             if detailed {
-                // Few nodes on screen: draw the knob and the checkbox, so that
-                // swapping in the real controls on hover is not visible.
+                // Few nodes on screen: the knob and the checkbox too.
                 let knob_x = track.x0 + inner_width * self.value;
                 painter
                     .fill(
@@ -363,9 +286,6 @@ impl Widget for GraphNode {
     }
 
     /// Writes control changes straight back into the model.
-    ///
-    /// Without this, virtualisation would silently discard the user's edits the
-    /// moment a node scrolled off screen.
     fn on_action(
         &mut self,
         ctx: &mut ActionCtx<'_>,
@@ -386,22 +306,14 @@ impl Widget for GraphNode {
         }
     }
 
-    /// The precise half of the two-phase hit test (`rnd/architecture.md` §6.2).
-    ///
-    /// Masonry has already checked the bounding box by the time this runs; what it
-    /// cannot know is that the corners are rounded away. Without this a click three
-    /// pixels into the corner of a node lands on the node instead of on whatever is
-    /// behind it — a link, or the empty canvas that starts a pan.
+    /// The precise half of the hit test: the corners are rounded away.
     fn find_widget_under_pointer<'c>(&'c self, ctx: QueryCtx<'c>, pos: Point) -> Option<WidgetRef<'c, dyn Widget>> {
         self.hit.find_widget(self, ctx, pos)
     }
 
     fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
         CanvasDetail::prop_changed(ctx, property_type);
-        // The outline is drawn by `paint`, not by the box Masonry paints for a widget, and
-        // Masonry answers a change of `BorderColor` with a *pre*-paint — the box — and
-        // nothing more. Without asking, a node that became selected kept its old paint,
-        // and the window showed no selection at all once the editor stopped outlining it.
+        // `paint` draws the outline, and Masonry repaints only the box for `BorderColor`.
         if property_type == TypeId::of::<BorderColor>() {
             ctx.request_paint_only();
         }
@@ -409,7 +321,7 @@ impl Widget for GraphNode {
 
     /// The port dots, drawn by the node so that they sit at its level among the nodes: a
     /// node raised over this one covers them, and a corner it leaves unpainted shows them
-    /// (§50.8). After the controls, which reach close to the edge the dots sit on.
+    ///. After the controls, which reach close to the edge the dots sit on.
     fn post_paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, painter: &mut Painter<'_>) {
         PORTS.paint_ports(painter, ctx.border_box(), NODE_PORTS);
     }
@@ -435,11 +347,7 @@ impl Widget for GraphNode {
     fn accessibility(&mut self, _ctx: &mut AccessCtx<'_>, _props: &PropertiesRef<'_>, _node: &mut AccessNode) {}
 }
 
-/// The node body as a hit shape.
-///
-/// The same rounded rectangle `paint` fills. One function, so the two cannot drift
-/// apart: a shape that is picked where it is not drawn is a bug nobody sees until
-/// they click.
+/// The node body as a hit shape: the rounded rectangle `paint` fills.
 fn body_shape(size: Size) -> ShapeHit {
     ShapeHit::fill(RoundedRect::from_rect(
         Rect::from_origin_size(Point::ORIGIN, size),
@@ -448,32 +356,15 @@ fn body_shape(size: Size) -> ShapeHit {
 }
 
 /// Builds and draws nodes for the canvas.
-///
-/// A struct rather than a closure because the canvas needs three things from it: a
-/// widget when the node is big enough to interact with, a rectangle when it is not,
-/// and the answer to "is this point on this node" for both cases. See
-/// [`NodeSource::paint_far`] and [`NodeSource::hit`].
 pub struct GraphSource {
     graph: SharedGraph,
     /// The canvas this source builds for, once it is in the tree.
     canvas: Option<WidgetId>,
     /// This canvas's place among the graph's views, given up when the canvas is dropped.
-    ///
-    /// Held here because the source is what a canvas drops when it leaves the tree, and
-    /// that drop is the only notice anybody gets: Masonry has no removal event. A view
-    /// joined away or detached used to stay registered and owed every later change, so
-    /// the windows were woken after every event for good.
     view: Option<ViewToken>,
-    /// One shape for every node, because every node is the same size.
-    ///
-    /// Kept here rather than built per pick: the flattened cache inside it is what
-    /// makes the exact test 15x cheaper than re-walking the path (§25.1), and it only
-    /// pays if it survives between picks.
+    /// One shape for every node (all the same size), kept for its flattened cache.
     body: ShapeHit,
     /// How large a corner must be on screen before the far field rounds it.
-    ///
-    /// A field rather than the constant alone so the benchmark can price the rule:
-    /// zero rounds always, a large value never (§35.2).
     far_min_radius_px: f64,
     /// One reusable path per tint, for the far field. See [`NodeSource::paint_far`].
     far_batches: Vec<(Color, BezPath)>,
@@ -521,19 +412,12 @@ impl NodeSource for GraphSource {
     }
 
     /// Registers this canvas as one of the graph's views.
-    ///
-    /// Done here rather than at construction because a canvas has no id until it is in
-    /// the tree, and doing it here keeps every constructor in this crate unchanged: a
-    /// canvas over a shared graph is a view of it by the fact of existing.
     fn attached(&mut self, canvas: WidgetId) {
         self.canvas = Some(canvas);
         self.view = Some(self.graph.borrow().views().attach(canvas));
     }
 
-    /// Records a drag in the model and names the other views that have to follow it.
-    ///
-    /// The canvas's own drag, which no editor sees — so the record the other windows
-    /// collect is written here, like the editor writes its own.
+    /// Records the canvas's own drag in the model, and names the other views to follow.
     fn moved(&mut self, index: usize, pos: Point, peers: &mut Vec<WidgetId>) {
         self.graph.borrow_mut().set_pos(index, pos);
         let graph = self.graph.borrow();
@@ -555,16 +439,7 @@ impl NodeSource for GraphSource {
     }
 
     fn paint_far(&mut self, nodes: &[(usize, Rect)], scale: f64, painter: &mut Painter<'_>) {
-        // The far field: no widget, no layout, no widget-tree hit route — the nodes
-        // are shapes in the canvas's own scene. Picking still works, because the
-        // canvas asks `hit` rather than the tree.
-        //
-        // Grouped by tint and filled once per group. The generated graph has six
-        // tints, so five thousand nodes cost six commands instead of five thousand,
-        // and that is the difference between 5.27 ms and 1.40 ms a frame — a command
-        // is charged in every frame the scene is appended, which is every frame (§31).
-        // The grouping is a linear scan because six is the number: a map would cost
-        // more than it saves.
+        // Grouped by tint and filled once per group: six commands rather than one per node.
         let graph = self.graph.borrow();
         let rounded = RADIUS * scale >= self.far_min_radius_px;
         let mut batches = std::mem::take(&mut self.far_batches);
@@ -580,17 +455,7 @@ impl NodeSource for GraphSource {
                     batches.last_mut().expect("just pushed")
                 },
             };
-            // Each node is its own subpath, so the fill treats them as separate
-            // shapes; `move_to` is what keeps them from being joined up.
-            //
-            // Rounded only while the rounding is visible. The corner is `RADIUS`
-            // canvas units, so at the far field's own zooms it is a fraction of a
-            // pixel — and it costs four of the node's eight path segments, which is
-            // the unit the second half of the frame is charged in (§32.3, §35.2).
-            // Keyed on the corner's own on-screen size rather than on the detail
-            // level, for the reason §31.4 gives: a rule about what can be seen belongs
-            // next to what it is about, and it switches itself off when someone
-            // configures a coarser threshold.
+            // Each node a subpath; rounded only while the corner is visible on screen.
             if rounded {
                 batch
                     .1
@@ -608,9 +473,7 @@ impl NodeSource for GraphSource {
     }
 
     fn hit(&mut self, _index: usize, rect: Rect, point: Point) -> bool {
-        // Every generated node has the same size, so one shape serves them all: the
-        // point moves into the shape's frame instead of the shape moving to the node.
-        // A graph with per-node sizes would keep a shape per size, not per node.
+        // One shape for all nodes: the point moves into its frame.
         if rect.size() != crate::model::NODE_SIZE {
             return rect.contains(point);
         }

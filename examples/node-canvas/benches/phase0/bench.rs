@@ -1,14 +1,8 @@
 //! Headless measurements for Phase 0.
 //!
-//! Runs the scenarios from `rnd/architecture.md` §7.4 against a `TestHarness`, so
-//! the numbers are reproducible and do not depend on a GPU, a compositor or a
-//! window manager. What is timed is Masonry's own work — event routing, the rewrite
-//! passes, and encoding the `VisualLayerPlan` — which is exactly the part this
-//! architecture is a bet on. GPU submission is deliberately out of scope: no
-//! backend choice can rescue a design that re-lays-out 5000 nodes per pan.
-//!
-//! Each scenario reports wall time per frame and the delta in the canvas counters,
-//! because a fast frame that quietly relaid out everything is not a pass.
+//! Runs the scenarios against a `TestHarness`, without a GPU: event routing, the rewrite
+//! passes and encoding the `VisualLayerPlan`. Each scenario reports time per frame and the
+//! canvas counters, which the criteria are decided on.
 
 use std::time::{Duration, Instant};
 
@@ -30,11 +24,7 @@ pub(crate) const VIEWPORT: (u32, u32) = (1100, 750);
 /// Frames per scenario. Enough to see a trend, short enough to stay interactive.
 const FRAMES: usize = 120;
 
-/// Frames per scenario in the quick set.
-///
-/// Every gated criterion is a per-frame average of a counter that is either zero or
-/// a small constant, so it converges in a few frames; the extra hundred exist to
-/// steady the *timings*, which the quick set does not gate on anyway.
+/// Frames per scenario in the quick set: counters converge in a few frames.
 const QUICK_FRAMES: usize = 40;
 
 /// Centre of the viewport, used as the zoom anchor everywhere.
@@ -47,15 +37,7 @@ pub(crate) const PAN_STEP: Vec2 = Vec2::new(-6.0, -2.0);
 pub struct Options {
     /// Nodes in the graph under test.
     pub count: usize,
-    /// Run only the scenarios the pass criteria are decided on.
-    ///
-    /// A fast inner loop while working on the canvas: it drops the scenarios that
-    /// exist to price design decisions for a human reader — zoom, hover, the
-    /// intermediate LOD levels — and keeps every scenario a criterion is computed
-    /// from, so the verdict is the same one CI would reach.
-    ///
-    /// CI runs the *full* set regardless. The whole benchmark is under a second, so
-    /// there is nothing to save by archiving fewer numbers.
+    /// Run only the scenarios the criteria are decided on: the same verdict, faster.
     pub quick: bool,
 }
 
@@ -74,14 +56,8 @@ pub(crate) struct Report {
     worst: Duration,
     before: CanvasStats,
     after: CanvasStats,
-    /// Most draw commands the window's layer plan held in any frame of the scenario.
-    ///
-    /// The other half of what a frame costs (§31): the paint pass rebuilds the plan
-    /// every frame and re-appends every widget's cached scene into it, so a scene of
-    /// ten thousand commands is charged ten thousand times a frame whether or not
-    /// anything moved. Widgets cannot see it — in the far field there are none.
-    ///
-    /// The largest rather than the last, because it is a ceiling.
+    /// Most draw commands the window's layer plan held in any frame of the scenario: the
+    /// part of a frame's cost that widgets do not show.
     commands: usize,
 }
 
@@ -94,11 +70,7 @@ impl Report {
         self.worst.as_secs_f64() * 1000.0
     }
 
-    /// Layout passes run on the canvas content.
-    ///
-    /// Coarser than [`child_layouts_per_frame`](Self::child_layouts_per_frame) and
-    /// harder to satisfy by accident: a pass that visits only clean children still
-    /// counts here, and that is exactly the failure a hover has to avoid.
+    /// Layout passes run on the canvas content (a pass over clean children counts too).
     fn content_layouts_per_frame(&self) -> f64 {
         self.per_frame(self.after.counters.content_layouts - self.before.counters.content_layouts)
     }
@@ -217,8 +189,7 @@ impl Report {
             "{:<26}   draw commands {:<10} links recorded {:>6}  hidden {:>6}",
             "", self.commands, self.after.recorded_links, self.after.hidden_links,
         );
-        // Only the scenarios that move the pointer have anything to say here, and a
-        // row of zeroes under every other one would bury the numbers that matter.
+        // Only the scenarios that move the pointer.
         if self.picks() > 0 {
             println!(
                 "{:<26}   picks {:<18} node geometries/pick {:>6.1}  curves/pick {:>6.1}",
@@ -266,11 +237,7 @@ fn per_pick(count: u64, picks: u64) -> f64 {
     if picks == 0 { 0.0 } else { count as f64 / picks as f64 }
 }
 
-/// Reads the canvas counters out of the live widget tree.
-///
-/// From the canvas itself rather than from the editor's cached copy: the copy is
-/// refreshed during layout, and a pick deliberately does not run one (§25.4), so a
-/// hover scenario read that way would report having picked nothing.
+/// Reads the canvas counters from the canvas itself (a pick runs no layout to copy them).
 pub(crate) fn stats(harness: &mut TestHarness<NodeEditor>) -> CanvasStats {
     harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats()))
 }
@@ -328,13 +295,8 @@ fn new_harness_with(count: usize, controls_on_hover: bool) -> TestHarness<NodeEd
     harness
 }
 
-/// A harness over a graph of the same size packed `times` more densely.
-///
-/// The variable that actually decides what a zoom materialises. A larger graph does
-/// not put more nodes under the viewport — the generated grid has one density, so
-/// beyond the point where the viewport is full the extra nodes are simply off screen
-/// (§29.1). Halving the spacing does: four times the nodes at the same zoom, the same
-/// node count, nothing else changed.
+/// A harness over a graph of the same size packed `times` more densely: density, not size,
+/// decides what a zoom materialises.
 fn dense_harness(count: usize, times: f64) -> TestHarness<NodeEditor> {
     let graph = share(GraphModel::generated_with_step(count, GRID_STEP / times.sqrt()));
     let canvas = CanvasSpec::new(count).over(&graph);
@@ -360,24 +322,15 @@ fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEdito
     harness
 }
 
-/// Widgets in the whole tree.
-///
-/// The quantity §20.2 says a frame costs, and the one the budget is written in — so
-/// the criterion is bounded on the tree itself rather than on the canvas's estimate
-/// of it. Deterministic, which is what lets the bound be tight (§20.9).
+/// Widgets in the whole tree: what a frame costs, counted on the tree itself.
 fn widgets_in_tree(harness: &mut TestHarness<NodeEditor>) -> usize {
     let mut widgets = 0;
     harness.inspect_widgets(|_| widgets += 1);
     widgets
 }
 
-/// Puts a canvas-space point under the centre of the viewport at a given zoom.
-///
-/// The sweep sets the view outright rather than zooming by a factor and panning,
-/// because the pan inside each point would otherwise accumulate: at zoom 0.02 a pan
-/// of six pixels is three hundred canvas units, and after a few points the viewport
-/// has left the graph and the rest of the sweep measures empty space. That mistake
-/// was made once, and it made the return leg look free.
+/// Puts a canvas-space point under the centre of the viewport at a given zoom, setting the
+/// view outright so the pans of a sweep do not accumulate off the graph.
 pub(crate) fn look_at(harness: &mut TestHarness<NodeEditor>, anchor: Point, zoom: f64) {
     let view = Affine::translate(VIEWPORT_CENTRE - (Affine::scale(zoom) * anchor)) * Affine::scale(zoom);
     harness.edit_root_widget(|mut editor| {
@@ -407,7 +360,7 @@ pub(crate) fn measure(
         let elapsed = start.elapsed();
         // Counted outside the clock: reading the plan is the measurement, not the
         // frame. It is exact and machine-independent, which is what lets a criterion
-        // be bounded on it (§20.9).
+        // be bounded on it.
         commands = commands.max(plan::commands(&layers));
         total += elapsed;
         worst = worst.max(elapsed);
@@ -518,7 +471,7 @@ pub fn run(opts: &Options) -> Outcome {
     // --- Scenario 5: pointer movement over the canvas.
     //
     // Every move is a pick: what is under the pointer, node or link, answered from
-    // the model through the grid and the recorded curve set (§25.3). The criterion
+    // the model through the grid and the recorded curve set. The criterion
     // this decides is that picking does not drag a layout pass behind it — a pointer
     // crossing a graph is the most common thing that happens to a canvas, and it has
     // to cost a repaint at most.
@@ -582,7 +535,7 @@ pub fn run(opts: &Options) -> Outcome {
     // The same view as scenario 2, reached the way a user reaches it: zoom out far
     // enough to see everything, then come back. A recorded region that could only
     // grow made this permanently slower than the pan it should be identical to
-    // (§28), so the two are measured against each other.
+    //, so the two are measured against each other.
     {
         let mut harness = new_harness(count);
         zoom_to(&mut harness, 0.05);
@@ -615,7 +568,7 @@ pub fn run(opts: &Options) -> Outcome {
     let pick_zooms = pick_zoom_sweep(opts);
     let zoom_picks = zoom_pick_sweep(opts);
     // Two graph sizes, because a ceiling that quietly follows the graph is exactly
-    // what the zoom thresholds did (§29.1) and the criterion has to be able to see it.
+    // what the zoom thresholds did and the criterion has to be able to see it.
     let frames = if opts.quick { 8 } else { 16 };
     let mut zooms = zoom_sweep(opts, count, frames, None);
     // The same sweep over a graph four times as dense. This is the comparison the
@@ -623,7 +576,7 @@ pub fn run(opts: &Options) -> Outcome {
     // the denser graph is the same interface under a different one.
     let dense = zoom_sweep(opts, count, frames, Some(4.0));
     let wobble = boundary_wobble(opts, count);
-    // The far field in the unit the second half of a frame is charged in (§35). Two
+    // The far field in the unit the second half of a frame is charged in. Two
     // graph sizes for the same reason the zoom sweep uses two: a ceiling that quietly
     // follows the graph is what has to be visible.
     let mut far = Vec::new();
@@ -633,10 +586,10 @@ pub fn run(opts: &Options) -> Outcome {
             far.extend(crate::far::far_table(opts, count * 4, zoom));
         }
     }
-    // What a gesture costs and where the operator layer can sit (§38).
+    // What a gesture costs and where the operator layer can sit.
     let gestures = crate::ops::ops_table(opts, count);
     let undo = crate::ops::undo_table(opts);
-    // What editing the shape of the graph costs, and what it must leave behind (§43).
+    // What editing the shape of the graph costs, and what it must leave behind.
     let edits = crate::edits::edit_table(opts);
 
     let criteria = evaluate(
@@ -677,17 +630,16 @@ pub fn run(opts: &Options) -> Outcome {
 
 /// Zooms the range end to end and back, recording what the tree holds at each stop.
 ///
-/// The sweep the widget budget is judged on (§29.3). Three things about its shape are
+/// The sweep the widget budget is judged on. Three things about its shape are
 /// load-bearing:
 ///
-/// * **It returns.** A sweep that only zooms out enters every state and leaves none, which tests half a switch (§28.4).
-///   It is also the only way to see the hysteresis: the same zoom legitimately carries a different level depending on
-///   which side it was reached from.
+/// * **It returns.** A sweep that only zooms out enters every state and leaves none, which tests half a switch. It is
+///   also the only way to see the hysteresis: the same zoom legitimately carries a different level depending on which
+///   side it was reached from.
 /// * **It looks at a fixed point of the graph.** Each stop sets the view outright, so a stop measures a zoom rather
 ///   than however far the previous stops have drifted.
 /// * **The endpoints are part of the criterion.** 0.02 is where the far field holds the whole graph and 4.0 is where it
-///   holds one node; a sweep that stopped at 0.1 would report a tree that never misbehaves because it never got large
-///   (§24.1).
+///   holds one node; a sweep that stopped at 0.1 would report a tree that never misbehaves because it never got large.
 fn zoom_sweep(opts: &Options, count: usize, frames: usize, density: Option<f64>) -> Vec<ZoomRecord> {
     const ZOOMS: [f64; 9] = [4.0, 1.0, 0.3, 0.21, 0.15, 0.1, 0.06, 0.04, 0.02];
     const QUICK_ZOOMS: [f64; 5] = [1.0, 0.21, 0.1, 0.04, 0.02];
@@ -902,7 +854,7 @@ struct PickRecord {
 /// and wrong is not an improvement over a rectangle.
 fn pick_sweep(opts: &Options) -> Vec<PickRecord> {
     // The sweep starts at 1000 rather than at 250, and the endpoint is part of the
-    // criterion just as it was in §24.1 — in the other direction. A 250-node graph
+    // criterion just as the node sweep was — in the other direction. A 250-node graph
     // is three rows tall, which is *smaller* than the region the canvas records
     // curves for, so a pick there examines fewer curves for a reason that has
     // nothing to do with the index: the graph runs out. Measured 46 curves/pick at
@@ -996,12 +948,12 @@ struct PickZoomRecord {
 /// things. Nodes come from the grid and are bounded by density, which the zoom does not
 /// change. Curves come from the *recorded* set, and that is bounded by the region the
 /// canvas records for — the viewport plus its margin, in canvas units — so it grows as
-/// the view pulls back: §28 measured 9857 curves recorded at a zoom whose viewport held
+/// the view pulls back: measured: 9857 curves recorded at a zoom whose viewport held
 /// 96 nodes. A pointer moving over empty canvas at an overview zoom asks that question
 /// on every move.
 ///
 /// Sampled over empty canvas as well as over nodes, deliberately: a pick that lands on
-/// a node never reaches the curves at all (§25.3), so a sweep that only touched nodes
+/// a node never reaches the curves at all, so a sweep that only touched nodes
 /// would report the cheap half.
 fn pick_zoom_sweep(opts: &Options) -> Vec<PickZoomRecord> {
     const ZOOMS: [f64; 5] = [1.0, 0.4, 0.15, 0.08, 0.03];
@@ -1051,7 +1003,7 @@ fn pick_zoom_sweep(opts: &Options) -> Vec<PickZoomRecord> {
 ///
 /// The tolerance is in screen pixels and the test is in canvas units, so the two are
 /// separated by the zoom — a factor of 400 across the range the canvas allows
-/// (§25.2). Sampled on a graph of two nodes and one link, so that "some other link"
+///. Sampled on a graph of two nodes and one link, so that "some other link"
 /// cannot be the answer: three points at fixed *screen* offsets from the curve, whose
 /// verdicts must not depend on the zoom at all.
 ///
@@ -1072,7 +1024,7 @@ fn zoom_pick_sweep(opts: &Options) -> (usize, usize) {
 
     // Put the middle of the only link under the centre of the viewport, so that
     // zooming about the centre leaves it exactly where it is.
-    // Where the curve runs is where its ends are, and they are the ports (§52): the
+    // Where the curve runs is where its ends are, and they are the ports: the
     // middle of the curve is the middle of its ends, since the handles are symmetric.
     let (from, to) = (node_rect(&mut harness, 0), node_rect(&mut harness, 1));
     let start = node_canvas::node::PORTS.position(from, blazy::canvas::PortSide::Output, 0);
@@ -1124,7 +1076,7 @@ const OVERVIEW_LINK_BLOCKS: u64 = 100;
 
 /// The Phase 0 pass criteria, evaluated against the numbers just measured.
 ///
-/// Bounds are set well clear of the measured values (§20.5), because a criterion is
+/// Bounds are set well clear of the measured values, because a criterion is
 /// a regression alarm, not a performance target: it must fire when the architecture
 /// stops holding, and stay silent through ordinary tuning. A criterion whose scenario
 /// did not run is simply absent — that is how the quick set drops the ones it cannot
@@ -1188,10 +1140,10 @@ fn evaluate(
     }
 
     if let Some(far) = find("pan, whole graph shown") {
-        // §20.6a: the far-field scene is recorded in canvas coordinates, so a pan
+        // The far-field scene is recorded in canvas coordinates, so a pan
         // inside the recorded region must reuse it untouched. If this climbs, the
         // scene is being thrown away every frame and the overview zoom is back to
-        // costing what it cost before §20.6.
+        // costing what it cost before.
         criteria.push(Criterion {
             name: "far_field_survives_a_pan",
             claim: "far-field scene is not re-recorded while panning",
@@ -1259,7 +1211,7 @@ fn evaluate(
     }
 
     if let (Some(plain), Some(after)) = (find("pan"), find("pan after an overview")) {
-        // §28: a region that only ever grew left the whole graph's edges recorded, so
+        // A region that only ever grew left the whole graph's edges recorded, so
         // the same view cost nine times more after one look at the overview. Counted
         // rather than timed, because the curves are the cause and the milliseconds
         // are only the symptom.
@@ -1298,7 +1250,7 @@ fn evaluate(
         });
     }
 
-    // --- Picking by shape (§25).
+    // --- Picking by shape.
 
     if let Some(hover) = find("hover") {
         // A pick is a question about the model, and answering it must not dirty the
@@ -1320,7 +1272,7 @@ fn evaluate(
         && small.nodes != large.nodes
     {
         // The grid answers "which nodes are near this point", and its cell holds a
-        // fixed number of nodes however big the graph is (§25.1). Bounded against the
+        // fixed number of nodes however big the graph is. Bounded against the
         // small graph rather than against a constant, so the criterion keeps meaning
         // the same thing if the generated graph's density changes.
         criteria.push(Criterion {
@@ -1357,7 +1309,7 @@ fn evaluate(
         // meaning the same thing if the graph's density changes.
         //
         // The margin is wide on purpose and it is not slack: the pick tolerance is in
-        // screen pixels and divided by the scale (§25.2), so at zoom 0.03 the pointer
+        // screen pixels and divided by the scale, so at zoom 0.03 the pointer
         // reaches a hundred canvas units and legitimately has more curves near it than
         // at zoom 1. What the criterion forbids is the cost following the *set*.
         criteria.push(Criterion {
@@ -1373,7 +1325,7 @@ fn evaluate(
     if let Some(last) = picks.last()
         && last.corners > 0
     {
-        // §6.1: the hit geometry is the shape, not the box. Counted from the failing
+        // The hit geometry is the shape, not the box. Counted from the failing
         // side, as the criteria always are: a positive claim would have to be
         // inverted, and a count of wrong answers is a bound like any other.
         criteria.push(Criterion {
@@ -1389,7 +1341,7 @@ fn evaluate(
     let (changes, samples) = zoom_picks;
     if samples > 0 {
         // The tolerance is in screen pixels, so the same screen offset must give the
-        // same answer at every zoom (§25.2). With the tolerance in canvas units
+        // same answer at every zoom. With the tolerance in canvas units
         // instead, a 400-fold range of zoom turns it into a 400-fold range of
         // tolerance, and the near samples stop being hits at the bottom of it.
         criteria.push(Criterion {
@@ -1402,7 +1354,7 @@ fn evaluate(
         });
     }
 
-    // --- The widget budget (§29).
+    // --- The widget budget.
 
     let budget = DetailBudget::default();
     let widest = |points: &[ZoomRecord]| points.iter().map(|p| p.widgets).max().unwrap_or(0) as f64;
@@ -1463,9 +1415,9 @@ fn evaluate(
         });
     }
 
-    // --- What the frame costs when there are no widgets left to count (§31).
+    // --- What the frame costs when there are no widgets left to count.
     //
-    // The budget of §29 bounds the tree; below the far-field threshold the tree is
+    // The budget bounds the tree; below the far-field threshold the tree is
     // three widgets and the canvas still fills the plan with the scene it painted.
     // Draw commands are the unit that half of the frame is charged in — the paint
     // pass rebuilds the plan every frame and re-appends every cached scene into it,
@@ -1493,7 +1445,7 @@ fn evaluate(
         });
     }
 
-    // --- The short-link rule stays where it belongs (§31.4).
+    // --- The short-link rule stays where it belongs.
     //
     // A link under two screen pixels is dropped when the set is chosen. The rule is
     // keyed on the curve's own on-screen size and not on the detail level, precisely
@@ -1518,14 +1470,14 @@ fn evaluate(
         });
     }
 
-    // --- §35: the far field, in the unit its half of the frame is charged in.
+    // --- The far field, in the unit its half of the frame is charged in.
     //
-    // Draw commands are the cheap half (§32.2), and the criterion above bounds them.
+    // Draw commands are the cheap half, and the criterion above bounds them.
     // What the rasteriser is charged for is path segments, and what the far field puts
     // in a frame is four per node plus four per link — the corner rounding, which is the
-    // other four per node, is dropped while it is sub-pixel (§35.2), and a link at an
+    // other four per node, is dropped while it is sub-pixel, and a link at an
     // overview zoom is a ribbon of one piece, four *filled* segments, where it used to
-    // be two stroked ones that cost the CPU rasteriser more (§53). Counted as the excess
+    // be two stroked ones that cost the CPU rasteriser more. Counted as the excess
     // over that model, so it fails from the side that costs a frame: restore the
     // rounding at an overview zoom and it is twenty thousand segments over.
     let far_excess = far
@@ -1550,7 +1502,7 @@ fn evaluate(
 
     // And what the far field is *for*: an overview shows the graph's structure. Drawn
     // the old way — two canvas units, stroked — a link at zoom 0.02 is 0.04 px wide and
-    // no block of the frame shows it, while it cost three quarters of a CPU frame (§53).
+    // no block of the frame shows it, while it cost three quarters of a CPU frame.
     // Counted on the frame against the same graph with no links, from the failing side.
     let hidden_overviews = far
         .iter()
@@ -1572,7 +1524,7 @@ fn evaluate(
     }
 
     // The other side of the same trade: the margin exists so that panning re-uses the
-    // recorded scene instead of choosing a new one (§20.6a), and §35.2 priced what it
+    // recorded scene instead of choosing a new one, and what it
     // costs in segments. Set the margin to zero and this is 1.00 — every frame.
     let far_records = far
         .iter()
@@ -1590,14 +1542,14 @@ fn evaluate(
         });
     }
 
-    // --- Operators, keymap and modality (§38).
+    // --- Operators, keymap and modality.
 
     let gesture = |name: &str, seat: &str| gestures.iter().find(|row| row.gesture == name && row.seat == seat);
 
     if let Some(click) = gesture("click select", "tree") {
         // Selecting is a change of state and of pixels, and of nothing else. A
         // selection that laid out would put the graph's geometry behind every click,
-        // which is the same mistake §22 found in mixing `ui_scale` with `view` — and
+        // which is the same mistake as mixing `ui_scale` with `view` — and
         // it is the one an operator layer makes by touching a widget instead of the
         // model. Measured: 0.00.
         criteria.push(Criterion {
@@ -1611,7 +1563,7 @@ fn evaluate(
     }
 
     if let Some(click) = gesture("click select", "tree") {
-        // A node knows it is selected by wearing a class (§38.7), and a click changes the
+        // A node knows it is selected by wearing a class, and a click changes the
         // class of the nodes whose selection it changed — one going, one coming — not of
         // every selected node, and not of the canvas.
         criteria.push(Criterion {
@@ -1678,7 +1630,7 @@ fn evaluate(
         // Dragging a link out of a port adds the link, and costs what adding a link costs:
         // the curve that follows the pointer is the editor's overlay, not the canvas's, so
         // the frames of the drag lay out nothing and the one that adds it re-chooses the
-        // recorded set once (§43).
+        // recorded set once.
         criteria.push(Criterion {
             name: "a_link_drag_lays_out_only_its_link",
             claim: "dragging a link lays out no more than the one structural edit at its end",
@@ -1712,7 +1664,7 @@ fn evaluate(
         // The claim modality is worth anything for: while the operator runs, the
         // events are the operator's. It holds because the driver takes Masonry's
         // pointer capture on the press that started it — and it holds *only* then,
-        // which is what the partner criterion below is about (§38.1).
+        // which is what the partner criterion below is about.
         criteria.push(Criterion {
             name: "a_press_started_operator_keeps_the_events",
             claim: "a modal operator started by a press sees every event first",
@@ -1724,7 +1676,7 @@ fn evaluate(
     }
 
     if let Some(grab) = gesture("grab (key G)", "tree") {
-        // The other half of the pair, and the finding §39 replaced. Under §38 this
+        // The other half of the pair, and the finding the layer seat replaced. Before it this
         // gesture leaked 21 events a gesture: a modal operator started by a key cannot
         // take pointer capture, and nothing else could keep an event from the tree. The
         // layer seat can withhold now, so a key-started gesture costs what a
@@ -1755,7 +1707,7 @@ fn evaluate(
 
         // A click is the case where withholding would be a theft rather than a saving:
         // the press and the release belong to the tree, and only the moves in between
-        // are the runtime's (§39.3). Zero, from the failing side.
+        // are the runtime's. Zero, from the failing side.
         let click_withholds = gestures
             .iter()
             .filter(|row| row.gesture == "click select")
@@ -1812,7 +1764,7 @@ fn evaluate(
             unit: "operators still running",
         });
 
-        // Half a switch is not a switch (§28.4): cancelling has to be in the table,
+        // Half a switch is not a switch: cancelling has to be in the table,
         // or "nothing is left running" is a claim about the confirming path only.
         criteria.push(Criterion {
             name: "the_cancel_is_exercised",
@@ -1827,7 +1779,7 @@ fn evaluate(
     if let Some(band) = gesture("box select", "tree") {
         // What an operator's context costs, in the unit it is made of. The context is
         // assembled on *hover* — the canvas publishes what it picked, and the driver
-        // reads it (§38.3) — so a gesture that has taken the pointer asks nothing more
+        // reads it — so a gesture that has taken the pointer asks nothing more
         // of the model. The failure this guards against is the obvious implementation:
         // a driver that hit-tests on every event, which is what the host seat is
         // forced into and what the leak above costs a key-started gesture (22 picks a

@@ -1,15 +1,9 @@
 //! Menus: a list of operators under the pointer.
 //!
-//! The third way into the same operators, after a key and a script (§11). A [`Menu`] is
-//! data — labels, operator names, properties — and choosing an entry runs the operator
-//! through the runtime that a key and a script go through, with the same poll and the same
-//! history: an entry the menu shows as available is one that runs, and one that would be
-//! refused is shown refused.
-//!
-//! A menu is opened by an operator of its own ([`MenuOp`]), because a binding's properties
-//! carry no strings (§38.6) — "open the menu called N" cannot be a property, but "the
-//! operator `menu.node`" can be a binding. The operator leaves the menu in the world, and
-//! the editor that drove it puts it on screen as a Masonry layer at the pointer.
+//! A [`Menu`] is data — labels, operator names, properties. Choosing an entry runs the
+//! operator as a script does, with the same poll (an entry that would be refused is shown
+//! refused) and the same history. A menu is opened by an operator of its own ([`MenuOp`]),
+//! which leaves it in the world for the editor to put on screen as a layer.
 
 use std::any::TypeId;
 use std::marker::PhantomData;
@@ -72,10 +66,7 @@ impl Menu {
     }
 }
 
-/// The operator that opens a menu.
-///
-/// One per menu, named as the keymap binds it — `menu.node` — so that a menu is opened the
-/// way any operator is run: by a key, by another menu, or by a script.
+/// The operator that opens a menu: one per menu, such as `menu.node`.
 pub struct MenuOp {
     name: &'static str,
     menu: Menu,
@@ -106,20 +97,15 @@ pub(crate) struct Entry {
     pub(crate) props: Props,
     /// Whether the operator's poll would let it run now.
     pub(crate) enabled: bool,
-    /// The binding that runs the same operator with the same properties, as a person
-    /// reads it.
+    /// The binding that runs the same operator with the same properties, as text.
     pub(crate) shortcut: Option<String>,
 }
 
 /// A menu on screen: a layer above the window, at the pointer.
 ///
-/// Choosing an entry runs its operator in the editor that opened the menu, through
-/// [`NodeEditor::exec`] — the script path, which is what a menu is: an operator chosen by
-/// name. Clicking anywhere else closes it and does nothing else; the click that closes it
-/// is kept from the tree, as Blender keeps it, so it cannot select or start a drag under
-/// the menu. Keys are the editor's while the menu is open — a layer cannot take focus as
-/// it is added (`request_focus` belongs to an event) — and the editor closes it on
-/// `Escape` and keeps every other key from its keymap meanwhile.
+/// An entry runs in the editor that opened the menu, through [`NodeEditor::exec`]. A click
+/// elsewhere closes it and goes no further, as in Blender. The editor closes it on `Escape`
+/// (a layer cannot take focus when it is added).
 pub struct MenuLayer<G: NodeGraph> {
     child: WidgetPod<dyn Widget>,
     /// Each entry's button, and what it runs.
@@ -162,8 +148,7 @@ impl<G: NodeGraph> MenuLayer<G> {
 }
 
 impl<G: NodeGraph> MenuLayer<G> {
-    /// Each entry's button and the operator it runs, in order — for a test, or for an
-    /// application that drives its menus from outside.
+    /// Each entry's button and the operator it runs, in order.
     pub fn entries(&self) -> impl Iterator<Item = (WidgetId, &str)> {
         self.entries.iter().map(|(id, op, _)| (*id, op.as_ref()))
     }
@@ -187,8 +172,7 @@ impl<G: NodeGraph> Widget for MenuLayer<G> {
             return;
         };
         let (op, props) = (op.clone(), props.clone());
-        // In the mutate pass, where the editor's `WidgetMut` is: the same path a script
-        // takes, so the same poll, the same flush into the canvas and the same history.
+        // In the mutate pass, where the editor's `WidgetMut` is: the script path.
         ctx.mutate_later(self.target, move |mut widget| {
             if let Some(mut editor) = widget.try_downcast::<NodeEditor<G>>() {
                 NodeEditor::menu_closed(&mut editor);
@@ -213,8 +197,7 @@ impl<G: NodeGraph> Widget for MenuLayer<G> {
         len_req: LenReq,
         cross_length: Option<Length>,
     ) -> Length {
-        // A layer root is measured with the window as its context — the only place a
-        // widget is told how big the window is, and what keeps the menu inside it.
+        // A layer root is measured against the window: that is how the menu learns its size.
         let window = ctx.context_size();
         if let (Some(width), Some(height)) = (window.length(Axis::Horizontal), window.length(Axis::Vertical)) {
             self.window = Some(Size::new(width.get(), height.get()));
@@ -227,10 +210,7 @@ impl<G: NodeGraph> Widget for MenuLayer<G> {
         let child_size = ctx.compute_size(&mut self.child, SizeDef::fit(size), size.into());
         ctx.run_layout(&mut self.child, child_size);
         ctx.place_child(&mut self.child, Point::ORIGIN);
-        // Opened at the pointer, and moved inside the window if that leaves it hanging off
-        // an edge — once, now that the menu knows how big it is. A menu opened near the
-        // bottom of a window is the usual case rather than the rare one, and half a menu is
-        // one whose bottom entries cannot be chosen.
+        // Moved inside the window once, if it opened hanging off an edge.
         if !self.placed
             && let Some(window) = self.window
         {

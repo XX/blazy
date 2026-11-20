@@ -2,10 +2,10 @@
 //!
 //! The point of the Phase 0.6 spike is that `ui_scale` is a *layout* input, and a
 //! widget that ignores it proves nothing either way. This one is made of the parts
-//! scaling is supposed to affect, and since §46 they are **real controls** rather than
+//! scaling is supposed to affect, and they are **real controls** rather than
 //! five painted rectangles: a caption from `blazy-widgets`, which owns the text channel,
 //! and stock Masonry buttons, which follow the box properties the bar pushes onto them.
-//! That is the whole claim of §46 standing in the window rather than only in a test.
+//! That is the claim standing in the window rather than only in a test.
 //!
 //! It also records the scale it last laid out at. Whether a region's root noticed a
 //! scale change cannot be asked from the mutate pass that pushed it (`blazy-areas`
@@ -39,13 +39,13 @@ pub struct ScaledHeader {
     tint: Color,
     /// The scale the last layout ran at.
     seen_scale: f64,
-    /// The row of controls, which is what carries the scale to each of them (§46).
+    /// The row of controls, which is what carries the scale to each of them.
     bar: WidgetPod<Bar>,
     /// The scale last handed to the bar.
     ///
     /// A container between the region's root and the controls has to pass the scale on
-    /// itself — there is no inheritance (§22.1). Forgetting it is invisible: the header
-    /// lays itself out at the new scale and everything inside it stays at 1 (§46).
+    /// itself — there is no inheritance. Forgetting it is invisible: the header
+    /// lays itself out at the new scale and everything inside it stays at 1.
     carried: Option<f64>,
 }
 
@@ -59,7 +59,7 @@ impl ScaledHeader {
     /// For a measurement that magnifies the header and compares the two images: the bar
     /// lays out as many controls as fit, so a header with buttons shows *different*
     /// content at two sizes, and a sharpness metric comparing one content with another
-    /// measures nothing (§23, §46).
+    /// measures nothing.
     pub fn caption(tint: Color, name: impl Into<std::sync::Arc<str>>) -> Self {
         Self::build(tint, name, 0)
     }
@@ -77,13 +77,12 @@ impl ScaledHeader {
         };
         let mut bar = Bar::new(metrics).with(NewWidget::new(Label::new(name)).erased(), metrics);
         for i in 0..controls {
-            // Stock Masonry buttons on purpose: §46's measurement is that they need no
+            // Stock Masonry buttons on purpose: the measurement is that they need no
             // replacing, and a header that used widgets of ours everywhere would prove
             // nothing about that.
             // A stock button with a caption of ours inside: the button needs no
             // replacing — its box follows the properties the bar pushes — but the words
-            // in it are a child it forwards nothing to, so the caption is one of ours
-            // (§46).
+            // in it are a child it forwards nothing to, so the caption is one of ours.
             let caption = match i {
                 0 => "split",
                 1 => "join",
@@ -103,7 +102,7 @@ impl ScaledHeader {
     /// The scale this header last laid itself out at.
     ///
     /// The benchmark compares it against the scale it asked for: a mismatch means the
-    /// property did not reach layout, which is exactly the failure §9 is about.
+    /// property did not reach layout, which is exactly the failure to catch.
     pub fn seen_scale(&self) -> f64 {
         self.seen_scale
     }
@@ -124,7 +123,7 @@ impl ScaledHeader {
 impl CarriesScale for ScaledHeader {
     fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
         // Recorded where the layout path records it, so the layout that follows finds it
-        // carried already — one owner for the state (§46.3).
+        // carried already — one owner for the state.
         this.widget.carried = Some(scale);
         {
             let mut bar = this.ctx.get_mut(&mut this.widget.bar);

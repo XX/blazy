@@ -1,19 +1,9 @@
 //! What the rasteriser will actually be asked to draw, counted without a device.
 //!
-//! `rnd/architecture.md` §32 measured the second half of a frame and found that it does
-//! not follow the number of draw commands at all: the same eight thousand curves cost
-//! the same 34 ms whether they arrive in two commands or in eight thousand. What the
-//! rasteriser charges for is **path segments** — a line, a quadratic or a cubic in the
-//! flattened scene — and nothing in the plan counts those.
-//!
-//! vello can encode a scene on the CPU, and the encoding says exactly how much of both
-//! there is: `draw_tags` is one entry per draw object, `n_path_segments` one per
-//! segment. Both are exact and machine-independent, so a criterion may stand on them
-//! (§20.9), and they exist on a machine with no graphics device at all.
-//!
-//! **This is a measurement, not a guard.** Encoding a scene costs milliseconds — the
-//! whole point of [`crate::tiles::over_budget`] is that it answers in front of every
-//! frame without encoding anything. Nothing here belongs on the frame path.
+//! The rasteriser charges for path segments, not draw commands. vello's CPU encoding
+//! counts both (`draw_tags`, `n_path_segments`), exactly and without a device. A
+//! measurement, not a guard: encoding costs milliseconds and does not belong on the
+//! frame path.
 
 use masonry::dpi::PhysicalSize;
 use masonry::imaging::record::{Scene, replay};
@@ -26,9 +16,6 @@ pub struct Encoded {
     /// Draw objects: one per command the rasteriser has to set up.
     pub objects: usize,
     /// Path segments: one per line, quadratic or cubic in the scene.
-    ///
-    /// The unit a far-field frame is charged in (§32.3). A rounded rectangle is eight
-    /// of them, a link curve one.
     pub segments: u64,
 }
 
@@ -69,13 +56,8 @@ mod tests {
         Color::from_rgb8(0x40, 0x70, 0xc0)
     }
 
-    /// What each shape of the far field costs in the unit that matters.
-    ///
-    /// The measurement the levers are chosen from (§35.1): a node drawn as a rounded
-    /// rectangle is eight segments, the same node as a plain rectangle is four, and a
-    /// stroked link curve is two — a stroke pays for both sides of its outline. So five
-    /// thousand nodes outweigh eight thousand links, which is not what §31 — written
-    /// when commands were the unit — would have suggested.
+    /// What each far-field shape costs in segments: a rounded rectangle eight, a plain one
+    /// four, a stroked curve two.
     #[test]
     fn a_rounded_rectangle_costs_twice_a_plain_one() {
         let mut scene = Scene::new();
@@ -106,9 +88,7 @@ mod tests {
         assert_eq!(encoded(&scene, FRAME).segments, 2);
     }
 
-    /// And a straight line costs exactly what the curve costs, which is why "simpler
-    /// geometry" is not a lever (§31.1 found the same for encoding, §35.2 for
-    /// rasterising).
+    /// A straight line costs exactly what the curve costs.
     #[test]
     fn a_line_costs_what_a_curve_costs() {
         let mut scene = Scene::new();
@@ -122,8 +102,7 @@ mod tests {
         assert_eq!(encoded(&scene, FRAME).segments, 2);
     }
 
-    /// Batching changes the number of objects and not the number of segments — the
-    /// whole of §32 in one assertion.
+    /// Batching changes the number of objects and not the number of segments.
     #[test]
     fn a_batch_changes_objects_and_not_segments() {
         let curve = |i: usize| {

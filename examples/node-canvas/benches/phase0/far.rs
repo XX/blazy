@@ -1,4 +1,4 @@
-//! The far field in the unit its half of the frame is charged in (§35).
+//! The far field in the unit its half of the frame is charged in.
 //!
 //! Its own file because it is a table rather than a scenario: one graph at one zoom,
 //! with one decision changed per row, and both halves of the frame timed next to the
@@ -15,26 +15,26 @@ use node_canvas::{CanvasSpec, property_set};
 
 use crate::bench::{Options, PAN_STEP, ScenarioRecord, VIEWPORT, look_at, measure, node_rect, pan_step, stats};
 
-// --- MARK: the far field, in segments (§35)
+// --- MARK: the far field, in segments
 
 /// Zooms the far-field measurements are taken at.
 ///
 /// Two, because they answer different questions. At 0.02 the whole graph is on screen
 /// and the recorded region is not the binding constraint — the graph is. At 0.10 the
 /// canvas is still in the far field but the graph continues past the region, which is
-/// the only situation in which the recorded margin costs anything (§35.2).
+/// the only situation in which the recorded margin costs anything.
 pub(crate) const FAR_ZOOMS: [f64; 2] = [0.02, 0.10];
 
 /// Frames the far-field rasterisation is timed over.
 ///
-/// Few, because each one is tens of milliseconds — that being the finding (§32.3).
+/// Few, because each one is tens of milliseconds — that being the finding.
 const FAR_RASTER_FRAMES: usize = 6;
 
 /// The two paths to pixels, opened once for a whole table.
 ///
 /// One device per table rather than one per row, for the reason the host benchmark
 /// gives: a driver initialisation inside a measurement is a variable nobody asked for,
-/// and §32.4 found that churning the target provokes frames the GPU never draws.
+/// and churning the target provokes frames the GPU never draws.
 struct Rasterisers {
     /// `false` in the quick set, where the tables are read for counters and not times.
     timed: bool,
@@ -47,7 +47,7 @@ impl Rasterisers {
         Self {
             timed,
             // Opened in the quick set too: what a lever does to the picture is decided
-            // on a CPU frame, and that is a counter, not a time (§53).
+            // on a CPU frame, and that is a counter, not a time.
             host: blazy::shell::Host::any().ok(),
             gpu: timed
                 .then(|| blazy::shell::gpu::GpuFrames::offscreen(PhysicalSize::new(VIEWPORT.0, VIEWPORT.1)).ok())
@@ -105,9 +105,9 @@ pub(crate) struct FarRow {
     /// Nodes and link curves in the recording — what the scene is made of.
     pub(crate) recorded_nodes: usize,
     pub(crate) recorded_links: usize,
-    /// Link curves the short-link rule dropped as too small to see (§31.4).
+    /// Link curves the short-link rule dropped as too small to see.
     pub(crate) hidden_links: usize,
-    /// What vello would be asked to draw (§35.1).
+    /// What vello would be asked to draw.
     pub(crate) objects: usize,
     pub(crate) segments: u64,
     /// Decisions per frame: re-choosing the recorded sets is what a margin buys off.
@@ -121,10 +121,10 @@ pub(crate) struct FarRow {
     /// 16x16 blocks of the frame holding a pixel visibly different from the frame with no
     /// links at all: how much of the graph's structure the picture shows.
     ///
-    /// The fidelity measure §53 needed and did not have. Measuring a lever against the
+    /// The fidelity measure far links needed and did not have. Measuring a lever against the
     /// stroked picture said every lever changed nothing — because the stroked picture
-    /// shows no links either. Pixels and not the block mean of §45: the default link is
-    /// half a pixel wide and moves a block's mean by less than antialiasing does (§53.6).
+    /// shows no links either. Pixels and not the block mean: the default link is
+    /// half a pixel wide and moves a block's mean by less than antialiasing does.
     pub(crate) blocks_with_links: Option<u64>,
     /// The CPU frame, for that comparison.
     picture: Option<Vec<u8>>,
@@ -133,7 +133,7 @@ pub(crate) struct FarRow {
 /// Path segments in the frame the canvas would hand the rasteriser.
 ///
 /// Outside the clock, like every other counter here: encoding the scene is the
-/// measurement, not the frame (§35.1).
+/// measurement, not the frame.
 pub(crate) fn segments_of(harness: &mut TestHarness<NodeEditor>) -> u64 {
     let (plan, _) = harness.redraw();
     let composed = blazy::shell::Composition::new(&plan, 1.0).scene;
@@ -210,7 +210,7 @@ fn far_case(case: FarCase, paths: &mut Rasterisers) -> FarRow {
 
 /// What a far-field frame is made of, and what each lever takes off it.
 ///
-/// The table §35 is argued from. Every row is the same graph at the same zoom; what
+/// The far-field table. Every row is the same graph at the same zoom; what
 /// changes is one decision at a time.
 pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> {
     let frames = opts.frames();
@@ -254,7 +254,7 @@ pub(crate) fn far_table(opts: &Options, count: usize, zoom: f64) -> Vec<FarRow> 
         far_case(row("overscan 0.00", with(0.0), None), &mut paths),
         far_case(row("links >= 4 px", links_at(4.0), None), &mut paths),
         far_case(row("links >= 8 px", links_at(8.0), None), &mut paths),
-        // §53: how a far-field link is drawn. The default is a filled ribbon at least half
+        // How a far-field link is drawn. The default is a filled ribbon at least half
         // a pixel wide; these are the alternatives it was chosen over.
         far_case(
             row(

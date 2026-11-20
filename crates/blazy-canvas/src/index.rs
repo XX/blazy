@@ -1,44 +1,22 @@
-//! A uniform grid over canvas coordinates, so that finding what is on screen does
-//! not cost a walk over the whole graph.
+//! A uniform grid over canvas coordinates, so that finding what is on screen does not
+//! walk the whole graph.
 //!
-//! Phase 0 removed the linear costs one at a time and left this one deliberately:
-//! the scan touches 32 bytes per node and no widget state, so it stayed invisible
-//! next to the cost of materialising widgets. Measured, it stays invisible up to
-//! about 64 000 nodes and then does not: panning a million-node graph spends 6.8 ms
-//! a frame walking geometry for the 24 nodes that are actually visible (§24).
-//!
-//! # Why a grid and not an R-tree
-//!
-//! A grid is an order of magnitude simpler and needs no rebalancing, which matters
-//! because nodes move: dragging one has to update the index without touching the
-//! rest. The case a grid is supposed to lose on is clustering — everything piled
-//! into a few cells — but the query only ever visits cells that overlap the
-//! viewport, so a dense cluster costs its own size only when it is on screen, and
-//! then those nodes have to be dealt with anyway. §24 has the measurement on a
-//! clustered graph.
+//! A grid rather than an R-tree: simpler, and a moved node is refiled without touching
+//! the rest. A query only visits cells overlapping the viewport, so clustering costs only
+//! when the cluster is on screen.
 
 use masonry::kurbo::{Point, Rect};
 
-/// Nodes a cell should hold on average.
-///
-/// Smaller cells mean fewer candidates per query and more memory: at one node per
-/// cell a million-node graph would allocate a million `Vec`s. Eight keeps the
-/// candidate set small while keeping the cell count an eighth of the node count.
+/// Nodes a cell should hold on average: fewer candidates against more cells.
 const TARGET_PER_CELL: f64 = 8.0;
 
-/// The largest grid we will build, in cells.
-///
-/// A guard against a graph whose bounding box is enormous but whose nodes are few,
-/// where the cell size derived from the node count would produce an absurd number of
-/// empty cells.
+/// The largest grid we will build, in cells (for a huge, sparse bounding box).
 const MAX_CELLS: usize = 1 << 20;
 
 /// Where a node currently sits in the grid.
 type CellId = u32;
 
-/// The cell of a node that is not in the grid: a slot never filled, or one emptied by
-/// a removal. A sentinel rather than an `Option<CellId>` so that `filed` stays four
-/// bytes a node — it is one of the two arrays that scale with the graph.
+/// The cell of a node that is not in the grid; a sentinel keeps `filed` four bytes a node.
 const UNFILED: CellId = CellId::MAX;
 
 /// A uniform grid of node indices, keyed by canvas position.
@@ -54,13 +32,8 @@ pub(crate) struct SpatialIndex {
     cells: Vec<Vec<u32>>,
     /// Which cell each node is filed under, so a move can remove it from the old one.
     filed: Vec<CellId>,
-    /// Cells of slack a query needs on the low side, per axis.
-    ///
-    /// A node is filed by its top-left corner, so a node filed to the left of the
-    /// query rect can still reach into it. How far back to look is decided by the
-    /// widest node rather than assumed: one cell would be wrong the moment a node is
-    /// bigger than a cell, and nothing would report it — the node would simply stop
-    /// being drawn near the left edge.
+    /// Cells of slack a query needs on the low side, per axis: a node is filed by its
+    /// corner and may reach into the query from a cell before it, as far as the widest node.
     slack: (usize, usize),
 }
 
@@ -119,11 +92,8 @@ impl SpatialIndex {
         }
     }
 
-    /// The cell a canvas point falls in, clamped to the grid.
-    ///
-    /// Clamping rather than rejecting is what lets a node be dragged outside the
-    /// original bounds: it is filed in a border cell, and a query from out there is
-    /// clamped to the same border cell, so it is still found.
+    /// The cell a canvas point falls in, clamped to the grid (a node outside the bounds is
+    /// filed and found in a border cell).
     fn cell_of(&self, point: Point) -> CellId {
         let col = (((point.x - self.origin.x) / self.cell).floor().max(0.0) as usize).min(self.cols - 1);
         let row = (((point.y - self.origin.y) / self.cell).floor().max(0.0) as usize).min(self.rows - 1);
@@ -145,14 +115,8 @@ impl SpatialIndex {
         self.filed[index] = cell;
     }
 
-    /// Files a node that was not in the grid before.
-    ///
-    /// The grid itself is not reshaped: a node landing outside the bounds it was built
-    /// for is clamped into a border cell, exactly as a node dragged out there is, and is
-    /// still found from out there (see [`cell_of`](Self::cell_of)). What does have to
-    /// grow is the query slack, which is derived from the widest node rather than
-    /// assumed — a node wider than the ones the grid was built from would otherwise stop
-    /// being found near the left edge, silently (§24.2).
+    /// Files a node that was not in the grid before, growing the query slack if it is wider
+    /// than any so far.
     pub(crate) fn insert(&mut self, index: usize, rect: Rect) {
         if self.filed.len() <= index {
             self.filed.resize(index + 1, UNFILED);
@@ -167,11 +131,7 @@ impl SpatialIndex {
         self.slack.1 = self.slack.1.max((rect.height() / self.cell).ceil() as usize);
     }
 
-    /// Takes a node out of the grid. Filing it again is [`insert`](Self::insert).
-    ///
-    /// The slack is left where it is: it is a bound on how far back a query has to
-    /// look, and shrinking it would mean re-measuring every node that stayed. Too much
-    /// slack costs candidates; too little loses nodes (§24.2).
+    /// Takes a node out of the grid; the slack stays (shrinking it would re-measure all).
     pub(crate) fn remove(&mut self, index: usize) {
         let Some(&cell) = self.filed.get(index) else {
             return;
@@ -186,11 +146,7 @@ impl SpatialIndex {
         self.filed[index] = UNFILED;
     }
 
-    /// Appends the indices of every node whose cell overlaps `rect`.
-    ///
-    /// Candidates, not answers: a cell overlapping the rect may hold nodes that do
-    /// not, so the caller still tests each rectangle. Output is sorted ascending,
-    /// which is what the canvas's set difference expects.
+    /// Appends, ascending, the candidates whose cell overlaps `rect`; the caller tests each.
     ///
     /// The length of the output is also the number of geometries examined, which is
     /// the counter the spatial-index criterion is decided on: exact, machine

@@ -1,26 +1,12 @@
 //! Undo as a journal of steps.
 //!
-//! §30 put the truth in the model, so undo lives there too — the question this module
-//! answers is *what a step is*. Two shapes were measured (§38.4): a **snapshot** of
-//! the model per step, and a **journal** of what each operator changed. The journal
-//! is what this is, because the snapshot is priced per node and the journal is priced
-//! per *touched* node, and a drag touches the selection while a graph holds twenty
-//! thousand.
-//!
-//! What the shape costs a caller is one method per operator that changes anything:
-//! [`Step::undo`] and [`Step::redo`] have to put the world back exactly. A snapshot
-//! needs none, which is the trade — and why the number rather than the taste decides.
-//!
-//! [`Step::bytes`] is not bookkeeping for its own sake: it is what makes a ceiling
-//! possible, and a ceiling is what keeps a journal of a long session from being the
-//! same problem as a snapshot.
+//! A journal of what each operator changed (cheaper than a snapshot of the model, which
+//! costs every node): [`Step::undo`] and [`Step::redo`] put the world back exactly, and
+//! [`Step::bytes`] lets the history keep under a ceiling.
 
 use std::collections::VecDeque;
 
 /// One reversible change.
-///
-/// `&mut self` on both halves so a step may keep whatever it needs to invert itself
-/// and swap it back and forth rather than storing both sides twice.
 pub trait Step<W> {
     /// What this step is called, for a history panel and for a test's assertion.
     fn name(&self) -> &'static str;
@@ -32,9 +18,6 @@ pub trait Step<W> {
     fn redo(&mut self, world: &mut W);
 
     /// Roughly what this step costs to hold, in bytes.
-    ///
-    /// Roughly is enough: it decides when to drop the oldest step, and being out by a
-    /// pointer per entry changes nothing about that decision.
     fn bytes(&self) -> usize {
         std::mem::size_of::<usize>()
     }
@@ -42,9 +25,7 @@ pub trait Step<W> {
 
 /// The history: what has been done, and what has been undone.
 pub struct UndoStack<W> {
-    /// A deque rather than a `Vec`, and the ceiling is the reason: steps are pushed and
-    /// undone at the back, and [`trim`](Self::trim) drops them at the *front*, which on
-    /// a `Vec` is a move of the whole history per dropped step.
+    /// A deque: [`trim`](Self::trim) drops at the front.
     done: VecDeque<Box<dyn Step<W>>>,
     undone: Vec<Box<dyn Step<W>>>,
     bytes: usize,
@@ -71,20 +52,13 @@ impl<W> UndoStack<W> {
     }
 
     /// A stack that drops its oldest steps once it holds more than `bytes`.
-    ///
-    /// No default ceiling is offered. What a session may spend on history is an
-    /// application's decision and depends on what its steps hold; a library number
-    /// here would be a guess dressed as a policy.
     #[must_use]
     pub fn with_limit(mut self, bytes: usize) -> Self {
         self.limit = bytes;
         self
     }
 
-    /// Records a step that has already been applied.
-    ///
-    /// Drops the redo branch, as every editor does: once the history has been
-    /// departed from, what was undone is no longer reachable.
+    /// Records a step that has already been applied, dropping the redo branch.
     pub fn push(&mut self, step: Box<dyn Step<W>>) {
         self.bytes += step.bytes();
         self.done.push_back(step);
@@ -143,13 +117,7 @@ impl<W> UndoStack<W> {
         }
     }
 
-    /// Drops the oldest steps until the history fits.
-    ///
-    /// The oldest rather than the largest: history is only useful as an unbroken
-    /// sequence backwards from now, and a hole in the middle of it is worse than a
-    /// shorter one. The most recent step is never dropped, so a ceiling smaller than
-    /// one step leaves one rather than none — an empty history is not a smaller one,
-    /// it is a different thing.
+    /// Drops the oldest steps until the history fits; never the most recent.
     fn trim(&mut self) {
         while self.bytes > self.limit && self.done.len() > 1 {
             let Some(step) = self.done.pop_front() else {

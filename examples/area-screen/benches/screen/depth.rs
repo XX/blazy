@@ -32,7 +32,7 @@ use blazy::widgets::{Bar, Label, Metrics, carry_ui_scale};
 ///
 /// Past the depth at which the slow path stops settling in one event — three — and past
 /// the one at which it is two frames late — seven — so the sweep shows the effect it
-/// guards against rather than stopping short of it (§24.1).
+/// guards against rather than stopping short of it.
 const DEEPEST: usize = 8;
 
 /// One container between a region's root and its controls.
@@ -205,7 +205,7 @@ pub(crate) fn depth_criteria(rows: &[DepthRow]) -> Vec<Criterion> {
             unit: "depths that needed another frame",
         },
         // And the sweep reaches the effect: without carriers some depth must spill over,
-        // or the sweep stops short of where the claim could fail (§24.1, §25.4).
+        // or the sweep stops short of where the claim could fail.
         Criterion {
             name: "the_depth_sweep_reaches_the_pass_budget",
             claim: "the sweep goes deep enough for the slow path to spill into another frame",

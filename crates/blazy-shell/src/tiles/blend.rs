@@ -3,7 +3,7 @@
 //! The second of the two buffers [`super`] models, and the one that is per *tile*
 //! rather than per path: a group charges every tile of its box, a rectangular clip only
 //! the tiles along its outline, and what is charged is the deepest each tile ever gets
-//! (§34.2). A map rather than a sum over layers because the same group is level five
+//!. A map rather than a sum over layers because the same group is level five
 //! over one tile and level one over another.
 
 use masonry::kurbo::Rect;
@@ -39,7 +39,7 @@ pub(super) enum Charge {
     /// Every tile of the box: a group, or a clip whose outline is not a rectangle.
     Whole(TileBox),
     /// The far column and the far row of the box: `columns + rows - 1` tiles, the count
-    /// a rectangular clip was measured to charge (§34.2, §34.3).
+    /// a rectangular clip was measured to charge.
     Edges(TileBox),
 }
 

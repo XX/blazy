@@ -22,18 +22,18 @@ pub struct BarCounters {
     ///
     /// One per change, not one per frame: a bar that re-pushed its children's properties
     /// on every layout would put the whole region through the property pass forever, and
-    /// nothing in a counter of *sizes* would show it (§28.4).
+    /// nothing in a counter of *sizes* would show it.
     pub scalings: u64,
     /// Children whose box properties were pushed, summed over those scalings.
     ///
-    /// The price §22.1 named and did not price: with no inherited properties, carrying a
+    /// With no inherited properties, carrying a
     /// scale costs one property write per control, and this is that count.
     pub children_scaled: u64,
 }
 
 /// A row of controls laid out at the interface scale of the region it sits in.
 ///
-/// This is the forwarding §22.1 describes and §46 prices: `UiScale` lives on the
+/// The forwarding Masonry's lack of inherited properties requires: `UiScale` lives on the
 /// region's root and reaches nobody below it, so a container that wants its children
 /// scaled has to carry the value itself. The bar carries it through both channels —
 /// [`scale_box`] for anything with a box, and [`UiScale`] pushed onto the child for
@@ -48,7 +48,7 @@ pub struct Bar {
     /// The scale the children were last pushed at, so an unchanged scale costs nothing.
     applied: Option<f64>,
     counters: BarCounters,
-    /// Along which axis the children follow one another: a row, or a column (§62).
+    /// Along which axis the children follow one another: a row, or a column.
     axis: Axis,
 }
 
@@ -71,9 +71,9 @@ impl Bar {
 
     /// An empty column: the children one under another, each as wide as the column.
     ///
-    /// What a properties panel is made of (§62). A stock `Flex` would do the layout, but
+    /// What a properties panel is made of. A stock `Flex` would do the layout, but
     /// not the carrying: its children cannot be reached through its `WidgetMut` on this
-    /// Masonry, so a scale stops at it and goes on a pass per level (§48). A column of
+    /// Masonry, so a scale stops at it and goes on a pass per level. A column of
     /// rows of this type carries the scale to the last control in the pass it arrived in.
     pub fn column(metrics: Metrics) -> Self {
         Self {
@@ -106,10 +106,10 @@ impl Bar {
     ///
     /// In `layout` rather than in `property_changed`, because that is where the value is:
     /// `property_changed` is told *which* property moved and not what it became, and a
-    /// container that guessed would push a stale number (§22). In `layout` rather than in
+    /// container that guessed would push a stale number. In `layout` rather than in
     /// `measure` for a blunter reason — a region is laid out at a size its parent fixed,
     /// so `measure` is never called on it at all, and a bar that carried the scale there
-    /// carried it never (§46).
+    /// carried it never.
     ///
     /// The mutate pass runs before the next layout pass of the same rewrite loop, so the
     /// children are scaled and laid out in the frame the scale changed in.
@@ -133,7 +133,7 @@ impl Bar {
 ///
 /// The same work the bar does from its layout, recorded in the same `applied`, so
 /// that the layout that follows finds nothing left to do — one owner for the state, two
-/// ways to reach it (§46.3).
+/// ways to reach it.
 impl CarriesScale for Bar {
     fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64) {
         if this.widget.applied == Some(scale) {
@@ -157,7 +157,7 @@ fn scale_child(widget: &mut WidgetMut<'_, dyn Widget>, metrics: Metrics, scale: 
     // what a widget of ours deeper down will read, and it is the value the child's own
     // layout will compare against. Handing the scale by call to some children and by
     // property to others is two owners for one piece of state — the caption's own layout
-    // then read the property it never got and put the text back (§46). Pushed rather than
+    // then read the property it never got and put the text back. Pushed rather than
     // inserted, so a child that carries a scale of its own carries it on in this pass.
     push_ui_scale(widget, scale);
     // And then, for a caption, the same scale *now* rather than through another rewrite
@@ -170,8 +170,7 @@ fn scale_child(widget: &mut WidgetMut<'_, dyn Widget>, metrics: Metrics, scale: 
         // caption is the commonest control of a dense UI, and its caption is a child it
         // does not forward anything to. Reaching it is exactly what an application should
         // not have to write — the box channel scales the button and leaves the words
-        // inside it at their old size, which looks like a bug in the scale and is not
-        // (§46).
+        // inside it at their old size, which looks like a bug in the scale and is not.
         let mut child = masonry::widgets::Button::child_mut(&mut button);
         // The property here too, and for the same reason as above: a caption given the
         // call but not the value compares its own layout against a scale of 1 and puts

@@ -24,7 +24,7 @@ use crate::{EditorWorld, Link, MoveRecord, NodeEditor, NodeGraph, SharedGraph, V
 /// and the views showing it.
 ///
 /// Names are indices with holes, and the holes are handed out again before fresh names
-/// — the free list of §41.2, which is what `insert_node` asks an application for. A
+/// — the free list, which is what `insert_node` asks an application for. A
 /// removed node's number is wiped with its rectangle, so whatever brings it back has to
 /// have kept it.
 #[derive(Default)]
@@ -44,11 +44,11 @@ struct Row {
     kinds: bool,
     /// Whether it names kinds it then cannot make — the default `insert_kind`.
     forgets_kinds: bool,
-    /// Whether its content has a text form, for the system clipboard (§66).
+    /// Whether its content has a text form, for the system clipboard.
     textual: bool,
 }
 
-/// `Row`'s text form: a value after a line break, so the escaping is exercised (§66).
+/// `Row`'s text form: a value after a line break, so the escaping is exercised.
 struct RowText;
 
 impl crate::ContentText<u32> for RowText {
@@ -65,7 +65,7 @@ impl crate::ContentText<u32> for RowText {
     }
 }
 
-/// What `Row`'s `wide` kind is sized to, whatever is asked: the graph decides (§64).
+/// What `Row`'s `wide` kind is sized to, whatever is asked: the graph decides.
 const WIDE: Size = Size::new(300.0, 50.0);
 
 impl NodeGraph for Row {
@@ -301,7 +301,7 @@ fn a_finished_move_goes_through_the_recorder() {
 /// The widget: an operator run through it reaches the canvas, not only the graph.
 ///
 /// The half of the driver a world-level test cannot see — carrying the moved node into
-/// the canvas's own copy of the geometry (§30).
+/// the canvas's own copy of the geometry.
 #[test]
 fn an_operator_run_through_the_editor_moves_the_canvas_too() {
     let graph = row(3);
@@ -340,9 +340,9 @@ fn an_operator_run_through_the_editor_moves_the_canvas_too() {
     );
 }
 
-// --- MARK: STRUCTURE (§43)
+// --- MARK: STRUCTURE
 
-/// The rule of §41.2, through the whole stack: a delete renumbers nothing, and undo
+/// The rule that names are never renumbered, through the whole stack: a delete renumbers nothing, and undo
 /// brings the node back under its own name, with its links.
 #[test]
 fn a_deleted_node_comes_back_under_its_own_name_with_its_links() {
@@ -578,7 +578,7 @@ fn a_view_is_forgotten_with_its_token() {
 }
 
 /// A view attached after a node was raised is owed the raise, and a name handed out
-/// again starts at the bottom (§50.8).
+/// again starts at the bottom.
 ///
 /// A canvas is built from the model's geometry and nothing else, so a view made later — a
 /// split, a detached window — would otherwise stack the graph by name and disagree with
@@ -709,7 +709,7 @@ fn a_key_and_a_script_zoom_by_their_factor() {
     let _ = harness.redraw();
     assert!((zoom(&mut harness) / before - 2.0).abs() < 1e-9);
 
-    // Keys reach the focus fallback and nobody else (§38.3); a host names the editor.
+    // Keys reach the focus fallback and nobody else; a host names the editor.
     let editor = harness.root_widget().ctx().widget_id();
     harness.set_focus_fallback(Some(editor));
     harness.process_text_event(masonry::core::TextEvent::Keyboard(
@@ -793,7 +793,7 @@ fn borders(harness: &mut TestHarness<NodeEditor<Row>>) -> Vec<(usize, masonry::p
 
 /// A selected node looks selected by its own style, and only the selected one does.
 ///
-/// §38.7's customer: the node never hears of a selection — it wears a class, and its
+/// The node never hears of a selection — it wears a class, and its
 /// type's property stack says what that class looks like.
 #[test]
 fn a_selected_node_looks_selected_by_its_own_style() {
@@ -1064,7 +1064,7 @@ fn a_node_built_after_the_selection_wears_it() {
 
 /// A selected node that scrolls out of view and back comes back wearing the class.
 ///
-/// Virtualisation drops the widget the moment the node leaves (§20.2); the class lives on
+/// Virtualisation drops the widget the moment the node leaves; the class lives on
 /// in the canvas's slot, and the next widget is built wearing it. Nothing tells the node
 /// again — that is the point.
 #[test]
@@ -1212,8 +1212,7 @@ mod menus {
 /// A menu opened near the bottom-right corner is moved inside the window.
 ///
 /// In a window the menu fits: moving it in is all the editor does, and a menu taller than
-/// its window is cut off — the editor's own menu grew past 400 px with the copy entries
-/// (§57.6).
+/// its window is cut off — the editor's own menu grew past 400 px with the copy entries.
 #[test]
 fn a_menu_opened_by_the_edge_stays_inside_the_window() {
     use masonry::core::TextEvent;
@@ -1967,7 +1966,7 @@ fn a_node_held_at_the_edge_scrolls_the_view_and_stays_under_the_pointer() {
     assert_eq!(
         child_layouts(&mut harness),
         layouts,
-        "a scroll is the view's, and the view goes into paint (§22)"
+        "a scroll is the view's, and the view goes into paint"
     );
     let counters = harness.root_widget().edge_pan_counters();
     assert!(counters.pans >= 50, "{counters:?}");
@@ -2072,7 +2071,7 @@ fn a_cancelled_gesture_puts_the_view_back() {
     harness.mouse_button_release(Some(masonry::core::PointerButton::Primary));
 }
 
-// --- MARK: COPIES (§57)
+// --- MARK: COPIES
 
 mod copies {
     use std::collections::BTreeSet;
@@ -2376,7 +2375,7 @@ mod cut_off {
                     key(runtime, world, "d", Modifiers::SHIFT);
                     move_to(runtime, world, Point::new(50.0, 70.0));
                 },
-                // The duplicate happened; only the move is cut off (§57).
+                // The duplicate happened; only the move is cut off.
                 true,
             ),
             "view.pan" => (
@@ -2424,7 +2423,7 @@ mod cut_off {
             },
             "node.select" | "view.zoom" | "menu.node" | "menu.add" | "menu.screen" | "node.add" | "node.delete"
             | "node.copy" | "node.paste" | "link.add" | "link.delete" | "ed.undo" | "ed.redo" => return None,
-            // The screen's operations ask the driver and end: none of them is modal (§71).
+            // The screen's operations ask the driver and end: none of them is modal.
             other if other.starts_with("screen.") => return None,
             other => panic!("`{other}` is not classified: modal or not, put it in `start`"),
         }])
@@ -2436,7 +2435,7 @@ mod cut_off {
     ///
     /// `link.drag` and `node.box_select` used to answer the missing event as they answer
     /// every unknown one — keep going — and their curve and band stayed on screen; `node.move`
-    /// did the same until §57.
+    /// did the same once.
     #[test]
     fn every_modal_operator_cut_off_leaves_nothing_behind() {
         let names = crate::ops::runtime::<Row>().operators().to_vec();
@@ -2998,7 +2997,7 @@ mod kinds {
 /// A menu entry that adds a node, in a window where a second editor shows the graph,
 /// finishes within the event: the harness panics when an event's rewrite passes run out,
 /// and the second view has built the node and put the selection on it before any redraw
-/// (`issues/26-11-20 menu entry pass budget.md`, §65).
+/// (`issues/26-11-20 menu entry pass budget.md`).
 #[test]
 fn a_menu_entry_reaches_a_second_view_within_the_event() {
     use std::rc::Rc;

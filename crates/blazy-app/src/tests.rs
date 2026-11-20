@@ -1,7 +1,7 @@
 //! The assembly against a graph of its own, in two windows, driven the way the shell
 //! drives them.
 //!
-//! Not a harness: a window is a `RenderRoot`, and a harness does not hand one out (§39.5).
+//! Not a harness: a window is a `RenderRoot`, and a harness does not hand one out.
 //! Each test does what the shell does — deliver a change, call `settled`, call `frame`
 //! on the window about to draw — and reads the canvases back.
 
@@ -148,7 +148,7 @@ impl NodeGraph for Grid {
 
     fn set_content(&mut self, _index: usize, _content: ()) {}
 
-    /// Nothing to say, said as nothing: a copy still goes to the system clipboard (§66).
+    /// Nothing to say, said as nothing: a copy still goes to the system clipboard.
     fn text_form(&self) -> Option<&dyn blazy_node_editor::ContentText<()>> {
         Some(&GridText)
     }
@@ -283,7 +283,7 @@ fn a_link_made_in_one_window_reaches_the_other() {
 }
 
 /// A node selected in one window looks selected, and comes to the front, in the other
-/// once it draws (§50.8).
+/// once it draws.
 ///
 /// Across windows the push does not reach, so this is the pull's half: the registry
 /// records the selection and the raise, and the other window's editor is woken to re-read
@@ -330,8 +330,7 @@ fn a_view_that_left_the_tree_is_owed_nothing() {
 
     root.edit_base_layer(|mut widget| {
         let mut screen = widget.downcast::<EditorScreen<Grid>>();
-        // Whichever area has a sibling that is an area: on three, one of them does not
-        // (§41.1).
+        // Whichever area has a sibling that is an area: on three, one of them does not.
         let tree = screen.widget.tree().clone();
         let (keep, gone) = tree
             .areas()
@@ -434,7 +433,7 @@ fn the_default_screen_keys_shadow_no_editor_binding() {
 }
 
 /// A key reaches the screen's operator it is bound to, with its modifiers exactly — in the
-/// editors' keymap, after the editor's own sections (§71).
+/// editors' keymap, after the editor's own sections.
 #[test]
 fn a_bound_key_names_its_action_and_an_unbound_one_nothing() {
     let keymap = crate::default_keymap();
@@ -534,7 +533,7 @@ fn one_file_overrides_the_editor_and_the_screen() {
     let app = app(&graph).with_keymap_overrides(&path).expect("the overrides read");
     let _ = std::fs::remove_file(&path);
 
-    // The screen's bindings are the editors' keymap now (§71): the overrides are in force there.
+    // The screen's bindings are the editors' keymap now: the overrides are in force there.
     let overridden = app.screen(SplitTree::balanced(1));
     let session = overridden.payload(0).expect("an area carries a session").clone();
     let keymap = session.borrow().runtime().keymap().clone();
@@ -762,7 +761,7 @@ fn a_link_drag_let_go_over_the_next_area_ends() {
 /// An operator started by a key goes on past its area, and ends where it is confirmed.
 ///
 /// `G` has no pointer capture and cannot have one — Masonry grants it during a press only
-/// (§38.1) — so past its area the tree gave the moves to the editor next door: the node
+/// — so past its area the tree gave the moves to the editor next door: the node
 /// stopped at the border, and the click that confirms went there too. The keys followed
 /// the pointer as well, so `Escape` over the next area reached the wrong editor.
 #[test]
@@ -863,7 +862,7 @@ fn view(root: &mut RenderRoot, area: usize) -> masonry::kurbo::Affine {
 
 /// With edge pan asked for, a node dragged out of its area into the next scrolls its own
 /// area's view while the pointer stands there, stays under the pointer, and the window
-/// stops asking for frames once the drag is over (§55).
+/// stops asking for frames once the drag is over.
 ///
 /// Past the border is in the band: Blender's node editor scrolls wherever the pointer is
 /// beyond the edge, and so does the default [`EdgePan`](blazy_node_editor::EdgePan).
@@ -904,7 +903,7 @@ fn a_node_dragged_into_the_next_area_scrolls_its_own() {
     assert_eq!(view(&mut root, 0), scrolled, "and the view stands where it scrolled to");
 }
 
-/// A grab started by a key scrolls too: its events come through the host seat (§54.3),
+/// A grab started by a key scrolls too: its events come through the host seat,
 /// and so does the pointer edge pan follows. `Escape` puts the node and the view back.
 #[test]
 fn a_grab_started_by_a_key_scrolls_and_escape_puts_the_view_back() {
@@ -997,7 +996,7 @@ fn a_screen_key_typed_into_a_text_field_is_text() {
 
     assert!(root.focus_on(Some(field)));
     let _ = blazy_shell::window::deliver_text(&mut app, &mut cx, key, &mut root, alt_x());
-    // After the event, as the loop does: the screen's operators ask, the driver does (§71).
+    // After the event, as the loop does: the screen's operators ask, the driver does.
     app.settled(&mut cx, key, &mut root);
     let _ = root.redraw();
     assert_eq!(areas(&mut root), 1, "the key went to the field, not to the screen");
@@ -1009,7 +1008,7 @@ fn a_screen_key_typed_into_a_text_field_is_text() {
     assert!(text.ends_with('x'), "{text:?}");
 
     // A key the field does not type bubbles to the editor: the screen's operator is refused
-    // while a text field has the keys (§56, §71).
+    // while a text field has the keys.
     let ctrl_space = masonry::core::TextEvent::Keyboard(KeyboardEvent {
         state: KeyState::Down,
         key: Key::Character(" ".into()),
@@ -1067,7 +1066,7 @@ fn shown(root: &mut RenderRoot, area: usize) -> usize {
 }
 
 /// Copied in one area with `Ctrl+C`, pasted in the other with `Ctrl+V` at its pointer:
-/// both areas show the copies in the same frame, and another window once it draws (§57).
+/// both areas show the copies in the same frame, and another window once it draws.
 #[test]
 fn a_copy_pastes_in_another_area_and_reaches_another_window() {
     let graph = Grid::new(8);
@@ -1105,7 +1104,7 @@ fn a_copy_pastes_in_another_area_and_reaches_another_window() {
         (10, 10),
         "both areas show it in the same frame"
     );
-    // One history, the graph's (§70): the link and the selection made in area 0 and the
+    // One history, the graph's: the link and the selection made in area 0 and the
     // paste made in area 1 are four steps of it, seen alike from both areas.
     assert_eq!(
         edit_editor(&mut root, 1, |editor| editor.widget.history_depth()),
@@ -1190,7 +1189,7 @@ fn a_duplicate_looks_selected_in_both_areas() {
 }
 
 /// Inside a text field the copy and paste keys are the field's: `Ctrl+C` copies no nodes
-/// and `Ctrl+V` pastes text, not nodes (§56).
+/// and `Ctrl+V` pastes text, not nodes.
 #[test]
 fn copy_and_paste_keys_in_a_text_field_are_the_fields() {
     use blazy_shell::text::MemoryClipboard;
@@ -1629,7 +1628,7 @@ fn a_graph_read_while_running_replaces_every_view_and_starts_the_history_over() 
     assert_eq!(other_session.borrow().runtime().history().depth(), 0);
 }
 
-/// The screen's operations are operators (§71): run by name — what a menu entry does — they
+/// The screen's operations are operators: run by name — what a menu entry does — they
 /// ask the driver, which does it after the event; refused where the area cannot do them;
 /// `node.paste` reads the system clipboard and `screen.load_workspace` reads the graph back
 /// the same way from a menu as from a key.

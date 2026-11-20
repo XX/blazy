@@ -1,8 +1,7 @@
 //! Correctness tests for virtualisation.
 //!
-//! The benchmark answers whether virtualisation is *fast*. These answer whether it
-//! is *correct*, which is the harder half: a canvas that quietly loses the user's
-//! edits when a node scrolls off screen would post excellent numbers.
+//! Whether virtualisation is correct: a canvas that loses edits when a node scrolls off
+//! would post excellent numbers.
 
 use blazy::canvas::{CanvasHit, CanvasLayer, DetailBudget};
 use blazy::masonry::core::{NewWidget, WidgetId, WidgetRef};
@@ -65,9 +64,6 @@ fn live_id(harness: &mut TestHarness<NodeEditor>, index: usize) -> Option<Widget
 }
 
 /// Moves the pointer over node `index` and settles the resulting passes.
-///
-/// Controls are materialised only for the node under the pointer, so anything that
-/// wants to touch a slider or a checkbox has to hover first — exactly as a user does.
 fn hover_node(harness: &mut TestHarness<NodeEditor>, index: usize) {
     let centre = harness.edit_root_widget(|mut editor| {
         NodeEditor::with_canvas(&mut editor, |mut canvas| {
@@ -174,12 +170,8 @@ fn controls_write_back_to_the_model() {
     let after = graph.borrow().node(index).checked;
     assert_ne!(before, after, "toggling the checkbox should have reached the model");
 
-    // Twice, because Masonry's `Checkbox` does not toggle itself: it emits
-    // `CheckboxToggled(!self.checked)` and leaves the state to whoever owns the source
-    // of truth (upstream says so in its own docs). A node that writes the model and
-    // forgets to tell the checkbox therefore emits the *same* target state on every
-    // click, and the model latches instead of alternating — which is what happened
-    // before the node started reloading itself from the model (§30).
+    // Twice: Masonry's `Checkbox` does not toggle itself, so a node that forgets to
+    // reload it latches the model instead of alternating.
     harness.mouse_click_on(checkbox, Some(PointerButton::Primary));
     assert_eq!(
         graph.borrow().node(index).checked,
@@ -210,12 +202,7 @@ fn far_field_materialises_no_widgets() {
     );
 }
 
-/// The far field must actually be drawn.
-///
-/// Without this the optimisation would look like a huge win precisely because it
-/// stopped rendering anything: no widgets and no painting is very fast and very
-/// wrong. Rendering to an image and counting non-background pixels is the only
-/// check that cannot be satisfied by doing nothing.
+/// The far field must actually be drawn: counted in pixels, which doing nothing fails.
 #[test]
 fn far_field_is_actually_painted() {
     let (mut harness, _graph) = harness(5000);
@@ -262,11 +249,7 @@ fn far_field_nodes_stay_draggable() {
     );
 }
 
-/// The HUD must survive being cached.
-///
-/// Its shaped text is now rebuilt only when the string changes, which is exactly the
-/// kind of optimisation that shows up as a large speed-up when it silently stops
-/// drawing. Same guard as `far_field_is_actually_painted`: look at the pixels.
+/// The HUD must survive being cached (its text is reshaped only when it changes).
 #[test]
 fn hud_is_painted_and_survives_reshaping() {
     let (mut harness, _graph) = harness(500);
@@ -295,10 +278,6 @@ fn hud_is_painted_and_survives_reshaping() {
 }
 
 /// By default every node on screen at `Full` carries real controls.
-///
-/// The painted stand-in is for `Simplified` only, where the node is too small to
-/// interact with anyway. Using it at `Full` is possible but off by default: see
-/// `only_the_hovered_node_has_controls`.
 #[test]
 fn full_detail_nodes_all_have_controls() {
     let (mut harness, _graph) = harness(5000);
@@ -312,10 +291,7 @@ fn full_detail_nodes_all_have_controls() {
     }
 }
 
-/// With `with_controls_on_hover`, controls exist for exactly one node.
-///
-/// Stashing them instead would look identical on screen and cost the same as before,
-/// which is exactly the trap section 20.2 of the architecture note describes.
+/// With `with_controls_on_hover`, controls exist for exactly one node (not stashed).
 #[test]
 fn only_the_hovered_node_has_controls() {
     let (mut harness, _graph) = harness_with(5000, true);
@@ -361,14 +337,13 @@ fn detail_rebuild_preserves_state() {
 
     // Crossing into Simplified drops the controls; coming back rebuilds them, and the
     // rebuilt widget has to pick up what the model holds now.
-    // 0.08: between the default thresholds of 0.1 and 0.02 (§53.6).
+    // 0.08: between the default thresholds of 0.1 and 0.02.
     zoom_out(&mut harness, 0.08);
     assert!(
         live(&mut harness).iter().any(|(i, _)| *i == target),
         "the node should still be materialised at simplified detail"
     );
-    // Otherwise the zoom never crossed a threshold and nothing below tests a rebuild —
-    // which is how this test went on failing for the wrong reason when they moved.
+    // Otherwise nothing below tests a rebuild.
     let id = live_id(&mut harness, target).expect("node is live");
     assert!(
         node_ref(&harness, id).checkbox_id().is_none(),
@@ -387,10 +362,6 @@ fn detail_rebuild_preserves_state() {
 }
 
 /// Panning inside the far field must not re-record its scene.
-///
-/// The scene is stored in canvas coordinates, so a pan is a change of one `Affine`
-/// and nothing else. This is the property the whole vector-display-list argument
-/// rests on, so it is worth asserting rather than assuming.
 #[test]
 fn far_field_does_not_repaint_while_panning() {
     let (mut harness, _graph) = harness(5000);
@@ -429,10 +400,8 @@ fn under_pointer(harness: &TestHarness<NodeEditor>, pos: Point) -> Option<Widget
         .map(|widget| widget.id())
 }
 
-/// The canvas's own statistics.
-///
-/// Not `NodeEditor::stats`, which is a copy taken during layout: a pick deliberately
-/// does not run one (§25.4), so the copy would be from before the pointer moved.
+/// The canvas's own statistics (`NodeEditor::stats` is copied in layout, which a pick
+/// does not run).
 fn canvas_stats(harness: &mut TestHarness<NodeEditor>) -> blazy::canvas::CanvasStats {
     harness.edit_root_widget(|mut editor| NodeEditor::with_canvas(&mut editor, |canvas| canvas.widget.stats()))
 }
@@ -455,10 +424,6 @@ fn node_pos(harness: &mut TestHarness<NodeEditor>, index: usize) -> Point {
 }
 
 /// A node that sits well inside the viewport, with its right-hand neighbour.
-///
-/// The generated grid starts at the origin and jitters, so the first few nodes hang
-/// off the top-left corner of the window; a test about window positions has to pick
-/// one that is actually in the window.
 fn node_inside_the_viewport(harness: &mut TestHarness<NodeEditor>) -> usize {
     // Row 0 straddles the top edge of the window, so the search has to reach the
     // second row: the grid is 80 wide.
@@ -470,11 +435,7 @@ fn node_inside_the_viewport(harness: &mut TestHarness<NodeEditor>) -> usize {
         .expect("some node is fully on screen")
 }
 
-/// The precise phase, in the widget tree: a node's corner is drawn round, so it is
-/// not the node.
-///
-/// This is the half of `blazy-shape` that runs inside Masonry's own descent
-/// (§6.2) — the canvas is not consulted at all.
+/// The precise phase, in the widget tree: a node's rounded corner is not the node.
 #[test]
 fn a_rounded_corner_is_not_the_node_in_the_widget_tree() {
     let (mut harness, _graph) = harness(500);
@@ -537,13 +498,7 @@ fn a_link_can_be_picked_and_highlights_under_the_pointer() {
     assert_eq!(canvas_stats(&mut harness).hovered, hit);
 }
 
-/// A link whose node has moved is pickable where it is now, not where it was.
-///
-/// The pick rejects a recorded curve by the bounding box stored when the set was
-/// chosen, and a drag moves the curve without re-choosing the set (§24.3) — so the box
-/// has to be re-measured as the node moves or the link becomes unpickable until the
-/// next selection. Nothing else would notice: the picture is redrawn from the
-/// endpoints and looks perfectly right.
+/// A link whose node has moved is pickable where it is now: its stored box is re-measured.
 #[test]
 fn a_link_follows_the_node_that_moved() {
     let (mut harness, _graph) = harness(500);
@@ -577,9 +532,6 @@ fn a_link_follows_the_node_that_moved() {
 }
 
 /// Below the far-field threshold nothing is a widget, and picking still works.
-///
-/// The point of answering from the model: `find_widget_under_pointer` has nothing
-/// to find here, because the nodes are painted into the canvas's own scene.
 #[test]
 fn picking_works_where_there_are_no_widgets() {
     let (mut harness, _graph) = harness(5000);
@@ -603,7 +555,7 @@ fn picking_works_where_there_are_no_widgets() {
 }
 
 /// Picking must not drag a layout pass behind it: a pointer moving over a graph is
-/// the most common thing that happens to a canvas (§25.4).
+/// the most common thing that happens to a canvas.
 #[test]
 fn hovering_does_not_relayout() {
     let (mut harness, _graph) = harness(5000);
@@ -624,12 +576,8 @@ fn hovering_does_not_relayout() {
     assert!(after.hit_queries >= 40, "the moves were picked: {}", after.hit_queries);
 }
 
-/// One look at the whole graph must not make the close-up view slow for ever.
-///
-/// §28: the recorded regions used to be able to grow and never shrink, so a trip to
-/// the overview zoom left every edge in the graph recorded, and the canvas kept
-/// drawing all of them at a zoom whose viewport held a hundred. Measured before the
-/// fix: 9857 curves and 2.46 ms a frame where a fresh canvas took 0.27.
+/// One look at the whole graph must not make the close-up view slow for ever: recorded
+/// regions shrink as well as grow.
 #[test]
 fn a_look_at_the_whole_graph_does_not_stay_expensive() {
     let (mut harness, _graph) = harness(5000);
@@ -655,7 +603,7 @@ fn a_look_at_the_whole_graph_does_not_stay_expensive() {
     assert_eq!(back.recorded_far, 0, "and the far field let its nodes go");
 }
 
-// --- MARK: the widget budget (§29)
+// --- MARK: the widget budget
 
 /// A harness over a canvas with an explicit cost ceiling.
 fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEditor> {
@@ -670,7 +618,7 @@ fn budgeted_harness(count: usize, budget: DetailBudget) -> TestHarness<NodeEdito
     harness
 }
 
-/// Widgets in the whole tree — the quantity §20.2 says a frame costs.
+/// Widgets in the whole tree: what a frame costs.
 fn widgets_in_tree(harness: &mut TestHarness<NodeEditor>) -> usize {
     let mut n = 0;
     harness.inspect_widgets(|_| n += 1);
@@ -678,7 +626,7 @@ fn widgets_in_tree(harness: &mut TestHarness<NodeEditor>) -> usize {
 }
 
 /// A zoom that is perfectly readable can still be unaffordable, and then the budget
-/// decides (§29.2).
+/// decides.
 ///
 /// At zoom 1 the thresholds say `Full` without hesitation; 24 nodes with a slider and
 /// a checkbox each are 99 widgets, and a ceiling of 40 does not hold them.
@@ -699,9 +647,6 @@ fn the_budget_overrules_a_readable_zoom() {
 }
 
 /// The pair that proves it was the budget: same graph, same zoom, no ceiling.
-///
-/// Without it the previous test would pass just as well if the controls had been lost
-/// for some entirely different reason.
 #[test]
 fn an_unlimited_budget_keeps_the_controls() {
     let mut harness = budgeted_harness(5000, DetailBudget::unlimited());
@@ -713,7 +658,7 @@ fn an_unlimited_budget_keeps_the_controls() {
 }
 
 /// The tree stays inside the ceiling at a zoom that used to blow through it, and it
-/// does so on two graph sizes — which is what the zoom thresholds could not do (§29.1).
+/// does so on two graph sizes — which is what the zoom thresholds could not do.
 #[test]
 fn the_budget_holds_on_two_graph_sizes() {
     let budget = DetailBudget::default();
@@ -729,17 +674,8 @@ fn the_budget_holds_on_two_graph_sizes() {
     }
 }
 
-/// Hysteresis: a set wobbling about the ceiling must not switch level on the wobble.
-///
-/// The stimulus is a zoom oscillating by 2% — a mouse wheel nudged back and forth, or
-/// a trackpad resting under a hand — which moves the visible count by about 3%. That
-/// is far inside the margin the default hysteresis leaves, so the level must not move
-/// at all after the first decision. Without the margin this switches on **every
-/// frame** (measured: 40 switches in 40 frames), and each switch rebuilds every
-/// visible node.
-///
-/// The budget is calibrated from the graph rather than guessed: the boundary has to
-/// land inside the wobble, or the test passes by never being near it.
+/// Hysteresis: a zoom wobbling by 2% about the ceiling must not switch level (without the
+/// margin it switches every frame). The budget is calibrated to land inside the wobble.
 #[test]
 fn a_wobble_at_the_boundary_does_not_flap() {
     let mut probe = budgeted_harness(5000, DetailBudget::unlimited());
@@ -778,11 +714,7 @@ fn panning_at_zoom_one_never_switches_level() {
 }
 
 /// A port's dot is at its node's level among the nodes: covered by a node stacked above,
-/// and shown in the corner that node leaves unpainted.
-///
-/// The dots were the canvas's, drawn over every node; clipped by the box of each node
-/// above, they vanished under a rounded corner while the links and nodes beside them
-/// showed through it. Pixels, because what is under test is what is on screen.
+/// and shown in the corner that node leaves unpainted. Checked in pixels.
 #[test]
 fn a_dot_is_covered_by_a_node_above_and_shows_in_its_corner() {
     use blazy::canvas::PortSide;

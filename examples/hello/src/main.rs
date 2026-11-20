@@ -5,7 +5,7 @@
 //! against the facade and nothing else. Every other example reaches the library the same
 //! way, but each of them is an experiment first; this one exists only so that "an
 //! application needs nothing but `blazy`" is a program that compiles rather than a
-//! sentence in `crates/blazy` (§15.1), and so that what an application has to write is
+//! sentence in `crates/blazy`, and so that what an application has to write is
 //! counted rather than claimed (`issues/application assembly.md`).
 //!
 //! What it writes is what only it knows — the graph, what a node looks like, what fills
@@ -89,9 +89,9 @@ const PORT_LAYOUT: PortLayout = PortLayout {
 /// looking.
 ///
 /// A node's index is an index with holes where removals were, and a freed one is handed
-/// out again first — the rule `NodeGraph::insert_node` asks for (§43). Its title is what
+/// out again first — the rule `NodeGraph::insert_node` asks for. Its title is what
 /// the user typed into its field; the model holds it, because the field's widget comes
-/// and goes with the view (§20.2) and there is one per area (§30).
+/// and goes with the view and there is one per area.
 #[derive(Default)]
 struct Graph {
     nodes: Vec<Option<Rect>>,
@@ -258,7 +258,7 @@ impl NodeGraph for Graph {
 /// What a node looks like, and the canvas's place among the graph's views.
 ///
 /// A node's widget is built when the node scrolls into view and dropped when it leaves,
-/// so it holds no state of its own (§20.3): what it shows comes from the name, which is
+/// so it holds no state of its own: what it shows comes from the name, which is
 /// to say from the model. The token is held here because the canvas drops its source
 /// when it leaves the tree, and that is how the graph learns the view is gone.
 struct Nodes {
@@ -269,7 +269,7 @@ struct Nodes {
 }
 
 /// A field over node `index`'s title: every key into the model, one step in the history
-/// when the edit ends, recorded past `past` — the library's `ContentField` (§70).
+/// when the edit ends, recorded past `past` — the library's `ContentField`.
 fn title_field(
     graph: &SharedGraph<Graph>,
     session: &SessionHandle<Graph>,
@@ -303,7 +303,7 @@ impl NodeSource for Nodes {
         .erased()
     }
 
-    /// The nodes too small to deserve widgets, all in one fill (§31): without this an
+    /// The nodes too small to deserve widgets, all in one fill: without this an
     /// overview shows the links and nothing at their ends.
     fn paint_far(&mut self, nodes: &[(usize, Rect)], _scale: f64, painter: &mut Painter<'_>) {
         let mut path = BezPath::new();
@@ -329,7 +329,7 @@ impl NodeSource for Nodes {
 ///
 /// Its own type rather than a stock `SizedBox` for the dots: they are drawn by the node,
 /// so that they sit at its level among the nodes — a node over this one covers them, and
-/// the corner it leaves unpainted shows them (§50.8). The box is Masonry's: it paints
+/// the corner it leaves unpainted shows them. The box is Masonry's: it paints
 /// the background and the border of any widget from its properties.
 ///
 /// The field is the library's `ContentField` over a stock `TextInput`, which is the point
@@ -397,7 +397,7 @@ const NUDGE: f64 = 20.0;
 /// big; two arrows that move it — or a word, for no node or several.
 ///
 /// Every container a carrier, so the sidebar's interface scale reaches the last caption in
-/// the event it is set in (§62).
+/// the event it is set in.
 fn properties_of(
     graph: &SharedGraph<Graph>,
     selection: &std::collections::BTreeSet<usize>,
@@ -469,7 +469,7 @@ fn properties_of(
 ///
 /// The name is the model's, written as the node's own field writes it and recorded past
 /// the panel — the panel shows the edit already, and rebuilding it would take the field
-/// from under the caret (§47). The arrows are a move, so they go through the editor's
+/// from under the caret. The arrows are a move, so they go through the editor's
 /// `node.move`: a step in the history, which `Ctrl+Z` undoes, and in every view.
 struct Properties {
     content: WidgetPod<dyn Widget>,
@@ -702,7 +702,7 @@ mod tests {
                 CanvasLayer::link_name(&mut canvas, Link::new(0, 4)).is_some()
             })
         });
-        assert!(in_other, "the other area shows the link in the same frame (§30)");
+        assert!(in_other, "the other area shows the link in the same frame");
     }
 
     /// A quick pull out of a port, whose first move is already past the port, is a link.
@@ -711,7 +711,7 @@ mod tests {
     /// the press was. Deciding it on what the pointer was over by then handed a fast drag
     /// out of a port to the view, which panned — seen on a render of this window, and
     /// invisible to the editor's own tests, whose single-widget harness did not move the
-    /// hover while the button was down (§52). Here, in the shape the window builds.
+    /// hover while the button was down. Here, in the shape the window builds.
     #[test]
     fn a_fast_pull_out_of_a_port_links_rather_than_pans() {
         use blazy::masonry::kurbo::Point;
@@ -782,7 +782,7 @@ mod tests {
 
     /// A title typed into a node's field is the model's, and the other area shows it once
     /// it collects what it is owed — without the field being typed into rebuilt under the
-    /// cursor (§47).
+    /// cursor.
     #[test]
     fn a_title_typed_in_one_area_reaches_the_other() {
         let graph = Graph::grid();
@@ -820,7 +820,7 @@ mod tests {
     }
     /// A duplicate is called what its original is called, in both areas, and an undone
     /// delete brings a node back under its name even when the name was handed out again
-    /// in between — the title travels with the history, not in the graph's slot (§57).
+    /// in between — the title travels with the history, not in the graph's slot.
     #[test]
     fn a_copy_keeps_the_title_and_an_undone_delete_brings_it_back() {
         let graph = Graph::grid();

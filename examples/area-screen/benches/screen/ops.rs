@@ -1,6 +1,6 @@
-//! What an operation on the areas costs, and what it must not do (§41.2).
+//! What an operation on the areas costs, and what it must not do.
 //!
-//! The four operations of §16 item 4 — split, join, swap, maximize/restore — plus the
+//! The four area operations — split, join, swap, maximize/restore — plus the
 //! round trip through a workspace file, on a real screen rather than on inert leaves:
 //! eight areas, each holding a canvas over one graph. The unit tests in `blazy-areas`
 //! check the same claims against a widget that does nothing, which is the right place
@@ -32,7 +32,7 @@ pub(crate) struct OpsRow {
     ///
     /// The counter the whole set is judged on: an area that survived an operation must
     /// come out of it as the same widget, because what it holds — the view, the
-    /// selection, the materialised nodes — does not live anywhere else (§30).
+    /// selection, the materialised nodes — does not live anywhere else.
     pub(crate) builds: u64,
     /// Areas handed a size different from the one they had.
     pub(crate) resizes: u64,
@@ -124,7 +124,7 @@ fn round_trip(areas: usize, nodes: usize) -> OpsRow {
     // splitter that is **not** where a balanced screen puts it. The last one is not
     // decoration — a tree straight out of `balanced` has 0.5 at every split, and a writer
     // that rounded its ratios to one decimal would round-trip it perfectly. Found by
-    // breaking this criterion on purpose and watching it pass (§41.7).
+    // breaking this criterion on purpose and watching it pass.
     let sibling = harness.root_widget().tree().joinable(0);
     harness.edit_root_widget(|mut screen| {
         assert!(AreaScreen::join(&mut screen, 0, sibling.expect("area 0 has a sibling")));
@@ -179,7 +179,7 @@ fn round_trip(areas: usize, nodes: usize) -> OpsRow {
     }
 }
 
-/// The table §41.2 is written from.
+/// The table of area operations.
 pub(crate) fn ops_table(opts: &Options, areas: usize, nodes: usize) -> Vec<OpsRow> {
     let areas = areas.max(2);
     // The graph is what makes an area expensive to rebuild, so the quick set keeps it

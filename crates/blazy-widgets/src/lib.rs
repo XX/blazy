@@ -3,8 +3,8 @@
 //! This crate is not a set of controls. Masonry already has label, button, checkbox,
 //! slider, switch, text input, flex and grid, and measurement showed they need no
 //! replacing: **a stock widget follows the box properties someone pushes onto it**, so
-//! scaling one costs no code of its own (§46). What Masonry has no answer for is where
-//! the scale comes from — it has no inherited properties (§22.1), so `UiScale` sits on
+//! scaling one costs no code of its own. What Masonry has no answer for is where
+//! the scale comes from — it has no inherited properties, so `UiScale` sits on
 //! the region's root and reaches nobody below it.
 //!
 //! So this crate owns the carrying, and it is two channels rather than one, because
@@ -45,7 +45,7 @@ pub use crate::label::Label;
 ///
 /// Everything here goes into the frame through ordinary properties, which is why it can
 /// be applied to a widget whose type is unknown. Constructed with `..Default::default()`
-/// and extended in place: it is configuration, not a counter (§40.4).
+/// and extended in place: it is configuration, not a counter.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[expect(clippy::exhaustive_structs, reason = "configuration, constructed by the caller")]
 pub struct Metrics {
@@ -90,10 +90,10 @@ impl Metrics {
 /// Hands `scale` to a child, if it is not the one the child already has.
 ///
 /// The one call every container between a region's root and its controls has to make,
-/// and the trap §22.1 warns about in one line: Masonry has no inherited properties, so a
+/// and the trap in one line: Masonry has no inherited properties, so a
 /// container that forgets this leaves everything below it at scale 1 — and a region
 /// *itself* laid out at the new scale looks exactly right until you measure a control
-/// inside it (§46). Returns whether anything was carried, so a caller can count it.
+/// inside it. Returns whether anything was carried, so a caller can count it.
 ///
 /// `applied` is where the caller keeps what it last handed down; the value is written
 /// back, so an unchanged scale costs nothing.
@@ -115,7 +115,7 @@ pub fn carry_ui_scale<W: Widget + masonry::core::FromDynWidget + ?Sized>(
 
 /// Pushes `metrics` scaled by `scale` onto `widget`, as ordinary properties.
 ///
-/// The box channel of §46, and the half that needs no knowledge of the widget: a stock
+/// The box channel, and the half that needs no knowledge of the widget: a stock
 /// Masonry control resolves `Padding`, `CornerRadius`, `BorderWidth` and `Gap` from its
 /// own property stack before falling back to the theme, so pushing them here is enough
 /// to move its geometry. Measured on a stock `Button`: its insets went from 34x14 to

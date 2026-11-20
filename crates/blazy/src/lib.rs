@@ -1,17 +1,8 @@
 //! blazy — a Blender-style UI layer on top of Masonry.
 //!
-//! This is the crate an application depends on; the others are the pieces it is made
-//! of. See `rnd/architecture.md` for the design it implements.
-//!
-//! Early, and honest about it: six subsystems exist, all measured against the
-//! criteria in §20–§43, and the rest of §16 is still to be written. What is here is
-//! meant to be built on rather than replaced — the shapes have been checked — but the
-//! API will move.
-//!
-//! The facade exists for a second reason, from §15.1: everything below it sits on two
-//! young crates pinned to a git commit. Re-exporting through one surface is what makes
-//! it possible to absorb upstream churn in one place instead of in every application
-//! that depends on this one.
+//! The crate an application depends on; the others are the pieces it is made of, and
+//! `masonry` is re-exported so an application never repeats the git pin. Early: the API
+//! will move.
 //!
 //! ```
 //! use blazy::areas::SplitTree;
@@ -19,7 +10,7 @@
 //! use blazy::ops::keymap::Keymap;
 //!
 //! // A screen of eight areas, each holding a canvas over one graph: the widget budget
-//! // is a window quantity, so it is divided rather than repeated (§29.1).
+//! // is a window quantity, so it is divided rather than repeated.
 //! let screen = SplitTree::balanced(8);
 //! let per_area = DetailBudget::default().split(screen.area_count());
 //! assert_eq!(per_area.widgets, DetailBudget::default().widgets / 8);
@@ -32,10 +23,9 @@
 //! # Features
 //!
 //! * `window` (default) — owner mode: our own window and event loop, and [`app`], the assembly of editors in areas and
-//!   windows that drives it. Turn it off for guest mode (§14) or a headless host, and nothing below pulls in a window
-//!   system.
-//! * `vello` — the GPU rasteriser, chosen at startup rather than at compile time (§26.2). Off by default, because it
-//!   needs a graphics device.
+//!   windows that drives it. Turn it off for guest mode or a headless host, and nothing below pulls in a window system.
+//! * `vello` — the GPU rasteriser, chosen at startup rather than at compile time. Off by default, because it needs a
+//!   graphics device.
 //! * `testing` — Masonry's `TestHarness`, as `blazy::masonry::testing`, for an application's own tests.
 
 #![warn(missing_docs, unreachable_pub)]
@@ -52,7 +42,7 @@ pub use blazy_widgets as widgets;
 /// The Masonry this library is built against.
 ///
 /// Every public signature here speaks Masonry's types — `NewWidget`, `WidgetMut`,
-/// `Affine` — and Masonry is a git dependency pinned to one commit (§15.1). An
+/// `Affine` — and Masonry is a git dependency pinned to one commit. An
 /// application that named its own `masonry` would have to repeat that pin exactly, or
 /// end up with two copies of the crate and types that do not match across the seam.
 /// Through this re-export it gets the one blazy was built and measured against.

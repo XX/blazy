@@ -35,10 +35,6 @@ struct Args {
     budget_widgets: usize,
 
     /// Which rasteriser to draw with.
-    ///
-    /// The choice §16 item 1 asks for, and the reason this window goes through
-    /// `blazy-shell` rather than through `masonry_winit`: upstream picks the backend
-    /// with a cascade of `cfg` at compile time (§26.2).
     #[arg(long, value_name = "NAME")]
     backend: Option<String>,
 }
@@ -58,7 +54,7 @@ fn main() {
         ..Default::default()
     });
     // With the operator layer: click selects, left-drag on empty canvas boxes,
-    // `G` grabs, `B` boxes, Escape cancels, Ctrl+Z undoes (§38). The canvas's own
+    // `G` grabs, `B` boxes, Escape cancels, Ctrl+Z undoes. The canvas's own
     // primary-button gestures step aside for the keymap; the middle button still pans
     // and the wheel still zooms.
     let editor = node_canvas::editor::with_ops(canvas, &graph);
@@ -68,10 +64,7 @@ fn main() {
         .with_size(1100.0, 750.0)
         .with_backend(backend);
 
-    // Sliders and checkboxes inside nodes submit actions. This experiment does not
-    // need to act on them — that they arrive at all is claim 3 holding. What the
-    // driver is here for is the other half of the keymap: the keys no focused widget
-    // claimed have to reach the editor, and only the host can say so.
+    // The driver makes the editor the focus fallback, so the keymap hears keys.
     run(config, NewWidget::new(editor).erased(), property_set(), KeymapFocus).unwrap();
 }
 

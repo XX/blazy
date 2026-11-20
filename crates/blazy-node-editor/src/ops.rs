@@ -1,24 +1,8 @@
-//! Selection, box-select, grab and pan, as operators over the graph.
+//! The node editor's operators and their default keymap (Blender's classic one).
 //!
-//! What this module is for is the shape rather than the gestures: every one of them
-//! could be forty lines inside a widget's `on_pointer_event`, and that is exactly what
-//! `rnd/architecture.md` §11 calls "scattering `is_dragging: bool` over the widgets".
-//! Here a gesture is an [`Operator`]: it is named, it says whether it can run, it can
-//! be started by a key, by a button or by a script, and while it is modal it gets the
-//! events instead of whatever is under the pointer.
-//!
-//! **Nothing here touches a widget.** An operator changes the graph — the truth, by
-//! §30 — and records in the world which nodes ([`EditorWorld::take_moved`]) a view has to follow. The
-//! driver ([`NodeEditor`](crate::NodeEditor)) carries that into the canvas afterwards.
-//! That separation is what makes [`Operator::exec`] worth having: the same operators
-//! run in a test with no widget tree at all, so "the key and the script do the same
-//! thing" is checked by comparing model state rather than pixels.
-//!
-//! The keymap is Blender's classic one, because it exercises both ways a modal
-//! operator can start and the difference between them is the finding of §38.1: a
-//! press-started operator takes Masonry's pointer capture and the tree never sees
-//! another event, while a key-started one (`G`, `B`) cannot — capture is only offered
-//! during a press — and every event reaches the tree first.
+//! An operator changes the graph and leaves in the world what the views have to follow;
+//! it never touches a widget. So the same operators run in a test without a widget tree,
+//! and a key, a menu and a script do the same thing.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -38,12 +22,8 @@ use crate::{EDGE_PAN, EditorWorld, Link, LinkPreview, MoveRecord, NodeGraph};
 /// The keymap context a node canvas's bindings live in.
 pub const CANVAS_CONTEXT: &str = "canvas";
 
-/// The context chain of an event over the canvas, innermost first.
-///
-/// Three levels rather than §11's four: the canvas, the window, and the screen around it
-/// (§71). The shape is the point: the canvas shadows the window, the window still catches
-/// undo, and the screen's operations — split, detach, save — come last, so a key bound by
-/// the editor and by the screen is the editor's.
+/// The context chain of an event over the canvas, innermost first: the canvas, the window,
+/// the screen. A key bound in two of them belongs to the first.
 pub const CANVAS_SCOPE: [&str; 3] = [CANVAS_CONTEXT, "window", crate::SCREEN_CONTEXT];
 
 /// Selects the node under the pointer.
@@ -55,15 +35,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for SelectOp {
         "node.select"
     }
 
-    /// Only over a node — or over one named by a property, or asked to clear.
-    ///
-    /// The other binding on the same button, the box select, is what a drag on empty
-    /// canvas reaches, and it reaches it *because* this refuses. The `index` half keeps
-    /// the scripted path honest: a poll that asked about the pointer alone would refuse
-    /// every call that does not come from one, and "the key and the script do the same
-    /// thing" would be true only of the key. The `deselect_all` half is Blender's
-    /// property of the same name — a click on nothing means "nothing selected", and it
-    /// is the operator's business what a click means, not the keymap's (§39.1).
+    /// Over a node, for a node named by `index`, or with `deselect_all` (a click on
+    /// nothing). Refusing elsewhere lets a drag on empty canvas reach the box select.
     fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
         cx.world().hovered_node().is_some()
             || cx.props().int("index", -1) >= 0
@@ -111,10 +84,6 @@ fn select<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, index: usize) -> OpR
 }
 
 /// Replaces the selection with `after`, and records the step if it changed.
-///
-/// Shared by everything that selects, because "the selection changed" and "the change
-/// is undoable" have to stay one decision: an operator that set the selection without
-/// the step would leave a hole in the history that undo walks straight past.
 fn set_selection<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, after: BTreeSet<usize>) {
     let before = cx.world().selection();
     if cx.world_mut().select(after.clone()) {
@@ -122,22 +91,13 @@ fn set_selection<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, after: BTreeS
     }
 }
 
-/// Drags a rubber band and selects what it covers.
-///
-/// Two ways in, and they are the two §38.1 is about. A press starts it tracking
-/// immediately and the driver takes pointer capture, so nothing else sees another
-/// event. `B` starts it *waiting* for a press, with no capture to be had — every event
-/// of that gesture reaches the widget tree before the runtime, and is counted.
+/// Drags a rubber band and selects what it covers: from a drag, or from `B` and then a
+/// press.
 #[derive(Default)]
 pub struct BoxSelectOp {
     anchor: Point,
     tracking: bool,
-    /// The button holding the band, if a button started it.
-    ///
-    /// Whichever one it was: the keymap binds this to two of them, and an operator
-    /// that ended on a fixed button would hang on the other. A gesture that cannot end
-    /// is the failure `a_gesture_leaves_nothing_running` exists for, and this is how it
-    /// was found.
+    /// The button holding the band, if a button started it (the keymap binds two).
     button: Option<PointerButton>,
 }
 
@@ -204,8 +164,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for BoxSelectOp {
                 finish_box(cx, rect);
                 OpResult::Finished
             },
-            // Escape, or the other button: both mean "not this". So does no event at all —
-            // the runtime cutting the gesture off — or the band stays on screen.
+            // Escape, the other button, or no event at all (cut off): cancel.
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
@@ -221,8 +180,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for BoxSelectOp {
                 cx.world_mut().dirty = true;
                 OpResult::Cancelled
             },
-            // A move before the press, or a key nobody claimed: the gesture is still
-            // ours, and the event is nobody's.
+            // A move before the press, or an unclaimed key.
             _ => OpResult::Running,
         }
     }
@@ -237,13 +195,8 @@ fn finish_box<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, rect: Rect) {
     set_selection(cx, after);
 }
 
-/// Moves the selection with the pointer — Blender's grab.
-///
-/// Two ways in, and they end differently because that is what each one means. Dragging
-/// with the primary button confirms when the button comes up; `G` confirms on the next
-/// press, because there is no button held to release. The difference is one field, and
-/// it is the difference between a gesture that feels like dragging and one that feels
-/// like a mode.
+/// Moves the selection with the pointer — Blender's grab. A drag confirms on release;
+/// `G` confirms on the next press.
 #[derive(Default)]
 pub struct MoveOp {
     anchor: Point,
@@ -258,14 +211,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
         "node.move"
     }
 
-    /// Something to move, and **the event says what** — no property required.
-    ///
-    /// This is what `under_pointer` used to buy, and why it is gone (§39.1). A pointer
-    /// gesture names its target by pointing at it: a drag that started on empty canvas
-    /// is not a request to move the selection, or the view would stop panning the moment
-    /// the user selected anything. A grab from `G`, or from a script, has no pointer to
-    /// mean anything by, and moves what is selected. The keymap says neither; the shape
-    /// of the event does.
+    /// Something to move: a drag moves the node it started on (never from empty canvas,
+    /// which pans); a key or a script moves the selection.
     fn poll(&self, cx: &OpCtx<'_, EditorWorld<G>>) -> bool {
         match cx.event() {
             Some(OpEvent::Drag { .. } | OpEvent::Click { .. } | OpEvent::Press { .. }) => {
@@ -277,8 +224,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
         self.from_press = matches!(cx.event(), Some(OpEvent::Drag { .. } | OpEvent::Press { .. }));
-        // Dragging an unselected node takes it, as every editor does: the alternative
-        // is a drag that silently moves something else.
+        // Dragging an unselected node selects it.
         if let Some(index) = cx.world().hovered_node()
             && self.from_press
             && !cx.world().is_selected(index)
@@ -289,10 +235,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for MoveOp {
         OpResult::Running
     }
 
-    /// From a script: the whole move at once, from properties.
-    ///
-    /// The same end state as the interactive drag that finished at the same delta,
-    /// and that equality is a test rather than an intention.
+    /// From a script: the whole move at once, from `dx` and `dy`.
     fn exec(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
         self.grab(cx);
         let delta = Vec2::new(cx.props().float("dx", 0.0), cx.props().float("dy", 0.0));
@@ -331,13 +274,8 @@ impl MoveOp {
         self.grab(cx);
     }
 
-    /// Follows one event of the gesture: moves the nodes, or says it is over.
-    ///
-    /// Apart from [`modal`](Operator::modal) because `node.duplicate` ends in the same
-    /// gesture and records it differently. No event at all is the runtime cancelling
-    /// every operator (`OpRuntime::cancel_all`, when the window loses focus), and it
-    /// cancels: answering `Running`, as every unknown event does, left a drag cut off that
-    /// way where the pointer had taken it, with nothing in the history to undo it by.
+    /// Follows one event of the gesture: moves the nodes, or says it is over. No event
+    /// (cut off) cancels. Shared with `node.duplicate`, which records the end differently.
     fn follow<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> Gesture {
         let event = cx.event().cloned();
         match event {
@@ -346,8 +284,7 @@ impl MoveOp {
                 self.apply(cx, delta);
                 Gesture::Running
             },
-            // The button that started it coming up, for a drag; the next press, for a
-            // grab started from the keyboard.
+            // The release, for a drag; the next press, for a grab from a key.
             Some(OpEvent::Release {
                 button: PointerButton::Primary,
                 ..
@@ -371,9 +308,7 @@ impl MoveOp {
                 ..
             })
             | None => {
-                // Cancelling is the operator's own job: the runtime keeps no snapshot
-                // on anyone's behalf, and the operator is the only thing that knows
-                // what "before" was.
+                // The runtime keeps no snapshot: putting things back is the operator's job.
                 self.apply(cx, Vec2::ZERO);
                 Gesture::Cancelled
             },
@@ -391,10 +326,7 @@ impl MoveOp {
             .collect();
     }
 
-    /// Puts every grabbed node at its start plus `delta`.
-    ///
-    /// From the start rather than from the last position, so a drag never accumulates
-    /// rounding and a cancel is `apply(ZERO)`.
+    /// Puts every grabbed node at its start plus `delta` (so a cancel is `apply(ZERO)`).
     fn apply<G: NodeGraph>(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>, delta: Vec2) {
         for (&index, &start) in self.nodes.iter().zip(&self.from) {
             cx.world_mut().set_pos(index, start + delta);
@@ -421,22 +353,8 @@ impl MoveOp {
     }
 }
 
-/// Moves the view with the pointer.
-///
-/// An operator that changes no model state at all, which is why it is here: the view is
-/// the widget's, and an operator may not touch a widget (§38.3). So it leaves the
-/// movement in the world and the driver carries it into the canvas, exactly
-/// as it carries a moved node. In screen units, because the view moves under the
-/// pointer while this runs.
-///
-/// **It used to decide what a click was, and no longer does** (§39.1). Under §38 pointer
-/// capture was granted during the press and at no other time, so an operator that might
-/// have to hold the pointer had to start on the press — before anyone could know what
-/// the gesture would become — and whoever held it was the only one who could say
-/// afterwards what it had been. That is why this operator carried `click_deselects`.
-/// With the layer seat able to withhold events, the runtime resolves the gesture before
-/// any operator starts, and a click on empty canvas is its own binding on
-/// `node.select`.
+/// Moves the view with the pointer, in screen units. Leaves the movement in the world for
+/// the driver: the view is the widget's.
 #[derive(Default)]
 pub struct PanOp {
     anchor: Point,
@@ -449,9 +367,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for PanOp {
     }
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
-        // Where the *press* was, not where the pointer is now: a drag is recognised a
-        // few pixels after it started, and those pixels are part of the movement. This
-        // is what `OpEvent::Drag` carries the gesture's origin for (§39.3).
+        // From the press, not the pointer: a drag is recognised a few pixels late.
         self.anchor = match cx.event() {
             Some(OpEvent::Drag { screen, .. }) => *screen,
             _ => cx.world().pointer_screen,
@@ -491,31 +407,20 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for PanOp {
                 button: PointerButton::Secondary,
                 ..
             }) => {
-                // Putting the view back is this operator's own job: the runtime keeps
-                // no snapshot on anyone's behalf.
+                // Putting the view back is the operator's job.
                 cx.world_mut().pan -= self.total;
                 OpResult::Cancelled
             },
-            // Cut off by the runtime: the view stays where it was taken, unlike `Escape`.
-            // A view is not the graph and has no history (§30), so leaving it moved is
-            // neither a trace nor a change nobody can undo — and a view that jumps back
-            // when the window loses focus is a surprise, not a cancel.
+            // Cut off: the view stays where it was taken (it is not the graph).
             None => OpResult::Finished,
             _ => OpResult::Running,
         }
     }
 }
 
-/// Zooms the view about the pointer.
-///
-/// What the canvas used to do on the wheel by itself, past the keymap — so the wheel
-/// could be neither rebound nor scripted (`issues/keymap file and zoom operator.md`). From
-/// the wheel the factor follows the scroll, at the canvas's own rate
-/// ([`WHEEL_ZOOM_RATE`](blazy_canvas::WHEEL_ZOOM_RATE)), so rebinding nothing changes
-/// nothing about how it feels; from a key or a script it is the `factor` property.
-///
-/// Like `view.pan` it changes the view and not the model, so it writes no undo step and
-/// the other views of the graph do not follow it (§30).
+/// Zooms the view about the pointer: by the scroll at
+/// [`WHEEL_ZOOM_RATE`](blazy_canvas::WHEEL_ZOOM_RATE) from the wheel, by `factor` from a key
+/// or a script. No undo step, and other views do not follow.
 #[derive(Default)]
 pub struct ZoomOp;
 
@@ -531,7 +436,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for ZoomOp {
 
     fn invoke(&mut self, cx: &mut OpCtx<'_, EditorWorld<G>>) -> OpResult {
         let factor = match cx.event() {
-            // Rolled towards the user is out, as the canvas has always had it.
+            // Rolled towards the user is out.
             Some(OpEvent::Scroll { dy, .. }) => {
                 let rate = cx.props().float("rate", blazy_canvas::WHEEL_ZOOM_RATE);
                 (-dy * rate).exp()
@@ -562,14 +467,10 @@ fn zoom<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, origin: Point, factor:
     OpResult::Finished
 }
 
-/// Adds a node where the pointer is, and selects it.
+/// Adds a node where the pointer is (or at `x`/`y`), and selects it.
 ///
-/// The size is [`EditorWorld::new_node_size`] unless the binding says otherwise, and the
-/// place is the pointer unless it does: a menu entry and a script both run the same
-/// operator, and neither has a pointer to mean anything by (§11). With `kind` set — a
-/// name from [`NodeGraph::node_kinds`] — the node is of that kind
-/// ([`NodeGraph::insert_kind`]); a kind the graph does not list is refused in the poll, so
-/// a mistyped binding does nothing and a menu shows it refused (§64).
+/// With `kind` set, the node is of that kind ([`NodeGraph::insert_kind`]); a kind the
+/// graph does not list is refused in the poll.
 #[derive(Default)]
 pub struct AddNodeOp;
 
@@ -610,12 +511,10 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddNodeOp {
             },
             None => cx.world_mut().add_node(asked),
         };
-        // The rectangle the model gave the node, for the step: undo and redo put it back as
-        // the model made it.
+        // The rectangle the model gave the node.
         let rect = cx.world().node_rect(index);
         let content = cx.world().graph.borrow().content(index);
-        // Selected here rather than through `set_selection`, because that records a step
-        // of its own and this is one action: see `AddStep`.
+        // Not through `set_selection`, which records a step of its own.
         cx.world_mut().select(BTreeSet::from([index]));
         cx.push_undo(Box::new(AddStep {
             index,
@@ -627,10 +526,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddNodeOp {
     }
 }
 
-/// Deletes the selection, or the node under the pointer if nothing is selected.
-///
-/// Every link that ended on a deleted node goes with it, and comes back with it: that is
-/// one action to the user, so it is one step in the history.
+/// Deletes the selection, or the node under the pointer if nothing is selected, with
+/// their links, in one step.
 #[derive(Default)]
 pub struct DeleteNodeOp;
 
@@ -666,12 +563,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for DeleteNodeOp {
     }
 }
 
-/// Copies the selection, and the links between the selected nodes, to the graph's
-/// clipboard — Blender's `node.clipboard_copy`.
-///
-/// Changes nothing in the graph, so it writes no step. The clipboard is the graph's
-/// ([`Views`](crate::Views)), so a copy made in one area pastes in any other, in any
-/// window (§57).
+/// Copies the selection and the links between it to the graph's clipboard, and to the
+/// system clipboard when the world has one. No undo step.
 #[derive(Default)]
 pub struct CopyOp;
 
@@ -688,12 +581,10 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for CopyOp {
         let selection = cx.world().selection();
         let graph = cx.world().graph.borrow();
         let clip = Clip::of(&*graph, &selection);
-        // As text too, for the driver to put on the system clipboard, when the graph can
-        // write its content (§66).
+        // As text too, when the graph has a text form.
         let text = clip.to_text(&*graph);
-        // Onto the system clipboard here, when a driver handed one over (§71) — from a key,
-        // a menu or a script alike. Without one, the text waits in the registry for a driver
-        // of its own (`Views::take_outbound_clip`).
+        // Without a system clipboard, the text waits in the registry
+        // (`Views::take_outbound_clip`).
         if let (Some(clipboard), Some(text)) = (cx.world().clipboard(), text.clone()) {
             clipboard.write(text);
         }
@@ -705,14 +596,10 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for CopyOp {
     }
 }
 
-/// The graph's clipboard, if it holds a copy of this graph's nodes.
-///
-/// A copy from another process, offered by the driver from the system clipboard, becomes
-/// the clipboard first (§66); offered text that is not a copy this graph reads is dropped,
-/// and this process's own copy is what is pasted.
+/// The copy to paste: what the system clipboard holds if it is a copy this graph reads,
+/// else this process's own.
 fn clip<G: NodeGraph>(world: &EditorWorld<G>) -> Option<Rc<Clip<G::Content>>> {
-    // What the system clipboard holds is offered first, when a driver handed it over: a copy
-    // from another process is pasted from a key, a menu or a script alike (§71).
+    // The system clipboard first, when the world has one.
     if let Some(text) = world.clipboard().and_then(crate::SystemClipboard::read) {
         world.graph.borrow().views().offer_clip_text(text);
     }
@@ -728,13 +615,7 @@ fn clip<G: NodeGraph>(world: &EditorWorld<G>) -> Option<Rc<Clip<G::Content>>> {
     views.clip()?.downcast().ok()
 }
 
-/// Pastes the graph's clipboard, centred on the pointer — Blender's
-/// `node.clipboard_paste` — and selects what it pasted.
-///
-/// At the pointer of the area it runs in, and the area is what decides it: every area
-/// over the graph shares its canvas coordinates, so a copy made in one area and pasted in
-/// another lands where that area's pointer is. A script names the centre with `x` and
-/// `y`. One step in the history for the nodes and their links together.
+/// Pastes the copy centred on the pointer (or on `x`/`y`) and selects it, in one step.
 #[derive(Default)]
 pub struct PasteOp;
 
@@ -760,21 +641,10 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for PasteOp {
 }
 
 /// Duplicates the selection in place and grabs the copies — Blender's
-/// `node.duplicate_move`.
+/// `node.duplicate_move`, as one undo step.
 ///
-/// Blender's is a macro, a duplicate followed by a translate; there are no macros here,
-/// so the operator holds both halves: it pastes a copy of the selection where it stands,
-/// then runs the same grab `node.move` runs (`MoveOp::follow`) until it is confirmed.
-/// That makes the whole thing **one step** in the history, with the copies where they
-/// ended up — a duplicate followed by a move step would take two undos to take back one
-/// `Shift+D`. Cancelling the grab leaves the copies where they were made, as Blender's
-/// does: the duplicate happened, only the move is cancelled.
-///
-/// From a script — or a menu, which runs through `exec` and cannot hold the pointer —
-/// the copies are moved by `dx` and `dy` instead, and nothing is grabbed.
-///
-/// Generic over the graph's content because it holds the step it is building while the
-/// grab runs.
+/// Cancelling the grab leaves the copies where they were made, as in Blender. From a
+/// script or a menu the copies are moved by `dx` and `dy` instead.
 pub struct DuplicateOp<C> {
     grab: MoveOp,
     pending: Option<CopyStep<C>>,
@@ -821,8 +691,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for DuplicateOp<G::Content> {
         let Some(mut step) = self.pending.take() else {
             return OpResult::Cancelled;
         };
-        // Where the copies ended up, so a redo puts them there rather than on top of
-        // what they were copied from.
+        // Where the copies ended up, for redo.
         for (index, rect, _) in &mut step.nodes {
             *rect = cx.world().node_rect(*index);
         }
@@ -835,8 +704,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for DuplicateOp<G::Content> {
 fn ends<G: NodeGraph>(cx: &OpCtx<'_, EditorWorld<G>>) -> Option<Link> {
     let (from, to) = (cx.props().int("from", -1), cx.props().int("to", -1));
     if from >= 0 && to >= 0 {
-        // Ports as well, when a script names them; output 0 and input 0 when it does not,
-        // which is what a link between two whole nodes always meant.
+        // Ports too, when named; output 0 and input 0 otherwise.
         let port = |name| u16::try_from(cx.props().int(name, 0)).unwrap_or(0);
         return Some(Link::between(
             from as usize,
@@ -878,9 +746,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddLinkOp {
         let Some(link) = ends(cx) else {
             return OpResult::Cancelled;
         };
-        // The graph refuses an end that is not there and a link it already holds, and
-        // either way there is nothing to put in the history. A full input gives up its
-        // oldest link, in the same step (`EditorWorld::connect`).
+        // A refused link records nothing; a full input gives up its oldest link.
         let Some(removed) = cx.world_mut().connect(link) else {
             return OpResult::Cancelled;
         };
@@ -896,12 +762,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddLinkOp {
     }
 }
 
-/// Drags a link out of a port and drops it on another node's port — or takes one off a
-/// port and drops it elsewhere, as Blender's `node.link` does (`node_link_init`).
-///
-/// Modal, started by a drag that began on a port (bound ahead of `node.move`, whose poll
-/// would otherwise take the press, since a port is part of its node). What it carries
-/// depends on where it started:
+/// Drags a link out of a port onto another port, or takes links off a port — Blender's
+/// `node.link`. What it carries depends on where it started:
 ///
 /// * **An input with a link** — the link comes off the input and its input end follows the pointer, from the output it
 ///   still leaves. The last of them, if the graph lets an input take several.
@@ -909,20 +771,14 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddLinkOp {
 ///   their output ends follow the pointer together.
 /// * **Anything else** — a new link out of the port.
 ///
-/// While it runs it asks the driver to pick on every move (`EditorWorld::track_hover`) —
-/// the pointer is the operator's, the canvas below sees no events and publishes no hover —
-/// and leaves the curves in `EditorWorld::link_preview`, with the graph's answer
-/// ([`NodeGraph::accepts_link`]) for the port under the pointer, so a refusal shows before
-/// the release. Letting go on a port that takes them makes the links; anywhere else makes
-/// none, and a link that was taken off stays off — one step either way, through the same
-/// history as everything else. `Escape`, the other button, or the runtime cutting the
-/// gesture off puts back what was taken off and leaves no step.
+/// Releasing on a port that takes them makes the links; anywhere else a link taken off
+/// stays off. One step either way. `Escape`, the other button, or a cut-off puts back
+/// what was taken off.
 #[derive(Default)]
 pub struct LinkDragOp {
     /// The side the ends that stay put are on; the pointer's end goes to the other.
     fixed: Option<PortSide>,
-    /// The ends that stay put, by node and port: one for a new link or a link taken off an
-    /// input, one per link for the links of an output.
+    /// The ends that stay put, by node and port.
     anchors: Vec<(usize, u16)>,
     /// The links taken off when the drag started, to be put back if it is cancelled.
     detached: Vec<Link>,
@@ -974,9 +830,7 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
                 button: PointerButton::Primary,
                 ..
             }) => self.let_go(cx),
-            // Cut off by the runtime, too: otherwise the curve stays on screen, every move
-            // goes on picking for an operator that is gone, and a link taken off stays off
-            // with nothing in the history to bring it back (§58).
+            // Cut off by the runtime, too.
             Some(OpEvent::Key {
                 key: Key::Named(NamedKey::Escape),
                 down: true,
@@ -999,8 +853,8 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for LinkDragOp {
     }
 }
 
-/// How far inside a node's left or right edge a drag resizes it rather than moving it, in
-/// screen pixels — Blender's `NODE_RESIZE_MARGIN`, a fifth of a widget unit, rounded up.
+/// How far inside a node's left or right edge a drag resizes it, in screen pixels
+/// (Blender's `NODE_RESIZE_MARGIN`).
 pub const RESIZE_EDGE_PX: f64 = 6.0;
 
 /// The edge of a node a resize drags.
@@ -1013,15 +867,9 @@ pub enum NodeEdge {
     Right,
 }
 
-/// The node, and the edge of it, that a drag starting at `at` would resize; `None` where a
-/// drag would move a node, pan the view or pull a link instead.
-///
-/// The strip just inside the left or the right edge of the node under the pointer, a few
-/// screen pixels wide (`RESIZE_EDGE_PX`), as in Blender's `node_get_resize_direction` — and
-/// only for a node the graph lets resize ([`NodeGraph::width_limits`]). A port on the edge
-/// wins: the canvas picks ports before nodes, so over a port the hover is the port. A node
-/// less than four strips wide on screen has no edge apart from its body — the far field, or
-/// a zoom at which it is a sliver — and is moved, not resized.
+/// The node and edge a drag starting at `at` would resize, if any: a strip inside the left
+/// or right edge of a resizable node. A port on the edge wins; a node too narrow on screen
+/// has no edges.
 pub(crate) fn edge_under<G: NodeGraph>(world: &EditorWorld<G>, at: Point) -> Option<(usize, NodeEdge)> {
     let Some(CanvasHit::Node { index, .. }) = world.hover else {
         return None;
@@ -1049,7 +897,7 @@ pub(crate) fn edge_under<G: NodeGraph>(world: &EditorWorld<G>, at: Point) -> Opt
 /// [`NodeGraph::width_limits`]; a node dragged by its edge while unselected is selected first,
 /// as `node.move` takes an unselected node. One step in the history (`node.resize`), with the
 /// rectangles before and after. `Escape`, the other button or the runtime cutting the
-/// gesture off (§58) puts every rectangle back and leaves no step.
+/// gesture off puts every rectangle back and leaves no step.
 ///
 /// From a script: the selection, by `dx`, on the right edge — or the left with `left` set.
 #[derive(Default)]
@@ -1187,13 +1035,8 @@ fn resized(from: Rect, edge: NodeEdge, dx: f64, (min, max): (f64, f64)) -> Rect 
     }
 }
 
-/// The links a link drag that starts on port `port` of `side` of node `index` takes off:
-/// the last link into an input, every link out of an output when `detach` asks — and none,
-/// for a drag that starts a new link.
-///
-/// Separate from the operator so that the rule has a name a test can call; the editor's
-/// light ([`port_hint`]) does not need it — a port lights whether a drag from it takes
-/// links off or draws a new one.
+/// The links a link drag from port `port` of `side` of node `index` takes off: the last
+/// link into an input, every link out of an output with `detach`, none for a new link.
 pub(crate) fn taken_off<G: NodeGraph>(graph: &G, index: usize, side: PortSide, port: u16, detach: bool) -> Vec<Link> {
     let mut on_port: Vec<Link> = graph
         .links_of(index)
@@ -1210,16 +1053,9 @@ pub(crate) fn taken_off<G: NodeGraph>(graph: &G, index: usize, side: PortSide, p
     }
 }
 
-/// The port under the pointer, if a press and drag from it with `mods` held would start a
-/// link drag — a new link out of it, or the links it would take off (`taken_off`) — which
-/// is what the editor lights up, as the canvas lights up the link under the pointer.
-///
-/// Asks the keymap rather than assuming: a port is lit only if some `link.drag` binding, on
-/// any button, matches a drag with `mods`. `None` while an operator runs — a link drag
-/// lights its own ends (`LinkPreview::source`, `LinkPreview::target`). Only `link.drag`
-/// bindings are read: a binding of another operator ahead of it for the same drag would be
-/// told apart by polls, which this does not run, because asking polls on every move would
-/// be counted as asking (`OpCounters::polled`).
+/// The port under the pointer if a drag from it with `mods` would start a link drag (some
+/// `link.drag` binding matches), for the editor to light. `None` while an operator runs.
+/// Polls are not run: that would be a poll per move.
 pub(crate) fn port_hint<G: NodeGraph>(
     runtime: &OpRuntime<EditorWorld<G>>,
     world: &EditorWorld<G>,
@@ -1253,11 +1089,8 @@ pub(crate) fn port_hint<G: NodeGraph>(
 type PortAt = (usize, PortSide, u16, Point);
 
 impl LinkDragOp {
-    /// The links the drag would make on the port under the pointer, if it is one they can
-    /// go to: the other side from the anchors, on another node than each anchor's.
-    ///
-    /// Empty when the pointer is not on such a port. An anchor on the hovered node is left
-    /// out rather than refusing the lot, as Blender skips it.
+    /// The links the drag would make on the port under the pointer; empty if they cannot go
+    /// there. An anchor on the hovered node is skipped, as in Blender.
     fn targets<G: NodeGraph>(&self, world: &EditorWorld<G>) -> (Vec<Link>, Option<PortAt>) {
         let (Some(fixed), Some(CanvasHit::Port { index, side, port, pos })) = (self.fixed, world.hover) else {
             return (Vec::new(), None);
@@ -1278,8 +1111,7 @@ impl LinkDragOp {
         (links, at)
     }
 
-    /// Puts the curves in the world: from each anchor to the port under the pointer if
-    /// the links could go there, to the pointer otherwise — with the graph's answer.
+    /// Puts the curves in the world, to the port under the pointer or to the pointer.
     fn show<G: NodeGraph>(&self, cx: &mut OpCtx<'_, EditorWorld<G>>) {
         let Some(fixed) = self.fixed else {
             return;
@@ -1329,7 +1161,7 @@ impl LinkDragOp {
         end_drag(cx);
         self.fixed = None;
         let mut removed = std::mem::take(&mut self.detached);
-        // Through `connect`, so a full input gives up its oldest link and the step records it.
+        // Through `connect`: a full input gives up its oldest link.
         let mut added = Vec::new();
         for link in links {
             if let Some(displaced) = cx.world_mut().connect(link) {
@@ -1403,7 +1235,7 @@ fn delete_link<G: NodeGraph>(cx: &mut OpCtx<'_, EditorWorld<G>>, link: Link) -> 
     OpResult::Finished
 }
 
-/// Undo, as an operator, so the keymap reaches it the way it reaches everything else.
+/// Undo.
 #[derive(Default)]
 pub struct UndoOp;
 
@@ -1445,48 +1277,29 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for RedoOp {
 
 /// The keymap a node editor opens with — Blender's classic one, as data.
 ///
-/// **Click and drag are triggers now** (§39.1), and the two sentences that used to be
-/// properties on somebody else's binding are two rows a user could move to another
-/// button: "drag on empty canvas pans the view" and "click on empty canvas deselects".
-/// Each button still carries several bindings whose operators' polls tell them apart —
-/// dragging moves the node under the pointer if there is one and the view if there is
-/// not — which is the mechanism §11 describes and the whole reason `poll` exists.
-///
-/// `G` and `B` start the same two operators from the keyboard. They are kept because
-/// they are Blender's, and because a modal operator started by a key cannot take pointer
-/// capture: the difference between the two kinds of start is the finding of §38.1, and
-/// an example with only one kind would hide it. What §39 changed is that it no longer
-/// *costs* anything — the layer seat withholds the events either way.
+/// A button carries several bindings, told apart by their operators' polls: a drag moves
+/// the node under the pointer if there is one, and the view otherwise. `G` and `B` start
+/// the same operators from the keyboard.
 pub fn default_keymap() -> Keymap {
     Keymap::new()
         .with(CANVAS_CONTEXT, vec![
-            // Left drag: a link out of the port under the pointer, the node under the
-            // pointer, or the view. Three rows, and the polls tell them apart — the port
-            // first, because a port is part of its node and `node.move` would take it.
-            //
-            // `edge_pan` on the two that carry something, as Blender's node keymap puts
-            // `view2d_edge_pan` on its translate: the view scrolls at the area's edge when
-            // the application turns edge pan on (`EditorSession::edge_pan`), and a keymap
-            // file can take it off one gesture alone. Not on the rubber band, which
-            // Blender does not scroll either.
+            // Left drag: a link from a port, the node, or the view; the polls tell them
+            // apart, the port first. `edge_pan` on the two that carry something, as in
+            // Blender.
             Binding::new(Pattern::drag(PointerButton::Primary), "link.drag")
                 .with_props(Props::new().with_bool(EDGE_PAN, true)),
-            // `Ctrl`-drag on an output takes all its links off and carries them, as
-            // Blender's `node.link` with `detach`. On an input a plain drag already does.
+            // `Ctrl`-drag on an output takes all its links off.
             Binding::new(
                 Pattern::drag(PointerButton::Primary).with_mods(Modifiers::CONTROL),
                 "link.drag",
             )
             .with_props(Props::new().with_bool("detach", true).with_bool(EDGE_PAN, true)),
-            // A node's left or right edge resizes it — after the links, as in Blender's
-            // keymap, because a port on the edge wins; before `node.move`, whose poll would
-            // take every press on a node.
+            // A node's edge resizes it: after the links, before `node.move`.
             Binding::new(Pattern::drag(PointerButton::Primary), "node.resize"),
             Binding::new(Pattern::drag(PointerButton::Primary), "node.move")
                 .with_props(Props::new().with_bool(EDGE_PAN, true)),
             Binding::new(Pattern::drag(PointerButton::Primary), "view.pan"),
-            // Left click: the node under the pointer, or nothing at all — the sentence
-            // that used to live inside `view.pan` as `click_deselects`.
+            // Left click: the node under the pointer, or nothing.
             Binding::new(Pattern::click(PointerButton::Primary), "node.select")
                 .with_props(Props::new().with_bool("deselect_all", true)),
             // Shift-left: add to the selection, by node or by band.
@@ -1511,24 +1324,19 @@ pub fn default_keymap() -> Keymap {
             // The keyboard half.
             Binding::new(Pattern::key("b"), "node.box_select"),
             Binding::new(Pattern::key("g"), "node.move").with_props(Props::new().with_bool(EDGE_PAN, true)),
-            // Structure (§43). `X` is two bindings on one key and the polls tell them
-            // apart, exactly as the mouse buttons do: a link under the pointer goes
-            // first, because pointing at something is how a gesture names its target.
-            // The `Add` menu first, for a graph that names its kinds; a graph that names none
-            // refuses it, and the same key adds a node straight away.
+            // Structure. `X` deletes the link under the pointer first, else the selection.
+            // `Shift+A` opens the `Add` menu for a graph with kinds, else adds a node.
             Binding::new(Pattern::key("a").with_mods(Modifiers::SHIFT), ADD_MENU),
             Binding::new(Pattern::key("a").with_mods(Modifiers::SHIFT), "node.add"),
             Binding::new(Pattern::key("x"), "link.delete"),
             Binding::new(Pattern::key("x"), "node.delete"),
             Binding::new(Pattern::key("f"), "link.add"),
-            // Copies (§57), on Blender's keys. `Ctrl+V` reaches this only outside a text
-            // field: inside one the host turns it into text first (§56).
+            // Copies, on Blender's keys (inside a text field the field takes them).
             Binding::new(Pattern::key("d").with_mods(Modifiers::SHIFT), "node.duplicate")
                 .with_props(Props::new().with_bool(EDGE_PAN, true)),
             Binding::new(Pattern::key("c").with_mods(Modifiers::CONTROL), "node.copy"),
             Binding::new(Pattern::key("v").with_mods(Modifiers::CONTROL), "node.paste"),
-            // The view. The wheel used to be the canvas's own and nobody's to rebind; `=`
-            // and `-` are the keys of a laptop with no numpad, where Blender's own are.
+            // The view: the wheel, and `=`/`-` for a keyboard without a numpad.
             Binding::new(Pattern::scroll(), "view.zoom"),
             Binding::new(Pattern::key("="), "view.zoom").with_props(Props::new().with_float("factor", ZoomOp::STEP)),
             Binding::new(Pattern::key("-"), "view.zoom")
@@ -1551,7 +1359,7 @@ pub const NODE_MENU: &str = "menu.node";
 /// The operator that opens [`screen_menu`].
 pub const SCREEN_MENU: &str = "menu.screen";
 
-/// The screen's operations, as a menu (§71): each refused — and shown refused — where a
+/// The screen's operations, as a menu: each refused — and shown refused — where a
 /// driver keeps no screen, or where the area cannot do it.
 pub fn screen_menu() -> crate::Menu {
     use crate::ScreenAction;
@@ -1575,10 +1383,8 @@ pub fn screen_menu() -> crate::Menu {
 /// The operator that opens the `Add` menu: one entry per kind the graph lists.
 pub const ADD_MENU: &str = "menu.add";
 
-/// Opens the `Add` menu — Blender's `Shift+A` — built from the graph's
-/// [`NodeGraph::node_kinds`] when it opens, so a graph whose kinds change shows the ones it
-/// has. Refused for a graph with no kinds, which lets `Shift+A` fall through to a plain
-/// `node.add` as it always did (§64).
+/// Opens the `Add` menu — Blender's `Shift+A` — from [`NodeGraph::node_kinds`]. Refused
+/// for a graph with no kinds.
 #[derive(Default)]
 pub struct AddMenuOp;
 
@@ -1601,19 +1407,15 @@ impl<G: NodeGraph> Operator<EditorWorld<G>> for AddMenuOp {
     }
 }
 
-/// The editor's menu: what can be done to the graph and the view from where the pointer is.
-///
-/// Every entry is an operator the keymap also binds, with the properties it binds it with,
-/// so the menu shows each one's shortcut — and teaches it.
+/// The editor's menu. Entries carry the properties the keymap binds them with, so each
+/// shows its shortcut.
 pub fn node_menu() -> crate::Menu {
     crate::Menu::new("Node")
-        // For a graph that names kinds, the second opens the list; for one that does not,
-        // it is shown refused and the first does it.
+        // With kinds, the second opens the list; without, it is refused and the first adds.
         .with("Add node", "node.add", Props::new())
         .with("Add", ADD_MENU, Props::new())
         .with("Delete", "node.delete", Props::new())
-        // The binding's properties, so the entry shows `Shift+D`: a menu runs `exec`, which
-        // grabs nothing and ignores `edge_pan`, and the copies stay where they were made.
+        // The binding's properties, so the entry shows `Shift+D`.
         .with("Duplicate", "node.duplicate", Props::new().with_bool(EDGE_PAN, true))
         .with("Copy", "node.copy", Props::new())
         .with("Paste", "node.paste", Props::new())
@@ -1625,17 +1427,13 @@ pub fn node_menu() -> crate::Menu {
             "view.zoom",
             Props::new().with_float("factor", 1.0 / ZoomOp::STEP),
         )
-        // The screen's operations (§71) in a menu of their own: nine more entries here would
-        // not fit a window, and a menu does not scroll yet (§57.4).
+        // A menu of their own: a menu does not scroll, and nine more would not fit.
         .with("Screen", SCREEN_MENU, Props::new())
         .with("Undo", "ed.undo", Props::new())
         .with("Redo", "ed.redo", Props::new())
 }
 
 /// A runtime with these operators registered and [`default_keymap`] in force.
-///
-/// A starting point rather than the only arrangement: a runtime with more operators, or
-/// a keymap read from a file, goes to [`NodeEditor::with_runtime`](crate::NodeEditor::with_runtime).
 pub fn runtime<G: NodeGraph>() -> OpRuntime<EditorWorld<G>> {
     runtime_with(default_keymap())
 }

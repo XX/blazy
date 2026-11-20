@@ -1,23 +1,11 @@
 //! A widget that reserves its rectangle for the host to draw.
 //!
-//! `rnd/architecture.md` §4.3: `VisualLayerKind::External` is how the core paint model
-//! says "the content here is not mine". For a Blender-like application this is the
-//! 3D viewport, and §14 lists it as a requirement rather than an option.
+//! `VisualLayerKind::External` marks content that is not Masonry's — a 3D viewport.
 //!
-//! # Why this is a widget and not a note in the documentation
-//!
-//! The declaration does not survive a frame in which the widget does not paint
-//! (§26.1): `paint_layer_mode` is reset to `Inline` at the start of every paint pass
-//! for every widget, and only the widget's own `paint` can set it again — which a
-//! retained tree does not call for a clean widget. The frame then carries the
-//! widget's *cached scene* inline instead of a hole, and nothing reports it.
-//!
-//! So an external widget has to keep painting. It draws nothing, so the cost is a
-//! function call and an empty scene; what it really costs is that the window cannot
-//! idle while one is on screen. That is acceptable for what this is for — a hole
-//! exists because something live is behind it — but it is a workaround, and the
-//! proper fix is upstream: the mode wants to be a property of the widget rather than
-//! a flag of the pass.
+//! `paint_layer_mode` is reset every paint pass and only the widget's own `paint` sets it
+//! again, so the widget repaints every frame (an animation frame each), and the window
+//! cannot idle while it is on screen. The proper fix is upstream: a property of the
+//! widget rather than a flag of the pass.
 
 use masonry::accesskit::{Node, Role};
 use masonry::core::{
@@ -37,10 +25,6 @@ pub struct ExternalContent {
     /// Size to ask for when nothing constrains it.
     natural: Size,
     /// How many times this widget has declared itself a hole.
-    ///
-    /// The declaration is per-paint and easy to lose (§26.1), so the count is worth
-    /// having: compared against the holes the host received, it is the difference
-    /// between "there was no hole" and "the hole went missing".
     declarations: u64,
 }
 
@@ -63,9 +47,7 @@ impl Widget for ExternalContent {
     type Action = NoAction;
 
     fn on_anim_frame(&mut self, ctx: &mut UpdateCtx<'_>, _props: &mut PropertiesMut<'_>, _interval: u64) {
-        // The declaration lives for exactly one paint (§26.1), so the widget has to
-        // paint every frame to keep it. Asking for the next animation frame here is
-        // what keeps that going without the host having to know this widget exists.
+        // The declaration lives one paint: ask for the next frame.
         ctx.request_paint_only();
         ctx.request_anim_frame();
     }
@@ -100,8 +82,7 @@ impl Widget for ExternalContent {
     fn layout(&mut self, _ctx: &mut LayoutCtx<'_>, _props: &PropertiesRef<'_>, _size: Size) {}
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {
-        // Nothing is drawn on purpose: whatever the host composites into this
-        // rectangle would otherwise be painted over by our own placeholder.
+        // Nothing drawn: the host composites here.
         ctx.set_paint_layer_mode(PaintLayerMode::External);
         self.declarations += 1;
     }

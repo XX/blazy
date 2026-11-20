@@ -15,7 +15,7 @@ use masonry::parley::StyleProperty;
 
 /// A caption whose text size follows [`UiScale`].
 ///
-/// The text channel of §46. A font size is not a property: it is a parley style, set
+/// The text channel. A font size is not a property: it is a parley style, set
 /// through `WidgetMut<masonry::widgets::Label>`, so nothing can push it onto a widget
 /// from outside the way [`scale_box`](crate::scale_box) pushes padding. Something has to
 /// know it is holding a label and make the call — and if that something is not this
@@ -72,7 +72,7 @@ impl Label {
     /// scale by property costs one pass per level of nesting, because each level has to
     /// be told, lay itself out and tell the next. Four levels is what Masonry allows
     /// before it calls the loop a loop — and header, bar, caption, inner label is four
-    /// (§46). A container that knows it is holding one of these calls this instead and
+    ///. A container that knows it is holding one of these calls this instead and
     /// spends no pass at all.
     pub fn set_scale(this: &mut WidgetMut<'_, Self>, scale: f64) {
         if this.widget.applied == scale {
@@ -85,7 +85,7 @@ impl Label {
             masonry::widgets::Label::insert_style(&mut inner, StyleProperty::FontSize(size));
         }
         // The inner label knows it changed; this one is the widget whose measurement the
-        // parent cached, and nothing else will tell it (§46).
+        // parent cached, and nothing else will tell it.
         this.ctx.request_layout();
     }
 
@@ -107,7 +107,7 @@ impl Widget for Label {
     type Action = NoAction;
 
     fn property_changed(&mut self, ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
-        // A scale change is a layout change, and saying so is §9's first rule: asking
+        // A scale change is a layout change: asking
         // for a repaint here is what makes an interface scale look free and behave wrong.
         UiScale::prop_changed(ctx, property_type);
     }

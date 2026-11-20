@@ -1,10 +1,8 @@
 //! How a composed frame reaches the screen.
 //!
-//! The seam `rnd/architecture.md` §27.2 puts *after* composition rather than around
-//! the rasteriser, and the reason is §26.2: `imaging_wgpu::TextureRenderer` has
-//! associated types, so it cannot be a trait object, while composition is the same
-//! work whichever way the frame travels. Everything above this trait — the device
-//! scale, the base colour, the holes — happens once.
+//! The seam sits after composition (the device scale, the base colour, the holes happen
+//! once), not around the rasteriser: `imaging_wgpu::TextureRenderer` cannot be a trait
+//! object.
 //!
 //! Two implementations, chosen at startup with the rasteriser:
 //!
@@ -20,34 +18,18 @@ use masonry::dpi::PhysicalSize;
 use crate::compose::Hole;
 
 /// What a frame cost on its way to the screen.
-///
-/// Two of these are the criteria of §27.4, and both are counters rather than times:
-/// whether a frame passes through main memory is a fact about the path, not about the
-/// machine it ran on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PresentCounters {
     /// Frames presented.
     pub frames: u64,
-    /// Bytes of frame data that travelled through main memory.
-    ///
-    /// Zero for a path that keeps the frame on the GPU. For the blit path it is the
-    /// size of the rasterised image, which is what has to be written and then read
-    /// again to reach the window.
+    /// Bytes of frame data that travelled through main memory; zero on the GPU path.
     pub cpu_bytes: u64,
-    /// Times a frame was copied back from the GPU.
-    ///
-    /// A GPU rasteriser that has to hand back pixels does `copy_texture_to_buffer`
-    /// and maps the result once per frame. Zero is the point of the swapchain path.
+    /// Times a frame was copied back from the GPU; zero on the swapchain path.
     pub readbacks: u64,
     /// Holes reported to the host, summed.
     pub holes: u64,
-    /// Frames the path refused to draw because the rasteriser could not take them.
-    ///
-    /// vello sizes its tile buffer with a constant and drops the frame in silence
-    /// when a scene needs more (§33). A refused frame is the same missing frame — but
-    /// counted, logged and returned as an error, instead of a window that quietly
-    /// shows what it showed last.
+    /// Frames refused because the rasteriser would have dropped them silently.
     pub frames_refused: u64,
 }
 
@@ -57,19 +39,15 @@ pub struct PresentCounters {
 pub enum PresentError {
     /// The frame could not be composed or rasterised.
     Host(crate::HostError),
-    /// The scene needs more tiles than the rasteriser can allocate (§33).
-    ///
-    /// Not sent to the GPU at all: submitting it would return `Ok` and leave the
-    /// previous frame in the target, which is the failure this variant exists to make
-    /// visible. The caller can simplify the scene, make the window smaller, or fall
-    /// back to the CPU rasteriser, which has no such limit.
+    /// The scene needs more tiles than the rasteriser can allocate; not sent (it would be
+    /// dropped silently). The CPU rasteriser has no such limit.
     SceneTooLarge {
         /// Tiles the scene asks for.
         tiles: u64,
         /// Tiles the rasteriser can allocate.
         budget: u64,
     },
-    /// The scene nests layers deeper than the rasteriser's blend scratch allows (§34).
+    /// The scene nests layers deeper than the rasteriser's blend scratch allows.
     ///
     /// The sibling of [`Self::SceneTooLarge`], in the second of vello's six fixed
     /// buffers, and the one a user interface reaches first: five nested groups over a
@@ -108,7 +86,7 @@ impl std::error::Error for PresentError {
         match self {
             Self::Host(error) => Some(error),
             // The two overflows are this crate's own findings and wrap nothing; the
-            // platform's error arrives as text on purpose (§15.1), so it has no cause
+            // platform's error arrives as text on purpose, so it has no cause
             // to hand on either.
             _ => None,
         }
@@ -138,7 +116,7 @@ pub trait Presenter {
         device_scale: f64,
     ) -> Result<(), PresentError>;
 
-    /// The rectangles the last frame left for the host to fill (§4.3).
+    /// The rectangles the last frame left for the host to fill.
     fn holes(&self) -> &[Hole];
 
     /// What this presenter's frames have cost so far.
@@ -147,7 +125,7 @@ pub trait Presenter {
     /// Tells the presenter the window changed size, in physical pixels.
     fn resize(&mut self, size: PhysicalSize<u32>);
 
-    /// Names the layers whose pixels may be kept between frames (§36).
+    /// Names the layers whose pixels may be kept between frames.
     ///
     /// A presenter that cannot keep pixels ignores this, and that is the honest answer
     /// for the blit path: it rasterises into a buffer on the CPU and has no texture to

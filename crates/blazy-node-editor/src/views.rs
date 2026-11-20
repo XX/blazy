@@ -12,10 +12,6 @@ use masonry::kurbo::Point;
 use crate::Edit;
 
 /// A change of the graph, as a view that missed it has to hear about it.
-///
-/// Everything a canvas copies out of the model: its geometry, which the canvas keeps a
-/// copy of (§30), its structure (§43), and — for a node that is already on screen — what
-/// the node holds, because a node widget reads the model once, when it is built (§44.9).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Change {
@@ -28,33 +24,22 @@ pub enum Change {
     },
     /// The shape of the graph changed.
     Structure(Edit),
-    /// What node `index` holds changed — a value, a flag — and a widget built before the
-    /// change shows the old one.
+    /// What node `index` holds changed; its widget is rebuilt.
     Contents {
         /// The node's name.
         index: usize,
     },
-    /// Node `index` was raised to stacking stamp `stamp` (`CanvasLayer::stack_node`).
-    ///
-    /// The stacking order is the graph's, like a position: a node brought to the front in
-    /// one area and left behind its neighbour in another is two pictures of one graph
-    /// (§50.8).
+    /// Node `index` was raised to stacking stamp `stamp`; the stacking order is the graph's.
     Raised {
         /// The node's name.
         index: usize,
         /// Its stamp from [`Views::raise`]; nodes stack by `(stamp, name)`.
         stamp: u64,
     },
-    /// The graph's selection changed ([`Views::selection`]).
-    ///
-    /// Carries nothing: what a node wears is decided by the editor over the canvas, from
-    /// the selection as it is now, so the change only has to wake it. The selection is the
-    /// graph's, as in Blender — kept per area, a node dragged in one area moved in the
-    /// other while a different node there looked selected.
+    /// The graph's selection changed ([`Views::selection`]); the editor over the canvas reads
+    /// it anew.
     Selection,
-    /// The graph was replaced as a whole — a file read while the application runs (§69):
-    /// the view starts over with `count` names and the links the registry kept with the
-    /// change ([`Views::graph_replaced`]).
+    /// The graph was replaced as a whole ([`Views::graph_replaced`]): the view starts over.
     Reset {
         /// How many names the new graph uses.
         count: usize,
@@ -68,10 +53,6 @@ pub struct ViewCounters {
     /// Canvases registered as views.
     pub attached: u64,
     /// Views that left the widget tree and were forgotten.
-    ///
-    /// The number that was missing (`issues/application assembly.md`): a view nobody
-    /// forgets is owed every change made after it left, for ever, and a registry that
-    /// still owes something wakes every window after every event (§36).
     pub detached: u64,
     /// Changes recorded, one per change per view that was owed it.
     pub noted: u64,
@@ -79,23 +60,15 @@ pub struct ViewCounters {
     pub delivered: u64,
 }
 
-/// The canvases showing one graph, and what each of them still owes.
+/// The views of one graph and what each is owed, plus what is the graph's rather than any
+/// view's: selection, stacking order, the copy, the history.
 ///
-/// **Two deliveries, one list.** Inside a window a change reaches the graph's other
-/// views as a push, in the same frame (§30); that push names a widget in one
-/// `RenderRoot`'s arena and is dropped without a word for any other (§44.3). So every
-/// change is also recorded here, against every view but the one that made it, and a
-/// window collects its share when it next draws ([`sync_canvas`]). Applying a change a
-/// second time writes the same truth a second time, so the two paths need not know about
-/// each other.
+/// Inside a window a change reaches the other views as a push in the same frame; it is
+/// also recorded here for every view but its origin, and a window collects its share when
+/// it draws ([`sync_canvas`]). Applying a change twice is harmless. The editor records what
+/// its operators change; record changes made past them with [`note`](Self::note).
 ///
-/// The editor records what its operators change — the same list it pushes, so the pull
-/// cannot miss what the push carries. What an application changes **past the
-/// operators** — a slider inside a node, a script writing the model — it records itself
-/// with [`note`](Self::note).
-///
-/// A handle: cloning it shares the registry. The graph keeps one, and every canvas over
-/// the graph holds a [`ViewToken`] into it.
+/// Cloning the handle shares the registry.
 #[derive(Clone, Default)]
 pub struct Views(Rc<RefCell<Ledger>>);
 
@@ -105,55 +78,32 @@ struct Ledger {
     views: Vec<(WidgetId, Vec<Change>)>,
     counters: ViewCounters,
     /// Each node's stacking stamp, by name; zero, or past the end, for never raised.
-    ///
-    /// Kept here rather than asked of the graph, because the order is the views' business
-    /// and every graph already has a registry: a method on `NodeGraph` would be one more
-    /// thing an application can get wrong, and a default for it would get it wrong
-    /// silently. Here, a view attached later is handed the order as it stands.
     stacking: Vec<u64>,
     /// The last stamp handed out.
     raise_seq: u64,
     /// The selected nodes, by name.
-    ///
-    /// Here for the reason the stacking is: every graph has a registry, and every view of
-    /// the graph reaches it. Each editor's session reads it rather than keeping its own.
     selection: BTreeSet<usize>,
-    /// What `node.copy` copied last, for `node.paste` — a `Clip` of the graph's content
-    /// type, behind `Any` because the registry is not generic over the graph.
-    ///
-    /// Here for the reason the selection is: copy in one area and paste in another, or in
-    /// another window, is the case that matters, and every view of the graph reaches the
-    /// registry. Per graph rather than per process, which is narrower than Blender's
-    /// (§57.5).
+    /// What `node.copy` copied last: a `Clip` of the graph's content type, behind `Any`
+    /// because the registry is not generic.
     clip: Option<Rc<dyn Any>>,
-    /// The copy as text, when the graph can write it — what went to the system clipboard,
-    /// so that the same text coming back is known for this copy (§66).
+    /// The copy as text, to recognise it when it comes back from the system clipboard.
     clip_text: Option<String>,
     /// The copy's text, not yet handed to the system clipboard.
     outbound: Option<String>,
-    /// Text the system clipboard held when a paste was about to run, and that is not this
-    /// process's copy: a copy from another process, or something else entirely.
+    /// Text from the system clipboard that is not this process's copy, for `node.paste`.
     offered: Option<String>,
-    /// Widgets that show the graph without being a canvas — a properties panel (§62) — and
-    /// whether each is owed a refresh, with the function that refreshes it.
-    ///
-    /// A flag rather than a list of changes: such a widget re-reads what it shows from the
-    /// model, so all it needs to know is *that* something changed, and many changes before
-    /// a frame cost one refresh.
+    /// Widgets that show the graph without being a canvas (panels), whether each is owed a
+    /// refresh, and what refreshes it.
     watchers: Vec<(WidgetId, bool, Refresh)>,
-    /// How many times the graph has been replaced as a whole; an editor that has seen fewer
-    /// starts its history over (§69).
+    /// How many times the graph has been replaced as a whole.
     generation: u64,
-    /// The links of the graph as it was when it was last replaced, for the views that start
-    /// over from it.
+    /// The links of the graph as last replaced, for the views that start over.
     replacement: Option<Rc<[Link]>>,
-    /// The graph's one history, which every session over it keeps (§70) — a
-    /// `SharedHistory` of the editor's world, behind `Any` for the reason `clip` is.
+    /// The graph's one history, shared by every session: a `SharedHistory` behind `Any`.
     history: Option<Rc<dyn Any>>,
 }
 
-/// What brings a watcher up to date, given its `WidgetMut`. A function rather than a
-/// downcast, because the registry is not generic over the watcher's type.
+/// What brings a watcher up to date, given its `WidgetMut`.
 pub type Refresh = fn(&mut WidgetMut<'_, dyn masonry::core::Widget>);
 
 impl std::fmt::Debug for Views {
@@ -174,19 +124,14 @@ impl Views {
 
     /// Registers `canvas` as a view, for as long as the token lives.
     ///
-    /// Called from [`NodeSource::attached`](blazy_canvas::NodeSource::attached), which
-    /// is the one moment a canvas knows its own id. Keep the token in the source: the
-    /// canvas owns its source and drops it when it leaves the tree, and the token's
-    /// `Drop` is then the only notice anyone gets. Masonry has no removal event for a
-    /// widget (`remove_child` carries a TODO where one would go), and without this a
-    /// view joined away or detached stays owed every change made after it left.
+    /// Call it from [`NodeSource::attached`](blazy_canvas::NodeSource::attached) and keep
+    /// the token in the source: dropped with the canvas, it is the only notice that the view
+    /// is gone (Masonry has no removal event).
     #[must_use = "the view is forgotten as soon as the token is dropped"]
     pub fn attach(&self, canvas: WidgetId) -> ViewToken {
         let mut ledger = self.0.borrow_mut();
         if !ledger.views.iter().any(|(id, _)| *id == canvas) {
-            // A canvas is built from the model's geometry and nothing else, so it starts
-            // with every node in name order; the nodes raised before it existed are owed
-            // to it like any change it missed (§44.9).
+            // A new canvas stacks in name order; nodes raised before it are owed to it.
             let owed: Vec<Change> = ledger
                 .stacking
                 .iter()
@@ -204,14 +149,12 @@ impl Views {
         }
     }
 
-    /// Registers a widget that shows the graph but is not a canvas — a properties panel —
-    /// for as long as the token lives (§62).
+    /// Registers a widget that shows the graph but is not a canvas (a panel), for as long as
+    /// the token lives.
     ///
-    /// It is owed a refresh after every change recorded here, whoever made it, unless it
-    /// made it ([`note_except`](Self::note_except) with its own id); `refresh` is called on
-    /// it by the push in its own window ([`owed_watchers`](Self::owed_watchers)) and by the
-    /// pull in any other ([`sync_root`]), and has to call [`refreshed`](Self::refreshed).
-    /// A watcher nothing changed for is not woken: a panel costs an idle frame nothing.
+    /// It is owed a refresh after a change it can show, unless it made it
+    /// ([`note_except`](Self::note_except)); `refresh` runs in its own window's push and in
+    /// [`sync_root`] elsewhere, and must call [`refreshed`](Self::refreshed).
     #[must_use = "the watcher is forgotten as soon as the token is dropped"]
     pub fn watch(&self, widget: WidgetId, refresh: Refresh) -> WatchToken {
         let mut ledger = self.0.borrow_mut();
@@ -243,10 +186,6 @@ impl Views {
     }
 
     /// Records a change for every view.
-    ///
-    /// For a change no view has applied yet — one an application made past the
-    /// operators. A change one canvas has already shown goes through
-    /// [`note_except`](Self::note_except).
     pub fn note(&self, change: Change) {
         self.0.borrow_mut().note(None, change);
     }
@@ -256,12 +195,8 @@ impl Views {
         self.0.borrow_mut().note(Some(origin), change);
     }
 
-    /// Brings node `index` to the front of every view and hands back its new stamp, or
-    /// `None` when it is in front already.
-    ///
-    /// Only the stamp: the caller stacks its own canvas with it
-    /// (`CanvasLayer::stack_node`) and records [`Change::Raised`] for the others, the way
-    /// a move is recorded.
+    /// Brings node `index` to the front and returns its new stamp, or `None` when it is in
+    /// front already; the caller stacks its canvas and records [`Change::Raised`].
     pub fn raise(&self, index: usize) -> Option<u64> {
         self.0.borrow_mut().raise(index)
     }
@@ -276,8 +211,8 @@ impl Views {
         self.0.borrow().selection.contains(&index)
     }
 
-    /// Replaces the selection and hands back the one it replaced, or `None` if nothing
-    /// changed. Announces nothing: see [`announce_selection`](Self::announce_selection).
+    /// Replaces the selection and returns the old one, or `None` if nothing changed.
+    /// Announces nothing: see [`announce_selection`](Self::announce_selection).
     pub(crate) fn replace_selection(&self, nodes: BTreeSet<usize>) -> Option<BTreeSet<usize>> {
         let mut ledger = self.0.borrow_mut();
         if ledger.selection == nodes {
@@ -286,17 +221,11 @@ impl Views {
         Some(std::mem::replace(&mut ledger.selection, nodes))
     }
 
-    /// Tells every view that the selection changed, and brings the nodes that `came` into
-    /// it to the front (§50.8).
+    /// Tells every view that the selection changed and raises the nodes that `came` into it;
+    /// returns what it recorded, for the push.
     ///
-    /// Apart from [`replace_selection`](Self::replace_selection) because of order: an
-    /// operator that adds a node and selects it changes the selection before the views
-    /// have heard of the node, and a raise filed ahead of the insertion lands on a slot
-    /// that is not there yet — and the insertion then resets the stamp. So the editor
-    /// announces after the structural edits of the same gesture. Noted for *every* view,
-    /// the editor's own included: the editor applies its own share at once.
-    ///
-    /// Hands back what it recorded, for the editor to push to the views in its window.
+    /// Called after the gesture's structure edits, so a node added and selected exists
+    /// before it is raised.
     pub(crate) fn announce_selection(&self, came: &[usize]) -> Vec<Change> {
         let mut ledger = self.0.borrow_mut();
         let mut announced = Vec::new();
@@ -324,37 +253,25 @@ impl Views {
         ledger.offered = None;
     }
 
-    /// The text of the last copy, for the system clipboard, once (§66).
-    ///
-    /// What a driver takes after an event — it is the one with the clipboard
-    /// (`ShellCtx::clipboard`), which an operator never sees. `None` when nothing was copied
-    /// since, or the graph's content has no text form.
+    /// The text of the last copy, once, for a driver that writes the system clipboard
+    /// itself. `None` if nothing was copied since, or the content has no text form.
     pub fn take_outbound_clip(&self) -> Option<String> {
         self.0.borrow_mut().outbound.take()
     }
 
-    /// Offers what the system clipboard holds, before a paste runs (§66).
-    ///
-    /// The text of this process's own copy is recognised and changes nothing — the copy in
-    /// the process is the exact one. Anything else is kept for `node.paste` to read: a copy
-    /// from another process becomes the clipboard, and text that is not a copy is dropped,
-    /// leaving this process's copy to paste.
+    /// Offers what the system clipboard holds, before a paste. This process's own copy is
+    /// recognised; anything else is kept for `node.paste`.
     pub fn offer_clip_text(&self, text: String) {
         let mut ledger = self.0.borrow_mut();
         ledger.offered = (ledger.clip_text.as_ref() != Some(&text)).then_some(text);
     }
 
-    /// Says that the graph was replaced as a whole — read from a file while the application
-    /// runs — and that every view has to start over from it (§69).
+    /// Says that the graph was replaced as a whole and every view has to start over.
     ///
-    /// What belonged to the old graph goes: the selection and the stacking order (names in
-    /// the new graph mean other nodes), the copy in the process and anything on its way to
-    /// the system clipboard, and everything the views were still owed — a view now owes one
-    /// thing, [`Change::Reset`]. Every watcher is owed a refresh. Each editor starts its
-    /// history over when it sees the new [`generation`](Self::generation), as Blender's Open
-    /// does: steps name nodes of a graph that is gone.
-    ///
-    /// Call with the graph already replaced, after the gestures over it were cancelled.
+    /// Drops the selection, the stacking, the copy and whatever the views were owed; each
+    /// view is owed [`Change::Reset`], each watcher a refresh, and each editor clears its
+    /// history on the new [`generation`](Self::generation). Call it with the graph already
+    /// replaced and the gestures over it cancelled.
     pub fn graph_replaced<G: crate::NodeGraph>(&self, graph: &G) {
         let count = graph.names();
         let links: Vec<Link> = (0..count)
@@ -427,8 +344,6 @@ impl Views {
     }
 
     /// Pushes into `out` every view but `this`.
-    ///
-    /// The other canvases a change has to reach in the same frame (§30).
     pub fn others(&self, this: WidgetId, out: &mut Vec<WidgetId>) {
         out.extend(self.0.borrow().views.iter().map(|(id, _)| *id).filter(|&id| id != this));
     }
@@ -448,10 +363,7 @@ impl Views {
         self.0.borrow().views.is_empty()
     }
 
-    /// Whether any view is behind.
-    ///
-    /// What a driver asks before waking other windows: an idle window is idle on
-    /// purpose (§36), and waking it after every event would undo that.
+    /// Whether any view is behind (whether to wake other windows).
     pub fn has_pending(&self) -> bool {
         let ledger = self.0.borrow();
         ledger.views.iter().any(|(_, owed)| !owed.is_empty()) || ledger.watchers.iter().any(|(_, owed, _)| *owed)
@@ -495,16 +407,13 @@ impl Ledger {
     }
 
     fn note(&mut self, origin: Option<WidgetId>, change: Change) {
-        // A name a removal frees and an insertion takes back is a new node: it starts at
-        // the bottom — in the canvases (`insert_node`) and so here.
+        // A reused name is a new node: it starts at the bottom.
         if let Change::Structure(Edit::NodeAdded { index, .. } | Edit::NodeRemoved { index }) = change
             && let Some(stamp) = self.stacking.get_mut(index)
         {
             *stamp = 0;
         }
-        // And a removed node is not selected. Only the removal: an insertion is noted after
-        // the operator that made it, and `node.add` selects what it adds — dropping the
-        // name here took the new node out of the selection it had just been put in.
+        // A removed node is not selected (an insertion is noted after `node.add` selected it).
         if let Change::Structure(Edit::NodeRemoved { index }) = change {
             self.selection.remove(&index);
         }
@@ -512,12 +421,9 @@ impl Ledger {
             if Some(*id) == origin {
                 continue;
             }
-            // A move replaces the move of the same node already owed (§70): a view in a
-            // window that is not drawing — minimised, covered — was owed one `Moved` per
-            // frame per node of every drag elsewhere, without bound. Only the last place
-            // matters, and the order of moves among themselves does not — but a move must not
-            // jump back over an edit of the structure, which may have removed and given the
-            // name out again, so the search stops at the last one.
+            // A move replaces the owed move of the same node, so a window that is not
+            // drawing owes one per node, not one per frame. Never across a structure edit,
+            // which may have given the name out again.
             if let Change::Moved { index, .. } = change
                 && let Some(slot) = owed
                     .iter_mut()
@@ -531,8 +437,7 @@ impl Ledger {
             owed.push(change);
             self.counters.noted += 1;
         }
-        // A watcher shows the selection, so a change it cannot show leaves it alone (§70):
-        // every frame of a drag of a node it does not show rebuilt every panel of the graph.
+        // A watcher shows the selection: a move of an unselected node is not its concern.
         let concerns_the_shown = match change {
             Change::Moved { index, .. } | Change::Structure(Edit::NodeResized { index, .. }) => {
                 self.selection.contains(&index)
@@ -551,8 +456,6 @@ impl Ledger {
 }
 
 /// A canvas's place in a graph's [`Views`], given up when the token is dropped.
-///
-/// See [`Views::attach`] for why the drop is the mechanism and not a convenience.
 pub struct ViewToken {
     ledger: Rc<RefCell<Ledger>>,
     canvas: WidgetId,
@@ -573,10 +476,8 @@ impl std::fmt::Debug for ViewToken {
 
 impl Drop for ViewToken {
     fn drop(&mut self) {
-        // A drop happens inside whatever removed the canvas — a join, a detach, a
-        // workspace load — and nothing in those paths holds the registry. If something
-        // ever does, forgetting the view later is better than a panic in a destructor;
-        // the debug assertion is what says the assumption broke.
+        // Nothing that removes a canvas holds the registry; if something does, skip rather
+        // than panic in a destructor.
         let Ok(mut ledger) = self.ledger.try_borrow_mut() else {
             debug_assert!(false, "the view registry was borrowed while a view left the tree");
             return;
@@ -612,24 +513,13 @@ impl Drop for WatchToken {
     }
 }
 
-/// Brings one canvas up to date with what `views` says it owes.
-///
-/// The half of §30 that crosses a window boundary, and it does not care what the canvas
-/// sits inside: a view *is* a canvas, named by the id it was attached under, so a window
-/// that finds the id in its own tree applies the changes to it — whatever area, editor or
-/// region wraps it. The pull used to look for the wrapper, and a wrapper it did not know
-/// was a window that collected nothing, silently (§44.6).
-///
-/// Every change is applied so that applying it twice is harmless, because inside a
-/// window the push has usually delivered it already.
-///
-/// Returns how many changes were applied.
+/// Brings one canvas up to date with what `views` says it owes, and returns how many changes
+/// it applied. Applying a change twice is harmless.
 pub fn sync_canvas(canvas: &mut WidgetMut<'_, CanvasLayer>, views: &Views) -> usize {
     let changes = views.take(canvas.ctx.widget_id());
     for &change in &changes {
         match change {
-            // Only the pull carries a reset: it is the one path with the registry at hand,
-            // and a replaced graph reaches every window through it (§69).
+            // Only the pull carries a reset: it has the registry, with the links.
             Change::Reset { count } => CanvasLayer::reset(canvas, count, views.replacement()),
             change => apply(canvas, change),
         }
@@ -637,11 +527,8 @@ pub fn sync_canvas(canvas: &mut WidgetMut<'_, CanvasLayer>, views: &Views) -> us
     changes.len()
 }
 
-/// Brings every view in one window's tree up to date, and says how many changes that took.
-///
-/// What a driver calls before a window draws. A view that is in another window is not in
-/// this tree and is left for that window; a view in no window cannot exist, because a
-/// canvas that leaves the tree drops its [`ViewToken`].
+/// Brings every view and watcher in one window's tree up to date, before it draws, and
+/// returns how many changes that took.
 pub fn sync_root(root: &mut masonry::app::RenderRoot, views: &Views) -> usize {
     let mut applied = 0;
     for id in views.ids() {
@@ -652,17 +539,14 @@ pub fn sync_root(root: &mut masonry::app::RenderRoot, views: &Views) -> usize {
             match widget.try_downcast::<CanvasLayer>() {
                 Some(mut canvas) => applied += sync_canvas(&mut canvas, views),
                 None => {
-                    // A view is registered under its canvas's own id, so this is a
-                    // registry that was handed some other widget's id. Loud, because a
-                    // view that cannot be reached goes on showing the wrong graph.
+                    // A registry given some other widget's id: that view shows the wrong graph.
                     debug_assert!(false, "a view registered under an id that is not a canvas");
                     tracing::warn!(view = ?id, "a view registered under an id that is not a canvas");
                 },
             }
         });
     }
-    // And the watchers this window holds: a panel shows what the graph's other windows
-    // changed once its own window draws, as a canvas does.
+    // And the watchers in this window.
     for (id, refresh) in views.owed_watchers() {
         if root.get_widget(id).is_some() {
             root.edit_widget(id, |mut widget| refresh(&mut widget));
@@ -683,9 +567,7 @@ pub(crate) fn apply(canvas: &mut WidgetMut<'_, CanvasLayer>, change: Change) {
         Change::Raised { index, stamp } => {
             CanvasLayer::stack_node(canvas, index, stamp);
         },
-        // The canvas has no use for it; the editor above it does, and a layout request
-        // travels up to it: an editor re-reads the selection after its layout. A layout of
-        // the canvas per click, never per frame.
+        // The editor above re-reads the selection after its layout.
         Change::Selection => canvas.ctx.request_layout(),
         Change::Reset { .. } => {
             debug_assert!(false, "a reset is delivered by `sync_canvas`, which has the links");

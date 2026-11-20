@@ -16,7 +16,7 @@
 //! The exception is [`Kind::Timing`]: "frame cost does not follow the graph size"
 //! is a claim about time and cannot be restated as a counter. It survives as a
 //! gate because it compares two times measured in the same process minutes apart,
-//! and because the margin is enormous — §20.5 measured 1.1x against a bound of
+//! and because the margin is enormous — measured at 1.1x against a bound of
 //! half the node ratio, which for a 16x sweep is 8x. Runner noise does not span
 //! that. Its counter sibling, `live_set_independent_of_graph_size`, is gated
 //! strictly and would catch the same regression a frame earlier.
@@ -90,13 +90,13 @@ pub struct SweepRecord {
 ///
 /// Separate from [`SweepRecord`] because the question is different: the scaling sweep
 /// asks what changes when the graph grows, and this one asks what the tree holds at
-/// each zoom — the quantity a cost budget is written in (§29).
+/// each zoom — the quantity a cost budget is written in.
 pub struct ZoomRecord {
     pub zoom: f64,
     /// Which leg: `false` on the way out, `true` coming back.
     ///
     /// Both are recorded because a sweep that only descends tests half a switch
-    /// (§28.4), and hysteresis makes the two legs legitimately different.
+    ///, and hysteresis makes the two legs legitimately different.
     pub returning: bool,
     pub nodes: usize,
     /// Nodes inside the viewport, whether or not they have widgets.
@@ -108,14 +108,14 @@ pub struct ZoomRecord {
     /// Draw commands in the window's layer plan (`plan::commands`).
     ///
     /// The other half of what a frame costs, and the half widgets do not see: below
-    /// the far-field threshold the tree is empty and the scene is not (§31).
+    /// the far-field threshold the tree is empty and the scene is not.
     pub commands: usize,
     /// Link curves the selection dropped as too short to see.
     pub hidden_links: usize,
-    /// Path segments in the scene vello would be asked to draw (§35).
+    /// Path segments in the scene vello would be asked to draw.
     ///
     /// The unit the *other* half of the frame is charged in: draw commands are what
-    /// assembling the plan costs, segments are what rasterising it costs, and §32
+    /// assembling the plan costs, segments are what rasterising it costs, and the architecture notes
     /// measured the two to be independent. Zero where the run had no encoder.
     pub segments: u64,
     pub mean_ms: f64,
@@ -179,7 +179,7 @@ impl Outcome {
     /// Hand-rolled rather than via serde: this is the only structure in the
     /// workspace that needs serialising, and a build-time dependency on a git-pinned
     /// tree is a cost we take only where it buys something (see `rnd/architecture.md`
-    /// §15.1 on keeping the dependency surface small).
+    /// on keeping the dependency surface small).
     pub fn to_json(&self) -> String {
         let mut out = String::new();
         out.push_str("{\n");

@@ -1,8 +1,6 @@
 //! The keymap as a file: written, read back, and laid over another as a user's overrides.
 //!
-//! The reason the keymap is data (§11, §38): a user rebinds a key without the application
-//! being rebuilt. The format is line-based, like the workspace file, and for the same
-//! reasons (§41.6) — no `serde`, a version on the first line, and a file is read as input:
+//! Line-based, like the workspace file, with a version on the first line:
 //!
 //! ```text
 //! blazy-keymap 1
@@ -25,17 +23,10 @@
 //!
 //! # One format, two uses
 //!
-//! A file **lays itself over** a keymap: its `unbind` lines take bindings out, and its
-//! `bind` lines go in **ahead** of what a context already holds, in the order the file
-//! gives them. Read over an empty keymap that is the whole keymap, in file order — which
-//! is what [`Keymap::parse`] does. Read over the application's defaults it is a user's
-//! overrides — [`Keymap::patched`] — and a user's binding on a key the defaults also use
-//! is tried first, which is what an override means.
-//!
-//! An `unbind` that finds nothing to take out is an **error**, not a no-op. It is the
-//! normal way an override file goes stale — the defaults changed under it — and a miss
-//! that looks like success is the shape every silent defect in this project has had
-//! (§45).
+//! A file lays itself over a keymap: `unbind` lines take bindings out, `bind` lines go in
+//! ahead of a context's own. Over an empty keymap that is [`Keymap::parse`]; over the
+//! defaults, a user's overrides ([`Keymap::patched`]). An `unbind` that finds nothing is an
+//! error: it is how an override file goes stale.
 
 use std::fmt::{self, Write as _};
 
@@ -95,8 +86,7 @@ impl Keymap {
     /// lines go in ahead of the context's own, and a `thresholds` line replaces the
     /// thresholds it names.
     ///
-    /// All or nothing: a file with a bad line changes nothing, so a typo in a user's
-    /// overrides leaves the defaults whole rather than half-replaced.
+    /// All or nothing: a file with a bad line changes nothing.
     ///
     /// # Errors
     ///

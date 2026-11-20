@@ -1,9 +1,6 @@
 //! The graph model: the source of truth for node state.
 //!
-//! With virtualisation a node's widget exists only while the node is on screen, so
-//! state cannot live in the widget. This is not a workaround — it is the right
-//! arrangement for an editor anyway, since the graph outlives any view of it and
-//! has to be saved, undone and scripted independently of what is visible.
+//! A node's widget exists only while the node is on screen, so its state lives here.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,65 +39,36 @@ pub struct NodeState {
 /// The graph.
 #[derive(Debug)]
 pub struct GraphModel {
-    /// Nodes by name. A hole is a name a removal freed (§43), and nothing renumbers the
-    /// nodes that stayed: a selection, a link and an undo step are all written in names.
-    ///
-    /// `Option<NodeState>` rather than a flag beside the array because `checked` is a
-    /// `bool` and lends the option its niche, so a hole costs nothing — which is what
-    /// keeps §38.4's snapshot the same size it was.
+    /// Nodes by name; a hole is a name a removal freed (nothing renumbers the rest).
     nodes: Vec<Option<NodeState>>,
     /// Names removals freed, handed out again before fresh ones.
     free: Vec<usize>,
     /// The edges of the graph, by name, with holes where removals were.
-    ///
-    /// In the model rather than in a canvas, and that is §43's other half: with two views
-    /// of one graph, links held by a view are two copies of the topology, and deleting a
-    /// link in one view would never reach the other — the defect §30 found for positions,
-    /// waiting to happen again.
     links: Vec<Option<Link>>,
     /// Edge names a removal freed.
     free_links: Vec<usize>,
-    /// The edges incident to each node, by name.
-    ///
-    /// The same shape the canvas needed for the same reason: without it, deleting a node
-    /// and refusing a duplicate both walk every edge in the graph, and the milliseconds
-    /// follow the graph even though the canvas's own counters do not (§43).
+    /// The edges incident to each node, by name, so an edit does not walk every edge.
     by_node: HashMap<u32, Vec<usize>>,
     /// The canvases currently showing this graph, and what each has not been told yet.
-    ///
-    /// Strictly this is not model state — a document does not know what looks at it —
-    /// and the registry is the library's (`blazy::node_editor::Views`). It is held here
-    /// because everything that changes the graph already holds this handle and needs the
-    /// list in the same breath: a change has to reach the other views *in the same frame*
-    /// (§30), and a view in another window has to be able to collect it later (§44.3).
     views: Views,
 }
 
 impl GraphModel {
-    /// Builds a deterministic grid of nodes.
-    ///
-    /// Deterministic on purpose: two benchmark runs must be comparable, so there is
-    /// no randomness anywhere. The jitter is a cheap hash of the index, not an RNG.
+    /// Builds a deterministic grid of nodes (the jitter is a hash of the index), so two
+    /// benchmark runs are comparable.
     pub fn generated(count: usize) -> Self {
         Self::generated_with_step(count, GRID_STEP)
     }
 
-    /// As [`generated`](Self::generated), with the grid spacing given.
-    ///
-    /// Exists for one measurement, and it is a measurement the shape of the whole
-    /// level-of-detail policy rests on: what a zoom materialises is decided by how
-    /// many nodes fit the viewport, which is spacing and node size, and *not* by how
-    /// many nodes the graph has (§29.1). Halving the step is the only way to put four
-    /// times as many nodes under the same viewport at the same zoom without changing
-    /// anything else.
+    /// As [`generated`](Self::generated), with the grid spacing given: for the density
+    /// sweep, since density and not graph size decides what a zoom materialises.
     pub fn generated_with_step(count: usize, step: f64) -> Self {
         let nodes = (0..count)
             .map(|i| {
                 let col = i % GRID_COLS;
                 let row = i / GRID_COLS;
 
-                // A reproducible pseudo-random offset, so the grid does not look
-                // like graph paper while staying identical between runs.
+                // A reproducible pseudo-random offset.
                 let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let jitter_x = ((h >> 33) % 61) as f64 - 30.0;
                 let jitter_y = ((h >> 17) % 41) as f64 - 20.0;
@@ -181,9 +149,7 @@ impl GraphModel {
     ///
     /// # Panics
     ///
-    /// Panics on a name nothing holds. Use [`try_node`](Self::try_node) where the name
-    /// may be stale — it comes from a view, and a view is told about a removal a frame
-    /// after the model knows.
+    /// Panics on a name nothing holds; use [`try_node`](Self::try_node) for a name from a view.
     pub fn node(&self, index: usize) -> NodeState {
         self.try_node(index).expect("a live node")
     }
@@ -203,10 +169,7 @@ impl GraphModel {
         self.nodes.len()
     }
 
-    /// The graph's edges, as a view is built over them.
-    ///
-    /// Collected rather than borrowed: the edges are stored with holes, and a caller
-    /// wants the graph rather than its name space. Called once per view, not per frame.
+    /// The graph's edges, without the holes, for building a view.
     pub fn links(&self) -> Vec<Link> {
         self.links.iter().flatten().copied().collect()
     }
@@ -220,37 +183,21 @@ impl GraphModel {
         self.len() == 0
     }
 
-    /// A copy of every node's state.
-    ///
-    /// Here for two callers and they want opposite things from it: a test comparing
-    /// "before undo" with "after redo" needs the whole state to compare, and the
-    /// snapshot form of an undo step (§38.4) needs the whole state to hold — which is
-    /// exactly why the journal form exists.
+    /// A copy of every node's state (for tests, and the snapshot form of undo).
     pub fn snapshot(&self) -> Vec<Option<NodeState>> {
         self.nodes.clone()
     }
 
-    /// Puts a snapshot back.
-    ///
-    /// Nodes beyond the snapshot's length are left alone, so restoring an older,
-    /// shorter snapshot cannot silently truncate a graph that has grown.
+    /// Puts a snapshot back; nodes beyond its length are left alone.
     pub fn restore(&mut self, nodes: &[Option<NodeState>]) {
         let shared = self.nodes.len().min(nodes.len());
         self.nodes[..shared].copy_from_slice(&nodes[..shared]);
     }
 
     /// Records a node's new position.
-    ///
-    /// Position is state like any other, and by §20.2 state lives here rather than in
-    /// the view: a canvas keeps its own copy of the geometry, and a second canvas over
-    /// the same graph keeps another. Before this existed a drag moved one copy and the
-    /// other views kept the old position for good.
     pub fn set_pos(&mut self, index: usize, pos: Point) {
         if let Some(Some(node)) = self.nodes.get_mut(index) {
-            // Not recorded for the other views here: whoever moved the node has it already
-            // — the editor records what its operators change, and the canvas's own drag
-            // records through the source — and a second entry would be the same truth
-            // twice, once per drag frame.
+            // Not recorded for the views: whoever moved the node records it.
             node.pos = pos;
         }
     }
@@ -296,8 +243,7 @@ impl NodeGraph for GraphModel {
         self.set_pos(index, pos);
     }
 
-    /// Every node here has the one size the measurements are made on, and none is resized
-    /// (`width_limits` keeps its default), so only the corner is the model's to write.
+    /// Every node has the one size; only the corner is written.
     fn set_node_rect(&mut self, index: usize, rect: Rect) {
         debug_assert_eq!(rect.size(), NODE_SIZE, "a node of this graph is not resized");
         self.set_pos(index, rect.origin());
@@ -307,8 +253,7 @@ impl NodeGraph for GraphModel {
         &self.views
     }
 
-    /// A new node takes a freed name if there is one, and looks like the node before it:
-    /// the tint says nothing about identity and everything about telling nodes apart.
+    /// A new node takes a freed name if there is one.
     fn insert_node(&mut self, rect: Rect) -> usize {
         let state = NodeState {
             pos: rect.origin(),
@@ -316,8 +261,7 @@ impl NodeGraph for GraphModel {
             value: 0.5,
             checked: false,
         };
-        // Not recorded for the views here: the editor records what its operators change
-        // (`Views`), and an insertion is always an operator's.
+        // The editor records the insertion for the views.
         match self.free.pop() {
             Some(index) => {
                 self.nodes[index] = Some(state);
@@ -331,9 +275,6 @@ impl NodeGraph for GraphModel {
     }
 
     /// Back under its own name, holding what it held when it went.
-    ///
-    /// The state comes from the history: this slot is emptied by the removal, and the
-    /// node used to come back with its slider and checkbox at their defaults (§57).
     fn restore_node(&mut self, index: usize, rect: Rect, content: NodeState) {
         if self.nodes.len() <= index {
             self.nodes.resize(index + 1, None);
@@ -353,8 +294,7 @@ impl NodeGraph for GraphModel {
         }
         self.nodes[index] = None;
         self.free.push(index);
-        // Its own links, through the adjacency: a scan of every edge in the graph is
-        // what this used to be, and what made a delete cost the graph (§43).
+        // Its own links, through the adjacency.
         let names = self.by_node.remove(&(index as u32)).unwrap_or_default();
         names.into_iter().filter_map(|name| self.unfile_link(name)).collect()
     }
@@ -424,10 +364,6 @@ fn same_link(a: Link, b: Link) -> bool {
 }
 
 /// Shared handle to the graph.
-///
-/// `Rc<RefCell<_>>` rather than a channel: the canvas, the node widgets and the app
-/// all live on the UI thread, and a node writing its slider value back to the model
-/// must be visible to the next `build` immediately, not one frame later.
 pub type SharedGraph = blazy::node_editor::SharedGraph<GraphModel>;
 
 /// Wraps a model in a shared handle.

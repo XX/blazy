@@ -1,4 +1,4 @@
-//! What the two channels of §46 do, and what they cost.
+//! What the two channels do, and what they cost.
 
 use blazy_areas::{AreaContent, UiScale};
 use masonry::core::{NewWidget, WidgetId};
@@ -40,7 +40,7 @@ fn content_box(harness: &TestHarness<AreaContent>, id: WidgetId) -> Size {
 /// A stock Masonry widget follows the box properties pushed onto it.
 ///
 /// The measurement the whole crate rests on, and the one that cancelled the widget set
-/// this plan item used to be (§46): `masonry_widgets_do_not_follow_ui_scale` is true, but
+/// this plan item used to be: `masonry_widgets_do_not_follow_ui_scale` is true, but
 /// only because nobody hands them the scale — their geometry *is* reachable from outside,
 /// as ordinary properties, without the widget knowing what a scale is.
 #[test]
@@ -88,7 +88,7 @@ fn the_box_channel_does_not_reach_the_text() {
     let after = content_box(&harness, label);
 
     // Width, not height: the bar stretches its children to the row, and the row follows
-    // the scale because the header's own height does (§22). What the text costs is its
+    // the scale because the header's own height does. What the text costs is its
     // width, and that is the number a property cannot move.
     assert_eq!(
         after.width, before.width,
@@ -119,10 +119,10 @@ fn a_label_of_this_crate_follows_the_region_scale() {
 
 /// The bar carries the scale once per change, not once per frame.
 ///
-/// The counter §22.1 asked for without pricing: carrying a scale with no inherited
+/// The cost of carrying a scale with no inherited
 /// properties costs one property write per control, so a bar that re-pushed on every
 /// layout would put the region through the property pass forever — and nothing in a
-/// counter of *sizes* would show it (§28.4).
+/// counter of *sizes* would show it.
 #[test]
 fn the_bar_carries_the_scale_once_per_change() {
     let bar = Bar::new(Metrics::default())
@@ -346,7 +346,7 @@ mod depth {
         assert_eq!(scale_through(3, false), (false, 1));
     }
 
-    /// A properties panel as `hello` builds one (§62): a sidebar holding a panel, holding a
+    /// A properties panel as `hello` builds one: a sidebar holding a panel, holding a
     /// column of rows,
     /// each row a caption and a stock text field. The sidebar's scale reaches the caption of
     /// the last row in the event it was set in, with no frame after — and without the
@@ -387,7 +387,7 @@ mod depth {
             // A sub-panel around the rows (Blender's collapsible group) and the panel at the
             // region's root (`GraphPanel`, a carrier), each stood in for by a nest: four
             // containers above the caption. Without the sub-panel it is three, which an
-            // event still carries by layout alone, with nothing to spare (§48, §62).
+            // event still carries by layout alone, with nothing to spare.
             let mut column = column.erased();
             for _ in 0..2 {
                 let nest = NewWidget::new(Nest {

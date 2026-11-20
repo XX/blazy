@@ -1,29 +1,12 @@
-//! Regions inside an area, and the per-region `ui_scale` of `rnd/architecture.md` §9.
+//! Regions inside an area, and the per-region `ui_scale`.
 //!
-//! An area is not one surface. Blender's editors carry a header, sometimes a toolbar
-//! and a sidebar, around the main view, and §9 gives each of those its own
-//! `ui_scale`: the user's idea of how big the interface should be, which is *not* the
-//! same knob as the window's HiDPI factor and *not* the same knob as panning and
-//! zooming the content.
+//! An area holds regions — a header, the main view, a sidebar — each with its own
+//! `ui_scale`: the interface size, not the HiDPI factor and not the content's pan and zoom.
+//! `ui_scale` goes into layout, and re-lays out only its region; `view` goes into paint.
 //!
-//! The distinction §9 insists on, and the one this module exists to keep:
-//!
-//! * `ui_scale` goes into **layout** — type size, padding, control sizes. Changing it is supposed to cost a re-layout
-//!   of the region, and only of the region.
-//! * `view` (pan/zoom of the content) goes into **paint** and nowhere else. Changing it must cost no layout at all.
-//!
-//! Mixing them means re-running layout on every frame of a zoom, which is the mistake
-//! that kills node editors. Phase 0 established that the canvas keeps `view` out of
-//! layout; this module is where `ui_scale` gets put *into* it without dragging `view`
-//! along.
-//!
-//! # How the value travels
-//!
-//! Masonry has no inherited properties. [`UiScale`] is set on the region's root
-//! widget with `WidgetMut::insert_prop`, which fires `Widget::property_changed`, and
-//! a widget that cares asks for a re-layout there. A container that wants its
-//! children scaled has to forward the value; nothing does it automatically. That is
-//! a finding, not a design choice — see `rnd/architecture.md` §22.
+//! Masonry has no inherited properties: [`UiScale`] is set on the region's root
+//! (`WidgetMut::insert_prop`, which fires `Widget::property_changed`), and a container has
+//! to forward it to its children ([`ScaleCarrier`]).
 
 use std::any::TypeId;
 use std::cell::Cell;
@@ -38,11 +21,8 @@ use masonry::imaging::Painter;
 use masonry::kurbo::{Axis, Point, Size};
 use masonry::layout::{LenReq, Length, SizeDef};
 
-/// What a region is for.
-///
-/// Three of the five §8 lists. Headers stack down the area's height; a sidebar takes its
-/// width off the right of the body below them — the second axis, which is not "more of
-/// the same arithmetic" (§61). A toolbar would be the sidebar's arithmetic on the left.
+/// What a region is for. Headers stack down the area's height; a sidebar takes its width
+/// off the right of the body below them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegionKind {
@@ -56,12 +36,8 @@ pub enum RegionKind {
 }
 
 /// What a sidebar is: whether it is shown, and how wide it is, in logical pixels at
-/// `ui_scale` 1.0.
-///
-/// Kept out of the widget (§61): an area is built again when it is detached into another
-/// window or a workspace is read (§41.2, §44), and a sidebar that lived in its widget
-/// would come back hidden and at the default width. The owner of the area's other state —
-/// its session — holds the [`SidebarState`], and the widget reads it.
+/// `ui_scale` 1.0. Kept outside the widget (in a [`SidebarState`]), so it survives a rebuilt
+/// area.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Sidebar {
@@ -100,17 +76,9 @@ pub const SIDEBAR_MAX_WIDTH: f64 = 900.0;
 /// drag resizes the sidebar by, and the one place in the area that is the area's own.
 pub const SIDEBAR_GRIP: f64 = 4.0;
 
-/// The interface scale of a region, as a property on its root widget.
-///
-/// A multiplier on logical lengths, not on the render target: 1.0 is the size the
-/// application was designed at. Read it in `measure` and `layout` and multiply the
-/// lengths you would otherwise have used; do **not** read it in `paint` to scale a
-/// transform, which is what `view` is for.
-///
-/// Widgets that ignore it simply do not scale, which is why the built-in Masonry
-/// widgets do not: nothing in `masonry::widgets` reads it, and their sizes come from
-/// the theme's `DefaultProperties`, which is one per application rather than one per
-/// region (§22).
+/// The interface scale of a region, as a property on its root widget: a multiplier on
+/// logical lengths, read in `measure` and `layout` (not in `paint`). Masonry's own widgets
+/// do not read it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiScale(pub f64);
 
@@ -129,10 +97,6 @@ impl Default for UiScale {
 
 impl UiScale {
     /// Call from `Widget::property_changed` to re-lay-out when the scale moves.
-    ///
-    /// A scale change is a layout change by definition — that is the whole content of
-    /// §9's first rule — so a widget that reads [`UiScale`] must ask for layout, not
-    /// merely for paint.
     pub fn prop_changed(ctx: &mut UpdateCtx<'_>, property_type: TypeId) {
         if property_type == TypeId::of::<Self>() {
             ctx.request_layout();
@@ -142,28 +106,16 @@ impl UiScale {
 
 /// "Hand the scale to your children, now" — a function a widget carries as a property.
 ///
-/// Why a property and why a function, both measured (`issues/rewrite pass budget.md`):
-/// carrying a scale by [`UiScale`] alone costs one rewrite pass per level of nesting —
-/// each level has to be told, lay itself out, and tell the next through `mutate_later`,
-/// which runs in the *next* pass — and Masonry runs four passes per event. Two containers
-/// between a region's root and its controls already spill into the next frame, which is
-/// drawn half-scaled.
-///
-/// The way around it is to carry the whole subtree in the pass that has the `WidgetMut`.
-/// Nobody can walk another widget's children — `get_mut` wants the `WidgetPod`, and only
-/// the parent has it — but whoever holds a child's `WidgetMut` can read the child's
-/// properties, and a property can be a function. So a widget that can carry its children
-/// carries this, set to its own [`CarriesScale::carry_now`], and [`push_ui_scale`] calls
-/// it. A widget without one is carried the slow way, through its own layout, which is
-/// correct and costs a pass.
+/// Carried through layouts, a scale costs a rewrite pass per level of nesting, and Masonry
+/// runs four per event. A widget carrying this ([`CarriesScale::carry_now`]) scales its
+/// children in the pass [`push_ui_scale`] reaches it in.
 #[derive(Clone, Copy)]
 pub struct ScaleCarrier(fn(&mut WidgetMut<'_, dyn Widget>, f64));
 
 impl ScaleCarrier {
     /// The carrier of widgets of type `W`.
     ///
-    /// Give it to the widget when it is made — `NewWidget::new(w).with_props(ScaleCarrier::of::<W>())`
-    /// — which is the only moment it can be given without a pass of its own.
+    /// Give it when the widget is made: `NewWidget::new(w).with_props(ScaleCarrier::of::<W>())`.
     pub fn of<W: CarriesScale>() -> Self {
         Self(|widget, scale| {
             if let Some(mut this) = widget.try_downcast::<W>() {
@@ -192,27 +144,20 @@ impl Default for ScaleCarrier {
     }
 }
 
-/// A widget that can hand an interface scale to its children in the pass it was given
-/// one, rather than through its next layout.
-///
-/// See [`ScaleCarrier`] for why that is the difference between a scale change that lands
-/// in one frame and one that does not.
+/// A widget that can hand an interface scale to its children in the pass it was given one.
 pub trait CarriesScale: Widget + masonry::core::FromDynWidget {
     /// Applies `scale` to this widget's own state and to its children, now.
     ///
-    /// For each child that is itself scaled, call [`push_ui_scale`] on its `WidgetMut`, so
-    /// that a carrier further down carries on. The widget's own layout must agree with
-    /// what this did — compare against what was carried, not against what was read — or
-    /// the two paths will fight over the same state (§46.3).
+    /// Call [`push_ui_scale`] on each scaled child. The widget's layout must agree with what
+    /// was carried.
     fn carry_now(this: &mut WidgetMut<'_, Self>, scale: f64);
 }
 
 /// Sets [`UiScale`] on `widget` and, if it carries a [`ScaleCarrier`], hands the scale
 /// on to its children in the same pass.
 ///
-/// The one call a holder of a `WidgetMut` makes to scale a subtree. A subtree of
-/// carriers is scaled entirely in the pass the call is made in, whatever its depth; a
-/// widget without a carrier stops the walk there and carries on through its layout.
+/// A subtree of carriers is scaled in this pass; a widget without one carries on through
+/// its layout.
 pub fn push_ui_scale(widget: &mut WidgetMut<'_, dyn Widget>, scale: f64) {
     widget.insert_prop(UiScale(scale));
     let carrier = *widget.get_prop::<ScaleCarrier>();
@@ -228,13 +173,6 @@ pub struct RegionCounters {
     /// Regions handed a border-box size different from their last one.
     pub resizes: u64,
     /// Times a new [`UiScale`] was pushed down to a region's root.
-    ///
-    /// Pushed in the mutate pass, because setting a property needs a `WidgetMut`.
-    ///
-    /// Whether the root *acted* on it is deliberately not counted here: from the
-    /// mutate pass there is no honest way to ask, and guessing would be worse than
-    /// not answering. The region's own content knows, and that is where the
-    /// measurement belongs — see `area-screen`'s header widget.
     pub scale_pushes: u64,
 }
 
@@ -253,23 +191,12 @@ struct Slot {
     sidebar: Option<SidebarState>,
 }
 
-/// The stack of regions filling one area.
-///
-/// Goes inside an [`AreaScreen`](crate::AreaScreen) area: the screen decides how big
-/// an area is, this decides how the area is divided between its regions.
-///
-/// Regions are stacked along the vertical axis, header first. §8's model has regions
-/// on any edge; a spike needs one axis to ask its questions and gains nothing from
-/// two.
+/// The regions filling one area of an [`AreaScreen`](crate::AreaScreen): headers stacked
+/// down the top, the main region below, a sidebar on its right.
 pub struct AreaContent {
     slots: Vec<Slot>,
-    /// Whether this area asks to be recorded as a scene layer of its own.
-    ///
-    /// The seam per-area caching is built on (§36): a host that can tell one area's
-    /// pixels from another's can keep the ones that did not change. Off by default,
-    /// because a layer boundary is only worth its cost to a host that caches — and
-    /// because it lives exactly one paint (§26.1), so an area that wants to stay a layer
-    /// has to be asked to repaint every frame, which the host does.
+    /// Whether this area asks to be recorded as a scene layer of its own, for a host that
+    /// caches layers. Off by default.
     isolated: bool,
     /// Regions whose root needs a new [`UiScale`], applied in the mutate pass.
     pending: Vec<usize>,
@@ -283,12 +210,8 @@ pub struct AreaContent {
 }
 
 impl AreaContent {
-    /// Builds an area from its regions, in stacking order.
-    ///
-    /// `base_height` is a header's height in logical pixels at scale 1.0, and is
-    /// ignored for anything else. The last region takes whatever height is left, so
-    /// it is the one that should be [`RegionKind::Main`]; a `Main` that is not last
-    /// would leave nothing for the regions after it.
+    /// Builds an area from its regions, in stacking order. `base_height` is a header's
+    /// height at scale 1.0; the last region, [`RegionKind::Main`], takes what is left.
     pub fn new(regions: Vec<(RegionKind, f64, NewWidget<dyn Widget>)>) -> Self {
         Self {
             slots: regions
@@ -322,11 +245,7 @@ impl AreaContent {
     }
 
     /// The same area with a sidebar on the right of its body, shown and sized as `state`
-    /// says.
-    ///
-    /// The state is the caller's to keep: the widget reads it in every layout and writes
-    /// the width a drag of the grip gives it. After changing it from outside — `N` — call
-    /// [`refresh`](Self::refresh).
+    /// says. After changing `state` from outside, call [`refresh`](Self::refresh).
     #[must_use]
     pub fn with_sidebar(mut self, widget: NewWidget<dyn Widget>, state: SidebarState) -> Self {
         self.slots.push(Slot {
@@ -341,34 +260,21 @@ impl AreaContent {
         self
     }
 
-    /// Lays the regions out again after their state changed from outside the widget.
-    ///
-    /// Showing or hiding a sidebar builds nothing: the sidebar's widget stays, stashed while
-    /// hidden, and the main region keeps its widget and only changes width.
+    /// Lays the regions out again after their state changed from outside the widget. A
+    /// hidden sidebar is stashed, not dropped.
     pub fn refresh(this: &mut WidgetMut<'_, Self>) {
         this.ctx.request_layout();
     }
 
-    /// Asks to be recorded as a scene layer of its own.
-    ///
-    /// What it buys is the possibility of caching: a host that sees this area as its own
-    /// layer can keep its pixels across the frames in which it did not change (§36).
-    /// What it costs is a repaint request per frame, which is the host's job and not the
-    /// screen's — `blazy_shell::window::ShellDriver::layers` names the layer owners once
-    /// per frame and the shell asks each of them to repaint. Without that the layer
-    /// disappears on the first frame the area is idle, which is exactly the frame worth
-    /// caching (§26.1, §36.1).
+    /// Asks to be recorded as a scene layer of its own, so a host can keep its pixels. The
+    /// host must ask it to repaint every frame (`ShellDriver::layers`).
     #[must_use]
     pub fn with_isolated_layer(mut self, isolated: bool) -> Self {
         self.isolated = isolated;
         self
     }
 
-    /// Builder form of [`set_ui_scale`](Self::set_ui_scale), for a scale known before
-    /// the widget is in a tree.
-    ///
-    /// The queued value is pushed down by the first layout pass, so a region built
-    /// this way is never briefly shown at the wrong size.
+    /// Builder form of [`set_ui_scale`](Self::set_ui_scale), applied by the first layout.
     #[must_use]
     pub fn with_ui_scale(mut self, index: usize, scale: f64) -> Self {
         if let Some(slot) = self.slots.get_mut(index) {
@@ -399,11 +305,7 @@ impl AreaContent {
         self.slots.get(index).map(|slot| slot.ui_scale)
     }
 
-    /// Sets the interface scale of one region.
-    ///
-    /// Pushes [`UiScale`] onto the region's root in this pass, through [`push_ui_scale`],
-    /// so a root that carries a [`ScaleCarrier`] scales its whole subtree before the
-    /// layout that follows — in the frame the change was made, whatever its depth.
+    /// Sets the interface scale of one region, pushed down in this pass ([`push_ui_scale`]).
     pub fn set_ui_scale(this: &mut WidgetMut<'_, Self>, index: usize, scale: f64) {
         let scale = scale.clamp(0.1, 8.0);
         let Some(slot) = this.widget.slots.get_mut(index) else {
@@ -416,13 +318,9 @@ impl AreaContent {
         if !this.widget.pending.contains(&index) {
             this.widget.pending.push(index);
         }
-        // Pushed now rather than from the next layout: this is a `WidgetMut`, so the root
-        // can be reached in this pass, and waiting for layout to schedule a mutate costs
-        // one of the four passes an event has (`issues/rewrite pass budget.md`). The
-        // queue stays for the builder, whose widget is not in a tree yet.
+        // Now, rather than from the next layout: that would cost a rewrite pass.
         Self::apply_pending(this);
-        // A header's own height is a function of its scale, so the stack has to be
-        // re-laid-out whatever the region's root decides to do about the property.
+        // A header's height depends on its scale.
         this.ctx.request_layout();
     }
 
@@ -467,10 +365,8 @@ impl Widget for AreaContent {
         UiScale::prop_changed(ctx, property_type);
     }
 
-    /// The grip: a press on it takes the pointer, a move resizes the sidebar, a release
-    /// lets go. The grip is the one place in the area no region covers, so these reach this
-    /// widget as its own events. The width goes into the [`SidebarState`], not into this
-    /// widget, and is not a step in any history — Blender's sidebar width is not either.
+    /// The grip, the one place no region covers: a drag resizes the sidebar, writing the
+    /// [`SidebarState`] (not a history step, as in Blender).
     fn on_pointer_event(
         &mut self,
         ctx: &mut masonry::core::EventCtx<'_>,
@@ -545,21 +441,13 @@ impl Widget for AreaContent {
         self.layouts += 1;
 
         if !self.pending.is_empty() {
-            // Setting a property needs a `WidgetMut`, which layout does not have. The
-            // mutate pass runs before the next layout pass in the same rewrite loop,
-            // so a scale change lands and is laid out in the same frame.
+            // Setting a property needs the mutate pass, which runs before the next layout.
             ctx.mutate_self_later(|mut this| Self::apply_pending(&mut this.downcast::<Self>()));
         }
 
-        // A header takes its scaled height off the top; anything else takes what is
-        // left, which is why the last region is the one that gets to be `Main`. The
-        // height is rounded to whole pixels for the reason `split_rect` is: a
-        // fractional boundary would make every region count as resized every frame.
-        //
-        // A sidebar is the second axis (§61): below the headers, it takes its width off the
-        // right of the body, the grip between it and the main region, and the main region
-        // takes what is left of the width — rounded too, so a drag of the grip resizes the
-        // two regions once per move and never by a fraction.
+        // Headers take their scaled height off the top; the sidebar and the grip take their
+        // width off the right of the body; the main region takes what is left. All rounded
+        // to whole pixels, or every region counts as resized every frame.
         let flow: Vec<usize> = (0..self.slots.len())
             .filter(|&i| self.slots[i].kind != RegionKind::Sidebar)
             .collect();
@@ -623,10 +511,7 @@ impl Widget for AreaContent {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx<'_>, _props: &PropertiesRef<'_>, _painter: &mut Painter<'_>) {
-        // Nothing of its own to draw — an area is its regions. The one thing it does
-        // here is claim a scene layer, and it has to claim it again in every paint,
-        // because the mode is reset for every widget at the start of every paint pass
-        // (§26.1, measured in §36.1).
+        // Nothing to draw; claims its scene layer, which every paint pass resets.
         if self.isolated {
             ctx.set_paint_layer_mode(PaintLayerMode::IsolatedScene);
         }
@@ -715,7 +600,7 @@ mod tests {
         assert_eq!(main, Size::new(AREA.0 as f64, AREA.1 as f64 - HEADER));
     }
 
-    /// §9's first rule, as a test rather than a timing: the scale is a layout input,
+    /// The first rule, as a test rather than a timing: the scale is a layout input,
     /// so it has to arrive at the region's layout and change what comes out of it.
     #[test]
     fn ui_scale_reaches_the_regions_layout() {
@@ -776,13 +661,8 @@ mod tests {
         assert_eq!(harness.root_widget().counters().resizes - before, 2);
     }
 
-    /// The finding §22 rests on, as a measurement rather than a reading of the
-    /// source: Masonry's own widgets do not scale, because nothing in them reads
-    /// [`UiScale`] and their sizes come from the theme's `DefaultProperties`, which
-    /// is one per application rather than one per region.
-    ///
-    /// Written as a test so that the day upstream grows a per-subtree scale, this
-    /// fails and tells us the workaround can go.
+    /// Masonry's own widgets do not read [`UiScale`]. Fails the day upstream scales a
+    /// subtree, and the workaround can go.
     #[test]
     fn masonry_widgets_do_not_follow_ui_scale() {
         use masonry::widgets::Button;
@@ -830,7 +710,7 @@ mod tests {
         );
         assert_eq!(
             before, after,
-            "a Masonry widget's padding followed ui_scale; §22 needs rewriting"
+            "a Masonry widget's padding followed ui_scale; the architecture notes need rewriting"
         );
         assert!(before.height > 0.0, "the check is vacuous if the button has no padding");
     }

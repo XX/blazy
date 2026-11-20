@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Exits non-zero if a criterion fails, which is what makes `rnd/architecture.md`
-//! §20.5 a gate rather than a paragraph someone has to remember to re-read. What is
+//! the claims a gate rather than a paragraph someone has to remember to re-read. What is
 //! gated and what is merely reported is argued in [`bench_utils::criteria`].
 //!
 //! `harness = false`: the criteria are counter thresholds with a pass/fail verdict,
